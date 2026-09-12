@@ -560,10 +560,11 @@ probe拉全页但只输出数量、金额字段覆盖和质量统计，不输出
 
 ### 5.1 注册表、支付能力与时间口径
 
-- [x] **5.1a 先写行为测试并观察失败。** `test_multi_source_metrics.py` 覆盖 tb/tm 只有出库源、fxg 交易源、混合按各自源取证、未知平台拒绝默认回退、PDD1 单据数可用而 paid_amount/paid_orders/aov/商品金额/现金差/cohort 不可用。空能力、缺档案也必须拒绝金额查询。首跑 `ModuleNotFoundError: bi_agent.sources`（红灯已留档）；现在 37 项全绿，其中 6 项跑在真实测试库 + `bi_reader` 身份上。
+- [x] **5.1a 先写行为测试并观察失败。** `test_multi_source_metrics.py` 覆盖 tb/tm 只有出库源、fxg 交易源、混合按各自源取证、未知平台拒绝默认回退、PDD1 单据数可用而 paid_amount/paid_orders/aov/商品金额/现金差/cohort 不可用。空能力、缺档案也必须拒绝金额查询。首跑 `ModuleNotFoundError: bi_agent.sources`（红灯已留档）；现在 44 项全绿，其中 14 项跑在独立测试库上（含以 `bi_reader` 身份验证“数据齐、覆盖全但没能力就一个数字也不给”的成对用例）。
 - [x] **5.1b 实现唯一注册表。** sources.py 只负责来源与能力解析；同步命令（包括 probe/refetch/replay）、质量核验、覆盖均调用它。将实体存在与指标能力分离，旧 orders 标签不提升支付权限。**pdd 支付源不登记**：2026-09-12 用户决定放弃方舟授权（见 [范围决定](../research/2026-09-12-drop-pdd-onboarding.md)），注册表只保留 pdd 单据能力，支付依赖直接解析为能力不足，不填猜测的方法名。同步侧：`ORDER_SOURCE_BY_PLATFORM`/`_shop_order_source` 已改为消费注册表，未登记平台报错退出而不是回退默认源；pdd 订单源改为出库通道（官方交易接口按文档排除拼多多）。
 - [ ] **5.1c 验证两个层次。** 请求门禁必须在金额 SQL 前返回 capability_unavailable；结果/Artifact 也不得绕过门禁直接读视图冒充平台总额。逐店能力经过迁移及核验维护，不因“同步成功”开通。
-  已完成：014 与 `sync capabilities [--apply]`（证据推导 + 回收）、`capability_unavailable` 进入状态/事件/Artifact/终止原因/恢复词表、真实库上“撤标签 → 零数字、给标签 → 照旧出 1000”对比用例。
+  已完成：014 与 `sync capabilities [--apply] [--all-shops]`（证据推导 + 回收，回写走单事务并在输出里携带 `quality_rule` 与警告）、`capability_unavailable` 进入状态/事件/Artifact/终止原因/恢复词表、运行层启动预检发现库未应用 014 时早报 `schema_outdated`、真实库上“撤标签 → 零数字 / 给标签 → 照旧出 1000”对比用例、“平台未登记来源”与“能力未授予”分开归因。
+  本任务只交**数据**未交**消费者**：`SourceBinding.coverage_certified` / `time_basis` 现在无生产读取方，“出库样本不得当完整支付窗口”由 5.2c 实现（旗标已有用例钉住不得删）。
   未完成（归 5.4c）：现有 `reporting.v_*` 视图仍可被直查绕过门禁；需等 basis 全链路一起验。
 
 ### 5.2 来源覆盖交集

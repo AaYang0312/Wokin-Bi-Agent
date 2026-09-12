@@ -765,6 +765,13 @@ class RunNotFound(Exception):
         super().__init__("run_not_found")
 
 
+class SchemaOutdated(Exception):
+    """数据库还没应用本进程依赖的迁移：早失败并说清是哪一版，不留“莫名 500”。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+
+
 class StaleRunRevision(Exception):
     def __init__(self) -> None:
         super().__init__("stale_run_revision")

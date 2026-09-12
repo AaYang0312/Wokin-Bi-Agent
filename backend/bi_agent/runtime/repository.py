@@ -10,6 +10,7 @@ from psycopg import errors
 from pydantic import ValidationError
 from psycopg.types.json import Jsonb
 
+from .artifacts import TERMINATION_REASONS
 from .models import (
     ArtifactPersistenceError,
     ArtifactRef,
@@ -21,6 +22,7 @@ from .models import (
     RunNotFound,
     RunStatus,
     RunTransition,
+    SchemaOutdated,
     StaleRunRevision,
     validate_artifact_payload,
     validate_coverage_payload,
@@ -37,13 +39,42 @@ class PostgresQueryRunStore:
     def __init__(self, conn: Any, *, forbidden_values: Collection[str]) -> None:
         self.conn = conn
         self._forbidden_values = frozenset(value for value in forbidden_values if value)
+        self._vocabulary_checked = False
         if not self._forbidden_values:
             raise ValueError("forbidden_values_required")
+
+    def _ensure_termination_vocabulary(self) -> None:
+        """确认库里的终止原因 CHECK 已经认识本进程的码表。
+
+        009 不能改写（已应用的迁移），新增原因码由 014 重新声明完整 CHECK。库没跑 014
+        就跑新代码时，一次正常的“能力未开通”查询会在收尾写入上撞 CHECK，被包成看不出
+        原因的失败。这里提前一次、按进程缓存地把它报成 schema_outdated。
+
+        读不到 `pg_constraint`（权限或对象缺失）时不额外拦路：那时仍由数据库自己的
+        CHECK 兜底，行为与今天一致。
+        """
+        if self._vocabulary_checked:
+            return
+        self._vocabulary_checked = True
+        try:
+            row = self.conn.execute(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid = 'bi.query_runs'::regclass "
+                "  AND conname = 'query_runs_termination_reason'").fetchone()
+        except errors.Error:
+            return
+        definition = str(row[0]) if row is not None else ""
+        missing = [code for code in sorted(TERMINATION_REASONS)
+                   if definition and f"'{code}'" not in definition]
+        if missing:
+            raise SchemaOutdated(f"schema_outdated:{missing[0]}")
 
     def create_run(self, record: NewQueryRun) -> UUID:
         record = self._revalidate_new_run(record)
         self._validate_normalized_request(record.normalized_request)
         self._validate_state(record.state)
+        # 契约校验先行，然后才碰库：带着非法载荷去探测 schema 只是把错因搅浑。
+        self._ensure_termination_vocabulary()
         run_id = uuid4()
         try:
             row = self.conn.execute(

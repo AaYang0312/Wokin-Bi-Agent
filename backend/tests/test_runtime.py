@@ -21,6 +21,7 @@ from bi_agent.runtime.models import (
     RunNotFound,
     RunStatus,
     RunTransition,
+    SchemaOutdated,
     StaleRunRevision,
 )
 from bi_agent.catalog import ref_for_key
@@ -538,14 +539,78 @@ class ProvenanceContractTests(unittest.TestCase):
         from bi_agent.runtime.artifacts import TERMINATION_REASONS
 
         sql_dir = pathlib.Path(__file__).parents[1] / "sql"
-        in_sql: set[str] = set()
+        # CHECK 是整段重新声明的（不能只追加），所以最新那份必须逐字等于码表；
+        # 只比对 009∪014 的并集会漏掉“新版本删了某个码而库里还留着”。
         for name in ("009_query_provenance.sql", "014_multi_source_contract.sql"):
             sql = (sql_dir / name).read_text(encoding="utf-8")
             block = sql.split("query_runs_termination_reason CHECK", 1)[1].split(");", 1)[0]
-            in_sql |= set(re.findall(r"'([a-z_]+)'", block))
+            in_sql = set(re.findall(r"'([a-z_]+)'", block))
+            if name.startswith("014"):
+                self.assertEqual(in_sql, set(TERMINATION_REASONS),
+                                 f"{name} 的 CHECK 必须与终止原因码表逐项一致")
+            self.assertTrue(in_sql <= set(TERMINATION_REASONS),
+                            f"{name} 含码表之外的原因码")
 
-        self.assertEqual(in_sql, set(TERMINATION_REASONS),
-                         "终止原因码表必须与迁移里的 CHECK 一致")
+
+class _PreflightConn:
+    """只回答 pg_constraint 预检的连接：任何业务写入都不该发生。"""
+
+    def __init__(self, definition: str | None):
+        self.definition = definition
+        self.sql: list[str] = []
+
+    def execute(self, sql, parameters=()):
+        self.sql.append(sql)
+
+        class _Result:
+            def __init__(self, row):
+                self._row = row
+
+            def fetchone(self):
+                return self._row
+
+        return _Result((self.definition,) if "pg_constraint" in sql else None)
+
+
+class StoreSchemaPreflightTests(unittest.TestCase):
+    """库里 CHECK 不认识本进程的码表时必须早失败，而不是收尾撞出一个看不出原因的失败。"""
+
+    def _record(self):
+        return NewQueryRun(
+            chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
+            tool_call_id="call_1", attempt_no=1,
+            normalized_request={"shop_refs": [S1_REF]},
+            state={"node": "received"},
+        )
+
+    def test_legacy_009_only_schema_is_reported_before_any_write(self):
+        from bi_agent.runtime.repository import PostgresQueryRunStore
+
+        legacy = ("CHECK (((termination_reason IS NULL) "
+                  "OR (termination_reason = ANY (ARRAY['succeeded'::text, "
+                  "'coverage_incomplete'::text]))))")
+        store = PostgresQueryRunStore(_PreflightConn(legacy),
+                                      forbidden_values={"S1"})
+        with self.assertRaises(SchemaOutdated):
+            store.create_run(self._record())
+        self.assertEqual(len(store.conn.sql), 1, "预检必须走在任何业务写入之前")
+
+    def test_current_schema_passes_and_is_checked_once_per_store(self):
+        from bi_agent.runtime.artifacts import TERMINATION_REASONS
+        from bi_agent.runtime.repository import PostgresQueryRunStore
+
+        current = "CHECK (termination_reason IS NULL OR termination_reason IN (" + \
+            ", ".join(f"'{code}'" for code in sorted(TERMINATION_REASONS)) + "))"
+        conn = _PreflightConn(current)
+        store = PostgresQueryRunStore(conn, forbidden_values={"S1"})
+
+        for _ in range(2):
+            # 预检过了以后会走到真实 INSERT；替身返回空行，说明已经越过门禁。
+            with self.assertRaises(Exception) as caught:
+                store.create_run(self._record())
+            self.assertNotIsInstance(caught.exception, SchemaOutdated)
+        self.assertEqual(len([item for item in conn.sql if "pg_constraint" in item]), 1,
+                         "每个 Store 实例最多预检一次")
 
 
 class MemoryQueryRunStoreTests(unittest.TestCase):

@@ -202,6 +202,28 @@ class CapabilityTagTests(unittest.TestCase):
 
         self.assertEqual(set(METRIC_CAPABILITIES), set(METRIC_DEFINITIONS))
 
+    def test_answerable_metric_reports_no_reason(self):
+        # 能回答时必须是 None，不能拿一个看起来像原因码的字符串占位。
+        self.assertIsNone(unsupported_reason(_shop("S1", "fxg", "paid_amount"),
+                                             "paid_amount"))
+
+    def test_uncertified_platform_is_grantable_but_flagged(self):
+        """能力开通与时间窗口认证是两件事，后者必须留着给 Task 5.2 消费。
+
+        没有这个旗标，5.2c “完整支付窗口”就无法拒绝把出库样本当全窗口；
+        现在它没有任何生产者，本用例钉住它不会因为“暂时没人读”被删。
+        """
+        granted = capabilities_from_evidence("tm", {(OUTSTOCK_SOURCE, ORDERS_ENTITY):
+                                                    "passed"})
+        self.assertIn("paid_amount", granted)
+        binding = resolve_metric_sources(_shop("S1", "tm", "paid_amount"),
+                                         "paid_amount")[0]
+        self.assertFalse(binding.coverage_certified)
+        # 已认证的抖音则相反：同一能力，时间口径可声称完整。
+        certified = resolve_metric_sources(_shop("S1", "fxg", "paid_amount"),
+                                           "paid_amount")[0]
+        self.assertTrue(certified.coverage_certified)
+
 
 class EvidenceGrantTests(unittest.TestCase):
     """能力只能由逐源核验证据推导，并且永远不超过该平台上限。"""
@@ -282,6 +304,26 @@ class CapabilityGateDatabaseTests(unittest.TestCase):
                 "WHERE shop_id=%s", (capabilities, platform, shop_id))
         self.conn.execute("SET LOCAL ROLE bi_reader")
 
+    def test_unregistered_platform_gets_the_onboarding_gap_not_the_capability_one(self):
+        # 平台没登记来源时，“换个已开通的指标”是错建议：只能先完成接入取证。
+        self._grant("{paid_amount,erp_documents}", platform="alibabac2m")
+        result = self._query(["paid_amount"])
+        self.assertEqual(result.status, "missing_data", result.limitations)
+        self.assertIn("source_not_onboarded", self._codes(result))
+        self.assertNotIn("capability_unavailable", self._codes(result))
+
+    def test_two_shops_with_two_gaps_get_two_distinct_disclosures(self):
+        # 未登记来源 + 有来源但未授予能力：同一请求里分开归因，不写成一回事。
+        self._grant("{paid_amount}", shop_id="S1", platform="alibabac2m")
+        self._grant("{erp_documents}", shop_id="S2")
+        result = self._query(["paid_amount"], shop_ids=("S1", "S2"))
+        codes = self._codes(result)
+        self.assertIn("source_not_onboarded", codes)
+        self.assertIn("capability_unavailable", codes)
+        self.assertEqual([item for item in result.limitations if "店铺" in item],
+                         ["1 家店铺的来源尚未开通（未授权或未同步），缩小日期范围不会补上这段数据",
+                          "1 家店铺缺少 paid_amount 的已核验能力，未执行金额查询"])
+
     def _codes(self, result) -> list[str]:
         from bi_agent.business_query.nodes import _limitation_codes
 
@@ -317,12 +359,6 @@ class CapabilityGateDatabaseTests(unittest.TestCase):
         money = self._query(["paid_amount"])
         self.assertEqual(money.status, "missing_data", money.limitations)
         self.assertEqual(money.data, [])
-
-    def test_unregistered_platform_is_refused_without_fallback(self):
-        self._grant("{paid_amount,erp_documents}", platform="alibabac2m")
-        result = self._query(["paid_amount"])
-        self.assertEqual(result.status, "missing_data", result.limitations)
-        self.assertIn("capability_unavailable", self._codes(result))
 
     def test_mixed_scope_keeps_the_request_and_names_the_missing_group(self):
         # 一家有能力、一家没有：不得悄悄删店后冒充全量成功。
@@ -418,6 +454,40 @@ class CapabilityMaintenanceTests(unittest.TestCase):
         self.assertEqual(unsupported_reason(
             ShopRecord.from_row("CM_UNK", "alibabac2m", ()), "erp_documents"),
             "source_unregistered")
+
+    def test_outstock_grant_is_flagged_until_coverage_follows_the_source(self):
+        """能力可以开通，但覆盖层还只读交易源：不提醒就会把缺能力误读成缺覆盖。"""
+        from bi_agent.sync import recompute_shop_capabilities
+
+        self._state("CM_PDD", OUTSTOCK_SOURCE, ORDERS_ENTITY, "passed")
+        grants = recompute_shop_capabilities(self.conn, ["CM_PDD"])
+        self.assertEqual(grants[0].granted, {"erp_documents"})
+        self.assertIn("coverage_source_mismatch", grants[0].warnings)
+
+        # 交易通道平台：覆盖层读的就是同一个源，不报这个警告。
+        self._state("CM_FXG", TRADE_LIST_SOURCE, ORDERS_ENTITY, "passed")
+        ok = recompute_shop_capabilities(self.conn, ["CM_FXG"])
+        self.assertNotIn("coverage_source_mismatch", ok[0].warnings)
+
+    def test_apply_writes_every_change_in_one_transaction(self):
+        from bi_agent.sync import recompute_shop_capabilities
+
+        self._state("CM_FXG", TRADE_LIST_SOURCE, ORDERS_ENTITY, "passed")
+        self.conn.execute("UPDATE bi.shops SET capabilities='{paid_amount}' "
+                          "WHERE shop_id='CM_FXG'")
+        grants = recompute_shop_capabilities(self.conn, ["CM_FXG", "CM_PDD"],
+                                             apply=True)
+        self.assertEqual(self._current("CM_FXG"), set(grants[0].granted))
+        self.assertIn("paid_amount", grants[0].granted)
+        # 只有订单证据时，退款类不该被开通：一次事务写的是完整集合，不是逐项累加。
+        self.assertNotIn("refund_amount", grants[0].granted)
+
+    def test_targets_default_to_the_authorized_scope(self):
+        from bi_agent.sync import capability_target_shops
+
+        self.assertEqual(capability_target_shops(self.conn, {"CM_FXG"}), ["CM_FXG"])
+        every = capability_target_shops(self.conn, {"CM_FXG"}, all_shops=True)
+        self.assertIn("CM_PDD", every, "回收必须能碰到授权范围外还在挂旧标签的店")
 
 
 if __name__ == "__main__":

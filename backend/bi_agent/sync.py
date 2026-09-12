@@ -23,10 +23,11 @@ import httpx
 
 from .catalog import EntityKind, bump_catalog_version, ensure_refs
 from .config import load_sync_settings
-from .data_quality import QUALITY_RULE, reconcile_source_quality
+from .data_quality import (
+    ENTITY_SOURCES, QUALITY_RULE, reconcile_source_quality)
 from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
 from .sources import (
-    AFTERSALE_SOURCE, OUTSTOCK_SOURCE, ShopRecord, TRADE_LIST_SOURCE,
+    AFTERSALE_SOURCE, ORDERS_ENTITY, OUTSTOCK_SOURCE, ShopRecord, TRADE_LIST_SOURCE,
     capabilities_from_evidence, platform_order_sources, resolve_order_source)
 
 logger = logging.getLogger(__name__)
@@ -1710,6 +1711,8 @@ class CapabilityGrant:
     platform: str
     current: frozenset[str]
     granted: frozenset[str]
+    # 开通后仍不能拿数的问题（如覆盖层还只读交易源）：不能藏在“写入成功”后面。
+    warnings: tuple[str, ...] = ()
 
     @property
     def changed(self) -> bool:
@@ -1742,6 +1745,19 @@ def read_quality_evidence(conn, shop_ids) -> dict[str, dict[tuple[str, str], str
     return evidence
 
 
+def capability_target_shops(conn, authorized, *, all_shops: bool = False) -> list[str]:
+    """能力重算该动哪些店。
+
+    默认只动授权范围（`BI_SHOP_IDS`）。但能力标签是长在 `bi.shops` 上的：范围外一家店
+    曾经开通的能力不会随证据消失而回收，只能靠 `--all-shops` 扫全集。默认不这么做，
+    是为了不让一次运维命令隐式改动本次部署不管的店铺。
+    """
+    if not all_shops:
+        return sorted(str(shop_id) for shop_id in authorized)
+    return [str(row[0]) for row in conn.execute(
+        "SELECT shop_id FROM bi.shops ORDER BY shop_id").fetchall()]
+
+
 def recompute_shop_capabilities(conn, shop_ids, *,
                                 apply: bool = False) -> list[CapabilityGrant]:
     """按已登记的来源与逐源对账证据重算能力标签（默认只报告，不写库）。
@@ -1758,17 +1774,27 @@ def recompute_shop_capabilities(conn, shop_ids, *,
     for shop_id, platform, capabilities in conn.execute(
             _SHOP_PROFILES_SQL, (ids,)).fetchall():
         record = ShopRecord.from_row(shop_id, platform, capabilities)
-        granted = capabilities_from_evidence(record.platform,
-                                             evidence.get(str(shop_id), {}))
+        shop_evidence = evidence.get(str(shop_id), {})
+        granted = capabilities_from_evidence(record.platform, shop_evidence)
+        warnings: list[str] = []
+        if granted and resolve_order_source(record) != ENTITY_SOURCES[ORDERS_ENTITY]:
+            # 出库通道平台：能力已经开通，但覆盖门禁还只读交易源（Task 5.2 未交付）。
+            # 不报出来，运维会看到“写了标签仍然缺数据”，然归因到覆盖上去。
+            warnings.append("coverage_source_mismatch")
         grants.append(CapabilityGrant(
             shop_id=str(shop_id), platform=record.platform,
-            current=frozenset(record.capabilities), granted=frozenset(granted)))
+            current=frozenset(record.capabilities), granted=frozenset(granted),
+            warnings=tuple(warnings)))
     if apply:
-        for grant in grants:
-            if not grant.changed:
-                continue
-            conn.execute("UPDATE bi.shops SET capabilities=%s WHERE shop_id=%s",
-                         (sorted(grant.granted), grant.shop_id))
+        # 一批写完：中途崩溃不能留下“一半店已回收、一半店还挂着旧标签”。
+        with conn.transaction():
+            for grant in grants:
+                if not grant.changed:
+                    continue
+                conn.execute("UPDATE bi.shops SET capabilities=%s WHERE shop_id=%s",
+                             (sorted(grant.granted), grant.shop_id))
+                logger.info("capabilities updated shop=%s granted=%s rule=%s",
+                            grant.shop_id, sorted(grant.granted), QUALITY_RULE)
     return grants
 
 
@@ -1797,6 +1823,8 @@ def main(argv: list[str] | None = None) -> int:
         help="按逐来源对账证据重算指标能力标签（默认只报告差异，--apply 才写库）")
     capabilities.add_argument("--apply", action="store_true",
                               help="确实回写 bi.shops.capabilities")
+    capabilities.add_argument("--all-shops", action="store_true",
+                              help="覆盖 bi.shops 全集（回收授权范围外的旧标签），默认只动 BI_SHOP_IDS")
     args = parser.parse_args(argv)
 
     settings = load_sync_settings(os.environ)
@@ -1897,14 +1925,17 @@ def main(argv: list[str] | None = None) -> int:
                                       "payment_downgrade_blocked":
                                           GUARD_STATS.payment_downgrade_blocked - before}))
             elif args.command == "capabilities":
-                grants = recompute_shop_capabilities(conn, sorted(settings.shop_ids),
-                                                     apply=args.apply)
+                targets = capability_target_shops(
+                    conn, settings.shop_ids, all_shops=args.all_shops)
+                grants = recompute_shop_capabilities(conn, targets, apply=args.apply)
                 for grant in grants:
                     print(json.dumps({
                         "action": "capabilities", "shop_id": grant.shop_id,
                         "platform": grant.platform, "mode": "apply" if args.apply else "report",
+                        "quality_rule": QUALITY_RULE,
                         "current": sorted(grant.current), "granted": sorted(grant.granted),
-                        "changed": grant.changed}, ensure_ascii=False))
+                        "changed": grant.changed, "warnings": list(grant.warnings)},
+                        ensure_ascii=False))
             elif args.command == "refresh-session":
                 _refresh_session(conn, client)
         finally:

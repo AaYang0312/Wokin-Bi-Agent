@@ -31,7 +31,7 @@ psql -d bi_agent -f backend/sql/009_query_provenance.sql
 
 单实例：全程持有数据库 advisory 锁，重复启动立即失败。
 
-### 平台路由（淘系 tb/tm）
+### 平台路由与来源注册表
 
 当前开发基线为 main，旧分支的同步入口统一迁入 backend。淘系“入库完成”与“查询可用”分别验收：[多来源契约](superpowers/specs/2026-09-12-multi-source-metrics-design.md)及[任务5/11](superpowers/plans/2026-09-07-ecommerce-bi-agent.md)。任务 5.1 已交付来源注册表与逐指标能力门禁（`backend/bi_agent/sources.py`）；单源覆盖交集（5.2）、未匹配退款硬门禁（5.3）与 basis 全链路（5.4）仍未完成；pdd 不得因档案或单据存在被宣称支付可用（2026-09-12 已决定不接入拼多多支付）。
 
@@ -61,6 +61,11 @@ Vite 将 `/api` 代理到 `http://127.0.0.1:8001`。开发页必须通过 `http:
 `bi_sync` 写业务事实，`bi_reader` 只能读报表视图，`bi_app` 读取相同视图并读写 `bi.app_chats` 与 `bi.app_messages`。API 查询与消息写入都有五秒 SQL 超时；同一会话同时生成时返回 `409 chat_busy`。
 
 已有数据库升级快麦字段映射与指标口径时，先由管理员执行前向迁移，再部署同步代码。迁移不会重写历史事实；为使修正后的状态、行号、行类型和完成时间生效，须对保留历史范围显式重放订单和售后，再刷新店铺档案。同步启动会检查 002 所需列；缺失时以 `schema_outdated` 拒绝写入。`replay` 仅会重规范化相同 `source_updated_at` 的版本，不会让较旧上游版本覆盖较新版本。
+
+**部署顺序硬约束：014 必须在应用新代码之前跑完。**终止原因码表新增了
+`capability_unavailable`，而 009 的 CHECK 已应用不可改写；库还停在 009 时，一次正常的
+“能力未开通”查询会在收尾写入上撞 CHECK。现在运行层会预检一次并早报
+`schema_outdated:<码>`，但那仍是服务不可用——先跑迁移，再部署。
 
 ```powershell
 Set-Location backend
@@ -98,6 +103,9 @@ uv run --env-file ../.env.sync python -m bi_agent.sync shops
 uv run --env-file ../.env.sync python -m bi_agent.sync backfill --days 90
 uv run --env-file ../.env.sync python -m bi_agent.sync incremental
 uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
+# 对账凭证落下后才能开通指标能力：先只报告，确认后再接着跑 --apply
+uv run --env-file ../.env.sync python -m bi_agent.sync capabilities
+uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --apply
 ```
 
 同步在完整分页、校验和事务提交后才推进水位。分页、权限或上游错误不会成为零业务数据；每日重核最近七天以处理晚到退款。
@@ -142,11 +150,17 @@ uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
 - **指标能力标签（`bi.shops.capabilities`）只能由对账证据开通**：先 `reconcile`，再跑能力重算，最后才可能出数。
 
 ```powershell
-# 先报告差异（默认不写库）：逐店显示当前标签、证据推导出的标签与是否有变化
+# 先报告差异（默认不写库）：逐店显示当前标签、证据推导出的标签、是否有变化与警告
 uv run --env-file ../.env.sync python -m bi_agent.sync capabilities
 # 确认无误后回写；证据消失时该标签同样会被回收
 uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --apply
+# 授权范围（BI_SHOP_IDS）之外的店也可能挂着旧标签：回收时加上这个开关
+uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --all-shops --apply
 ```
+
+输出里的 `warnings: ["coverage_source_mismatch"]` 不是写入失败，而是“能力已开通，但
+覆盖门禁还只读交易通道”（Task 5.2 未交付）：这类店现在仍会报覆盖缺口，不能据此判断
+接入成功，也不能拿它当能力开通的反证。
 
 能力标签取值与指标同名（`paid_amount`/`paid_orders`/`erp_documents`/`aov`/`quantity`/
 `product_paid_amount`/`refund_amount`/`cash_difference`/`cohort_refund_rate`）。旧的

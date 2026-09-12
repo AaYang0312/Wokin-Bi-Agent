@@ -92,33 +92,28 @@ class PlatformRegistration:
     # 能力上限：平台上限之外的标签即使被误写进库也不放行。
     ceiling: frozenset[str] = field(default_factory=frozenset)
 
-    @property
-    def grants_payment_metrics(self) -> bool:
-        return self.payment_basis is not None
 
-
-ALL_METRICS = METRIC_CAPABILITIES
 # 拼多多上限：仅已核验单据能力（行标识缺失、售后未逐店取证，其余一律关）。
 PDD_CEILING: frozenset[str] = frozenset({"erp_documents"})
 
 _REGISTRATIONS: dict[str, PlatformRegistration] = {
     # 抖音：交易通道排除淘系/拼多多，fxg 的支付口径与付款时间语义均已逐元对账。
     "fxg": PlatformRegistration("fxg", TRADE_LIST_SOURCE, "pay_time", PAYMENT_BASIS,
-                                True, ALL_METRICS),
+                                True, METRIC_CAPABILITIES),
     # 同一交易通道，但支付时间完整性未逐店取证：口径可同名，认证不复制。
     "jd": PlatformRegistration("jd", TRADE_LIST_SOURCE, "pay_time", PAYMENT_BASIS,
-                               False, ALL_METRICS),
+                               False, METRIC_CAPABILITIES),
     "kuaishou": PlatformRegistration("kuaishou", TRADE_LIST_SOURCE, "pay_time",
-                                     PAYMENT_BASIS, False, ALL_METRICS),
+                                     PAYMENT_BASIS, False, METRIC_CAPABILITIES),
     "wxsph": PlatformRegistration("wxsph", TRADE_LIST_SOURCE, "pay_time",
-                                  PAYMENT_BASIS, False, ALL_METRICS),
+                                  PAYMENT_BASIS, False, METRIC_CAPABILITIES),
     "wsxc": PlatformRegistration("wsxc", TRADE_LIST_SOURCE, "pay_time",
-                                PAYMENT_BASIS, False, ALL_METRICS),
+                                PAYMENT_BASIS, False, METRIC_CAPABILITIES),
     # 淘系唯一非敏感订单通道是销售出库；它按自身时间字段裁剪，不承诺支付窗口完整。
     "tb": PlatformRegistration("tb", OUTSTOCK_SOURCE, "outstock_time", OUTSTOCK_BASIS,
-                              False, ALL_METRICS),
+                              False, METRIC_CAPABILITIES),
     "tm": PlatformRegistration("tm", OUTSTOCK_SOURCE, "outstock_time", OUTSTOCK_BASIS,
-                              False, ALL_METRICS),
+                              False, METRIC_CAPABILITIES),
     # 拼多多：2026-09-12 决定不接入支付。单据口径保留，支付族永久解析不通。
     # 订单源只能给出库通道——官方 `erp.trade.list.query` 明确排除淘系与拼多多，
     # 拿交易源去同步会被空响应伪造成“完整覆盖”（设计 §3 禁止的正是这个回退）。
@@ -131,10 +126,6 @@ _REGISTRATIONS: dict[str, PlatformRegistration] = {
 TradeListPlatforms: tuple[str, ...] = tuple(
     sorted(item.platform for item in _REGISTRATIONS.values()
            if item.order_source == TRADE_LIST_SOURCE))
-# 已登记的平台全集；未登记者（1688、淘工厂、任何新出现的写法）一律无来源。
-RegisteredPlatforms: tuple[str, ...] = tuple(sorted(_REGISTRATIONS))
-
-
 @dataclass(frozen=True)
 class ShopRecord:
     """服务端加载的店铺记录。模型只能给 shop_ref，来源与能力一律由服务端解析。"""
@@ -179,7 +170,7 @@ def _capability_set(capabilities: object) -> frozenset[str]:
 
 
 def platform_order_sources() -> dict[str, str]:
-    """平台→订单源快照：同步路由与用例遍历共用，不在两处各拄一份。"""
+    """平台→订单源快照：同步路由与用例遍历共用，不在两处各抄一份。"""
     return {platform: item.order_source
             for platform, item in sorted(_REGISTRATIONS.items())}
 
@@ -241,17 +232,23 @@ def resolve_metric_sources(shop: ShopRecord,
     return tuple(bindings)
 
 
-def unsupported_reason(shop: ShopRecord, metric: str) -> str:
-    """能力不足的具体原因（稳定码）：不允许调用方自己猜。
+def unsupported_reason(shop: ShopRecord, metric: str) -> str | None:
+    """为什么这家店回答不了这个指标；能回答时返回 None。
 
-    - `source_unregistered`：平台没有登记来源，禁止回退。
-    - `capability_ungranted`：来源有，但这家店没被授予该指标能力。
+    原因码稳定，且与 `resolve_metric_sources` 同源，调用方不得自己猜归因：
+
+    - `source_unregistered`：平台没有登记来源，禁止回退到别的通道。
+    - `capability_ungranted`：来源在，但这家店没被授予该指标能力。
     - `capability_unavailable`：授予了标签，但该来源口径拿不到这个指标（拼多多支付族、
-      未知指标名）。注册表上限优先于标签，误写的标签不会打开任何能力。
+      未知指标名）。注册表上限优先于标签，误写进库的标签不会打开任何能力。
+
+    归因顺序把「没有来源」放在最前：换指标救不了没登记的平台，两种缺口的用户建议不同。
     """
     reg = registration(shop.platform)
     if reg is None:
         return "source_unregistered"
+    if resolve_metric_sources(shop, metric):
+        return None
     if metric not in METRIC_CAPABILITIES:
         return "capability_unavailable"
     if metric in PAYMENT_FAMILY and reg.payment_basis is None:
@@ -260,13 +257,7 @@ def unsupported_reason(shop: ShopRecord, metric: str) -> str:
         return "capability_unavailable"
     if metric not in shop.capabilities:
         return "capability_ungranted"
-    return "capability_available"
-
-
-def required_entities(metrics) -> list[str]:
-    """这批指标一共依赖哪些业务实体。"""
-    return sorted({entity for metric in metrics
-                   for entity in ENTITY_REQUIREMENTS[str(metric)]})
+    return "capability_unavailable"
 
 
 def capabilities_from_evidence(
