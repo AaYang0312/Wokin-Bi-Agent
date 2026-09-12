@@ -133,6 +133,27 @@ def _safe_result(
         if isinstance(raw_shops, list):
             filters["shop_refs"] = [catalog.shop_ref(str(shop_id)) for shop_id in raw_shops]
 
+    # 口径凭证：内部带真实 shop_id 与来源，公开形状只留 shop_ref + 口径 + 时间归属。
+    # 模型必须看得见口径，否则它会把同名指标当同义词去汇总、比较与排名。
+    basis: list[dict[str, object]] = []
+    raw_basis = payload.get("basis")
+    if isinstance(raw_basis, list):
+        for item in raw_basis:
+            if not isinstance(item, dict):
+                continue
+            entry = {
+                "metric": item.get("metric"),
+                "basis": item.get("basis"),
+                "time_basis": item.get("time_basis"),
+                "metric_version": item.get("metric_version"),
+            }
+            if item.get("shop_id") is not None:
+                entry["shop_ref"] = catalog.shop_ref(str(item["shop_id"]))
+            basis.append(entry)
+
+    raw_diagnostics = payload.get("diagnostics")
+    diagnostics = raw_diagnostics if isinstance(raw_diagnostics, dict) else {}
+
     body: dict[str, object] = {
         "status": payload.get("status"),
         "metric_definition": payload.get("metric_definition"),
@@ -141,6 +162,8 @@ def _safe_result(
         "data_as_of": payload.get("data_as_of"),
         "filters": filters,
         "data": rows,
+        "basis": basis,
+        "diagnostics": diagnostics,
     }
     if not model_view:
         body["entities"] = catalog.entities_payload()

@@ -204,6 +204,26 @@
 > 旧的 pdd 交易通道 `sync_state` 行已被 pdd→出库的路由抛成孤儿：它既不参与覆盖判定
 > 也不删除（删就是抹掉取过数的痕迹），台账处置归 Task 5.3/发布清单。
 
+### 口径凭证全链路与混口径禁合并（Task 5.4）
+
+每个结果都携带逐店逐指标的口径凭证：内部形状是
+`{shop_id, metric, source, basis, time_basis, metric_version}`，公开投影只保留
+`{shop_ref, metric, basis, time_basis, metric_version}` ——**接口方法名与 ERP 主键都不外发**。
+模型因此看得见“这些数是什么口径”，但拿不到标识符。
+
+| 规则 | 结果 |
+| --- | --- |
+| 同一请求范围内出现互不兼容的 `(basis, time_basis)`，分组是 `total`/`day`/`product` | `invalid_parameters` + `basis_incompatible`，提示按店铺分列；不产出任何数字 |
+| 同上不兼容但 `group_by=shop` 且 `basis_policy=separate` | 每店一行、各带自己的口径；**永不产出跨口径合计、增长率或排名** |
+| `basis_policy=strict`（默认） | 连分列也要先确认口径：模型必须显式改用 `separate` 才能拿到分列结果 |
+| 上期与本期由**不同来源**覆盖（换过通道） | 拒答比较：两期差额是口径变化，不是经营增长 |
+| 单店结果 | 同样附口径；否则“淘系的单据数”会被当成按付款时间的全平台口径 |
+
+指纹与血缘纳入 `source_registry_version`、`basis_signature`（`指标\|口径\|时间归属`
+去重签名，不含主键）、`quality_rule`：登记新来源、改通道口径或升级对账规则后，旧结果
+不允许被复用，旧 Artifact 仍按当版口径原样可读。系统提示词同步要求：销售额先确认期间与
+口径、平台对比只展示可比结果、同名指标不得自动同义化。
+
 ### 可量化限制代替整次拒答（Task 5.3）
 
 以前“窗口里只要有一条未匹配的平台成功退款”就把整次查询打成 `missing_data`，

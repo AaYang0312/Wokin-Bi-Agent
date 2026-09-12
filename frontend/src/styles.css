@@ -568,6 +568,18 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
   font-variant-numeric: tabular-nums;
 }
 .artifact-meta svg { color: var(--text-3); flex: 0 0 auto; }
+/* 口径行：数据卡之前先说清这些数是什么口径，混口径时提高可见度。 */
+.basis-note {
+  margin: 0;
+  color: var(--text-muted, #8b93a1);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.basis-mixed {
+  color: #e0a458;
+}
+
 .limitations {
   margin: 10px 0 0;
   padding: 9px 11px;

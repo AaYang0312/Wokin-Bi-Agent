@@ -118,8 +118,9 @@ class PostgresQueryRunStore:
             """INSERT INTO bi.query_provenance (
                    run_id, template_id, template_version, metric_version, schema_version,
                    catalog_version, mapping_version, policy_version, graph_version,
-                   source_batches, data_as_of
-               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                   source_batches, data_as_of, source_registry_version,
+                   basis_signature, quality_rule
+               ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                ON CONFLICT (run_id) DO UPDATE SET
                    template_id = EXCLUDED.template_id,
                    template_version = EXCLUDED.template_version,
@@ -130,12 +131,17 @@ class PostgresQueryRunStore:
                    policy_version = EXCLUDED.policy_version,
                    graph_version = EXCLUDED.graph_version,
                    source_batches = EXCLUDED.source_batches,
-                   data_as_of = EXCLUDED.data_as_of""",
+                   data_as_of = EXCLUDED.data_as_of,
+                   source_registry_version = EXCLUDED.source_registry_version,
+                   basis_signature = EXCLUDED.basis_signature,
+                   quality_rule = EXCLUDED.quality_rule""",
             (run_id, provenance.template_id, provenance.template_version,
              provenance.metric_version, provenance.schema_version,
              provenance.catalog_version, provenance.mapping_version,
              provenance.policy_version, provenance.graph_version,
-             list(provenance.source_batches), provenance.data_as_of),
+             list(provenance.source_batches), provenance.data_as_of,
+             provenance.source_registry_version, list(provenance.basis_signature),
+             provenance.quality_rule or None),
         )
 
     def record_diagnostic(self, run_id: UUID, *, template_id: str, sql_text: str,

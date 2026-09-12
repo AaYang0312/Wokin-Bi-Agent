@@ -263,6 +263,38 @@ def describe_attribution_gap(gap: AttributionGap) -> str | None:
             f"无商品归属{_money(gap.no_product)}元；其他{_money(gap.other)}元）")
 
 
+_SWITCHED_SOURCES_SQL = """
+SELECT DISTINCT shop_id, entity, source FROM reporting.v_coverage
+WHERE entity = ANY(%s) AND shop_id = ANY(%s)
+  AND covered && tstzmultirange(tstzrange(%s, %s, '[)'))
+"""
+
+
+def switched_sources_between(conn, *, shop_ids: Sequence[str], entities: Sequence[str],
+                             current: set[tuple[str, str, str]],
+                             start_ts: datetime, end_ts: datetime) -> tuple[str, ...]:
+    """找出“上期由另一个来源覆盖”的店铺：这是换来源，不是增长或下滑。
+
+    两期差额只有在同来源、同口径、同时间归属时才有经营含义。上期窗口被一条**本次没在用**
+    的来源覆盖，说明这家店换过通道——把它解释成增长率会把口径变化说成业务变化。
+    """
+    if not shop_ids or not entities:
+        return ()
+    # 参数顺序与 SQL 一致：先 entity 再 shop_id，写反了查不到行就会静默放过换来源。
+    rows = conn.execute(_SWITCHED_SOURCES_SQL,
+                        (list(entities), [str(s) for s in shop_ids],
+                         start_ts, end_ts)).fetchall()
+    used_keys = {(shop_id, entity) for shop_id, entity, _source in current}
+    switched: set[str] = set()
+    for shop_id, entity, source in rows:
+        key = (str(shop_id), str(entity))
+        if key not in used_keys:
+            continue
+        if (str(shop_id), str(entity), str(source)) not in current:
+            switched.add(str(shop_id))
+    return tuple(sorted(switched))
+
+
 @dataclass(frozen=True)
 class RefundAttribution:
     """退款归属限制的量化形状：0/0 时比例是未知，不是 0%。"""

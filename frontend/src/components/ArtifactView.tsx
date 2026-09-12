@@ -106,6 +106,11 @@ export function ArtifactView({ artifact }: { artifact: Artifact }) {
   const shopRefs = Array.isArray(filters?.shop_refs)
     ? filters.shop_refs.filter((ref): ref is string => typeof ref === 'string') : []
   const limitations = Array.isArray(artifact.limitations) ? artifact.limitations : []
+  const basis = Array.isArray(artifact.basis) ? artifact.basis.filter(isRecord) : []
+  const basisKeys = new Set(basis.map((item) => `${text(item.basis)}/${text(item.time_basis)}`))
+  const basisLabels = [...new Set(basis.map((item) => (
+    `${text(item.metric)}＝${text(item.basis)}（${text(item.time_basis)}）`)))]
+  const mixedBasis = basisKeys.size > 1
   const rangeStart = typeof filters?.start === 'string' ? filters.start : null
   const rangeEnd = typeof filters?.end === 'string' ? filters.end : null
   const asOf = typeof artifact.data_as_of === 'string' ? artifact.data_as_of : null
@@ -118,6 +123,12 @@ export function ArtifactView({ artifact }: { artifact: Artifact }) {
         <span className="artifact-title"><TableIcon size={15} />查询结果</span>
         {dataRows.length > 0 && <span className="pill">{dataRows.length} 行</span>}
       </header>
+      {basisLabels.length > 0 && (
+        <p className={`basis-note${mixedBasis ? ' basis-mixed' : ''}`}>
+          统计口径：{basisLabels.join('；')}
+          {mixedBasis && '｜口径不同，不能汇总、求增长率或排名'}
+        </p>
+      )}
       {first && dataRows.length === 1 && (
         <div className="metric-grid">
           {numericKeys.map((key) => {

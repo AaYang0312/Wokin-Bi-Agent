@@ -603,10 +603,14 @@ missing = requested_multirange - common
 
 ### 5.4 basis 全链路和混合查询
 
-- [ ] **5.4a 写跨层反例。** strict 下 fxg+tb 总额返回 invalid_parameters/basis_incompatible；group_by=shop 且 basis_policy=separate 返回带各自 basis 的分店行，不附混合总数、增长率或跨平台排名。包含 PDD1 缺能力时明确缺失组，不自动删店。
-- [ ] **5.4b 实现请求/结果契约。** 基于服务端来源绑定构造逐店逐指标 basis、time_basis、diagnostics；模型给出的 basis 不能覆盖已核验登记。当前期/对比期换源或口径版本不兼容时同样阻止增减比较。
-- [ ] **5.4c 接通投影与状态。** Agent 系统提示词、QueryRequest、business_query 状态与恢复、runtime 白名单、response_summary、Artifact、前端 types/现有 limitations 卡片全部传递并展示口径。保持 opaque shop_ref，不向模型透露主键；旧 Artifact 可读并标旧契约。
-- [ ] **5.4d 版本与复用。** fingerprint/provenance 纳入 source/basis/time_basis/capability_version/metric_version/policy_version；同一问题换来源或开放能力必须重新取数，不复用旧口径结果。测试授权域不变、来源版本变更、旧 Artifact 恢复三种情形。
+- [x] **5.4a 写跨层反例。** strict 下 fxg+tb 总额返回 invalid_parameters/basis_incompatible；group_by=shop 且 basis_policy=separate 返回带各自 basis 的分店行，不附混合总数、增长率或跨平台排名。包含 PDD1 缺能力时明确缺失组，不自动删店。
+  交付：`BasisContractDatabaseTests`（真实测试库、`bi_reader` 身份）11 项。反例取 `erp_documents`：两家都能答，但一个按 `pay_time`、一个按 `outstock_time`，正好证明**兼容性不能只看指标同名**。缺能力时不自动删店由 5.1 的 `test_mixed_scope_keeps_the_request_and_names_the_missing_group` 钉住。
+- [x] **5.4b 实现请求/结果契约。** 基于服务端来源绑定构造逐店逐指标 basis、time_basis、diagnostics；模型给出的 basis 不能覆盖已核验登记。当前期/对比期换源或口径版本不兼容时同样阻止增减比较。
+  交付：`QueryRequest.basis_policy`（strict 默认 / separate）、`ToolResult.basis` 与 `ToolResult.diagnostics`、`binding_signature()` 作为唯一兼容性判据、`switched_sources_between()` 拦下“同店换源把两期差额当成增长”。模型只能请求策略，不能自行提供 basis（`extra="forbid"` + 白名单校验）。
+- [x] **5.4c 接通投影与状态。** Agent 系统提示词、QueryRequest、business_query 状态与恢复、runtime 白名单、response_summary、Artifact、前端 types/现有 limitations 卡片全部传递并展示口径。保持 opaque shop_ref，不向模型透露主键；旧 Artifact 可读并标旧契约。
+  交付：`business_query/tool.py` 把 basis 转成 `shop_ref` 并删掉 `source`；`runtime/models.py` 新增 `_basis_items`/`_diagnostics` 形状校验；`basis_policy` 进入 filters 与 normalized_request 白名单；`basis_incompatible` 进入归因与公开文本；确定性摘要补“统计口径”行；提示词写明同名≠同口径、混口径不汇总不排名、未认证口径只能当可观测样本；前端 `BasisEntry` + 口径行（混口径变色，+3 项 Vitest）。旧 Artifact 无 `basis` 键仍可读。
+- [x] **5.4d 版本与复用。** fingerprint/provenance 纳入 source/basis/time_basis/capability_version/metric_version/policy_version；同一问题换来源或开放能力必须重新取数，不复用旧口径结果。测试授权域不变、来源版本变更、旧 Artifact 恢复三种情形。
+  交付：`015_provenance_basis.sql` 给 `bi.query_provenance` 加 `source_registry_version` / `basis_signature[]` / `quality_rule`；版本常量收敛到 `sources.py`（运行层与指标层原来各抄一份 `METRIC_VERSION`/`POLICY_VERSION`，是漂移隐患）；`basis_signature_of()` 只留 `指标|口径|时间归属`，主键与接口方法名进不了血缘表；用例覆盖换口径/换注册表版本/换质量规则三种失效与签名形状拒绝。
 
 ### 5.5 验证与提交
 

@@ -11,6 +11,7 @@ artifact 引用，能读出当时发布给用户的载荷与其版本。没有�
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Literal
 from uuid import UUID
@@ -26,9 +27,11 @@ from .domain_registry import (
 
 # 口径版本：改指标定义、改名称目录口径、改映射规则都必须推进对应版本，
 # 否则旧的已存结果会被当成新版本数据复用。
-METRIC_VERSION = "metrics/2026-09-11.1"
-POLICY_VERSION = "quality-policy/2026-09-11.1"
+# 来源/口径/策略版本由注册表供给：换来源或改能力策略时只改那一处，指纹自然失效。
+from bi_agent.sources import METRIC_VERSION, POLICY_VERSION, SOURCE_REGISTRY_VERSION
 GRAPH_VERSION = "business_query-graph/2026-09-11.1"
+# 口径签名形状：`指标|口径|时间归属`，三段都取自注册表用过的字符集。
+_BASIS_SIGNATURE_RE = re.compile(r"^[a-z_]+\|[a-z0-9_/]+\|[a-z_]+$")
 QUERY_TEMPLATE_ID = "fixed_metric_query"
 QUERY_TEMPLATE_VERSION = "1"
 
@@ -63,14 +66,29 @@ class QueryProvenance(BaseModel):
     mapping_version: str = "identity/2026-09-11.1"
     policy_version: str = POLICY_VERSION
     graph_version: str = GRAPH_VERSION
+    # 来源注册表版本 + 实际用到的口径签名 + 当时生效的质量规则：
+    # 同店换来源或口径认证状态变化后，旧结果不允许被复用。
+    source_registry_version: str = SOURCE_REGISTRY_VERSION
+    basis_signature: tuple[str, ...] = ()
+    quality_rule: str = ""
     # 来源批次：服务端可信标识；不进模型载荷，只进 Artifact 与诊断记录。
     source_batches: tuple[str, ...] = ()
     data_as_of: datetime | None = None
 
     _clean = field_validator(
         "template_id", "template_version", "metric_version", "schema_version",
-        "mapping_version", "policy_version", "graph_version")(
+        "mapping_version", "policy_version", "graph_version",
+        "source_registry_version", "quality_rule")(
         classmethod(lambda cls, value: _reject_text(value)))
+
+    @field_validator("basis_signature")
+    @classmethod
+    def _basis_is_a_sorted_signature(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """签名形如 `paid_amount|platform_payment/v1|pay_time`：不带主键、不带方法名。"""
+        for item in value:
+            if not isinstance(item, str) or not _BASIS_SIGNATURE_RE.fullmatch(item):
+                raise ValueError("unsafe_provenance_value")
+        return tuple(sorted(set(value)))
 
     @field_validator("source_batches")
     @classmethod
@@ -94,6 +112,7 @@ class QueryProvenance(BaseModel):
         return {key: payload[key] for key in (
             "template_id", "template_version", "metric_version", "schema_version",
             "catalog_version", "mapping_version", "policy_version", "graph_version",
+            "source_registry_version", "basis_signature", "quality_rule",
             "source_batches", "data_as_of")}
 
 
@@ -134,6 +153,19 @@ def _termination_reasons() -> frozenset[str]:
 
 
 TERMINATION_REASONS = _termination_reasons()
+
+
+def basis_signature_of(entries) -> tuple[str, ...]:
+    """把逐店逐指标的口径凭证压成指纹材料：只留 `指标|口径|时间归属`。
+
+    店铺主键与接口方法名不进血缘表，也不进模型载荷；但它们的变化必须让指纹改变，
+    而签名集合里出现的每一个不同口径都会改变它。
+    """
+    return tuple(sorted({
+        f"{item.get('metric')}|{item.get('basis')}|{item.get('time_basis')}"
+        for item in entries
+        if isinstance(item, dict)
+    }))
 
 
 def request_fingerprint(*, subject_id: str, allowed_shop_ids: frozenset[str],

@@ -113,6 +113,12 @@ class PlatformRegistration:
     ceiling: frozenset[str] = field(default_factory=frozenset)
 
 
+# 版本标识：来源、口径与能力策略都参与请求指纹，版本一变旧结果就不许再命中。
+# 定义放在注册表旁边，避免运行层与指标层各抄一份后互相漂移。
+SOURCE_REGISTRY_VERSION = "sources/2026-09-12.1"
+METRIC_VERSION = "metrics/2026-09-12.1"
+POLICY_VERSION = "multi-source-policy/2026-09-12.1"
+
 # 拼多多上限：仅已核验单据能力（行标识缺失、售后未逐店取证，其余一律关）。
 PDD_CEILING: frozenset[str] = frozenset({"erp_documents"})
 
@@ -226,6 +232,16 @@ def _entity_basis(reg: PlatformRegistration, metric: str,
     if metric == "erp_documents" or reg.payment_basis is None:
         return DOCUMENT_BASIS, reg.time_certified
     return reg.payment_basis, reg.time_certified
+
+
+def binding_signature(bindings) -> tuple[tuple[str, str, str], ...]:
+    """一条依赖的可比性签名：口径 + 时间归属 + 认证状态。
+
+    兼容性不能只看指标同名，也不能只看平台名（设计 §6）：`erp_documents` 在付款时间
+    窗口与出库时间窗口上是两个不同问题的答案，把它们相加得到的不是“全平台单据数”。
+    """
+    return tuple(sorted((item.basis, item.time_basis, item.time_certification)
+                        for item in bindings))
 
 
 def resolve_order_source(shop: ShopRecord) -> str | None:

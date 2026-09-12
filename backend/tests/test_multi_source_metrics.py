@@ -16,7 +16,12 @@ from __future__ import annotations
 import os
 import time
 import unittest
+from types import SimpleNamespace
+from datetime import datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
+
+BEIJING = ZoneInfo("Asia/Shanghai")
 
 from bi_agent.sources import (
     AFTERSALE_COHORT_ENTITY, AFTERSALE_ENTITY, AFTERSALE_SOURCE, COHORT_BASIS,
@@ -418,6 +423,251 @@ class CapabilityGateDatabaseTests(unittest.TestCase):
         # 缺能力不能伪装成缺覆盖：能力门禁走在覆盖读取之前，覆盖保持“未评估”。
         self.assertIsNone(result.coverage.start)
         self.assertEqual(result.coverage.status, "missing")
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class BasisContractDatabaseTests(unittest.TestCase):
+    """设计 §6：口径（basis）必须跟着结果走，不能把不同口径汇成一个数再比较。
+
+    抖音的 `platform_payment/v1` 与淘系出库的 `erp_outstock_payment/v1` 同名不同义：
+    合起来当“全平台销售额”，或者拿它算增长率/排名，都是把口径差当成经营差异。
+    """
+
+    def setUp(self):
+        self.conn = connect_test_db(self)
+        seed_business_case(self.conn)          # S1 = fxg，支付 1000
+        self.conn.execute("RESET ROLE")
+        self._seed_tb_shop()
+        self.conn.execute("SET LOCAL ROLE bi_reader")
+
+    def _ms(self, moment):
+        return int(moment.timestamp() * 1000)
+
+    def _seed_tb_shop(self) -> None:
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name, capabilities) "
+            "VALUES ('TB1','tb','淘系店','{paid_amount,erp_documents}') "
+            "ON CONFLICT (shop_id) DO UPDATE SET capabilities = EXCLUDED.capabilities")
+        trade = normalise_trade({
+            "sid": "E-TB1", "userId": "TB1", "tid": "C-TB1", "payAmount": "100.00",
+            "payTime": self._ms(datetime(2026, 9, 2, 10, tzinfo=BEIJING)),
+            "updTime": self._ms(datetime(2026, 9, 2, 11, tzinfo=BEIJING)),
+            "status": "TRADE_NO_CREATED_EVALUATION", "sysStatus": 0,
+            "orders": [{"skuId": "S1", "num": "1", "payAmount": "100.00",
+                        "itemSysId": "P_A", "oid": "E-TB1-1"}],
+        }, source=OUTSTOCK_SOURCE)
+        assert trade["normalization_status"] == "normal", trade
+        self.assertTrue(apply_trade(self.conn, trade, batch_id="tb-seed"))
+        self.conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
+            "data_as_of, quality_status, quality_rule) VALUES "
+            "(%s, 'orders', 'TB1', '2026-09-08 00:00+08', "
+            "tstzmultirange(tstzrange('2026-09-01','2026-09-08','[)')), "
+            "'2026-09-08 00:00+08', 'passed', 'test-seed') "
+            "ON CONFLICT (source, entity, shop_id) DO UPDATE SET "
+            "covered = EXCLUDED.covered, data_as_of = EXCLUDED.data_as_of",
+            (OUTSTOCK_SOURCE,))
+
+    def _query(self, metrics, shop_ids, **overrides):
+        import time as time_module
+
+        from bi_agent.metrics import QueryRequest, query_business
+
+        defaults = dict(start="2026-09-01", end="2026-09-08",
+                        shop_ids=list(shop_ids), metrics=list(metrics))
+        defaults.update(overrides)
+        return query_business(self.conn, QueryRequest(**defaults),
+                              allowed_shop_ids=frozenset({"S1", "S2", "TB1"}),
+                              now=FROZEN_NOW, deadline=time_module.monotonic() + 30)
+
+    def test_mixed_time_basis_cannot_be_merged_into_one_total(self):
+        """两家都能答的 `erp_documents`，一个是 pay_time、一个是 outstock_time。
+
+        兼容性看 (口径, 时间归属) 两件事，不能只看指标同名——“ERP单据数”在两个通道
+        上是两个不同问题的答案，加起来不是“全平台单据数”。
+        """
+        result = self._query(["erp_documents"], ["S1", "TB1"])
+        self.assertEqual(result.status, "invalid_parameters", result.limitations)
+        self.assertIn("basis_incompatible", self._codes(result))
+        self.assertEqual(result.data, [])
+
+    def test_product_and_day_grouping_are_equally_incompatible(self):
+        day = self._query(["erp_documents"], ["S1", "TB1"], group_by="day")
+        self.assertEqual(day.status, "invalid_parameters")
+        self.assertIn("basis_incompatible", self._codes(day))
+
+    def test_separate_policy_answers_per_shop_rows_with_their_own_basis(self):
+        result = self._query(["erp_documents"], ["S1", "TB1"], group_by="shop",
+                             basis_policy="separate")
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        rows = {row["shop_id"]: row for row in result.data}
+        self.assertEqual(set(rows), {"S1", "TB1"})
+        self.assertEqual(rows["S1"]["erp_documents"], 6)
+        self.assertEqual(rows["TB1"]["erp_documents"], 1)
+        keys = {(entry["shop_id"], entry["time_basis"]) for entry in result.basis}
+        self.assertEqual(keys, {("S1", "pay_time"), ("TB1", "outstock_time")})
+
+    def test_strict_policy_still_refuses_per_shop_mixing(self):
+        """strict 的语义就是“不合并也不行，先确认口径”；separate 才是显式分列。"""
+        result = self._query(["erp_documents"], ["S1", "TB1"], group_by="shop",
+                             basis_policy="separate")
+        strict = self._query(["erp_documents"], ["S1", "TB1"], group_by="shop")
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(strict.status, "invalid_parameters")
+        self.assertIn("basis_incompatible", self._codes(strict))
+
+    def test_single_shop_result_still_carries_its_basis(self):
+        """单店也必须附 basis：否则“淘系的单据数”会被当成按付款时间的全平台口径。"""
+        result = self._query(["erp_documents"], ["TB1"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual([(item["shop_id"], item["metric"], item["basis"],
+                           item["time_basis"]) for item in result.basis],
+                         [("TB1", "erp_documents", DOCUMENT_BASIS, "outstock_time")])
+        # 内部项保留来源，公开投影只给 shop_ref：口径不能变成主键的泄露面。
+        self.assertTrue(all(item["source"] == OUTSTOCK_SOURCE for item in result.basis))
+
+    def test_comparison_across_a_source_switch_is_refused_not_explained_as_growth(self):
+        """同店换来源时，两期差额不能被解释成增长：那只是口径变了。"""
+        self.conn.execute("RESET ROLE")
+        # TB1 的上期落在交易通道（旧来源），本期落在出库通道：两期口径不同。
+        self.conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
+            "data_as_of, quality_status, quality_rule) VALUES "
+            "(%s, 'orders', 'TB1', '2026-09-01 00:00+08', "
+            "tstzmultirange(tstzrange('2026-08-25','2026-09-01','[)')), "
+            "'2026-09-01 00:00+08', 'passed', 'test-seed')",
+            (TRADE_LIST_SOURCE,))
+        self.conn.execute(
+            "INSERT INTO bi.orders(shop_id, erp_id, source, commercial_ids, active, "
+            "raw_pay_amount, paid_at, source_updated_at, batch_id) VALUES "
+            "('TB1','E-TB0',%s,ARRAY['C-TB0'],true,50,'2026-08-28 10:00+08',now(),'tb-seed')",
+            (TRADE_LIST_SOURCE,))
+        self.conn.execute(
+            "INSERT INTO bi.order_payments(shop_id, commercial_id, paid_at, amount, "
+            "currency, basis, verified, source_updated_at) VALUES "
+            "('TB1','C-TB0','2026-08-28 10:00+08',50,'CNY','head',true,now())")
+        self.conn.execute("SET LOCAL ROLE bi_reader")
+
+        result = self._query(["erp_documents"], ["TB1"], start="2026-09-01",
+                             compare="previous_period")
+        self.assertEqual(result.status, "invalid_parameters", result.limitations)
+        self.assertIn("basis_incompatible", self._codes(result))
+
+    def test_projection_keeps_basis_but_strips_identifiers_and_channels(self):
+        """口径要发给模型，主键与接口方法名不行。"""
+        import json
+
+        from bi_agent.business_query.tool import to_model_result, to_public_artifact
+        from bi_agent.catalog import build_catalog
+
+        result = self._query(["erp_documents"], ["S1", "TB1"], group_by="shop",
+                             basis_policy="separate")
+        catalog = build_catalog(self.conn, result,
+                               allowed_shop_ids=frozenset({"S1", "S2", "TB1"}))
+
+        model_payload = to_model_result(result, catalog)
+        artifact_payload = to_public_artifact(result, catalog)
+        text = json.dumps(model_payload, ensure_ascii=False)
+
+        self.assertTrue(model_payload["basis"], "口径必须发给模型")
+        for item in model_payload["basis"]:
+            self.assertNotIn("shop_id", item)
+            self.assertNotIn("source", item)
+            self.assertIn("shop_ref", item)
+        self.assertNotIn("TB1", text)
+        self.assertNotIn("erp.trade", text)
+        self.assertTrue(artifact_payload["basis"])
+
+    def test_basis_carrying_an_erp_key_is_rejected(self):
+        from bi_agent.business_query.tool import to_public_artifact
+        from bi_agent.catalog import build_catalog
+
+        result = self._query(["erp_documents"], ["TB1"])
+        catalog = build_catalog(self.conn, result,
+                                allowed_shop_ids=frozenset({"S1", "S2", "TB1"}))
+        # 内部形状带真实主键与来源；投影必须先转换再校验，不能原样转发。
+        self.assertTrue(all("shop_id" in item for item in result.basis))
+        payload = to_public_artifact(result, catalog)
+        self.assertTrue(all("shop_id" not in item for item in payload["basis"]))
+
+    def test_deterministic_summary_states_the_basis(self):
+        """兜底摘要不能比正常结果少说口径。"""
+        from bi_agent.business_query.tool import to_model_result
+        from bi_agent.catalog import build_catalog
+        from bi_agent.response_summary import render_result_summary
+
+        result = self._query(["erp_documents"], ["S1", "TB1"], group_by="shop",
+                             basis_policy="separate")
+        catalog = build_catalog(self.conn, result,
+                                allowed_shop_ids=frozenset({"S1", "S2", "TB1"}))
+        summary = render_result_summary(SimpleNamespace(
+            model_payload=to_model_result(result, catalog)))
+
+        self.assertIn("统计口径", summary)
+        self.assertIn("erp_document/v1", summary)
+        self.assertIn("outstock_time", summary)
+
+    def test_projection_keeps_basis_but_strips_identifiers_and_channels(self):
+        """口径要发给模型，主键与接口方法名不行。"""
+        import json
+
+        from bi_agent.business_query.tool import to_model_result, to_public_artifact
+        from bi_agent.catalog import build_catalog
+
+        result = self._query(["erp_documents"], ["S1", "TB1"], group_by="shop",
+                             basis_policy="separate")
+        catalog = build_catalog(self.conn, result,
+                               allowed_shop_ids=frozenset({"S1", "S2", "TB1"}))
+
+        model_payload = to_model_result(result, catalog)
+        artifact_payload = to_public_artifact(result, catalog)
+        text = json.dumps(model_payload, ensure_ascii=False)
+
+        self.assertTrue(model_payload["basis"], "口径必须发给模型")
+        for item in model_payload["basis"]:
+            self.assertNotIn("shop_id", item)
+            self.assertNotIn("source", item)
+            self.assertIn("shop_ref", item)
+        self.assertNotIn("TB1", text)
+        self.assertNotIn("erp.trade", text)
+        self.assertTrue(artifact_payload["basis"])
+
+    def test_basis_carrying_an_erp_key_is_rejected(self):
+        from bi_agent.business_query.tool import to_public_artifact
+        from bi_agent.catalog import build_catalog
+
+        result = self._query(["erp_documents"], ["TB1"])
+        catalog = build_catalog(self.conn, result,
+                                allowed_shop_ids=frozenset({"S1", "S2", "TB1"}))
+        # 内部形状带真实主键与来源；投影必须先转换再校验，不能原样转发。
+        self.assertTrue(all("shop_id" in item for item in result.basis))
+        payload = to_public_artifact(result, catalog)
+        self.assertTrue(all("shop_id" not in item for item in payload["basis"]))
+
+    def test_deterministic_summary_states_the_basis(self):
+        """兜底摘要不能比正常结果少说口径。"""
+        from bi_agent.business_query.tool import to_model_result
+        from bi_agent.catalog import build_catalog
+        from bi_agent.response_summary import render_result_summary
+
+        result = self._query(["erp_documents"], ["S1", "TB1"], group_by="shop",
+                             basis_policy="separate")
+        catalog = build_catalog(self.conn, result,
+                                allowed_shop_ids=frozenset({"S1", "S2", "TB1"}))
+        summary = render_result_summary(SimpleNamespace(
+            model_payload=to_model_result(result, catalog)))
+
+        self.assertIn("统计口径", summary)
+        self.assertIn("erp_document/v1", summary)
+        self.assertIn("outstock_time", summary)
+
+    def _codes(self, result) -> list[str]:
+        from bi_agent.business_query.nodes import _limitation_codes
+
+        return _limitation_codes(result.limitations)
 
 
 @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
