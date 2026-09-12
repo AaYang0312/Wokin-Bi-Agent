@@ -21,6 +21,9 @@ exports/
 logs/
 .serena
 
+# PostgreSQL 容器逻辑备份（含真实经营数据与角色定义）
+deploy/postgres/backup/
+
 # 本机公网测试拓扑（域名、SSH别名、端口等）
 public_test.local.cmd
 .DS_Store

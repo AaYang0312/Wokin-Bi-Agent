@@ -1,0 +1,69 @@
+# BI Agent 本地/内网 PostgreSQL —— 容器化工程
+#
+# 迁移自本机便携版集群 D:\Projects\pg17\data（PG 17.6 windows-msvc）。
+# 三条硬性约束，改动前先读：
+#   1. 宿主端口沿用 54329：.env.app / .env.test / .env.sync* 里所有 DSN 零改动。
+#   2. 认证沿用原集群的 trust 语义（DSN 不带密码）：网络边界交给
+#      「Windows 防火墙 + 仅放行 tailnet 段」，不靠数据库密码。见 pg_hba.conf 注释。
+#   3. 时区固定 Asia/Shanghai：库内是 timestamptz，但 `x::date`、`current_date`
+#      与日志时间戳都依赖会话/服务器时区，必须与原本机集群一致。
+#   4. max_connections / shared_buffers / DateStyle 等运行参数跟旧集群逐字对齐，
+#      参数差异表见 deploy/postgres/README.md。
+#
+# 常用命令（在本目录执行）：
+#   docker compose up -d      docker compose logs -f postgres
+#   docker compose stop       docker compose down        # 不要带 -v，会删数据卷
+name: bi-agent-pg
+
+services:
+  postgres:
+    image: postgres:17.6
+    container_name: bi-agent-postgres
+    restart: unless-stopped
+    ports:
+      # 0.0.0.0 发布：本机 localhost:54329、原 tailscale 直连、ssh -L 隧道全部照旧可用
+      - "54329:5432"
+    environment:
+      TZ: Asia/Shanghai
+      POSTGRES_USER: postgres
+      # PGDATA 放在卷根的子目录，避免 lost+found 干扰 initdb
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # 与源集群逐字对齐：UTF8 + libc provider + C collate/ctype
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C --locale-provider=libc --auth-local=trust --auth-host=trust"
+      # 仅用于满足官方镜像初始化校验；运行时真正生效的是下面挂载的 hba_file
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - bi_pg_data:/var/lib/postgresql/data
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    # 运行参数逐字对齐旧集群（timezone / datestyle / max_connections / shared_buffers /
+    # wal_level 均来自 D:\Projects\pg17\data\postgresql.conf）。
+    # 其中唯一故意新增的是 log_min_duration_statement（旧集群默认 -1 不记），
+    # 目的是让慢查询进容器日志；listen_addresses 在镜像配置里是 *，入站流量只能
+    # 从发布端口进来，到不了“绕过发布端口”那一步。
+    command:
+      - postgres
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - timezone=Asia/Shanghai
+      - -c
+      - log_timezone=Asia/Shanghai
+      - -c
+      - datestyle=iso, mdy
+      - -c
+      - max_connections=100
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - wal_level=replica
+      - -c
+      - log_min_duration_statement=1000
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+volumes:
+  bi_pg_data:

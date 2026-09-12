@@ -58,6 +58,25 @@ Vite 将 `/api` 代理到 `http://127.0.0.1:8001`。开发页必须通过 `http:
 
 ## 数据库和同步
 
+### 本机数据库容器
+
+本机 PostgreSQL 跑在 Docker（`deploy/postgres/docker-compose.yml`，`postgres:17.6` + 命名卷
+`bi-agent-pg_bi_pg_data`）。日常启停、备份还原、其他主机经 Tailscale 连接与安全边界见
+[`deploy/postgres/README.md`](../deploy/postgres/README.md)：
+
+```powershell
+cd deploy\postgres
+docker compose start        # 或 up -d；docker compose stop 不会删数据
+```
+
+宿主端口 `54329`、`postgres` 本机免密（trust），与迁移前的便携版集群一致，所以 `.env.app` / `.env.test` /
+`.env.sync*` 的 DSN 无需修改；若把 `pg_hba.conf` 换成 `scram-sha-256`，所有 DSN 要同步加口令。
+库里的 schema 版本以 `\dt bi.*` 和下面的迁移清单为准，缺哪个补哪个（迁移文件可重复执行）。
+
+DDL 只由管理员执行；`bi_sync` 拥有 `bi` schema 事实表读写权限；`bi_reader` 只有 `reporting` schema 指定视图的 SELECT 权限（默认只读、5 秒超时）。角色密码通过管理员 `\password` 或现有密钥设施设置，SQL 文件不含密码。
+
+### 角色边界与迁移
+
 `bi_sync` 写业务事实，`bi_reader` 只能读报表视图，`bi_app` 读取相同视图并读写 `bi.app_chats` 与 `bi.app_messages`。API 查询与消息写入都有五秒 SQL 超时；同一会话同时生成时返回 `409 chat_busy`。
 
 已有数据库升级快麦字段映射与指标口径时，先由管理员执行前向迁移，再部署同步代码。迁移不会重写历史事实；为使修正后的状态、行号、行类型和完成时间生效，须对保留历史范围显式重放订单和售后，再刷新店铺档案。同步启动会检查 002 所需列；缺失时以 `schema_outdated` 拒绝写入。`replay` 仅会重规范化相同 `source_updated_at` 的版本，不会让较旧上游版本覆盖较新版本。

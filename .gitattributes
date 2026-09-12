@@ -1,2 +1,4 @@
 # Windows CMD reads this launcher as GBK; Git stores a reviewable UTF-8 blob.
 public_test.cmd text working-tree-encoding=GBK eol=crlf
+# deploy/postgres 的 .cmd 刻意只用 ASCII 提示语，避免 GBK/UTF-8 混排；只需固定 CRLF。
+deploy/postgres/*.cmd text eol=crlf

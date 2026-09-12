@@ -18,6 +18,15 @@ React/Vite 前端 → /api 代理 → FastAPI → 受限 Agent
 
 需要 Python 3.11、Node.js 22、PostgreSQL 17。复制 `.env.example` 为 `.env.app`，只填写 API 所需的 `BI_APP_DSN`、店铺范围和一个模型 provider 配置；不要在其中放同步 DSN 或快麦凭证。
 
+本机 PostgreSQL 由 `deploy/postgres` 的 compose 工程提供（`postgres:17.6`，宿主端口 54329，数据在命名卷）：
+
+```powershell
+cd deploy\postgres
+docker compose up -d
+```
+
+备份还原、其他主机经 Tailscale 连接与安全边界见 [deploy/postgres/README.md](deploy/postgres/README.md)。
+
 ```powershell
 Set-Location backend
 uv sync --locked
@@ -44,6 +53,8 @@ psql -d bi_agent -f backend/sql/004_query_runtime.sql
 ```
 
 它创建 `bi_sync`、报表只读身份 `bi_reader` 与 API 身份 `bi_app`，并建立可审计的查询运行记录。API 使用 `bi_app`，只能读取 `reporting` 视图和读写聊天与查询运行表。
+
+本机两个库（`bi_agent`、`bi_agent_test`）已经建好并随命名卷保留，重建容器不需要重跑 DDL；新克隆时按上面顺序在两个库各跑一遍。
 
 ## 数据同步
 
