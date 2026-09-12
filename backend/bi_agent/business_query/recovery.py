@@ -31,6 +31,8 @@ GAP_REASONS = frozenset({
     "source_quality_failed", "comparison_coverage_incomplete",
     # 能力未开通同属缺口：重跑不会开通能力，只有完成逐源取证才行。
     "capability_unavailable",
+    # 时间口径未认证也不能靠重跑解决：需要与后台账单/业务日期对照登记。
+    "coverage_time_basis_unverified",
 })
 TERMINAL_REASONS = frozenset({
     "forbidden", "deadline_exceeded", "query_timeout", "invalid_date_range",

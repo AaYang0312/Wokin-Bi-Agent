@@ -113,6 +113,8 @@ class RequestIdentity(BaseModel):
         "source_not_onboarded", "revenue_not_attributed", "result_too_large",
         # 逐指标能力未授予：与来源未开通、缺覆盖分别归因。
         "capability_unavailable",
+        # 付款时间口径未认证：与缺覆盖、质量未核验分别是三件事。
+        "coverage_time_basis_unverified",
         "comparison_coverage_incomplete", "deadline_exceeded", "query_timeout",
         "persistence_failed", "contract_violation", "upstream_unavailable",
         "transient_source_failure", "recovery_exhausted",

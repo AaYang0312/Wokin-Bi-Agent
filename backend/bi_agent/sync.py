@@ -23,11 +23,10 @@ import httpx
 
 from .catalog import EntityKind, bump_catalog_version, ensure_refs
 from .config import load_sync_settings
-from .data_quality import (
-    ENTITY_SOURCES, QUALITY_RULE, reconcile_source_quality)
+from .data_quality import QUALITY_RULE, reconcile_source_quality
 from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
 from .sources import (
-    AFTERSALE_SOURCE, ORDERS_ENTITY, OUTSTOCK_SOURCE, ShopRecord, TRADE_LIST_SOURCE,
+    AFTERSALE_SOURCE, OUTSTOCK_SOURCE, ShopRecord, TRADE_LIST_SOURCE,
     capabilities_from_evidence, platform_order_sources, resolve_order_source)
 
 logger = logging.getLogger(__name__)
@@ -1711,9 +1710,6 @@ class CapabilityGrant:
     platform: str
     current: frozenset[str]
     granted: frozenset[str]
-    # 开通后仍不能拿数的问题（如覆盖层还只读交易源）：不能藏在“写入成功”后面。
-    warnings: tuple[str, ...] = ()
-
     @property
     def changed(self) -> bool:
         return self.current != self.granted
@@ -1776,15 +1772,9 @@ def recompute_shop_capabilities(conn, shop_ids, *,
         record = ShopRecord.from_row(shop_id, platform, capabilities)
         shop_evidence = evidence.get(str(shop_id), {})
         granted = capabilities_from_evidence(record.platform, shop_evidence)
-        warnings: list[str] = []
-        if granted and resolve_order_source(record) != ENTITY_SOURCES[ORDERS_ENTITY]:
-            # 出库通道平台：能力已经开通，但覆盖门禁还只读交易源（Task 5.2 未交付）。
-            # 不报出来，运维会看到“写了标签仍然缺数据”，然归因到覆盖上去。
-            warnings.append("coverage_source_mismatch")
         grants.append(CapabilityGrant(
             shop_id=str(shop_id), platform=record.platform,
-            current=frozenset(record.capabilities), granted=frozenset(granted),
-            warnings=tuple(warnings)))
+            current=frozenset(record.capabilities), granted=frozenset(granted)))
     if apply:
         # 一批写完：中途崩溃不能留下“一半店已回收、一半店还挂着旧标签”。
         with conn.transaction():
@@ -1934,8 +1924,7 @@ def main(argv: list[str] | None = None) -> int:
                         "platform": grant.platform, "mode": "apply" if args.apply else "report",
                         "quality_rule": QUALITY_RULE,
                         "current": sorted(grant.current), "granted": sorted(grant.granted),
-                        "changed": grant.changed, "warnings": list(grant.warnings)},
-                        ensure_ascii=False))
+                        "changed": grant.changed}, ensure_ascii=False))
             elif args.command == "refresh-session":
                 _refresh_session(conn, client)
         finally:

@@ -613,6 +613,55 @@ class StoreSchemaPreflightTests(unittest.TestCase):
                          "每个 Store 实例最多预检一次")
 
 
+class QuantifiedLimitationContractTests(unittest.TestCase):
+    """设计 §5 的可量化限制：披露文本要能通过公开校验，并映射到稳定码。
+
+    没登记词表的披露会在保存 Artifact 时被契约校验拒掉，把一次正常查询变成
+    result_contract_violation；只看数据库用例看不出来，所以三层一起钉。
+    """
+
+    CODES = {
+        "退款归属未确认：未匹配1条/共4条，金额25元，比例25%": "unmatched_refunds",
+        "退款归属未确认：未匹配1条/共0条，金额25元，比例未知": "unmatched_refunds",
+        "退款归属未确认：未匹配1条/共4条，金额24.5元，比例25.5%": "unmatched_refunds",
+        "同批退款率仅含已匹配退款（1条未匹配退款无法归属，未计入）": "matched_cohort_only",
+        "未认证支付3笔（金额未定2笔），已知原始金额89669.39元（1笔）": "unverified_payments",
+    }
+
+    def _payload(self, limitation):
+        return {
+            "status": "ok", "metric_definition": {},
+            "coverage": {"status": "complete", "start": "2026-09-01",
+                         "end": "2026-09-08", "gaps": []},
+            "limitations": [limitation], "data_as_of": None,
+            "filters": {}, "data": [],
+        }
+
+    def test_each_disclosure_is_accepted_and_carries_a_stable_code(self):
+        from bi_agent.business_query.nodes import _limitation_codes
+        from bi_agent.runtime.models import (
+            validate_artifact_payload, validate_model_payload)
+
+        for text, code in self.CODES.items():
+            with self.subTest(text=text[:20]):
+                validate_artifact_payload(self._payload(text))
+                validate_model_payload(self._payload(text))
+                self.assertEqual(_limitation_codes([text]), [code])
+
+    def test_invented_or_leaking_variants_are_rejected(self):
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        for bad in (
+            "退款归属未确认：未匹配1条/共4条，金额25元，比例25%（店铺166754）",
+            "退款归属未确认：未匹配1条，比例25%",
+            "未认证支付3笔（金额未定2笔），已知原始金额约9万元（1笔）",
+            "同批退款率仅含已匹配退款",
+        ):
+            with self.subTest(bad=bad[:22]):
+                with self.assertRaises(ValueError):
+                    validate_artifact_payload(self._payload(bad))
+
+
 class MemoryQueryRunStoreTests(unittest.TestCase):
     def setUp(self):
         self.store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})

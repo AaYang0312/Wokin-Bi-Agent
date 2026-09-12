@@ -1,5 +1,8 @@
--- 多来源唯一注册表与逐指标能力门禁（原路线图 Task 5.1）。
+-- 多来源唯一注册表与逐指标能力门禁（原路线图 Task 5.1、5.2c）。
 -- 依赖 001（bi.shops.capabilities、bi.sync_state）与 009（终止原因 CHECK）。
+--
+-- 本迁移未对外发布，且写法本身就是 DROP + ADD（可在新库上重跑），因此 5.2c 新增的
+-- 原因码继续补在本文件里，不开 015 只为了扩一个枚举。
 --
 -- 注册表本体在代码里（`bi_agent/sources.py`）：来源、口径版本与时间认证必须与代码同批
 -- 评审、同批发布，不能在数据库里再开一套可自由配置的“来源中心”。本迁移只做两件事：
@@ -21,7 +24,9 @@ ALTER TABLE bi.query_runs ADD CONSTRAINT query_runs_termination_reason CHECK (
     'persistence_failed', 'contract_violation', 'upstream_unavailable',
     'transient_source_failure', 'recovery_exhausted',
     -- 逐指标能力未授予：与「来源未开通」「缺覆盖」分别归因，重跑不会开通能力。
-    'capability_unavailable')
+    'capability_unavailable',
+    -- 付款时间口径未认证：等回填不会解决，需要与后台账单/业务日期对照登记。
+    'coverage_time_basis_unverified')
 );
 
 -- 2) 能力列口径：标签与指标同名，实体标签退役为“无权限含义”。

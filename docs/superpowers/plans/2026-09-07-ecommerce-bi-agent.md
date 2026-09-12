@@ -564,14 +564,18 @@ probe拉全页但只输出数量、金额字段覆盖和质量统计，不输出
 - [x] **5.1b 实现唯一注册表。** sources.py 只负责来源与能力解析；同步命令（包括 probe/refetch/replay）、质量核验、覆盖均调用它。将实体存在与指标能力分离，旧 orders 标签不提升支付权限。**pdd 支付源不登记**：2026-09-12 用户决定放弃方舟授权（见 [范围决定](../research/2026-09-12-drop-pdd-onboarding.md)），注册表只保留 pdd 单据能力，支付依赖直接解析为能力不足，不填猜测的方法名。同步侧：`ORDER_SOURCE_BY_PLATFORM`/`_shop_order_source` 已改为消费注册表，未登记平台报错退出而不是回退默认源；pdd 订单源改为出库通道（官方交易接口按文档排除拼多多）。
 - [ ] **5.1c 验证两个层次。** 请求门禁必须在金额 SQL 前返回 capability_unavailable；结果/Artifact 也不得绕过门禁直接读视图冒充平台总额。逐店能力经过迁移及核验维护，不因“同步成功”开通。
   已完成：014 与 `sync capabilities [--apply] [--all-shops]`（证据推导 + 回收，回写走单事务并在输出里携带 `quality_rule` 与警告）、`capability_unavailable` 进入状态/事件/Artifact/终止原因/恢复词表、运行层启动预检发现库未应用 014 时早报 `schema_outdated`、真实库上“撤标签 → 零数字 / 给标签 → 照旧出 1000”对比用例、“平台未登记来源”与“能力未授予”分开归因。
-  本任务只交**数据**未交**消费者**：`SourceBinding.coverage_certified` / `time_basis` 现在无生产读取方，“出库样本不得当完整支付窗口”由 5.2c 实现（旗标已有用例钉住不得删）。
+  ~~本任务只交数据未交消费者~~：`SourceBinding.coverage_certified` / `time_basis` 已由 Task 5.2b/5.2c 消费（见下）。
   未完成（归 5.4c）：现有 `reporting.v_*` 视图仍可被直查绕过门禁；需等 basis 全链路一起验。
 
 ### 5.2 来源覆盖交集
 
-- [ ] **5.2a 固定反例。** 用上表孔洞场景验证 covered_windows 和 missing_windows；删除任一来源或 data_as_of 变 NULL 后不能给共同完整截止；当前/上期均测试；不相干旧源的区间不能影响实际依赖。
-- [ ] **5.2b 修改 assess_query_coverage。** 按 `(source, entity, time_basis)` 批量查状态，每个店/依赖先裁剪请求区间，再求交集；保留 source 维度的缺口及使用的批次。不能沿用当前将各店 covered_spans 并集后当公共建议窗口的做法。
-- [ ] **5.2c 加入业务时间认证。** 出库接口只证明已采集出库范围，未经证据认证的 pay_time 不得给完整支付覆盖；观察到的最早/最晚时间不等于完整性。业务窗口与修改窗口继续区分，质量 unknown 不能抵消时间语义未认证。对账核验同一来源、同一指标时间基准。
+- [x] **5.2a 固定反例。** 用上表孔洞场景验证 covered_windows 和 missing_windows；删除任一来源或 data_as_of 变 NULL 后不能给共同完整截止；当前/上期均测试；不相干旧源的区间不能影响实际依赖。
+  交付在 `tests/test_data_quality.py::MultiSourceCoverageIntersectionTests`（8 项，独立测试库）+ `SpanAlgebraTests`（3 项纯函数）。旧用例里拿并集当公共覆盖的断言按新口径改写（`test_aftersale_cohort_requirement_is_assessed_separately`、`test_shop_without_onboarded_source_is_reported_as_unconfigured` 改为 missing + 断言 `suggested_window is None`），没有删断言。
+- [x] **5.2b 修改 assess_query_coverage。** 按 `(source, entity, time_basis)` 批量查状态，每个店/依赖先裁剪请求区间，再求交集；保留 source 维度的缺口及使用的批次。不能沿用当前将各店 covered_spans 并集后当公共建议窗口的做法。
+  交付：依赖由 `sources.resolve_metric_dependencies` 解析（**不看能力标签**，否则能力缺口会被误报成覆盖缺口），按 `(source, entity)` 分组一次查完且依赖去重；`CoverageGap` 增加 `source`（与 shop_id 同样只留服务端）；`source_batches` 只收本次真用到的通道；某店某指标没有任何可用依赖时整段窗口按未知处理，不会因为“没有依赖”算出假完整。5.1 的 `coverage_source_mismatch` 警告随本项撤销（覆盖已跟来源走，留着就是过时的恐吓）。
+- [x] **5.2c 加入业务时间认证。** 出库接口只证明已采集出库范围，未经证据认证的 pay_time 不得给完整支付覆盖；观察到的最早/最晚时间不等于完整性。业务窗口与修改窗口继续区分，质量 unknown 不能抵消时间语义未认证。对账核验同一来源、同一指标时间基准。
+  交付：认证改为三态 `certified` / `unmeasured` / `disproved`（“没测过”与“测了不成立”后果不同）：`disproved`（出库通道实测 83/8367 行越界）对按支付时间归属的指标直接拒答 `coverage_time_basis_unverified`；`unmeasured`（同通道同参数但未逐店对照）出数并披露为可观测样本；`erp_documents` 不主张支付窗口，两档都只披露。`SourceBinding.coverage_certified` 保留为设计 §3 的布尔契约（= `certified`）。
+  本项故意不提前建设：逐店 `time_basis` 登记表与写入入口。现在认证是按通道登记的代码事实，等真拿到“与后台账单/业务日期对照”的逐店证据时再建表并与 `capabilities` 同批维护，不先建无人写入的表。
 
 算法约束（日期/时区转换沿用现有工具）：
 
@@ -586,11 +590,16 @@ missing = requested_multirange - common
 
 ### 5.3 未匹配退款、未认证支付与质量降级
 
-- [ ] **5.3a 写新基准断言。** TB1 退款50、收支差50可答且 diagnostics 为1/2、50%、20元；cohort30%标 matched_cohort_only；零分母 NULL。去掉硬拒答后先确认旧测试确实因新政策失败，再改实现，不把旧断言悄悄删除。
-- [ ] **5.3b 独立退款发生与匹配。** refund_amount 依赖退款发生覆盖，canonical 成功且未匹配也计入；现金差额额外要求支付覆盖；cohort 只对已知 cohort 做关联，未匹配不能强配或忽略披露。诊断计数/金额与比率分母按设计 §5 冻结。
-- [ ] **5.3c paid_amount 补齐静默缺额防护。** 未认证支付按 orphan/undetermined/冲突分项披露数量和已知金额；无法量化保持 NULL。支付事实仍经现有头行交叉核验和防降级，不把 active 或正金额直接当 verified。
-- [ ] **5.3d 消除第二道拒答。** 修改 reconcile_source_quality，未匹配本身不置 failed；金额核验失败等真实错误仍为硬门禁。版本化质量规则，旧 unmatched-only failed 在重新逐源取证后迁移；不批量放行。退款发生、cohort、支付分别判断受影响指标。
-- [ ] **5.3e 验证补拉收敛。** 已付款关闭单匹配后退出 unmatched_commercials；原单真的未到时保留 bounded retry 和来源路由；分页失败不能留下支付/批次/覆盖半成品。查询不做上游补拉。
+- [x] **5.3a 写新基准断言。** TB1 退款50、收支差50可答且 diagnostics 为1/2、50%、20元；cohort30%标 matched_cohort_only；零分母 NULL。去掉硬拒答后先确认旧测试确实因新政策失败，再改实现，不把旧断言悄悄删除。
+  红灯留档：`test_unmatched_refund_degrades_to_missing_data`（`'ok' != 'missing_data'`）与 `test_unmatched_success_refund_demotes_to_failed_with_reason`（`'passed' != 'failed'`）在改实现前先转红，再按新契约改写（没删断言）。量化披露用例在 `test_unmatched_refunds_are_answered_with_a_quantified_disclosure`（1/4、25%、25元、退款 125、收支差 875、同批 0.05）与 `test_unmatched_count_and_amount_are_quantified_per_window`（失败工单不进分母、0/0 → 未知）。
+- [x] **5.3b 独立退款发生与匹配。** refund_amount 依赖退款发生覆盖，canonical 成功且未匹配也计入；现金差额额外要求支付覆盖；cohort 只对已知 cohort 做关联，未匹配不能强配或忽略披露。诊断计数/金额与比率分母按设计 §5 冻结。
+  交付：`ENTITY_REQUIREMENTS["refund_amount"]` 收窄为只需 `aftersales_occurrence`（旧写法会拿“订单未覆盖”打死本可答的退款查询）；`cash_difference` 继续双依赖；分母固定为同窗口 canonical 平台成功退款，Decimal 计算、按条数不按金额。
+- [x] **5.3c paid_amount 补齐静默缺额防护。** 未认证支付按 orphan/undetermined/冲突分项披露数量和已知金额；无法量化保持 NULL。支付事实仍经现有头行交叉核验和防降级，不把 active 或正金额直接当 verified。
+  交付：`unverified_payments()` 从 `reporting.v_payments` 读 `NOT verified` 行，拆「金额未定」与「有原始金额」两档并给已知合计（笔数一起给，避免把 0 读成“这些单值 0 元”）。视图无 basis 列，所以下一版要拆到冲突/孤立细分需先开只读登记视图。
+- [x] **5.3d 消除第二道拒答。** 修改 reconcile_source_quality，未匹配本身不置 failed；金额核验失败等真实错误仍为硬门禁。版本化质量规则，旧 unmatched-only failed 在重新逐源取证后迁移；不批量放行。退款发生、cohort、支付分别判断受影响指标。
+  交付：`QUALITY_RULE` → `kuaimai-reconcile/2`；reconcile 只写原因不降级。旧 `failed` 行**不自动解禁**（必须重跑 `reconcile` 逐源取证），运行手册已写明。
+- [x] **5.3e 验证补拉收敛。** 已付款关闭单匹配后退出 unmatched_commercials；原单真的未到时保留 bounded retry 和来源路由；分页失败不能留下支付/批次/覆盖半成品。查询不做上游补拉。
+  交付：`tests/test_db.py::RefetchConvergenceTests`（5 项），补上实测报告点名的 `unmatched_commercials` / `refetch_orders_for_commercials` **零覆盖**空白：已付款关闭单退出集合、真缺单留在集合、无原单号不成为补拉目标、按平台通道补拉且收敛、上游失败不留订单/批次半成品。
 
 ### 5.4 basis 全链路和混合查询
 

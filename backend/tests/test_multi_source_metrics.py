@@ -101,22 +101,25 @@ class MetricBindingTests(unittest.TestCase):
                 self.assertEqual(binding.basis, PAYMENT_BASIS)
                 self.assertFalse(binding.coverage_certified)
 
-    def test_refund_metrics_bind_both_the_order_and_after_sale_source(self):
-        for metric in ("refund_amount", "cash_difference"):
-            with self.subTest(metric=metric):
-                bindings = resolve_metric_sources(
-                    _shop("S1", "fxg", metric), metric)
-                self.assertEqual({item.source for item in bindings},
-                                 {TRADE_LIST_SOURCE, AFTERSALE_SOURCE})
-                self.assertEqual({item.entity for item in bindings},
-                                 {ORDERS_ENTITY, AFTERSALE_ENTITY})
+    def test_refund_amount_binds_only_the_after_sale_source(self):
+        """设计 §4：退款发生额只需退款发生源。
 
-    def test_refund_amount_does_not_require_the_cohort_entity(self):
-        # 退款发生只需退款源；把 cohort 也拉进来会白白拖死一次可答查询。
+        订单还没取到的退款也是真实发生的退款；把 orders 也列进依赖，就会拿“订单没覆盖”
+        去打死一个本可回答的问题（计划 5.3b）。
+        """
         bindings = resolve_metric_sources(_shop("S1", "fxg", "refund_amount"),
                                           "refund_amount")
-        self.assertNotIn(AFTERSALE_COHORT_ENTITY,
-                         {item.entity for item in bindings})
+        self.assertEqual({item.source for item in bindings}, {AFTERSALE_SOURCE})
+        self.assertEqual({item.entity for item in bindings}, {AFTERSALE_ENTITY})
+
+    def test_cash_difference_binds_both_the_payment_and_refund_sources(self):
+        # 现金差 = 支付 − 期间退款发生：两端都要，所以两条依赖都在。
+        bindings = resolve_metric_sources(_shop("S1", "fxg", "cash_difference"),
+                                          "cash_difference")
+        self.assertEqual({item.source for item in bindings},
+                         {TRADE_LIST_SOURCE, AFTERSALE_SOURCE})
+        self.assertEqual({item.entity for item in bindings},
+                         {ORDERS_ENTITY, AFTERSALE_ENTITY})
 
     def test_cohort_binds_the_cohort_entity_not_the_occurrence_entity(self):
         entities = {item.entity for item in resolve_metric_sources(
@@ -302,6 +305,16 @@ class CapabilityGateDatabaseTests(unittest.TestCase):
             self.conn.execute(
                 "UPDATE bi.shops SET capabilities=%s::text[], platform=%s "
                 "WHERE shop_id=%s", (capabilities, platform, shop_id))
+            if platform in ("pdd", "tb", "tm"):
+                # 出库通道平台的依赖在出库源上：把种子留在交易通道下的状态行
+                # 原样照一份过去。旧行保留着，正好证明它不再参与覆盖判定。
+                self.conn.execute(
+                    "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, "
+                    "covered, data_as_of, quality_status, quality_rule) "
+                    "SELECT %s, entity, shop_id, watermark, covered, data_as_of, "
+                    "quality_status, quality_rule FROM bi.sync_state "
+                    "WHERE source='erp.trade.list.query' AND entity='orders' AND shop_id=%s",
+                    (OUTSTOCK_SOURCE, shop_id))
         self.conn.execute("SET LOCAL ROLE bi_reader")
 
     def test_unregistered_platform_gets_the_onboarding_gap_not_the_capability_one(self):
@@ -359,6 +372,40 @@ class CapabilityGateDatabaseTests(unittest.TestCase):
         money = self._query(["paid_amount"])
         self.assertEqual(money.status, "missing_data", money.limitations)
         self.assertEqual(money.data, [])
+
+    def test_disproved_pay_time_channel_refuses_a_payment_window_result(self):
+        """出库接口实测按自身时间裁剪（83/8367 行越界）：它给不出完整支付窗口。
+
+        数据齐、覆盖全也不能出数——把可观测样本当完整窗口，就是拿偏小的数字冒充总额。
+        """
+        self._grant("{paid_amount}", platform="tb")
+        result = self._query(["paid_amount"])
+        self.assertEqual(result.status, "missing_data", result.limitations)
+        self.assertEqual(result.data, [])
+        self.assertIn("coverage_time_basis_unverified", self._codes(result))
+        self.assertEqual(sorted(result.filters["shop_ids"]), ["S1"], "原请求不得被改写")
+
+    def test_document_count_is_answered_but_disclosed_as_a_sample(self):
+        """设计 §4：单据数仍可在覆盖成立时查询，但必须披露它是出库来源样本。"""
+        self._grant("{erp_documents}", platform="tb")
+        result = self._query(["erp_documents"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertIn("coverage_time_basis_unverified", self._codes(result))
+        self.assertEqual(result.coverage.status, "complete",
+                         "披露时间口径不等于缺覆盖：两件事分开说")
+
+    def test_certified_channel_neither_refuses_nor_discloses(self):
+        self._grant("{paid_amount}", platform="fxg")
+        result = self._query(["paid_amount"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertNotIn("coverage_time_basis_unverified", self._codes(result))
+
+    def test_unmeasured_trade_channel_answers_with_a_disclosure(self):
+        """同通道同参数但没逐店对照过：出数 + 披露，不把没测过说成不成立。"""
+        self._grant("{paid_amount}", platform="kuaishou")
+        result = self._query(["paid_amount"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertIn("coverage_time_basis_unverified", self._codes(result))
 
     def test_mixed_scope_keeps_the_request_and_names_the_missing_group(self):
         # 一家有能力、一家没有：不得悄悄删店后冒充全量成功。
@@ -454,20 +501,6 @@ class CapabilityMaintenanceTests(unittest.TestCase):
         self.assertEqual(unsupported_reason(
             ShopRecord.from_row("CM_UNK", "alibabac2m", ()), "erp_documents"),
             "source_unregistered")
-
-    def test_outstock_grant_is_flagged_until_coverage_follows_the_source(self):
-        """能力可以开通，但覆盖层还只读交易源：不提醒就会把缺能力误读成缺覆盖。"""
-        from bi_agent.sync import recompute_shop_capabilities
-
-        self._state("CM_PDD", OUTSTOCK_SOURCE, ORDERS_ENTITY, "passed")
-        grants = recompute_shop_capabilities(self.conn, ["CM_PDD"])
-        self.assertEqual(grants[0].granted, {"erp_documents"})
-        self.assertIn("coverage_source_mismatch", grants[0].warnings)
-
-        # 交易通道平台：覆盖层读的就是同一个源，不报这个警告。
-        self._state("CM_FXG", TRADE_LIST_SOURCE, ORDERS_ENTITY, "passed")
-        ok = recompute_shop_capabilities(self.conn, ["CM_FXG"])
-        self.assertNotIn("coverage_source_mismatch", ok[0].warnings)
 
     def test_apply_writes_every_change_in_one_transaction(self):
         from bi_agent.sync import recompute_shop_capabilities
