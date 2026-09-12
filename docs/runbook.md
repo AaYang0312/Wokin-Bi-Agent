@@ -33,7 +33,7 @@ psql -d bi_agent -f backend/sql/009_query_provenance.sql
 
 ### 平台路由与来源注册表
 
-当前开发基线为 main，旧分支的同步入口统一迁入 backend。淘系“入库完成”与“查询可用”分别验收：[多来源契约](superpowers/specs/2026-09-12-multi-source-metrics-design.md)及[任务5/11](superpowers/plans/2026-09-07-ecommerce-bi-agent.md)。任务 5.1 已交付来源注册表与逐指标能力门禁（`backend/bi_agent/sources.py`）；单源覆盖交集（5.2）、未匹配退款硬门禁（5.3）与 basis 全链路（5.4）仍未完成；pdd 不得因档案或单据存在被宣称支付可用（2026-09-12 已决定不接入拼多多支付）。
+当前开发基线为 main，旧分支的同步入口统一迁入 backend。淘系“入库完成”与“查询可用”分别验收：[多来源契约](superpowers/specs/2026-09-12-multi-source-metrics-design.md)及[任务5/11](superpowers/plans/2026-09-07-ecommerce-bi-agent.md)。任务 5.1–5.3 已交付：来源注册表与逐指标能力门禁（`backend/bi_agent/sources.py`）、覆盖按 (店铺×来源×实体) 取交集与付款时间口径三态认证、未匹配退款/未认证支付改为可量化披露（`coverage_time_basis_unverified` 等进入词表）。**basis 全链路与版本失效（5.4）仍未完成**；pdd 不得因档案或单据存在被宣称支付可用（2026-09-12 已决定不接入拼多多支付）。
 
 - 订单源由 `sources.py` 注册表按 `bi.shops.platform` 解析：`tb`/`tm`/`pdd` 用 `erp.trade.outstock.simple.query`（销售出库·非敏感字段），`fxg`/`jd`/`kuaishou`/`wxsph`/`wsxc` 用 `erp.trade.list.query`。**未登记平台（1688、淘工厂等）没有默认回退**：`_shop_order_source` 直接报错退出，逐店循环里该店被跳过并打印原因，绝不把“拿不到”写成“没有”。`sync_state` 主键含 source，两通道水位/覆盖互不干扰。
 - 新增一个来源必须先拿齐方法名、权限、时间语义与金额对账证据，再写进注册表；数据库里不维护第二套可自由配置的来源表。
@@ -153,7 +153,12 @@ uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
   两档都只披露不拒答。等回填不会改变这个结论，要的是与后台账单/业务日期的对照登记。
 
 - 历史遗留的“从未核验”统一是 `unknown`，仍可出数但会带「来源质量未核验」说明；不得直接当数据有错。
-- 对账发现归属未确认的平台成功退款时，该范围降为 `failed` 并**停止出数**，修复后重跑 `reconcile` 才能恢复。
+- 对账发现归属未确认的平台成功退款时，**不再**把来源降为 `failed`：它是一道可量化限制，
+  逐结果披露条数/分母/金额/比例，同时把 `quality_reason` 记为 `unmatched_success_refunds`。
+  金额冲突、分页或覆盖凭证损坏等真实核验失败仍为硬门禁。
+- 质量规则升到 `kuaimai-reconcile/2` 后：旧 `passed` 视同未核验（自动降为 `unknown`），
+  而**旧规则因 unmatched 被标 `failed` 的店不会自动解禁**——必须重跑一次能落在窗口内
+  留下批次凭证的 `reconcile`，再跑 `capabilities --apply`。禁止批量清空 `failed`。
 - `quality_rule` 变更后旧 `passed` 自动失效，必须重跑对账。
 - **指标能力标签（`bi.shops.capabilities`）只能由对账证据开通**：先 `reconcile`，再跑能力重算，最后才可能出数。
 

@@ -2044,8 +2044,12 @@ class MetricsTests(unittest.TestCase):
         result = self._query(metrics=["refund_amount", "cash_difference"])
         self.assertEqual(Decimal(result.data[0]["refund_amount"]), Decimal("100"))
 
-    def test_unmatched_refund_degrades_to_missing_data(self):
-        """另加一条未匹配成功退款：退款归属未确认，返回缺数据并显示数量。"""
+    def test_unmatched_refunds_are_answered_with_a_quantified_disclosure(self):
+        """计划 5.3a：未匹配退款不再拒答，改为逐结果披露条数/分母/金额/比例。
+
+        种子窗口内 canonical 平台成功退款共 4 条（R1/R2/R3 + 新加的 R7），
+        其中 R7 没有原单：退款发生额 125 含它，同批率不含它。
+        """
         from bi_agent.sync import apply_aftersale, normalise_aftersale
 
         self.conn.execute("RESET ROLE")
@@ -2057,10 +2061,22 @@ class MetricsTests(unittest.TestCase):
         })
         self.assertTrue(apply_aftersale(self.conn, record, batch_id="seed2"))
         self.conn.execute("SET LOCAL ROLE bi_reader")
-        result = self._query(metrics=["refund_amount", "cohort_refund_rate"])
-        self.assertEqual(result.status, "missing_data")
-        self.assertTrue(any("未匹配" in item for item in result.limitations))
-        # 纯支付指标不受影响
+        result = self._query(metrics=["refund_amount", "cash_difference",
+                                      "cohort_refund_rate"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(result.data[0]["refund_amount"]), Decimal("125"),
+                         "matched=false 的 canonical 成功退款同样是已发生的退款")
+        self.assertEqual(Decimal(result.data[0]["cash_difference"]), Decimal("875"))
+        self.assertTrue(any("未匹配1条/共4条" in item and "金额25元" in item
+                            and "比例25%" in item for item in result.limitations),
+                        result.limitations)
+        self.assertTrue(any("仅含已匹配退款" in item for item in result.limitations),
+                        "同批率不能把所有未匹配退款猜配到本期")
+        self.assertEqual(Decimal(result.data[0]["cohort_refund_rate"]), Decimal("0.05"),
+                         "同批只算能归属到本期支付原单的退款：R1+R2=50 / 1000")
+
+        # 支付指标不受退款归属问题影响，但要把未认证支付说清楚。
         paid = self._query(metrics=["paid_amount"])
         self.assertEqual(paid.status, "ok")
         self.assertEqual(Decimal(paid.data[0]["paid_amount"]), Decimal("1000"))
@@ -2106,6 +2122,132 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(row["paid_orders"], 6)
         self.assertEqual(Decimal(row["refund_amount"]), Decimal("100"))
         self.assertEqual(row["erp_documents"], 6)
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class RefetchConvergenceTests(unittest.TestCase):
+    """计划 5.3e：补拉集合必须收敛，失败不能留下半成品。
+
+    2026-09-12 淘系实测记录指出这两条路径此前**零用例覆盖**，于是“集合永不收敛”
+    每轮白跑 625 次上游调用都没被发现。这里把它钉住。
+    """
+
+    def setUp(self):
+        self.conn = connect_test_db(self)
+
+    def _shop(self, shop_id="S1", platform="fxg"):
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) VALUES (%s,%s,'店') "
+            "ON CONFLICT (shop_id) DO UPDATE SET platform = EXCLUDED.platform",
+            (shop_id, platform))
+
+    def _order(self, *, shop_id="S1", erp_id="E1", commercial="C1", active=False,
+               paid="100.00", paid_at=None, source="erp.trade.list.query"):
+        self.conn.execute(
+            "INSERT INTO bi.orders(shop_id, erp_id, source, commercial_ids, active, "
+            "raw_pay_amount, paid_at, source_updated_at, batch_id) "
+            "VALUES (%s, %s, %s, ARRAY[%s], %s, %s, %s, now(), 'probe') "
+            "ON CONFLICT (shop_id, erp_id) DO NOTHING",
+            (shop_id, erp_id, source, commercial, active, Decimal(paid),
+             paid_at or datetime(2026, 9, 2, 10, tzinfo=BEIJING)))
+
+    def _refund(self, *, shop_id="S1", aftersale_id="A1", commercial="C1"):
+        self.conn.execute(
+            "INSERT INTO bi.aftersales(shop_id, aftersale_id, commercial_id, "
+            "platform_success, refund_canonical, matched, raw_platform_amount, "
+            "platform_completed_at, source_updated_at, batch_id) VALUES "
+            "(%s, %s, %s, true, true, false, 30, %s, now(), 'probe') "
+            "ON CONFLICT (shop_id, aftersale_id) DO NOTHING",
+            (shop_id, aftersale_id, commercial,
+             datetime(2026, 9, 3, 8, tzinfo=BEIJING)))
+
+    def _pending(self, shop_id="S1"):
+        from bi_agent.sync import unmatched_commercials
+
+        return unmatched_commercials(self.conn, shop_id)
+
+    def test_paid_but_closed_order_leaves_the_refetch_set(self):
+        """已付款关闭单已能参与匹配：它不得再留在补拉集合里（否则每轮白跑）。"""
+        self._shop()
+        self._order(active=False, paid="100.00")
+        self._refund()
+
+        self.assertEqual(self._pending(), set(),
+                         "关闭但已付款的原单同样是原单，不能继续要求补拉")
+
+    def test_genuinely_missing_order_stays_in_the_set(self):
+        self._shop()
+        self._refund(commercial="C_MISSING")
+
+        self.assertEqual(self._pending(), {"C_MISSING"},
+                         "原单真的没到时必须继续等待补拉，不能当作已解决")
+
+    def test_unmatched_refund_without_commercial_id_is_not_a_refetch_target(self):
+        self._shop()
+        self.conn.execute(
+            "INSERT INTO bi.aftersales(shop_id, aftersale_id, commercial_id, "
+            "platform_success, refund_canonical, matched, raw_platform_amount, "
+            "platform_completed_at, source_updated_at, batch_id) VALUES "
+            "('S1', 'A_NO_CID', NULL, true, true, false, 20, %s, now(), 'probe')",
+            (datetime(2026, 9, 4, 8, tzinfo=BEIJING),))
+
+        self.assertEqual(self._pending(), set(),
+                         "没有原单号就没有可补拉的 tid：这类退款归披露，不归补拉")
+
+    def test_refetch_uses_the_platform_channel_and_converges(self):
+        """补拉按店铺平台走实际通道，取回原单后集合收敛。"""
+        from bi_agent.sync import refetch_orders_for_commercials
+
+        self._shop(platform="tb")
+        self._refund(commercial="C9")
+
+        class FakeClient:
+            def __init__(self):
+                self.methods: list[str] = []
+
+            def call(self, method, params):
+                self.methods.append(method)
+                return {"success": True, "total": 1, "hasNext": False,
+                        "list": [{"sid": "E9", "userId": "S1", "tid": "C9",
+                                  "payAmount": "60.00",
+                                  "payTime": _ms(datetime(2026, 9, 1, 9, tzinfo=BEIJING)),
+                                  "updTime": _ms(datetime(2026, 9, 1, 10, tzinfo=BEIJING)),
+                                  "status": "TRADE_CLOSED", "sysStatus": 0,
+                                  "orders": [{"oid": "E9-1", "tid": "C9",
+                                               "itemSysId": "P_A", "num": "1",
+                                               "payAmount": "60.00"}]}]}
+
+        client = FakeClient()
+        accepted = refetch_orders_for_commercials(
+            self.conn, client, shop_id="S1", commercial_ids={"C9"},
+            order_source="erp.trade.outstock.simple.query")
+
+        self.assertEqual(client.methods, ["erp.trade.outstock.simple.query"])
+        self.assertGreaterEqual(accepted, 1)
+        self.assertEqual(self._pending(), set(), "补拉回来的原单必须让集合收敛")
+
+    def test_failed_refetch_leaves_no_half_written_state(self):
+        """上游失败时不能留下支付/批次半成品：一次补拉的窗口要么整事务成立要么不成立。"""
+        from bi_agent.kuaimai import KuaimaiError
+        from bi_agent.sync import refetch_orders_for_commercials
+
+        self._shop()
+        self._refund(commercial="C9")
+
+        class FailingClient:
+            def call(self, method, params):
+                raise KuaimaiError("upstream")
+
+        with self.assertRaises(KuaimaiError):
+            refetch_orders_for_commercials(
+                self.conn, FailingClient(), shop_id="S1", commercial_ids={"C9"})
+
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.orders WHERE erp_id='E9'").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.sync_batches WHERE mode='incremental'"
+        ).fetchone()[0], 0, "失败的上游页不能留下批次凭证")
+        self.assertEqual(self._pending(), {"C9"})
 
 
 if __name__ == "__main__":

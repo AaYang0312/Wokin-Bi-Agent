@@ -590,11 +590,16 @@ missing = requested_multirange - common
 
 ### 5.3 未匹配退款、未认证支付与质量降级
 
-- [ ] **5.3a 写新基准断言。** TB1 退款50、收支差50可答且 diagnostics 为1/2、50%、20元；cohort30%标 matched_cohort_only；零分母 NULL。去掉硬拒答后先确认旧测试确实因新政策失败，再改实现，不把旧断言悄悄删除。
-- [ ] **5.3b 独立退款发生与匹配。** refund_amount 依赖退款发生覆盖，canonical 成功且未匹配也计入；现金差额额外要求支付覆盖；cohort 只对已知 cohort 做关联，未匹配不能强配或忽略披露。诊断计数/金额与比率分母按设计 §5 冻结。
-- [ ] **5.3c paid_amount 补齐静默缺额防护。** 未认证支付按 orphan/undetermined/冲突分项披露数量和已知金额；无法量化保持 NULL。支付事实仍经现有头行交叉核验和防降级，不把 active 或正金额直接当 verified。
-- [ ] **5.3d 消除第二道拒答。** 修改 reconcile_source_quality，未匹配本身不置 failed；金额核验失败等真实错误仍为硬门禁。版本化质量规则，旧 unmatched-only failed 在重新逐源取证后迁移；不批量放行。退款发生、cohort、支付分别判断受影响指标。
-- [ ] **5.3e 验证补拉收敛。** 已付款关闭单匹配后退出 unmatched_commercials；原单真的未到时保留 bounded retry 和来源路由；分页失败不能留下支付/批次/覆盖半成品。查询不做上游补拉。
+- [x] **5.3a 写新基准断言。** TB1 退款50、收支差50可答且 diagnostics 为1/2、50%、20元；cohort30%标 matched_cohort_only；零分母 NULL。去掉硬拒答后先确认旧测试确实因新政策失败，再改实现，不把旧断言悄悄删除。
+  红灯留档：`test_unmatched_refund_degrades_to_missing_data`（`'ok' != 'missing_data'`）与 `test_unmatched_success_refund_demotes_to_failed_with_reason`（`'passed' != 'failed'`）在改实现前先转红，再按新契约改写（没删断言）。量化披露用例在 `test_unmatched_refunds_are_answered_with_a_quantified_disclosure`（1/4、25%、25元、退款 125、收支差 875、同批 0.05）与 `test_unmatched_count_and_amount_are_quantified_per_window`（失败工单不进分母、0/0 → 未知）。
+- [x] **5.3b 独立退款发生与匹配。** refund_amount 依赖退款发生覆盖，canonical 成功且未匹配也计入；现金差额额外要求支付覆盖；cohort 只对已知 cohort 做关联，未匹配不能强配或忽略披露。诊断计数/金额与比率分母按设计 §5 冻结。
+  交付：`ENTITY_REQUIREMENTS["refund_amount"]` 收窄为只需 `aftersales_occurrence`（旧写法会拿“订单未覆盖”打死本可答的退款查询）；`cash_difference` 继续双依赖；分母固定为同窗口 canonical 平台成功退款，Decimal 计算、按条数不按金额。
+- [x] **5.3c paid_amount 补齐静默缺额防护。** 未认证支付按 orphan/undetermined/冲突分项披露数量和已知金额；无法量化保持 NULL。支付事实仍经现有头行交叉核验和防降级，不把 active 或正金额直接当 verified。
+  交付：`unverified_payments()` 从 `reporting.v_payments` 读 `NOT verified` 行，拆「金额未定」与「有原始金额」两档并给已知合计（笔数一起给，避免把 0 读成“这些单值 0 元”）。视图无 basis 列，所以下一版要拆到冲突/孤立细分需先开只读登记视图。
+- [x] **5.3d 消除第二道拒答。** 修改 reconcile_source_quality，未匹配本身不置 failed；金额核验失败等真实错误仍为硬门禁。版本化质量规则，旧 unmatched-only failed 在重新逐源取证后迁移；不批量放行。退款发生、cohort、支付分别判断受影响指标。
+  交付：`QUALITY_RULE` → `kuaimai-reconcile/2`；reconcile 只写原因不降级。旧 `failed` 行**不自动解禁**（必须重跑 `reconcile` 逐源取证），运行手册已写明。
+- [x] **5.3e 验证补拉收敛。** 已付款关闭单匹配后退出 unmatched_commercials；原单真的未到时保留 bounded retry 和来源路由；分页失败不能留下支付/批次/覆盖半成品。查询不做上游补拉。
+  交付：`tests/test_db.py::RefetchConvergenceTests`（5 项），补上实测报告点名的 `unmatched_commercials` / `refetch_orders_for_commercials` **零覆盖**空白：已付款关闭单退出集合、真缺单留在集合、无原单号不成为补拉目标、按平台通道补拉且收敛、上游失败不留订单/批次半成品。
 
 ### 5.4 basis 全链路和混合查询
 

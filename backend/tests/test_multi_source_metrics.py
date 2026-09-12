@@ -101,22 +101,25 @@ class MetricBindingTests(unittest.TestCase):
                 self.assertEqual(binding.basis, PAYMENT_BASIS)
                 self.assertFalse(binding.coverage_certified)
 
-    def test_refund_metrics_bind_both_the_order_and_after_sale_source(self):
-        for metric in ("refund_amount", "cash_difference"):
-            with self.subTest(metric=metric):
-                bindings = resolve_metric_sources(
-                    _shop("S1", "fxg", metric), metric)
-                self.assertEqual({item.source for item in bindings},
-                                 {TRADE_LIST_SOURCE, AFTERSALE_SOURCE})
-                self.assertEqual({item.entity for item in bindings},
-                                 {ORDERS_ENTITY, AFTERSALE_ENTITY})
+    def test_refund_amount_binds_only_the_after_sale_source(self):
+        """设计 §4：退款发生额只需退款发生源。
 
-    def test_refund_amount_does_not_require_the_cohort_entity(self):
-        # 退款发生只需退款源；把 cohort 也拉进来会白白拖死一次可答查询。
+        订单还没取到的退款也是真实发生的退款；把 orders 也列进依赖，就会拿“订单没覆盖”
+        去打死一个本可回答的问题（计划 5.3b）。
+        """
         bindings = resolve_metric_sources(_shop("S1", "fxg", "refund_amount"),
                                           "refund_amount")
-        self.assertNotIn(AFTERSALE_COHORT_ENTITY,
-                         {item.entity for item in bindings})
+        self.assertEqual({item.source for item in bindings}, {AFTERSALE_SOURCE})
+        self.assertEqual({item.entity for item in bindings}, {AFTERSALE_ENTITY})
+
+    def test_cash_difference_binds_both_the_payment_and_refund_sources(self):
+        # 现金差 = 支付 − 期间退款发生：两端都要，所以两条依赖都在。
+        bindings = resolve_metric_sources(_shop("S1", "fxg", "cash_difference"),
+                                          "cash_difference")
+        self.assertEqual({item.source for item in bindings},
+                         {TRADE_LIST_SOURCE, AFTERSALE_SOURCE})
+        self.assertEqual({item.entity for item in bindings},
+                         {ORDERS_ENTITY, AFTERSALE_ENTITY})
 
     def test_cohort_binds_the_cohort_entity_not_the_occurrence_entity(self):
         entities = {item.entity for item in resolve_metric_sources(

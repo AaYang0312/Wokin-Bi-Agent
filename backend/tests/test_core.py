@@ -1030,7 +1030,9 @@ class FakeWarehouse:
     """
 
     def __init__(self, *, daily_rows=(), product_rows=(), shops=(), data_as_of=None,
-                 cohort=(None, None), unmatched=0, shop_profiles=(), catalog_version=7,
+                 cohort=(None, None), refund_gap=(0, 0, 0),
+                 unverified_payments=(0, 0, 0, 0), shop_profiles=(),
+                 catalog_version=7,
                  quality_status="passed", quality_rule=QUALITY_RULE,
                  capabilities=("paid_amount", "paid_orders", "erp_documents", "aov",
                                "quantity", "product_paid_amount", "refund_amount",
@@ -1056,7 +1058,9 @@ class FakeWarehouse:
         self.quality_status = quality_status
         self.quality_rule = quality_rule
         self.cohort = tuple(cohort)
-        self.unmatched = unmatched
+        # 退款归属与未认证支付诊断：默认“没有这类限制”，与真实健康库一致。
+        self.refund_gap = tuple(refund_gap)
+        self.unverified_payments = tuple(unverified_payments)
         self.statements: list[tuple[str, tuple]] = []
 
     def _shop_row(self, row: tuple) -> tuple:
@@ -1113,8 +1117,13 @@ class FakeWarehouse:
         if "FROM reporting.v_payment_attribution" in text:
             # 健康替身：total, closed, gift, no_product, other 全零 = 完全归属。
             return _FakeResult([(0, 0, 0, 0, 0)])
-        if text.startswith("SELECT count(*) FROM reporting.v_refunds"):
-            return _FakeResult([(self.unmatched,)])
+        if text.startswith("SELECT count(*) FILTER (WHERE commercial_id IS NULL"):
+            # 退款归属诊断：(未匹配条数, canonical 成功总数, 未匹配金额)。
+            # 按语句前缀认，不按视图名认：cohort 的 CTE 也读 v_refunds/v_payments。
+            return _FakeResult([self.refund_gap])
+        if text.startswith("SELECT count(*), count(*) FILTER (WHERE amount IS NULL)"):
+            # 未认证支付诊断：(总笔数, 金额未定, 有原始金额, 已知金额合计)。
+            return _FakeResult([self.unverified_payments])
         if text.startswith("WITH cohort"):
             return _FakeResult([self.cohort])
         if "FROM reporting.v_product_daily" in text:

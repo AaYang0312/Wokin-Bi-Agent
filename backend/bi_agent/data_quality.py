@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Iterable, Literal, Sequence
 from zoneinfo import ZoneInfo
 
@@ -51,17 +51,35 @@ WHERE source=%s AND entity=%s AND shop_id = ANY(%s)
   AND window_kind = 'business' AND window_start < %s AND window_end > %s
 """
 
-# 平台成功退款找不到原单：退款归属未确认，不能当已核验数据出数。
-# 定义在本模块，指标层引用同一份，避免两边口径漂移。
+# 退款归属诊断：分母固定为同一窗口内 canonical 平台成功退款，失败/待处理/重复工单
+# 排除在外。未匹配是**归属限制**，不是数据有错（计划 5.3a/5.3b），所以它只披露不拒答。
 UNMATCHED_REFUNDS_SQL = """
-SELECT count(*) FROM reporting.v_refunds
+SELECT count(*) FILTER (WHERE commercial_id IS NULL OR NOT matched),
+       count(*),
+       coalesce(sum(raw_platform_amount) FILTER (
+           WHERE commercial_id IS NULL OR NOT matched), 0)
+FROM reporting.v_refunds
 WHERE shop_id = ANY(%s) AND platform_success AND refund_canonical
   AND platform_completed_at >= %s AND platform_completed_at < %s
-  AND (commercial_id IS NULL OR NOT matched)
+"""
+
+# 未认证支付诊断：verified=false 的行不能无声消失。金额未定与「确实为 0」必须分开，
+# 已知金额只对有原始金额的行求和，笔数一起给出，避免把 0 读成“这些单值 0 元”。
+UNVERIFIED_PAYMENTS_SQL = """
+SELECT count(*),
+       count(*) FILTER (WHERE amount IS NULL),
+       count(*) FILTER (WHERE amount IS NOT NULL),
+       coalesce(sum(amount) FILTER (WHERE amount IS NOT NULL), 0)
+FROM reporting.v_payments
+WHERE shop_id = ANY(%s) AND NOT verified
+  AND paid_at >= %s AND paid_at < %s
 """
 
 # 核验口径版本：规则一变，旧的 passed 自动失效（降级为 unknown）。
-QUALITY_RULE = "kuaimai-reconcile/1"
+# /2：未匹配退款从「整店 failed」改成「可量化限制 + 逐结果披露」（计划 5.3d）。
+# 升级后必须按运行手册重跑 `reconcile` 再 `capabilities --apply`，否则既有 passed
+# 全部视同未核验，能力会被回收——这是刻意的：口径变了，旧凭证不能继续给新口径背书。
+QUALITY_RULE = "kuaimai-reconcile/2"
 
 _CAPABILITIES_SQL = """
 SELECT shop_id, platform FROM reporting.v_shops WHERE shop_id = ANY(%s)
@@ -142,15 +160,16 @@ def reconcile_source_quality(conn, *, shop_id: str, entity: str,
         return "unknown"
 
     unmatched = conn.execute(UNMATCHED_REFUNDS_SQL, ([shop_id], start, end)).fetchone()[0]
-    status: QualityStatus = "failed" if unmatched else "passed"
+    # 未匹配退款只记录为归属原因，不再独自把来源打成 failed：换成另一道门禁等于
+    # 换个理由继续拒答（设计 §5）。金额冲突、覆盖损坏等真实失败仍在各自路径上拦。
     conn.execute(
         "UPDATE bi.sync_state SET quality_status=%s, quality_checked_at=now(), "
         "quality_rule=%s, quality_reason=%s "
         "WHERE source=%s AND entity=%s AND shop_id=%s",
-        (status, QUALITY_RULE, "unmatched_success_refunds" if unmatched else None,
-         source, entity, shop_id),
+        ("passed", QUALITY_RULE,
+         "unmatched_success_refunds" if unmatched else None, source, entity, shop_id),
     )
-    return status
+    return "passed"
 
 
 _ATTRIBUTION_SQL = """
@@ -209,6 +228,11 @@ class AttributionGap:
         return self.total > 0
 
 
+def money_text(value: Decimal) -> str:
+    """对外披露用的金额文本：原值去尾零，不舍入，分项与合计才对得上。"""
+    return _money(value)
+
+
 def _money(value: Decimal) -> str:
     """金额按原值渲染，只去尾零：不做舍入，免得分项与合计对不上。"""
     text = format(value, "f")
@@ -237,6 +261,69 @@ def describe_attribution_gap(gap: AttributionGap) -> str | None:
     return (f"支付额中{_money(gap.total)}元未计入商品维度"
             f"（关闭订单行{_money(gap.closed)}元；赠品行{_money(gap.gift)}元；"
             f"无商品归属{_money(gap.no_product)}元；其他{_money(gap.other)}元）")
+
+
+@dataclass(frozen=True)
+class RefundAttribution:
+    """退款归属限制的量化形状：0/0 时比例是未知，不是 0%。"""
+
+    unmatched: int
+    total: int
+    unmatched_amount: Decimal
+
+    @property
+    def ratio_text(self) -> str:
+        """比例只在有条目可分时存在：0/0 是未知，不是 0%。
+
+        按**条数**算，不按金额算，也不拿各店比例求平均（设计 §5 冻结的口径）。
+        """
+        if self.total <= 0:
+            return "未知"
+        ratio = (Decimal(self.unmatched) * 100 / Decimal(self.total)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP)
+        text = format(ratio, "f").rstrip("0").rstrip(".")
+        return f"{text}%"
+
+    @property
+    def material(self) -> bool:
+        return self.unmatched > 0
+
+
+def refund_attribution_gap(conn, *, shop_ids: Sequence[str],
+                           start_ts: datetime, end_ts: datetime) -> RefundAttribution:
+    """这批退款里有多少找不到原单：条数、分母、金额与比例一起给。"""
+    shops = [str(shop_id) for shop_id in shop_ids]
+    if not shops:
+        return RefundAttribution(0, 0, Decimal(0))
+    unmatched, total, amount = conn.execute(
+        UNMATCHED_REFUNDS_SQL, (shops, start_ts, end_ts)).fetchone()
+    return RefundAttribution(int(unmatched or 0), int(total or 0),
+                             Decimal(str(amount or 0)))
+
+
+@dataclass(frozen=True)
+class UnverifiedPayments:
+    """拿不到核验章的支付事实：数量、金额未定的笔数与已知金额分开披露。"""
+
+    total: int
+    amount_undetermined: int
+    amount_known: int
+    known_amount: Decimal
+
+    @property
+    def material(self) -> bool:
+        return self.total > 0
+
+
+def unverified_payments(conn, *, shop_ids: Sequence[str],
+                        start_ts: datetime, end_ts: datetime) -> UnverifiedPayments:
+    shops = [str(shop_id) for shop_id in shop_ids]
+    if not shops:
+        return UnverifiedPayments(0, 0, 0, Decimal(0))
+    total, undetermined, known, amount = conn.execute(
+        UNVERIFIED_PAYMENTS_SQL, (shops, start_ts, end_ts)).fetchone()
+    return UnverifiedPayments(int(total or 0), int(undetermined or 0), int(known or 0),
+                              Decimal(str(amount or 0)))
 
 
 def required_entities(metrics: Sequence[str]) -> list[str]:

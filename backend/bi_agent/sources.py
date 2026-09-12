@@ -87,7 +87,9 @@ ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "aov": (ORDERS_ENTITY,),
     "quantity": (ORDERS_ENTITY,),
     "product_paid_amount": (ORDERS_ENTITY,),
-    "refund_amount": (ORDERS_ENTITY, AFTERSALE_ENTITY),
+    # 退款发生额只依赖退款发生源：订单还没取到的退款也是真实发生的退款，
+    # 要求订单覆盖只会把可答的查询打死（设计 §4、计划 5.3b）。
+    "refund_amount": (AFTERSALE_ENTITY,),
     "cash_difference": (ORDERS_ENTITY, AFTERSALE_ENTITY),
     "cohort_refund_rate": (ORDERS_ENTITY, AFTERSALE_COHORT_ENTITY),
 }

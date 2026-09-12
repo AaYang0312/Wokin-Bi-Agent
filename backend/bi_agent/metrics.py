@@ -45,8 +45,8 @@ METRIC_DEFINITIONS: dict[str, str] = {
 # 指标→实体依赖与覆盖来源定义在 sources 注册表（唯一真源）；data_quality 向外转发，
 # 本模块只引用，不再存第二份，避免门禁与指标两边口径漂移。
 from bi_agent.data_quality import (
-    ENTITY_REQUIREMENTS, UNMATCHED_REFUNDS_SQL, attribution_gap,
-    assess_query_coverage, describe_attribution_gap)
+    ENTITY_REQUIREMENTS, assess_query_coverage, attribution_gap,
+    describe_attribution_gap, money_text, refund_attribution_gap, unverified_payments)
 from bi_agent.sources import ShopRecord, unsupported_reason
 
 
@@ -520,16 +520,31 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
     if attribution:
         limitations.append(attribution)
 
-    # 未匹配成功退款影响退款归属
-    refund_metrics = {"refund_amount", "cash_difference", "cohort_refund_rate"}
-    if set(request.metrics) & refund_metrics:
-        unmatched = conn.execute(
-            UNMATCHED_REFUNDS_SQL, (request.shop_ids, start_ts, end_ts)).fetchone()[0]
-        if unmatched:
-            limitations.append(f"存在{unmatched}条未匹配的平台成功退款，退款归属未确认")
-            return ToolResult(status="missing_data", coverage=coverage,
-                              metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
-                              filters=filters, data_as_of=data_as_of, limitations=limitations)
+    # 可量化限制而不是拒答（设计 §5、计划 5.3）：未匹配退款与未认证支付都逐结果披露。
+    # 一条未匹配就把整次查询打成 missing_data，等于用另一个门禁继续拒答；
+    # 让它们无声消失则是另一种错——数字会偏小而没人知道为什么。
+    refund_gap = None
+    if set(request.metrics) & {"refund_amount", "cash_difference", "cohort_refund_rate"}:
+        refund_gap = refund_attribution_gap(conn, shop_ids=request.shop_ids,
+                                            start_ts=start_ts, end_ts=end_ts)
+        if refund_gap.material:
+            limitations.append(
+                f"退款归属未确认：未匹配{refund_gap.unmatched}条/共{refund_gap.total}条，"
+                f"金额{money_text(refund_gap.unmatched_amount)}元，比例{refund_gap.ratio_text}")
+        if "cohort_refund_rate" in request.metrics and refund_gap.material:
+            # 同批率只能对已归属的退款计算：报出来的数不是“完整同批退款率”。
+            limitations.append(
+                f"同批退款率仅含已匹配退款（{refund_gap.unmatched}条未匹配退款无法归属，未计入）")
+
+    if set(request.metrics) & {"paid_amount", "paid_orders", "aov",
+                               "product_paid_amount", "cash_difference"}:
+        unverified = unverified_payments(conn, shop_ids=request.shop_ids,
+                                         start_ts=start_ts, end_ts=end_ts)
+        if unverified.material:
+            limitations.append(
+                f"未认证支付{unverified.total}笔（金额未定{unverified.amount_undetermined}笔），"
+                f"已知原始金额{money_text(unverified.known_amount)}元"
+                f"（{unverified.amount_known}笔）")
 
     # 行数预检：只对逐日分组有意义（total/shop 在SQL端按店聚合，日行不进 Python）
     if request.group_by == "day":

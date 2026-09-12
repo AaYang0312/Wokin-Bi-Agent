@@ -8,6 +8,7 @@
 import os
 import unittest
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -335,7 +336,12 @@ class QualityPromotionTests(unittest.TestCase):
         self.assertIsNotNone(checked_at, "对账时间要留下取证时刻")
         self.assertIsNone(reason)
 
-    def test_unmatched_success_refund_demotes_to_failed_with_reason(self):
+    def test_unmatched_success_refund_is_recorded_but_does_not_fail(self):
+        """计划 5.3d：未匹配是归属限制，不再独自把来源打成 failed。
+
+        留着原因字段，是为了让“为什么这些退款还没归到原单”可查；换成另一道门禁
+        继续拒答，等于换个理由不说真话（设计 §5）。
+        """
         self._state("passed", rule="kuaimai-reconcile/1")
         self._evidence()
         self.conn.execute(
@@ -345,10 +351,38 @@ class QualityPromotionTests(unittest.TestCase):
             "('DQ_Q1', 'A_ORPHAN', NULL, true, true, false, %s, now(), 'probe')",
             (datetime(2026, 9, 5, tzinfo=BEIJING),))
 
-        self.assertEqual(self._reconcile(), "failed")
+        self.assertEqual(self._reconcile(), "passed")
         status, _, _, reason = self._quality_row()
-        self.assertEqual((status, reason), ("failed", "unmatched_success_refunds"),
-                         "已知有错要显式降为 failed 并留下原因")
+        self.assertEqual((status, reason), ("passed", "unmatched_success_refunds"),
+                         "归属未确认要留下原因，但不能靠它拒答")
+
+    def test_unmatched_count_and_amount_are_quantified_per_window(self):
+        """设计 §5：披露未匹配条数/分母/金额/比例，0/0 时比例是未知而不是 0%。"""
+        from bi_agent.data_quality import refund_attribution_gap
+
+        self.conn.execute(
+            "INSERT INTO bi.aftersales(shop_id, aftersale_id, commercial_id, "
+            "platform_success, refund_canonical, matched, raw_platform_amount, "
+            "platform_completed_at, source_updated_at, batch_id) VALUES "
+            "('DQ_Q1', 'A_M1', 'C1', true, true, true, 30, %s, now(), 'probe'),"
+            "('DQ_Q1', 'A_U1', NULL, true, true, false, 20, %s, now(), 'probe'),"
+            "('DQ_Q1', 'A_FAIL', NULL, false, true, false, 999, %s, now(), 'probe')",
+            (datetime(2026, 9, 5, tzinfo=BEIJING),) * 3)
+        moment = (datetime(2026, 9, 4, tzinfo=BEIJING), datetime(2026, 9, 11, tzinfo=BEIJING))
+
+        gap = refund_attribution_gap(self.conn, shop_ids=["DQ_Q1"],
+                                     start_ts=moment[0], end_ts=moment[1])
+
+        self.assertEqual((gap.unmatched, gap.total), (1, 2),
+                         "分母只算 canonical 平台成功退款，失败工单不进分母")
+        self.assertEqual(gap.unmatched_amount, Decimal("20"))
+        self.assertEqual(gap.ratio_text, "50%")
+
+        empty = refund_attribution_gap(self.conn, shop_ids=["DQ_Q1"],
+                                       start_ts=datetime(2026, 1, 1, tzinfo=BEIJING),
+                                       end_ts=datetime(2026, 1, 2, tzinfo=BEIJING))
+        self.assertEqual((empty.unmatched, empty.total, empty.ratio_text),
+                         (0, 0, "未知"))
 
     def test_stale_rule_version_is_reported_as_unknown_not_passed(self):
         """口径升级后旧的 passed 不能自动沿用。"""

@@ -501,6 +501,12 @@ def _limitation_codes(limitations: list[str]) -> list[str]:
         if code is None and limitation.startswith("支付额中") and "未计入商品维度" in limitation:
             # 参数化文本：只有已通过载荷校验的披露形式能归到这个码。
             code = "revenue_not_attributed"
+        if code is None and limitation.startswith("退款归属未确认："):
+            code = "unmatched_refunds"
+        if code is None and limitation.startswith("同批退款率仅含已匹配退款"):
+            code = "matched_cohort_only"
+        if code is None and limitation.startswith("未认证支付"):
+            code = "unverified_payments"
         if (code is None and " 家店铺的" in limitation
                 and ("付款时间口径未经认证" in limitation
                      or "未认证付款时间口径" in limitation)):
