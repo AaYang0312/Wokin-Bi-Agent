@@ -257,4 +257,4 @@ orders                 passed    kuaimai-reconcile/1
   `find_reusable_run`，但**尚未接入主 Agent 的复用调用点**（等 Task 5 端到端一起验）
 - 价审 / 库存领域的恢复分支（stale、unconfigured、incomparable）依赖
   Task 9 / 10 的领域实现，本轮只登记了领域与错误码白名单
-- 淘系与拼多多的接入等待用户在快麦侧开通授权
+- 淘系的接入等待用户在快麦侧开通授权；**拼多多已于 2026-09-12 决定不接入支付**（见 [范围决定](2026-09-12-drop-pdd-onboarding.md)），不再是待批项

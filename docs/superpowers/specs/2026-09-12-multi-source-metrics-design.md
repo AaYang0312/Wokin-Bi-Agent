@@ -36,11 +36,13 @@
 | --- | --- | --- | --- |
 | fxg 与已验证的 jd/kuaishou/wxsph/wsxc | erp.trade.list.query | 按平台核验的支付口径，fxg 使用 `platform_payment/v1` | 逐店证据决定；不能把 fxg 的认证复制给其他平台 |
 | tb/tm | erp.trade.outstock.simple.query | `erp_outstock_payment/v1` | ERP 出库来源已验证支付；不是平台账单，不承诺支付时间窗口完整 |
-| pdd，方舟开通前 | 已核验的单据来源 | `erp_document/v1` | 仅 `erp_documents`，不得授予 paid_amount/paid_orders/aov/product_paid_amount/cash_difference/cohort_refund_rate |
-| pdd，方舟开通后 | 按实际获批文档注册第三个订单源 | 逐项实测并版本化的支付口径 | 权限、时间语义、金额及退款对账全部验收后逐店启用 |
+| pdd（**决定不接入支付**） | 已核验的单据来源 | `erp_document/v1` | 仅 `erp_documents`，不得授予 paid_amount/paid_orders/aov/product_paid_amount/cash_difference/cohort_refund_rate |
 | 未知平台、无店铺档案、未登记来源 | 无 | 无 | fail closed；禁止回退交易源后把空响应标为完整覆盖 |
 
-不猜方舟方法名；未登记、未授权时解析支付依赖直接返回能力不足。所有售后目前使用 `erp.aftersale.list.query`；退款发生与 cohort 仍是不同 entity。
+不猜方舟方法名；未登记、未授权时解析支付依赖直接返回能力不足。2026-09-12 用户决定放弃拼多多方舟授权（见
+[范围决定](../research/2026-09-12-drop-pdd-onboarding.md)）：注册表**不再有 pdd 支付分支**，也不保留
+「开通后再登记」的待办；拼多多支付依赖永久解析为 `capability_unavailable`，全平台汇总必须把它列进
+`excluded_scope`，不得算进覆盖分母。所有售后目前使用 `erp.aftersale.list.query`；退款发生与 cohort 仍是不同 entity。
 
 接口契约（服务端对象；不得由模型指定 source）：
 

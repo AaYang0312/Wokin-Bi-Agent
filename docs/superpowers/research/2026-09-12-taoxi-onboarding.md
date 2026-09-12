@@ -153,7 +153,7 @@
 2. **淘系 `verified` 88.7% 的剩余缺口**：348 条 `undetermined` 源于 162 张单"行级实付合计 > 单头实付"（优惠/运费分摊口径差），需与业务确认应以单头还是行级为准。
 3. **`timeType=pay_time` 在两个通道语义不一致（§3）**：回填/对账用 `timeType=pay_time` 分片。抖音通道严格（0/9414 行越界），出库通道不严格（83/8367 行 `paid_at` 早于 `covered` 起点，最早 2026-07-02，早 42 天）。后果：这些行的支付事实落在 `covered` 外，查询该更早区间时 metrics 会按覆盖率返回 partial/missing（设计行为，非数据丢失），但回填行数预估不能按窗口天数线性推。需确认是否补一段 `covered_from = min(paid_at)` 的存量重述（同类：需重述通道）。
 4. **【前置必做】metrics 层不识别出库通道，12 家淘系店当前完整不可查（§1.6）**：`_ENTITY_SOURCES` 单源常量使所有淘系查询返回 missing_data，且与抖音店混合查询时**连带拖死抖音部分**。需改为每实体多源（按平台解析或取 covered 交集）并补测；同时注意修好后第二道门禁会立刻把淘系退款类指标打成 missing_data（现窗 659 条），所以这一项必须与 §5.1 的口径决策同批排期。另：`tests/test_db.py` 对 `unmatched_commercials` / `refetch_orders_for_commercials` **零覆盖**（只有 `mark_refund_canonical` 有独立用例），改该路径时需一并补收敛用例（`_seed_shop(platform="tb")` 可直接复用）。
-5. 拼多多订单需方舟 appkey，未接。1688（`1688`/`alibabac2b`→`alibabac2m`）本次范围外。
+5. ~~拼多多订单需方舟 appkey，未接。~~ **2026-09-12 已决定不接入拼多多支付（授权成本过高，不再作为待办前置）**，见 [范围决定](2026-09-12-drop-pdd-onboarding.md)；pdd 仅保留单据口径。1688（`1688`/`alibabac2b`→`alibabac2m`）本次范围外。
 - 页面/Agent 侧对 12 家淘系店的开放与否是后续人工决定（前提：先完成 §5.4 的 metrics 多源登记）。
 - 长尾回填：出库 queryType=0 仅覆盖近 3 个月，更早订单需要 queryType=1 归档窗口回填（本次 30 天范围内未受影响）。
 - 建议排期：每日 `incremental`（orders×2 通道 + aftersales occurrence/cohort），每周 `reconcile --days 3`，每月 `replay --start <月末-40d> --end <月末>` 清理退款迟到/补发/换货。
