@@ -181,11 +181,12 @@ class CoverageAssessmentTests(unittest.TestCase):
     def test_shop_without_onboarded_source_is_reported_as_unconfigured(self):
         """未开通来源的店与“有覆盖但窗口缺一天”是两回事。
 
-        前者缩小日期范围永远拿不到数据（平台未授权/从未同步），
+        前者平台没登记来源（未授权），缩小日期范围永远拿不到数据；
         把两者都说成“请缩小范围”会误导经营者。
         """
+        # 平台未登记 = 没有取数来源；能力标签不参与这一步（Task 5.1 能力门禁另行归因）。
         self.conn.execute(
-            "UPDATE bi.shops SET capabilities = '{orders,aftersales_occurrence}' WHERE shop_id='DQ_S1'")
+            "UPDATE bi.shops SET platform = 'alibabac2m' WHERE shop_id='DQ_S2'")
         self._state(
             "DQ_S1",
             covered=[(datetime(2026, 9, 4, tzinfo=BEIJING),
@@ -195,14 +196,11 @@ class CoverageAssessmentTests(unittest.TestCase):
         assessment = self._assess(self._request(shop_ids=["DQ_S1", "DQ_S2"]))
 
         self.assertEqual(assessment.source_unconfigured, ("DQ_S2",),
-                         "未登记能力的店必须单独归因")
+                         "未登记来源的店必须单独归因")
         self.assertEqual(assessment.status, "partial")
 
     def test_configured_shop_is_not_reported_as_unconfigured(self):
-        self.conn.execute(
-            "UPDATE bi.shops SET capabilities = '{orders,aftersales_occurrence}' WHERE shop_id='DQ_S1'")
-        self.conn.execute(
-            "UPDATE bi.shops SET capabilities = '{orders}' WHERE shop_id='DQ_S2'")
+        # 已登记来源就不报“未开通”：淘系与拼多多都有出库通道，能力缺失不混到这一步。
         for shop in ("DQ_S1", "DQ_S2"):
             self._state(
                 shop,

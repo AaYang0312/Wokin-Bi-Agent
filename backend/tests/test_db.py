@@ -23,6 +23,17 @@ from .dbfixtures import connect_test_db
 BEIJING = ZoneInfo("Asia/Shanghai")
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
+# 种子店默认“已逐来源核验并授予全部指标能力”；未授权/未取证对照店保持空数组。
+ALL_CAPABILITIES = ("paid_amount", "paid_orders", "erp_documents", "aov", "quantity",
+                    "product_paid_amount", "refund_amount", "cash_difference",
+                    "cohort_refund_rate")
+
+
+def set_capabilities(conn, shop_id: str, *capabilities: str) -> None:
+    """写能力标签。它代表“已完成逐来源取证”这件事，只能由测试显式调用。"""
+    conn.execute("UPDATE bi.shops SET capabilities=%s WHERE shop_id=%s",
+                 (list(capabilities), shop_id))
+
 
 def _ms(moment: datetime) -> int:
     """北京时间转快麦毫秒时间戳。"""
@@ -35,12 +46,19 @@ class DatabaseTests(unittest.TestCase):
         # 外层事务必须在这儿开：被测同步函数自己开 transaction()，否则它们会提交假数据。
         self.conn = connect_test_db(self)
 
-    def _seed_shop(self, shop_id: str = "S1", platform: str = "fxg"):
+    def _seed_shop(self, shop_id: str = "S1", platform: str = "fxg",
+                   capabilities=ALL_CAPABILITIES):
+        """预置一家店；默认代表“已逐来源取证并授予全部指标能力”的健康店。
+
+        能力标签不随“插了一行店铺档案”自动成立：需要未开通能力的场景时，
+        调用方显式传 `capabilities=()` 或事后 `set_capabilities` 掉。
+        """
         self.conn.execute(
             "INSERT INTO bi.shops(shop_id, platform, display_name) VALUES (%s, %s, %s) "
             "ON CONFLICT (shop_id) DO NOTHING",
             (shop_id, platform, "店铺A"),
         )
+        set_capabilities(self.conn, shop_id, *capabilities)
 
     # -- 权限 ----------------------------------------------------------------
 
@@ -1526,6 +1544,9 @@ class DatabaseTests(unittest.TestCase):
                 "INSERT INTO bi.shops(shop_id, platform, display_name) "
                 "VALUES (%s, 'fxg', %s) ON CONFLICT (shop_id) DO NOTHING",
                 (shop_id, shop_id))
+            # 行上限检查走在能力门禁之后：这些店必须被当成“已取证”，
+            # 否则测到的是能力而不是截断。
+            set_capabilities(self.conn, shop_id, *ALL_CAPABILITIES)
             self.conn.execute(
                 "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
                 "data_as_of) VALUES ('erp.trade.list.query', 'orders', %s, %s, "
@@ -1762,10 +1783,16 @@ COVERAGE_END = datetime(2026, 9, 8, 0, 0, tzinfo=BEIJING)
 
 def seed_business_case(conn) -> None:
     """冻结时刻2026-09-08 09:00+08；覆盖2026-08-25至2026-09-08；金额均为元。"""
+    # 种子代表“已逐源取证并授予能力的参考场景”：S1 拿到全部指标能力，
+    # S2 是未授权对照店（能力为空）。能力标签与指标同名，旧的 orders 一类实体标签
+    # 不授予任何指标（设计 §4），所以种子必须显式写标签。
     conn.execute(
         "INSERT INTO bi.shops(shop_id, platform, display_name) VALUES "
         "('S1','fxg','店铺A'), ('S2','fxg','店铺B') "
-        "ON CONFLICT (shop_id) DO NOTHING")
+        "ON CONFLICT (shop_id) DO UPDATE SET platform = EXCLUDED.platform, "
+        "display_name = EXCLUDED.display_name")
+    set_capabilities(conn, "S1", *ALL_CAPABILITIES)
+    set_capabilities(conn, "S2")
 
     def pay_time(day: int, hour: int) -> datetime:
         return datetime(2026, 9, day, hour, tzinfo=BEIJING)

@@ -9,7 +9,7 @@ from __future__ import annotations
 import time
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import psycopg
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -42,11 +42,12 @@ METRIC_DEFINITIONS: dict[str, str] = {
     "product_paid_amount": "已核验的非赠品父项行级分摊支付金额（按line_kind标注）",
 }
 
-# 指标→实体依赖与覆盖来源定义在 data_quality（覆盖门禁的唯一真源）；
+# 指标→实体依赖与覆盖来源定义在 sources 注册表（唯一真源）；data_quality 向外转发，
 # 本模块只引用，不再存第二份，避免门禁与指标两边口径漂移。
 from bi_agent.data_quality import (
     ENTITY_REQUIREMENTS, UNMATCHED_REFUNDS_SQL, attribution_gap,
     assess_query_coverage, describe_attribution_gap)
+from bi_agent.sources import ShopRecord, unsupported_reason
 
 
 class QueryRequest(BaseModel):
@@ -276,7 +277,8 @@ FROM cohort c LEFT JOIN refunds r USING (shop_id, commercial_id)
 """
 
 _SHOPS_SQL = """
-SELECT shop_id, enabled, currency FROM reporting.v_shops WHERE shop_id = ANY(%s)
+SELECT shop_id, enabled, currency, platform, capabilities
+FROM reporting.v_shops WHERE shop_id = ANY(%s)
 """
 
 
@@ -332,6 +334,51 @@ def _compute_aov(values: dict[str, Decimal | int | None]) -> Decimal | None:
     return amount / orders
 
 
+class _ShopRow(NamedTuple):
+    """一家店的服务端档案：开关、币种与来源/能力解析所需的平台+能力标签。"""
+
+    enabled: bool
+    currency: str | None
+    record: ShopRecord
+
+
+def _capability_gap(records, metrics) -> list[str]:
+    """把「这次问的指标哪些店回答不了」写成固定披露，并分开两类缺口。
+
+    - 平台没登记来源：换指标、改日期都救不了，只能先完成接入取证。
+    - 来源在但该指标未授予能力：只有逐源对账 + `sync capabilities --apply` 能开通。
+    两者混成一句就会说错话（把前者说成“换个指标试试”）。
+
+    只报家数与指标名：ERP 店铺主键不得经局限性文本进入模型载荷。能力缺口与
+    覆盖缺口是两回事，所以这一步走在读取覆盖之前，也不能被“缩小日期范围”掩盖。
+    """
+    unregistered: set[str] = set()
+    ungranted: set[str] = set()
+    unregistered_metrics: set[str] = set()
+    ungranted_metrics: set[str] = set()
+    for record in records:
+        for metric in metrics:
+            reason = unsupported_reason(record, metric)
+            if reason is None:
+                continue
+            if reason == "source_unregistered":
+                unregistered.add(record.shop_id)
+                unregistered_metrics.add(metric)
+            else:
+                ungranted.add(record.shop_id)
+                ungranted_metrics.add(metric)
+    texts: list[str] = []
+    if unregistered:
+        texts.append(
+            f"{len(unregistered)} 家店铺的来源尚未开通（未授权或未同步），"
+            "缩小日期范围不会补上这段数据")
+    if ungranted:
+        names = "、".join(sorted(ungranted_metrics))
+        texts.append(f"{len(ungranted)} 家店铺缺少 {names} 的已核验能力，"
+                     "未执行金额查询")
+    return texts
+
+
 def query_business(conn, request: QueryRequest, *, allowed_shop_ids: frozenset[str],
                    now: datetime, deadline: float) -> ToolResult:
     """确定性指标查询：覆盖门禁优先，拒绝部分汇总冒充总额。"""
@@ -380,17 +427,21 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
     filters = _filters(request)
     limitations: list[str] = []
 
-    # 店铺能力检查
-    shops = {row[0]: (row[1], row[2]) for row in conn.execute(_SHOPS_SQL, (request.shop_ids,)).fetchall()}
+    # 店铺档案：平台与已授予的指标能力一起读，后面的来源解析不得再看模型输入。
+    shops = {
+        row[0]: _ShopRow(enabled=row[1], currency=row[2],
+                         record=ShopRecord.from_row(row[0], row[3], row[4]))
+        for row in conn.execute(_SHOPS_SQL, (request.shop_ids,)).fetchall()
+    }
     unknown = [s for s in request.shop_ids if s not in shops]
     if unknown:
         return ToolResult(
             status="missing_data", coverage=Coverage(status="missing", start=None, end=None),
             filters=filters, limitations=["店铺尚未同步，无法查询"])
-    disabled = [s for s in request.shop_ids if not shops[s][0]]
+    disabled = [s for s in request.shop_ids if not shops[s].enabled]
     if disabled:
         limitations.append("部分店铺已停用，仅返回剩余范围")
-        enabled_shop_ids = [s for s in request.shop_ids if shops[s][0]]
+        enabled_shop_ids = [s for s in request.shop_ids if shops[s].enabled]
         if not enabled_shop_ids:
             return ToolResult(
                 status="missing_data", coverage=Coverage(status="missing", start=None, end=None),
@@ -399,6 +450,16 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         request = request.model_copy(update={"shop_ids": enabled_shop_ids})
         filters = _filters(request)
         filters["requested_shop_ids"] = requested_shop_ids
+
+    # 能力门禁（设计 §4）：先解析逐店逐指标的来源与能力，缺任何一项都不进金额 SQL。
+    # 这一步必须在覆盖读取之前：缺能力和缺覆盖是两种不同的缺口。
+    gap_texts = _capability_gap([shops[shop_id].record for shop_id in request.shop_ids],
+                                request.metrics)
+    if gap_texts:
+        return ToolResult(
+            status="missing_data", coverage=Coverage(status="missing", start=None, end=None),
+            metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+            filters=filters, limitations=limitations + gap_texts)
 
     # 覆盖与质量门禁：先判定再跑指标 SQL，缺哪段说哪段，不先聚合再掩饰。
     if not _set_query_budget(conn, deadline):
@@ -410,10 +471,14 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
     data_as_of = assessment.data_as_of
 
     # 来源尚未开通的店铺单独说清：这类店缩小日期范围永远拿不到数据。
+    # 金额查询路径上能力门禁已经给过同一句（不重复追加）；本行继续为
+    # 直接调用 assess_query_coverage 的其他领域保留同一归因。
     if assessment.source_unconfigured:
-        limitations.append(
+        onboarded = (
             f"{len(assessment.source_unconfigured)} 家店铺的来源尚未开通（未授权或未同步），"
             "缩小日期范围不会补上这段数据")
+        if onboarded not in limitations:
+            limitations.append(onboarded)
     if assessment.quality_status == "failed":
         # 对账已知失败：不能用“覆盖完整”盖住口径问题，直接拒绝出数。
         return ToolResult(

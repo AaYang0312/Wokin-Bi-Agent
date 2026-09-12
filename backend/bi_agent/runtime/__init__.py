@@ -19,6 +19,7 @@ from .models import (
     RunNotFound,
     RunStatus,
     RunTransition,
+    SchemaOutdated,
     StaleRunRevision,
     TurnContext,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "RunNotFound",
     "RunStatus",
     "RunTransition",
+    "SchemaOutdated",
     "StaleRunRevision",
     "TurnContext",
 ]

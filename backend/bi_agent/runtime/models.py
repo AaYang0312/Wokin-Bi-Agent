@@ -56,6 +56,7 @@ PublicMessage = Literal[
     "本次查询时间预算已耗尽，请缩小日期或店铺范围后重试。",
     "所查时间段的数据覆盖不足，可按建议窗口查询或等待回填完成。",
     "该店铺的数据来源尚未开通，调整日期范围不会补上这段数据。",
+    "本次查询的指标能力尚未开通，换成已开通的指标或先完成来源核验后再查。",
     "来源质量核验未通过，暂时不能出数。",
     "查询参数无效",
     "查询参数无效，请调整后重试。",
@@ -98,6 +99,8 @@ _LIMITATION_CODES = frozenset({
     # 支付额未进商品维度：金额与成因由确定 SQL 产生，必须可归因不可自创。
     "revenue_not_attributed",
     "source_not_onboarded",
+    # 指标能力门禁：来源存在但逐指标能力未授予，与缺覆盖不同类。
+    "capability_unavailable",
 })
 # 披露文本里的金额片段：与 _DECIMAL_RE 同一形式，不另加一套数字规则。
 _MONEY = r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?"
@@ -126,6 +129,8 @@ _PUBLIC_LIMITATION_PATTERNS = (
     # 来源未开通：家数可变，其余文字固定；与“覆盖有缺口”不同类，不能混因。
     re.compile(r"^[0-9]+ 家店铺的来源尚未开通（未授权或未同步），"
                r"缩小日期范围不会补上这段数据$"),
+    # 能力门禁：家数与指标名可变（只能是已登记的指标名），其余文字固定。
+    re.compile(r"^[0-9]+ 家店铺缺少 [a-z_、]+ 的已核验能力，未执行金额查询$"),
     # 商品归属披露：四个分项必现（缺项就是给猜测留空间），金额形式与 _DECIMAL_RE 同源。
     re.compile(
         r"^支付额中" + _MONEY + r"元未计入商品维度"
@@ -758,6 +763,13 @@ class RunContextNotFound(Exception):
 class RunNotFound(Exception):
     def __init__(self) -> None:
         super().__init__("run_not_found")
+
+
+class SchemaOutdated(Exception):
+    """数据库还没应用本进程依赖的迁移：早失败并说清是哪一版，不留“莫名 500”。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
 
 
 class StaleRunRevision(Exception):
