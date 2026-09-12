@@ -46,6 +46,14 @@ def render_result_summary(domain_result: Any) -> str:
     if rendered:
         lines.append("已核验结果：" + rendered)
 
+    basis = [item for item in (payload.get("basis") or []) if isinstance(item, dict)]
+    if basis:
+        # 同名指标可能来自不同通道：摘要必须带上口径与时间归属，否则兜底回答
+        # 比正常结果更容易被拿去跨平台比较。
+        lines.append("统计口径：" + "；".join(
+            f"{item.get('metric')}＝{item.get('basis')}（时间归属 {item.get('time_basis')}）"
+            for item in basis))
+
     limitations = [str(item) for item in (payload.get("limitations") or [])]
     if limitations:
         lines.append("限制：" + "；".join(limitations) + "。")

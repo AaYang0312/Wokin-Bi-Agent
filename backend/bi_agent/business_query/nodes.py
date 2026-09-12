@@ -389,6 +389,8 @@ _TERMINATION_BY_CODE = {
     "source_quality_failed": "source_quality_failed",
     "source_not_onboarded": "source_not_onboarded",
     "coverage_time_basis_unverified": "coverage_time_basis_unverified",
+    # 跨口径汇总/比较：归到参数不兼容，而不是“缺数据”或“模型不可用”。
+    "basis_incompatible": "invalid_parameters",
     # 能力门禁：来源存在但这家店没有该指标的已核验能力。
     "capability_unavailable": "capability_unavailable",
     "revenue_not_attributed": "revenue_not_attributed",
@@ -426,6 +428,7 @@ _MESSAGE_BY_LIMITATION = {
     "source_not_onboarded": "该店铺的数据来源尚未开通，调整日期范围不会补上这段数据。",
     "capability_unavailable": "本次查询的指标能力尚未开通，换成已开通的指标或先完成来源核验后再查。",
     "coverage_time_basis_unverified": "该来源的付款时间口径尚未完成对照取证，不能按完整支付窗口出数。",
+    "basis_incompatible": "这些范围的统计口径不兼容，不能汇总或比较；请按店铺分列后逐组查看。",
     "source_quality_failed": "来源质量核验未通过，暂时不能出数。",
 }
 
@@ -501,6 +504,11 @@ def _limitation_codes(limitations: list[str]) -> list[str]:
         if code is None and limitation.startswith("支付额中") and "未计入商品维度" in limitation:
             # 参数化文本：只有已通过载荷校验的披露形式能归到这个码。
             code = "revenue_not_attributed"
+        if code is None and "口径互不兼容" in limitation:
+            # 跨口径汇总/比较被拒：这是参数范围问题，不是数据问题。
+            code = "basis_incompatible"
+        if code is None and "上期与本期数据来源不同" in limitation:
+            code = "basis_incompatible"
         if code is None and limitation.startswith("退款归属未确认："):
             code = "unmatched_refunds"
         if code is None and limitation.startswith("同批退款率仅含已匹配退款"):

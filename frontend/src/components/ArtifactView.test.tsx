@@ -96,3 +96,35 @@ describe('名称解析纯函数', () => {
     }]]))).toBe('名称未取得')
   })
 })
+
+describe('口径凭证展示', () => {
+  const single = renderToStaticMarkup(<ArtifactView artifact={{
+    ...artifact,
+    basis: [{ metric: 'paid_amount', basis: 'platform_payment/v1',
+              time_basis: 'pay_time', shop_ref: SHOP_REF }],
+  }} />)
+
+  it('把口径与时间归属显示出来，不显示主键和接口方法名', () => {
+    expect(single).toContain('paid_amount＝platform_payment/v1（pay_time）')
+    expect(single).not.toContain('erp.trade.list.query')
+  })
+
+  const mixed = renderToStaticMarkup(<ArtifactView artifact={{
+    ...artifact,
+    basis: [
+      { metric: 'erp_documents', basis: 'erp_document/v1', time_basis: 'pay_time',
+        shop_ref: SHOP_REF },
+      { metric: 'erp_documents', basis: 'erp_document/v1', time_basis: 'outstock_time',
+        shop_ref: PRODUCT_REF },
+    ],
+  }} />)
+
+  it('混口径时明确提示不能汇总比较', () => {
+    expect(mixed).toContain('口径不同，不能汇总、求增长率或排名')
+    expect(mixed).toContain('basis-mixed')
+  })
+
+  it('没有口径凭证的旧 Artifact 仍然可读', () => {
+    expect(renderToStaticMarkup(<ArtifactView artifact={artifact} />)).not.toContain('统计口径')
+  })
+})

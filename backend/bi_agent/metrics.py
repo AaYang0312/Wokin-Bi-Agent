@@ -46,8 +46,11 @@ METRIC_DEFINITIONS: dict[str, str] = {
 # 本模块只引用，不再存第二份，避免门禁与指标两边口径漂移。
 from bi_agent.data_quality import (
     ENTITY_REQUIREMENTS, assess_query_coverage, attribution_gap,
-    describe_attribution_gap, money_text, refund_attribution_gap, unverified_payments)
-from bi_agent.sources import ShopRecord, unsupported_reason
+    describe_attribution_gap, money_text, refund_attribution_gap, required_entities,
+    switched_sources_between, unverified_payments)
+from bi_agent.sources import (
+    METRIC_VERSION, ShopRecord, binding_signature, resolve_metric_sources,
+    unsupported_reason)
 
 
 class QueryRequest(BaseModel):
@@ -60,6 +63,12 @@ class QueryRequest(BaseModel):
     metrics: list[Metric] = Field(min_length=1)
     group_by: Literal["total", "day", "shop", "product"] = "total"
     compare: Literal["none", "previous_period"] = "none"
+    # strict 禁止把不兼容口径汇成一个值（连分列也不给，先确认口径）；
+    # separate 只放行“明确分店、各带自己口径”的结果，从不产出跨口径合计。
+    basis_policy: Literal["strict", "separate"] = Field(
+        default="strict",
+        description="strict 拒绝口径不兼容的范围；separate 只允许按店铺分列、"
+                    "各带自己口径的结果，永不产出跨口径合计")
     top_n: int = Field(default=10, ge=1, le=500)
     currency: Literal["CNY"] = "CNY"
 
@@ -102,6 +111,11 @@ class ToolResult(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     # 结果依赖了哪几批同步：血缘由门禁一次算出，运行层直接引用。
     source_batches: tuple[str, ...] = ()
+    # 逐店逐指标的口径凭证（内部形状，带真实 shop_id 与来源）：公开投影在
+    # business_query/tool.py 里换成 shop_ref 并丢掉来源，单店结果也必须带。
+    basis: list[dict[str, str]] = Field(default_factory=list)
+    # 结构化诊断（可量化限制的机器可读形式）：文本披露之外还要能按字段核对。
+    diagnostics: dict[str, dict[str, str | int | None]] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -342,6 +356,42 @@ class _ShopRow(NamedTuple):
     record: ShopRecord
 
 
+def _basis_evidence(records, metrics, bindings_by_shop_metric) -> list[dict[str, str]]:
+    """给每个 (店铺, 指标) 生成一条口径凭证。
+
+    模型不能指定口径：这份证据只由服务端注册表推导，写进结果、Artifact 与指纹。
+    """
+    entries: list[dict[str, str]] = []
+    for record in records:
+        for metric in metrics:
+            bindings = bindings_by_shop_metric.get((record.shop_id, str(metric)), ())
+            if not bindings:
+                continue
+            entries.append({
+                "shop_id": record.shop_id,
+                "metric": str(metric),
+                "source": bindings[0].source,
+                "basis": bindings[0].basis,
+                "time_basis": bindings[0].time_basis,
+                "metric_version": METRIC_VERSION,
+            })
+    return entries
+
+
+def _incompatible_metrics(records, metrics, bindings_by_shop_metric) -> list[str]:
+    """哪些指标在这次请求里出现了互不兼容的口径。"""
+    bad: list[str] = []
+    for metric in metrics:
+        signatures = {
+            binding_signature(bindings_by_shop_metric.get((record.shop_id, str(metric)), ()))
+            for record in records
+        }
+        signatures.discard(())
+        if len(signatures) > 1:
+            bad.append(str(metric))
+    return bad
+
+
 def _capability_gap(records, metrics) -> list[str]:
     """把「这次问的指标哪些店回答不了」写成固定披露，并分开两类缺口。
 
@@ -418,6 +468,7 @@ def _filters(request: QueryRequest) -> dict[str, object]:
         "group_by": request.group_by,
         "compare": request.compare,
         "currency": request.currency,
+        "basis_policy": request.basis_policy,
     }
 
 
@@ -426,6 +477,7 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
     start_ts, end_ts = _window_range(request.start, request.end)
     filters = _filters(request)
     limitations: list[str] = []
+    diagnostics: dict[str, dict[str, str | int | None]] = {}
 
     # 店铺档案：平台与已授予的指标能力一起读，后面的来源解析不得再看模型输入。
     shops = {
@@ -451,15 +503,37 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         filters = _filters(request)
         filters["requested_shop_ids"] = requested_shop_ids
 
+    records = [shops[shop_id].record for shop_id in request.shop_ids]
+    entities = required_entities(request.metrics)
+    bindings_by_shop_metric = {
+        (record.shop_id, str(metric)): resolve_metric_sources(record, str(metric))
+        for record in records for metric in request.metrics
+    }
+
     # 能力门禁（设计 §4）：先解析逐店逐指标的来源与能力，缺任何一项都不进金额 SQL。
     # 这一步必须在覆盖读取之前：缺能力和缺覆盖是两种不同的缺口。
-    gap_texts = _capability_gap([shops[shop_id].record for shop_id in request.shop_ids],
-                                request.metrics)
+    gap_texts = _capability_gap(records, request.metrics)
     if gap_texts:
         return ToolResult(
             status="missing_data", coverage=Coverage(status="missing", start=None, end=None),
             metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
             filters=filters, limitations=limitations + gap_texts)
+
+    # 口径兼容性（设计 §6）：同名指标在不同通道上是不同问题的答案。
+    # separate 只放行“分店、各带自己口径”的结果；跨口径合计、增长率与排名一律不产出。
+    incompatible = _incompatible_metrics(records, request.metrics,
+                                        bindings_by_shop_metric)
+    if incompatible and not (request.group_by == "shop"
+                             and request.basis_policy == "separate"):
+        return ToolResult(
+            status="invalid_parameters",
+            coverage=Coverage(status="missing", start=None, end=None),
+            metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+            filters=filters,
+            limitations=[f"这些指标在本次范围内口径互不兼容：{'、'.join(incompatible)}；"
+                         "请按店铺分列后逐组查看，不能汇总或比较"],
+            basis=_basis_evidence(records, request.metrics, bindings_by_shop_metric))
+    basis = _basis_evidence(records, request.metrics, bindings_by_shop_metric)
 
     # 覆盖与质量门禁：先判定再跑指标 SQL，缺哪段说哪段，不先聚合再掩饰。
     if not _set_query_budget(conn, deadline):
@@ -501,14 +575,15 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
             status="unavailable", coverage=coverage,
             metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
             filters=filters, data_as_of=data_as_of,
-            limitations=limitations + ["来源质量核验未通过，拒绝出数"])
+            limitations=limitations + ["来源质量核验未通过，拒绝出数"], basis=basis)
     if coverage.status != "complete" or data_as_of is None:
         limitations.append("覆盖未完成，拒绝部分汇总；缺口见coverage.gaps")
         if data_as_of is None:
             limitations.append("数据截止未知（回填未完成）")
         return ToolResult(status="missing_data", coverage=coverage,
                           metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
-                          filters=filters, data_as_of=data_as_of, limitations=limitations)
+                          filters=filters, data_as_of=data_as_of, limitations=limitations,
+                          basis=basis, diagnostics=diagnostics)
     if assessment.quality_status == "unknown":
         # 从未对账不等于数据有错：可以出数，但必须把未核验这件事说明白。
         limitations.append("来源质量未核验（尚无对账记录）")
@@ -527,6 +602,14 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
     if set(request.metrics) & {"refund_amount", "cash_difference", "cohort_refund_rate"}:
         refund_gap = refund_attribution_gap(conn, shop_ids=request.shop_ids,
                                             start_ts=start_ts, end_ts=end_ts)
+        if refund_gap.material:
+            diagnostics["unmatched_refunds"] = {
+                "unmatched_count": refund_gap.unmatched,
+                "successful_count": refund_gap.total,
+                "unmatched_amount": money_text(refund_gap.unmatched_amount),
+                "ratio": refund_gap.ratio_text,
+                "currency": "CNY",
+            }
         if refund_gap.material:
             limitations.append(
                 f"退款归属未确认：未匹配{refund_gap.unmatched}条/共{refund_gap.total}条，"
@@ -555,7 +638,8 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
                 status="invalid_parameters", coverage=coverage,
                 metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
                 filters=filters, data_as_of=data_as_of,
-                limitations=[f"结果超过{MAX_ROWS}组，请缩小日期范围或店铺范围"])
+                limitations=[f"结果超过{MAX_ROWS}组，请缩小日期范围或店铺范围"],
+                basis=basis)
 
     compare = request.compare == "previous_period"
     prev_start = prev_end = None
@@ -566,6 +650,23 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         prev_ts = _window_range(prev_start, prev_end)
         prev_assessment = assess_query_coverage(conn, request.model_copy(update={
             "start": prev_start, "end": prev_end}))
+        # 同店换来源：两期差额只是口径变了，不是经营增长。这里拒答而不是降级比较。
+        switched = switched_sources_between(conn, shop_ids=request.shop_ids,
+                                            entities=entities,
+                                            current={(binding.shop_id, binding.entity,
+                                                      binding.source)
+                                                     for bindings in
+                                                     bindings_by_shop_metric.values()
+                                                     for binding in bindings},
+                                            start_ts=prev_ts[0], end_ts=prev_ts[1])
+        if switched:
+            return ToolResult(
+                status="invalid_parameters", coverage=coverage,
+                metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+                filters=filters, data_as_of=data_as_of,
+                limitations=limitations + [
+                    f"{len(switched)} 家店铺的上期与本期数据来源不同，不能按增长比较"],
+                basis=basis)
         if (prev_assessment.status != "complete"
                 or prev_assessment.data_as_of is None):
             compare = False
@@ -613,7 +714,8 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         status="ok", data=rows,
         metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
         filters=filters, data_as_of=data_as_of, coverage=coverage,
-        limitations=limitations, source_batches=assessment.source_batches)
+        limitations=limitations, source_batches=assessment.source_batches,
+        basis=basis, diagnostics=diagnostics)
 
 
 def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: datetime,

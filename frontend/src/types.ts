@@ -24,6 +24,19 @@ export type DisplayEntity = {
 
 export type Artifact = Record<string, unknown>
 
+/**
+ * 一个 (店铺, 指标) 的口径凭证。后端在 results 与 Artifact 里都带这份证据：
+ * 同名指标可能来自不同通道，缺了口径就容易被拿去汇总或排名。
+ * 只出现不透明 shop_ref，不出现 ERP 主键与接口方法名。
+ */
+export type BasisEntry = {
+  shop_ref?: string
+  metric: string
+  basis: string
+  time_basis: string
+  metric_version?: string
+}
+
 export type ChatMessage = {
   id: string
   role: 'user' | 'assistant'

@@ -58,6 +58,7 @@ PublicMessage = Literal[
     "该店铺的数据来源尚未开通，调整日期范围不会补上这段数据。",
     "本次查询的指标能力尚未开通，换成已开通的指标或先完成来源核验后再查。",
     "该来源的付款时间口径尚未完成对照取证，不能按完整支付窗口出数。",
+    "这些范围的统计口径不兼容，不能汇总或比较；请按店铺分列后逐组查看。",
     "来源质量核验未通过，暂时不能出数。",
     "查询参数无效",
     "查询参数无效，请调整后重试。",
@@ -106,6 +107,8 @@ _LIMITATION_CODES = frozenset({
     "coverage_time_basis_unverified",
     # 可量化限制（设计 §5）：披露而非拒答，三条各自归因。
     "unmatched_refunds", "matched_cohort_only", "unverified_payments",
+    # 跨口径汇总/比较被拒：口径不兼容是参数范围问题。
+    "basis_incompatible",
 })
 # 披露文本里的金额片段：与 _DECIMAL_RE 同一形式，不另加一套数字规则。
 _MONEY = r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?"
@@ -136,6 +139,10 @@ _PUBLIC_LIMITATION_PATTERNS = (
                r"缩小日期范围不会补上这段数据$"),
     # 能力门禁：家数与指标名可变（只能是已登记的指标名），其余文字固定。
     re.compile(r"^[0-9]+ 家店铺缺少 [a-z_、]+ 的已核验能力，未执行金额查询$"),
+    # 口径不兼容：指标名可变（只能是已登记的指标名），其余文字固定。
+    re.compile(r"^[0-9]+ 家店铺的上期与本期数据来源不同，不能按增长比较$"),
+    re.compile(r"^这些指标在本次范围内口径互不兼容：[a-z_、]+；"
+               r"请按店铺分列后逐组查看，不能汇总或比较$"),
     # 可量化限制：数字可变，句式固定（金额片段与 _MONEY 同源）。
     re.compile(r"^退款归属未确认：未匹配[0-9]+条/共[0-9]+条，金额" + _MONEY
                + r"元，比例(?:[0-9]+(?:\.[0-9]+)?%|未知)$"),
@@ -159,20 +166,38 @@ _STATE_KEYS = frozenset({
 })
 _EVENT_KEYS = frozenset({
     "problem_codes", "tool_status", "target_status", "coverage_status", "data_as_of",
-    "limitation_codes", "artifact_refs", "result_count",
+    "limitation_codes", "artifact_refs", "result_count", "basis_codes",
 })
 _NORMALIZED_REQUEST_KEYS = frozenset({
     "shop_refs", "metrics", "start", "end", "group_by", "compare", "top_n", "currency",
+    "basis_policy",
 })
 _ARTIFACT_KEYS = frozenset({
     "status", "metric_definition", "coverage", "limitations", "data_as_of", "filters",
-    "data", "entities", "catalog_version",
+    "data", "basis", "diagnostics", "entities", "catalog_version",
 })
+# 口径与诊断：名称形如 `platform_payment/v1`、`kuaimai-metrics/2`、`pay_time`。
+# 版本段允许 `v1`、`2` 或日期式 `2026-09-12.1`：只允许纯数字会把已登记口径判成非法。
+_BASIS_NAME_RE = re.compile(r"^[a-z0-9_-]+(?:/[a-z0-9][a-z0-9._-]*)?$")
+_BASIS_ITEM_KEYS = frozenset({
+    "shop_ref", "metric", "basis", "time_basis", "metric_version",
+})
+_BASIS_METRIC_KEYS = frozenset({"metric", "basis", "time_basis", "metric_version"})
+_DIAGNOSIS_KEYS = frozenset({
+    "unmatched_refunds", "matched_cohort_only", "unverified_payments",
+})
+_DIAGNOSIS_FIELDS = {
+    "unmatched_refunds": frozenset({
+        "unmatched_count", "successful_count", "unmatched_amount", "ratio", "currency"}),
+    "unverified_payments": frozenset({
+        "total", "amount_undetermined", "amount_known", "known_amount"}),
+    "matched_cohort_only": frozenset({"unmatched_count"}),
+}
 # 名称只在授权展示层出现：模型载荷带上这两项就是契约违规。
 _PUBLIC_ONLY_ARTIFACT_KEYS = frozenset({"entities", "catalog_version"})
 _FILTER_KEYS = frozenset({
     "start", "end", "shop_refs", "metrics", "group_by", "compare", "top_n", "currency",
-    "mode",
+    "basis_policy", "mode",
 })
 
 _LINE_KINDS = frozenset({"sale", "gift", "suite", "combination", "processing"})
@@ -542,7 +567,52 @@ def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
         _filters(payload["filters"], public=public)
     if "data" in payload:
         _result_rows(payload["data"], public=public)
+    if "basis" in payload:
+        _basis_items(payload["basis"])
+    if "diagnostics" in payload:
+        _diagnostics(payload["diagnostics"])
     return payload
+
+
+def _basis_items(value: object) -> None:
+    """口径凭证校验：指标取自固定词表，口径名带版本，主键只能以 shop_ref 出现。
+
+    模型必须看得见口径（否则它会把同名指标当同义词汇总、比较、排名），
+    但它看到的只能是不透明引用与口径标签，不能是 ERP 主键或接口方法名。
+    """
+    if not isinstance(value, list):
+        raise ValueError("basis_invalid")
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("basis_invalid")
+        if set(item) - _BASIS_ITEM_KEYS:
+            raise ValueError("basis_invalid")
+        for key in ("metric", "basis", "time_basis"):
+            if key not in item:
+                raise ValueError("basis_invalid")
+        if item["metric"] not in _METRIC_DEFINITION_TEXTS:
+            raise ValueError("basis_invalid")
+        for key in ("basis", "time_basis", "metric_version"):
+            if key in item and not (isinstance(item[key], str)
+                                    and _BASIS_NAME_RE.fullmatch(item[key])):
+                raise ValueError("basis_invalid")
+        if "shop_ref" in item and not (isinstance(item["shop_ref"], str)
+                                       and REF_RE.fullmatch(item["shop_ref"])):
+            raise ValueError("basis_invalid")
+
+
+def _diagnostics(value: object) -> None:
+    """可量化限制的结构化形状：与披露文本同一来源，只允许已登记的诊断与字段。"""
+    if not isinstance(value, dict):
+        raise ValueError("diagnostics_invalid")
+    for key, fields in value.items():
+        if key not in _DIAGNOSIS_KEYS or not isinstance(fields, dict):
+            raise ValueError("diagnostics_invalid")
+        if set(fields) - _DIAGNOSIS_FIELDS[key]:
+            raise ValueError("diagnostics_invalid")
+        for item in fields.values():
+            if not isinstance(item, (int, str)) or isinstance(item, bool):
+                raise ValueError("diagnostics_invalid")
 
 
 def validate_model_payload(value: object) -> dict[str, object]:

@@ -208,9 +208,11 @@ def _record_run_versions(runtime: BusinessQueryRuntime, store: object) -> None:
     指纹包含授权范围与数据版本，所以回填推进数据之后，同一个问题不会命中旧结果。
     记录失败不吞：宁可让这次运行显式失败，也不留下"看起来成功但没有血缘"的记录。
     """
+    from bi_agent.data_quality import QUALITY_RULE
     from bi_agent.runtime.artifacts import (
         QueryProvenance,
         RequestIdentity,
+        basis_signature_of,
         request_fingerprint,
     )
 
@@ -222,6 +224,10 @@ def _record_run_versions(runtime: BusinessQueryRuntime, store: object) -> None:
         source_batches=(tuple(runtime.result.source_batches)
                         if runtime.result is not None else ()),
         data_as_of=runtime.result.data_as_of if runtime.result is not None else None,
+        # 口径签名不带店铺主键：换来源或换时间归属都会改变指纹，旧结果不许复用。
+        basis_signature=basis_signature_of(
+            runtime.result.basis if runtime.result is not None else ()),
+        quality_rule=QUALITY_RULE,
     )
     identity = RequestIdentity(
         # 一次业务查询就是一个根请求；恢复尝试沿用同一身份（Task 4 使用）。

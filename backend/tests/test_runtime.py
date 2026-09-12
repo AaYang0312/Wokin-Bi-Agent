@@ -462,6 +462,46 @@ class ProvenanceContractTests(unittest.TestCase):
         self.assertNotEqual(self._fingerprint(shops=("S1",)),
                             self._fingerprint(shops=("S1", "S2")))
 
+    def test_basis_change_invalidates_previous_results(self):
+        """同店换来源（口径或时间归属变了）不许命中旧结果。
+
+        否则一次通道切换会被下游读成经营增长：数字差异其实来自口径差异。
+        """
+        paid = self._provenance(basis_signature=("paid_amount|platform_payment/v1|pay_time",))
+        outstock = self._provenance(
+            basis_signature=("paid_amount|erp_outstock_payment/v1|outstock_time",))
+
+        self.assertNotEqual(self._fingerprint(provenance=paid),
+                            self._fingerprint(provenance=outstock))
+
+    def test_source_registry_and_quality_rule_versions_are_fingerprint_material(self):
+        base = self._provenance()
+        self.assertNotEqual(self._fingerprint(provenance=base), self._fingerprint(
+            provenance=self._provenance(source_registry_version="sources/2026-01-01.1")))
+        self.assertNotEqual(self._fingerprint(provenance=base), self._fingerprint(
+            provenance=self._provenance(quality_rule="kuaimai-reconcile/1")))
+
+    def test_basis_signature_rejects_identifiers_and_free_text(self):
+        for bad in ("166754|platform_payment/v1|pay_time",
+                    "paid_amount|erp.trade.list.query|pay_time",
+                    "口径变了"):
+            with self.subTest(bad=bad[:18]):
+                with self.assertRaises(ValidationError):
+                    self._provenance(basis_signature=(bad,))
+
+    def test_basis_signature_drops_shop_dimension(self):
+        """签名去重后只看 (指标, 口径, 时间归属)：多店同口径不该膨胀成多条。"""
+        from bi_agent.runtime.artifacts import basis_signature_of
+
+        entries = [
+            {"shop_id": "S1", "metric": "paid_amount", "basis": "platform_payment/v1",
+             "time_basis": "pay_time"},
+            {"shop_id": "TB1", "metric": "paid_amount", "basis": "platform_payment/v1",
+             "time_basis": "pay_time"},
+        ]
+        self.assertEqual(basis_signature_of(entries),
+                         ("paid_amount|platform_payment/v1|pay_time",))
+
     def test_metric_version_change_invalidates_previous_results(self):
         from bi_agent.runtime.artifacts import METRIC_VERSION, QueryProvenance
 

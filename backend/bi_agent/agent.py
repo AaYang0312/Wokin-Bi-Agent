@@ -51,6 +51,11 @@ _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%
 支持维度：合计、按日、按店铺、按商品。
 结果里的 shop_ref/product_ref 是实体引用：正文直接引用它们，系统会负责换成经营者可读的名称。
 「销售额」在未确认支付/出库口径前不能直接当支付金额；只能按店铺筛，不能按商品名筛。
+每个结果都带 basis（统计口径）与 time_basis（时间归属）：同名指标不代表同一口径，
+不能自动同义化。平台/店铺对比只展示 basis 相同且已认证的结果；basis 或 time_basis 不同
+时不要汇总、不要算增长率、不要排名（工具会以 basis_incompatible 拒绝，提示按店铺分列，
+必要时用 basis_policy=separate 重新发起 group_by=shop 的查询）。
+未被认证的付款时间口径只能作为可观测样本转述，不得说成“完整支付窗口”。
 数据共同截止与覆盖限制会在工具结果中给出；未覆盖的历史不能编造数字。
 已知能力之外（广告实耗、全平台汇总、净利润）明确说不可用。
 不要重算金额，不要把相关性写成因果；数字以工具结果为准。"""
@@ -359,7 +364,8 @@ def _tool_schemas() -> list[dict[str, object]]:
     return [
         {"type": "function", "function": {
             "name": "query_business",
-            "description": "按已确认口径查询经营指标，日期end排他；shop_ids 只填 ent- 店铺引用",
+            "description": "按已确认口径查询经营指标，日期end排他；shop_ids 只填 ent- 店铺引用；"
+                           "跨口径范围要分列时用 basis_policy=separate 且 group_by=shop",
             "parameters": QueryRequest.model_json_schema()}},
         {"type": "function", "function": {
             "name": "evaluate_promotion",
