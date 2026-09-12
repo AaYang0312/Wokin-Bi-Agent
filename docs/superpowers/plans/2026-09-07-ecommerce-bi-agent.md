@@ -564,14 +564,18 @@ probe拉全页但只输出数量、金额字段覆盖和质量统计，不输出
 - [x] **5.1b 实现唯一注册表。** sources.py 只负责来源与能力解析；同步命令（包括 probe/refetch/replay）、质量核验、覆盖均调用它。将实体存在与指标能力分离，旧 orders 标签不提升支付权限。**pdd 支付源不登记**：2026-09-12 用户决定放弃方舟授权（见 [范围决定](../research/2026-09-12-drop-pdd-onboarding.md)），注册表只保留 pdd 单据能力，支付依赖直接解析为能力不足，不填猜测的方法名。同步侧：`ORDER_SOURCE_BY_PLATFORM`/`_shop_order_source` 已改为消费注册表，未登记平台报错退出而不是回退默认源；pdd 订单源改为出库通道（官方交易接口按文档排除拼多多）。
 - [ ] **5.1c 验证两个层次。** 请求门禁必须在金额 SQL 前返回 capability_unavailable；结果/Artifact 也不得绕过门禁直接读视图冒充平台总额。逐店能力经过迁移及核验维护，不因“同步成功”开通。
   已完成：014 与 `sync capabilities [--apply] [--all-shops]`（证据推导 + 回收，回写走单事务并在输出里携带 `quality_rule` 与警告）、`capability_unavailable` 进入状态/事件/Artifact/终止原因/恢复词表、运行层启动预检发现库未应用 014 时早报 `schema_outdated`、真实库上“撤标签 → 零数字 / 给标签 → 照旧出 1000”对比用例、“平台未登记来源”与“能力未授予”分开归因。
-  本任务只交**数据**未交**消费者**：`SourceBinding.coverage_certified` / `time_basis` 现在无生产读取方，“出库样本不得当完整支付窗口”由 5.2c 实现（旗标已有用例钉住不得删）。
+  ~~本任务只交数据未交消费者~~：`SourceBinding.coverage_certified` / `time_basis` 已由 Task 5.2b/5.2c 消费（见下）。
   未完成（归 5.4c）：现有 `reporting.v_*` 视图仍可被直查绕过门禁；需等 basis 全链路一起验。
 
 ### 5.2 来源覆盖交集
 
-- [ ] **5.2a 固定反例。** 用上表孔洞场景验证 covered_windows 和 missing_windows；删除任一来源或 data_as_of 变 NULL 后不能给共同完整截止；当前/上期均测试；不相干旧源的区间不能影响实际依赖。
-- [ ] **5.2b 修改 assess_query_coverage。** 按 `(source, entity, time_basis)` 批量查状态，每个店/依赖先裁剪请求区间，再求交集；保留 source 维度的缺口及使用的批次。不能沿用当前将各店 covered_spans 并集后当公共建议窗口的做法。
-- [ ] **5.2c 加入业务时间认证。** 出库接口只证明已采集出库范围，未经证据认证的 pay_time 不得给完整支付覆盖；观察到的最早/最晚时间不等于完整性。业务窗口与修改窗口继续区分，质量 unknown 不能抵消时间语义未认证。对账核验同一来源、同一指标时间基准。
+- [x] **5.2a 固定反例。** 用上表孔洞场景验证 covered_windows 和 missing_windows；删除任一来源或 data_as_of 变 NULL 后不能给共同完整截止；当前/上期均测试；不相干旧源的区间不能影响实际依赖。
+  交付在 `tests/test_data_quality.py::MultiSourceCoverageIntersectionTests`（8 项，独立测试库）+ `SpanAlgebraTests`（3 项纯函数）。旧用例里拿并集当公共覆盖的断言按新口径改写（`test_aftersale_cohort_requirement_is_assessed_separately`、`test_shop_without_onboarded_source_is_reported_as_unconfigured` 改为 missing + 断言 `suggested_window is None`），没有删断言。
+- [x] **5.2b 修改 assess_query_coverage。** 按 `(source, entity, time_basis)` 批量查状态，每个店/依赖先裁剪请求区间，再求交集；保留 source 维度的缺口及使用的批次。不能沿用当前将各店 covered_spans 并集后当公共建议窗口的做法。
+  交付：依赖由 `sources.resolve_metric_dependencies` 解析（**不看能力标签**，否则能力缺口会被误报成覆盖缺口），按 `(source, entity)` 分组一次查完且依赖去重；`CoverageGap` 增加 `source`（与 shop_id 同样只留服务端）；`source_batches` 只收本次真用到的通道；某店某指标没有任何可用依赖时整段窗口按未知处理，不会因为“没有依赖”算出假完整。5.1 的 `coverage_source_mismatch` 警告随本项撤销（覆盖已跟来源走，留着就是过时的恐吓）。
+- [x] **5.2c 加入业务时间认证。** 出库接口只证明已采集出库范围，未经证据认证的 pay_time 不得给完整支付覆盖；观察到的最早/最晚时间不等于完整性。业务窗口与修改窗口继续区分，质量 unknown 不能抵消时间语义未认证。对账核验同一来源、同一指标时间基准。
+  交付：认证改为三态 `certified` / `unmeasured` / `disproved`（“没测过”与“测了不成立”后果不同）：`disproved`（出库通道实测 83/8367 行越界）对按支付时间归属的指标直接拒答 `coverage_time_basis_unverified`；`unmeasured`（同通道同参数但未逐店对照）出数并披露为可观测样本；`erp_documents` 不主张支付窗口，两档都只披露。`SourceBinding.coverage_certified` 保留为设计 §3 的布尔契约（= `certified`）。
+  本项故意不提前建设：逐店 `time_basis` 登记表与写入入口。现在认证是按通道登记的代码事实，等真拿到“与后台账单/业务日期对照”的逐店证据时再建表并与 `capabilities` 同批维护，不先建无人写入的表。
 
 算法约束（日期/时区转换沿用现有工具）：
 

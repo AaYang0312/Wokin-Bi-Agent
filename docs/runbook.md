@@ -144,6 +144,14 @@ uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
 
 推进规则与限制：
 
+- 覆盖、截止与质量按 `(店铺 × 来源 × 实体)` 取**交集**判定（计划 Task 5.2b）：
+  `covered_windows` 与 `suggested_window` 都是“每家、每个依赖都齐”的区间，不再拿各店
+  已覆盖段的并集当建议窗口；缺口按实体、店铺与具体来源归因，旧通道残留的状态行不再参与。
+- 付款时间口径未认证（Task 5.2c）分两档：`disproved`（销售出库接口实测按自身时间裁剪）
+  不得给支付窗口类结果，返回 `coverage_time_basis_unverified`；`unmeasured`（同通道但未
+  逐店对照）可出数但必须披露为可观测样本。`erp_documents` 是单据计数、不是支付窗口主张，
+  两档都只披露不拒答。等回填不会改变这个结论，要的是与后台账单/业务日期的对照登记。
+
 - 历史遗留的“从未核验”统一是 `unknown`，仍可出数但会带「来源质量未核验」说明；不得直接当数据有错。
 - 对账发现归属未确认的平台成功退款时，该范围降为 `failed` 并**停止出数**，修复后重跑 `reconcile` 才能恢复。
 - `quality_rule` 变更后旧 `passed` 自动失效，必须重跑对账。
@@ -158,9 +166,8 @@ uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --apply
 uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --all-shops --apply
 ```
 
-输出里的 `warnings: ["coverage_source_mismatch"]` 不是写入失败，而是“能力已开通，但
-覆盖门禁还只读交易通道”（Task 5.2 未交付）：这类店现在仍会报覆盖缺口，不能据此判断
-接入成功，也不能拿它当能力开通的反证。
+输出逐店携带 `quality_rule` 与当前/推导出的标签：能力回收与开通走同一条命令，日志里能
+直接回答“这几家店的数是按哪版取证口径开的”。
 
 能力标签取值与指标同名（`paid_amount`/`paid_orders`/`erp_documents`/`aov`/`quantity`/
 `product_paid_amount`/`refund_amount`/`cash_difference`/`cohort_refund_rate`）。旧的

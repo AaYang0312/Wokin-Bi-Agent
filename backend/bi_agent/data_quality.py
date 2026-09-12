@@ -24,12 +24,12 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 # 指标→实体依赖定义在 sources 注册表（来源与能力的唯一真源）；本模块继续向外转发，
 # 不养第二份，否则覆盖门禁与指标层会各自演化出口径。
 from bi_agent.sources import (
-    ENTITY_REQUIREMENTS, ShopRecord, resolve_order_source)
+    ENTITY_REQUIREMENTS, ORDERS_ENTITY, PAYMENT_WINDOW_METRICS, PAY_TIME_METRICS,
+    ShopRecord, SourceBinding, resolve_metric_dependencies, resolve_order_source)
 
-# 同一覆盖来源名：同步状态按数据来源记录。
-# 注意：`orders` 在这里仍是单源常量，只反映交易通道。淘系出库通道的逐店来源解析已经
-# 由 `sources.resolve_order_source` 提供，覆盖按 `(source, entity, time_basis)` 取交集
-# 是计划 Task 5.2 的范围；在那之前不得拿本常量当平台可用性证据。
+# 默认来源名：只给 `reconcile_source_quality` 在调用方没显式传 source 时兜底。
+# 覆盖判定不再读这份常量——Task 5.2b 起按 `sources.resolve_metric_dependencies`
+# 逐店逐实体解析真实来源再取交集。拿它当“某平台可用”的证据就是回到旧的单源假设。
 ENTITY_SOURCES: dict[str, str] = {
     "orders": "erp.trade.list.query",
     "aftersales_occurrence": "erp.aftersale.list.query",
@@ -67,6 +67,8 @@ _CAPABILITIES_SQL = """
 SELECT shop_id, platform FROM reporting.v_shops WHERE shop_id = ANY(%s)
 """
 
+_PROFILES_SQL = _CAPABILITIES_SQL
+
 QualityStatus = Literal["unknown", "passed", "failed"]
 CoverageStatus = Literal["complete", "partial", "missing"]
 Window = tuple[str, str]
@@ -75,16 +77,17 @@ Span = tuple[date, date]
 
 @dataclass(frozen=True)
 class CoverageGap:
-    """结构化缺口：归因到实体与店铺，供恢复策略决定该怎么回答。
+    """结构化缺口：归因到实体、店铺与**具体来源**，供恢复策略决定该怎么回答。
 
-    shop_id 是 ERP 主键，只能留在服务端对象里；对外投影依旧走 coverage
-    的日期串缺口，不能让缺口反而成为名称/主键的泄露面。
+    shop_id 是 ERP 主键，source 是接口方法名，两者都只能留在服务端对象里；
+    对外投影依旧只走 coverage 的日期串缺口，不能让缺口反而成为名称/主键的泄露面。
     """
 
     entity: str
     shop_id: str
     start: date
     end: date
+    source: str = ""
 
     @property
     def window(self) -> Window:
@@ -106,6 +109,10 @@ class CoverageAssessment:
     suggested_window: Window | None
     # 来源尚未开通（能力未登记）的店铺：只能留在服务端，不得迚入模型载荷。
     source_unconfigured: tuple[str, ...] = ()
+    # 业务时间口径认证：`blocking` 里的店不得给支付窗口类结果（实测不成立），
+    # `disclosure` 里的店可以出数但必须披露为可观测样本。两者都只留在服务端。
+    time_basis_blocking: tuple[str, ...] = ()
+    time_basis_disclosure: tuple[str, ...] = ()
 
 
 def _effective_quality(status: object, rule: object) -> QualityStatus:
@@ -257,6 +264,39 @@ def _windows(spans: Iterable[Span]) -> tuple[Window, ...]:
                          for span_start, span_end in spans}))
 
 
+def intersect_spans(left: Sequence[Span], right: Sequence[Span]) -> list[Span]:
+    """两个 [start,end) 区间集合的交集（输入各自不重叠，输出按起点排序）。
+
+    公共覆盖必须靠交集算：并集会把“甲店有这两天、乙店有那两天”拼成一个谁都不
+    完整的“建议窗口”，拿着它再查一次仍然缺数。
+    """
+    out: list[Span] = []
+    for a_start, a_end in left:
+        for b_start, b_end in right:
+            start = max(a_start, b_start)
+            end = min(a_end, b_end)
+            if start < end:
+                out.append((start, end))
+    return sorted(out)
+
+
+def subtract_spans(whole: Sequence[Span], parts: Sequence[Span]) -> list[Span]:
+    """从区间集合里去掉另一组区间：请求窗口减公共覆盖就是真正的缺口。"""
+    out: list[Span] = list(whole)
+    for part_start, part_end in parts:
+        kept: list[Span] = []
+        for span_start, span_end in out:
+            if part_end <= span_start or part_start >= span_end:
+                kept.append((span_start, span_end))
+                continue
+            if span_start < part_start:
+                kept.append((span_start, part_start))
+            if part_end < span_end:
+                kept.append((part_end, span_end))
+        out = kept
+    return sorted(out)
+
+
 def _suggested(covered_windows: tuple[Window, ...], requested: Window,
                status: CoverageStatus) -> Window | None:
     """请求内最大的连续已覆盖段；只返回来当建议，调用方不得回写窗口。"""
@@ -302,44 +342,95 @@ def assess_query_coverage(conn, request) -> CoverageAssessment:
     shop_ids = sorted({str(shop_id) for shop_id in request.shop_ids})
 
     covered_spans: list[Span] = []
-    missing_spans: list[Span] = []
     gaps: list[CoverageGap] = []
     cutoffs: list[datetime] = []
     qualities: list[QualityStatus] = []
     batches: list[str] = []
-    pairs = 0
 
     entities = required_entities(request.metrics)
     unconfigured = _unconfigured_shops(conn, shop_ids, entities)
+    profiles = {str(row[0]): ShopRecord.from_row(row[0], row[1], ())
+                for row in conn.execute(_PROFILES_SQL, (shop_ids,)).fetchall()}
 
-    for entity in entities:
-        source = ENTITY_SOURCES[entity]
-        # 一个实体一次查完：区间运算留在 SQL 里，不按店铺逐条往返。
-        states = {str(row[0]): row for row in conn.execute(
-            _COVERAGE_SQL, (start_ts, end_ts, start_ts, end_ts,
-                            source, entity, shop_ids)).fetchall()}
-        batches.extend(str(row[0]) for row in conn.execute(
-            _BATCHES_SQL, (source, entity, shop_ids, end_ts, start_ts)).fetchall())
-
+    # 逐店逐指标解析依赖，再按 (source, entity) 分组一次查完：既不再拿单源常量
+    # 当全部平台的来源，也不按店铺逐条往返。同一条依赖去重只查一次。
+    dependencies: dict[tuple[str, str, str], SourceBinding] = {}
+    resolved_dependencies: list[tuple[str, SourceBinding]] = []
+    unresolvable = False
+    for metric in request.metrics:
         for shop_id in shop_ids:
-            pairs += 1
-            row = states.get(shop_id)
-            if row is None:
-                # 没有同步状态行就是从未取过数：未知，不是“确实没有交易”。
+            record = profiles.get(shop_id)
+            bindings = () if record is None else resolve_metric_dependencies(record,
+                                                                            str(metric))
+            if not bindings:
+                # 这个平台的来源拿不到该口径（或根本没有店铺档案）：整段窗口当未知，
+                # 绝不能因为“没有依赖”而拼出一个“完整覆盖”。
+                unresolvable = True
                 qualities.append("unknown")
-                gaps.append(CoverageGap(entity=entity, shop_id=shop_id,
+                gaps.append(CoverageGap(entity=metric, shop_id=shop_id,
                                         start=start, end=end))
-                missing_spans.append((start, end))
                 continue
-            qualities.append(_effective_quality(row[4], row[5]))
-            if row[3] is not None:
-                cutoffs.append(row[3])
-            covered_spans.extend(_spans(row[1]))
-            missing = _spans(row[2])
-            if missing:
-                missing_spans.extend(missing)
-                gaps.extend(CoverageGap(entity=entity, shop_id=shop_id,
-                                        start=gap[0], end=gap[1]) for gap in missing)
+            for binding in bindings:
+                dependencies[(binding.shop_id, binding.source, binding.entity)] = binding
+                resolved_dependencies.append((str(metric), binding))
+
+    groups: dict[tuple[str, str], list[str]] = {}
+    for shop_id, source, entity in dependencies:
+        groups.setdefault((source, entity), []).append(shop_id)
+
+    states: dict[tuple[str, str, str], object] = {}
+    for (source, entity), group_shops in sorted(groups.items()):
+        group_shops = sorted(set(group_shops))
+        for row in conn.execute(_COVERAGE_SQL, (start_ts, end_ts, start_ts, end_ts,
+                                                source, entity, group_shops)).fetchall():
+            states[(source, entity, str(row[0]))] = row
+        # 批次血缘只收本次实际用到的来源：旧通道残留的批次不能混进结果。
+        batches.extend(str(row[0]) for row in conn.execute(
+            _BATCHES_SQL, (source, entity, group_shops, end_ts, start_ts)).fetchall())
+
+    # 时间口径核对（设计 §4）：先于覆盖读取判定，因为“实测不成立”与“没测过”后果不同。
+    # 只有按支付时间归属的指标才受这条约束；退款发生额按平台完成时间归属。
+    blocking: set[str] = set()
+    disclosure: set[str] = set()
+    pay_time_shops = {binding.shop_id for _metric, binding in resolved_dependencies
+                      if _metric in PAY_TIME_METRICS and binding.entity == ORDERS_ENTITY}
+    window_shops = {binding.shop_id for _metric, binding in resolved_dependencies
+                    if _metric in PAYMENT_WINDOW_METRICS
+                    and binding.entity == ORDERS_ENTITY}
+    for (shop_id, source, entity), binding in dependencies.items():
+        if shop_id not in pay_time_shops or entity != ORDERS_ENTITY:
+            continue
+        certification = binding.time_certification
+        if certification == "certified":
+            continue
+        if certification == "disproved" and shop_id in window_shops:
+            blocking.add(shop_id)
+        else:
+            disclosure.add(shop_id)
+
+    # 公共可覆盖范围 = 请求范围 ∩ 每一个必需的 (店铺 × 来源 × 实体) 区间。
+    common: list[Span] = [(start, end)]
+    for (shop_id, source, entity), _binding in sorted(dependencies.items()):
+        row = states.get((source, entity, shop_id))
+        if row is None:
+            # 没有同步状态行就是从未取过数：未知，不是“确实没有交易”。
+            qualities.append("unknown")
+            gaps.append(CoverageGap(entity=entity, shop_id=shop_id,
+                                    start=start, end=end, source=source))
+            common = []
+            continue
+        qualities.append(_effective_quality(row[4], row[5]))
+        if row[3] is not None:
+            cutoffs.append(row[3])
+        clipped = _spans(row[1])
+        common = intersect_spans(common, clipped)
+        gaps.extend(
+            CoverageGap(entity=entity, shop_id=shop_id, start=gap[0], end=gap[1],
+                        source=source)
+            for gap in subtract_spans([(start, end)], clipped))
+
+    if unresolvable:
+        common = []
 
     if "failed" in qualities:
         quality_status: QualityStatus = "failed"
@@ -348,8 +439,8 @@ def assess_query_coverage(conn, request) -> CoverageAssessment:
     else:
         quality_status = "unknown"
 
-    covered_windows = _windows(covered_spans)
-    missing_windows = _windows(missing_spans)
+    covered_windows = _windows(common)
+    missing_windows = _windows(subtract_spans([(start, end)], common))
     if not missing_windows:
         status: CoverageStatus = "complete"
     elif covered_windows:
@@ -363,10 +454,14 @@ def assess_query_coverage(conn, request) -> CoverageAssessment:
         covered_windows=covered_windows,
         missing_windows=missing_windows,
         # 共同截止：任一依赖项没有推进 data_as_of，整体截止就是未知。
-        data_as_of=min(cutoffs) if len(cutoffs) == pairs else None,
+        data_as_of=(min(cutoffs)
+                    if cutoffs and len(cutoffs) == len(dependencies) and not unresolvable
+                    else None),
         quality_status=quality_status,
         source_batches=tuple(sorted(set(batches))),
         gaps=tuple(gaps),
         source_unconfigured=unconfigured,
+        time_basis_blocking=tuple(sorted(blocking)),
+        time_basis_disclosure=tuple(sorted(disclosure - blocking)),
         suggested_window=_suggested(covered_windows, requested, status),
     )

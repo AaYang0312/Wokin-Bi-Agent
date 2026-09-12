@@ -388,6 +388,7 @@ _TERMINATION_BY_CODE = {
     "data_as_of_unknown": "data_as_of_unknown",
     "source_quality_failed": "source_quality_failed",
     "source_not_onboarded": "source_not_onboarded",
+    "coverage_time_basis_unverified": "coverage_time_basis_unverified",
     # 能力门禁：来源存在但这家店没有该指标的已核验能力。
     "capability_unavailable": "capability_unavailable",
     "revenue_not_attributed": "revenue_not_attributed",
@@ -424,6 +425,7 @@ _MESSAGE_BY_LIMITATION = {
     "data_as_of_unknown": "所查时间段的数据覆盖不足，可按建议窗口查询或等待回填完成。",
     "source_not_onboarded": "该店铺的数据来源尚未开通，调整日期范围不会补上这段数据。",
     "capability_unavailable": "本次查询的指标能力尚未开通，换成已开通的指标或先完成来源核验后再查。",
+    "coverage_time_basis_unverified": "该来源的付款时间口径尚未完成对照取证，不能按完整支付窗口出数。",
     "source_quality_failed": "来源质量核验未通过，暂时不能出数。",
 }
 
@@ -499,6 +501,11 @@ def _limitation_codes(limitations: list[str]) -> list[str]:
         if code is None and limitation.startswith("支付额中") and "未计入商品维度" in limitation:
             # 参数化文本：只有已通过载荷校验的披露形式能归到这个码。
             code = "revenue_not_attributed"
+        if (code is None and " 家店铺的" in limitation
+                and ("付款时间口径未经认证" in limitation
+                     or "未认证付款时间口径" in limitation)):
+            # 时间口径未认证与缺覆盖是两类缺口：前者等回填不会自己好。
+            code = "coverage_time_basis_unverified"
         if (code is None and " 家店铺缺少 " in limitation
                 and "的已核验能力，未执行金额查询" in limitation):
             # 指标能力未开通与缺覆盖是两回事：前者缩小日期范围永远拿不到数，

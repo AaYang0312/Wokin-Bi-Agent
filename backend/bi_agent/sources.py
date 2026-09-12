@@ -16,9 +16,16 @@
 2. **未知平台 fail closed**。没有登记就没有来源，更不允许「回退到交易源」之后把空响应
    标成完整覆盖。
 
-`time_certified` 只表示该平台/通道有没有拿到「业务时间窗口完整」的对照证据。抖音通道实测
-严格（0/9414 行越界）；出库接口实测不严格（83/8367 行 `paid_at` 早于窗口起点），所以淘系
-为 False。未逐店测过的平台不沿用抖音的结论——认证不能跨平台复制。
+时间口径分三态，因为“没测过”和“测了不成立”不能混为一谈：
+
+- `certified`：拿到「业务时间窗口完整」的对照证据（抖音交易通道实测 0/9414 行越界）。
+- `unmeasured`：通道语义按文档成立，但这家店/这个平台没有逐店对照证据。仍可出数，
+  但必须披露为可观测样本，不能宣称完整支付窗口。
+- `disproved`：实测不成立。销售出库接口按自身时间字段裁剪（83/8367 行 `paid_at`
+  早于窗口起点，最早早 42 天），所以它的 `pay_time` 覆盖永远给不出完整支付窗口。
+
+三态判断只看通道语义；**金额口径与逐指标能力仍是逐店取证**（5.1 的 capabilities
+只能由对账证据开通），不把抖音的结论复制给别的平台。
 """
 
 from __future__ import annotations
@@ -63,6 +70,15 @@ PAYMENT_FAMILY: frozenset[str] = frozenset(
     ("paid_amount", "paid_orders", "aov", "product_paid_amount", "cash_difference",
      "cohort_refund_rate"))
 
+# 按支付时间归属的指标：它们的“完整窗口”声明受时间口径认证约束。
+PAY_TIME_METRICS: frozenset[str] = frozenset(
+    ("paid_amount", "paid_orders", "aov", "quantity", "product_paid_amount",
+     "erp_documents", "cash_difference", "cohort_refund_rate"))
+
+# 只有对“支付窗口完整”的主张才允许把未认证升为拒答。`erp_documents` 是单据计数，
+# 设计 §4 明确它“仍可在对应覆盖成立时查询”，所以它只披露、不拒答。
+PAYMENT_WINDOW_METRICS: frozenset[str] = PAY_TIME_METRICS - {"erp_documents"}
+
 # 指标 → 依赖的业务实体。覆盖门禁与来源解析共用这一份，两边不再各抄一遍。
 ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "paid_amount": (ORDERS_ENTITY,),
@@ -77,6 +93,8 @@ ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
 }
 
 TimeBasis = Literal["pay_time", "outstock_time", "aftersale_completion_time"]
+# 业务时间窗口的认证状态：见模块开头的三态说明。
+TimeCertification = Literal["certified", "unmeasured", "disproved"]
 
 
 @dataclass(frozen=True)
@@ -87,8 +105,8 @@ class PlatformRegistration:
     order_source: str
     order_time_basis: TimeBasis
     payment_basis: str | None
-    # 该平台是否拿到「业务时间窗口完整」的对照证据；False 时不得声称完整支付窗口。
-    time_certified: bool
+    # 该平台/通道的业务时间窗口认证；`disproved` 时不得开放完整支付窗口。
+    time_certified: TimeCertification
     # 能力上限：平台上限之外的标签即使被误写进库也不放行。
     ceiling: frozenset[str] = field(default_factory=frozenset)
 
@@ -97,28 +115,28 @@ class PlatformRegistration:
 PDD_CEILING: frozenset[str] = frozenset({"erp_documents"})
 
 _REGISTRATIONS: dict[str, PlatformRegistration] = {
-    # 抖音：交易通道排除淘系/拼多多，fxg 的支付口径与付款时间语义均已逐元对账。
+    # 抖音：交易通道的付款时间语义实测严格（0/9414 行越界），金额也逐元对过。
     "fxg": PlatformRegistration("fxg", TRADE_LIST_SOURCE, "pay_time", PAYMENT_BASIS,
-                                True, METRIC_CAPABILITIES),
-    # 同一交易通道，但支付时间完整性未逐店取证：口径可同名，认证不复制。
+                                "certified", METRIC_CAPABILITIES),
+    # 同一交易通道、同一 timeType 参数，但没逐店与后台账单对照过：可出数，必须披露。
     "jd": PlatformRegistration("jd", TRADE_LIST_SOURCE, "pay_time", PAYMENT_BASIS,
-                               False, METRIC_CAPABILITIES),
+                               "unmeasured", METRIC_CAPABILITIES),
     "kuaishou": PlatformRegistration("kuaishou", TRADE_LIST_SOURCE, "pay_time",
-                                     PAYMENT_BASIS, False, METRIC_CAPABILITIES),
+                                     PAYMENT_BASIS, "unmeasured", METRIC_CAPABILITIES),
     "wxsph": PlatformRegistration("wxsph", TRADE_LIST_SOURCE, "pay_time",
-                                  PAYMENT_BASIS, False, METRIC_CAPABILITIES),
+                                  PAYMENT_BASIS, "unmeasured", METRIC_CAPABILITIES),
     "wsxc": PlatformRegistration("wsxc", TRADE_LIST_SOURCE, "pay_time",
-                                PAYMENT_BASIS, False, METRIC_CAPABILITIES),
+                                 PAYMENT_BASIS, "unmeasured", METRIC_CAPABILITIES),
     # 淘系唯一非敏感订单通道是销售出库；它按自身时间字段裁剪，不承诺支付窗口完整。
     "tb": PlatformRegistration("tb", OUTSTOCK_SOURCE, "outstock_time", OUTSTOCK_BASIS,
-                              False, METRIC_CAPABILITIES),
+                               "disproved", METRIC_CAPABILITIES),
     "tm": PlatformRegistration("tm", OUTSTOCK_SOURCE, "outstock_time", OUTSTOCK_BASIS,
-                              False, METRIC_CAPABILITIES),
+                               "disproved", METRIC_CAPABILITIES),
     # 拼多多：2026-09-12 决定不接入支付。单据口径保留，支付族永久解析不通。
     # 订单源只能给出库通道——官方 `erp.trade.list.query` 明确排除淘系与拼多多，
     # 拿交易源去同步会被空响应伪造成“完整覆盖”（设计 §3 禁止的正是这个回退）。
     "pdd": PlatformRegistration("pdd", OUTSTOCK_SOURCE, "outstock_time", None,
-                                False, PDD_CEILING),
+                                "disproved", PDD_CEILING),
 }
 
 # 走交易通道的平台集合：供同步与用例遍历，不表示能力相同。拼多多不在里面——
@@ -151,7 +169,12 @@ class SourceBinding:
     source: str
     basis: str
     time_basis: str
-    coverage_certified: bool
+    # 三态认证；`coverage_certified` 是设计 §3 的布尔契约，只有 certified 才为 True。
+    time_certification: TimeCertification = "unmeasured"
+
+    @property
+    def coverage_certified(self) -> bool:
+        return self.time_certification == "certified"
 
 
 def _normalise_platform(platform: object) -> str:
@@ -189,13 +212,17 @@ def _entity_source(reg: PlatformRegistration,
 
 
 def _entity_basis(reg: PlatformRegistration, metric: str,
-                  entity: str) -> tuple[str, bool]:
-    """指标在某实体上到底用哪个口径，以及该口径的时间窗口是否已认证。"""
+                  entity: str) -> tuple[str, str]:
+    """指标在某实体上到底用哪个口径，以及该口径的业务时间窗口认证状态。
+
+    售后实体按平台完成时间归属，与交易/出库通道自己的时间口径不是同一件事，
+    在没有对照证据之前一律 `unmeasured`（可出数但披露为样本）。
+    """
     if entity != ORDERS_ENTITY:
         basis = COHORT_BASIS if entity == AFTERSALE_COHORT_ENTITY else REFUND_BASIS
-        return basis, False
+        return basis, "unmeasured"
     if metric == "erp_documents" or reg.payment_basis is None:
-        return DOCUMENT_BASIS, False
+        return DOCUMENT_BASIS, reg.time_certified
     return reg.payment_basis, reg.time_certified
 
 
@@ -205,17 +232,16 @@ def resolve_order_source(shop: ShopRecord) -> str | None:
     return None if reg is None else reg.order_source
 
 
-def resolve_metric_sources(shop: ShopRecord,
-                           metric: str) -> tuple[SourceBinding, ...]:
-    """解析「这家店回答这个指标」需要读哪些来源。
+def resolve_metric_dependencies(shop: ShopRecord,
+                                metric: str) -> tuple[SourceBinding, ...]:
+    """回答这个指标到底要读哪些来源——**不看这家店被授予了什么能力**。
 
-    返回空元组就是能力不足：可能是没登记平台、没授予标签、平台上限不含它，
-    或该指标需要的支付口径这个来源根本拿不到。调用方不得把空结果当「没有数据」。
+    覆盖与质量判定需要同一份依赖表，但不能被能力标签卡住：能力未授予时它必须报
+    「能力未开通」，而不是「覆盖未知」；两个原因混在一起就等于说错话。
+    返回空元组表示这个平台的来源根本拿不到该口径（未登记平台、拼多多支付族）。
     """
     reg = registration(shop.platform)
     if reg is None or metric not in METRIC_CAPABILITIES:
-        return ()
-    if metric not in shop.capabilities:
         return ()
     if metric not in reg.ceiling:
         return ()
@@ -225,11 +251,23 @@ def resolve_metric_sources(shop: ShopRecord,
     bindings: list[SourceBinding] = []
     for entity in ENTITY_REQUIREMENTS[metric]:
         source, time_basis = _entity_source(reg, entity)
-        basis, certified = _entity_basis(reg, metric, entity)
+        basis, certification = _entity_basis(reg, metric, entity)
         bindings.append(SourceBinding(
             shop_id=shop.shop_id, platform=reg.platform, entity=entity, source=source,
-            basis=basis, time_basis=time_basis, coverage_certified=certified))
+            basis=basis, time_basis=time_basis, time_certification=certification))
     return tuple(bindings)
+
+
+def resolve_metric_sources(shop: ShopRecord,
+                           metric: str) -> tuple[SourceBinding, ...]:
+    """解析「这家店现在能不能回答这个指标」。
+
+    在依赖表之上再加两道授权：标签必须授过，且注册表上限允许。拿不到就是能力不足，
+    调用方不得把空结果当「没有数据」。
+    """
+    if metric not in shop.capabilities:
+        return ()
+    return resolve_metric_dependencies(shop, metric)
 
 
 def unsupported_reason(shop: ShopRecord, metric: str) -> str | None:

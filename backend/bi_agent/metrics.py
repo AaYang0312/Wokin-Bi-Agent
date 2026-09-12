@@ -470,6 +470,22 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
     coverage = _coverage_of(assessment)
     data_as_of = assessment.data_as_of
 
+    # 业务时间口径核对（设计 §4）：实测不成立的通道给不出“完整支付窗口”，不得出数；
+    # 没逐店对照过的通道可以出数，但必须披露为可观测样本。两者都不改原请求窗口，
+    # 也不与“缺覆盖”混成同一个原因——那会把未认证的口径说成等回填就能解决的问题。
+    if assessment.time_basis_blocking:
+        return ToolResult(
+            status="missing_data", coverage=Coverage(status="missing", start=None, end=None),
+            metric_definition={m: METRIC_DEFINITIONS[m] for m in request.metrics},
+            filters=filters, data_as_of=data_as_of,
+            limitations=limitations + [
+                f"{len(assessment.time_basis_blocking)} 家店铺的付款时间口径未经认证，"
+                "未执行金额查询"])
+    if assessment.time_basis_disclosure:
+        limitations.append(
+            f"{len(assessment.time_basis_disclosure)} 家店铺的结果来自未认证付款时间口径，"
+            "按可观测样本披露")
+
     # 来源尚未开通的店铺单独说清：这类店缩小日期范围永远拿不到数据。
     # 金额查询路径上能力门禁已经给过同一句（不重复追加）；本行继续为
     # 直接调用 assess_query_coverage 的其他领域保留同一归因。
