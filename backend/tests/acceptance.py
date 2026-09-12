@@ -246,6 +246,9 @@ def run_offline() -> int:
     conn.execute(
         "INSERT INTO bi.shops(shop_id, platform, display_name) "
         "VALUES ('S9','fxg','店铺A') ON CONFLICT (shop_id) DO NOTHING")
+    from .test_db import ALL_CAPABILITIES, set_capabilities
+
+    set_capabilities(conn, "S9", *ALL_CAPABILITIES)
 
     import bi_agent.metrics as metrics_module
 
@@ -401,6 +404,9 @@ def run_live() -> int:
     conn.execute(
         "INSERT INTO bi.shops(shop_id, platform, display_name) "
         "VALUES ('S9','fxg','店铺A') ON CONFLICT (shop_id) DO NOTHING")
+    from .test_db import ALL_CAPABILITIES, set_capabilities
+
+    set_capabilities(conn, "S9", *ALL_CAPABILITIES)
     import bi_agent.metrics as metrics_module
 
     real_query = metrics_module.query_business

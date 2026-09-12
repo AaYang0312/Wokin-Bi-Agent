@@ -527,19 +527,25 @@ class ProvenanceContractTests(unittest.TestCase):
                              dataset_ref=uuid4(), chart_version=1)
 
     def test_termination_reason_vocabulary_matches_database(self):
-        """SQL CHECK 与 Python 码表同源：两边各写一份必然漂移。"""
+        """SQL CHECK 与 Python 码表同源：两边各写一份必然漂移。
+
+        009 已经应用过，不得改写：后续新增原因码只能由新迁移重新声明完整 CHECK，
+        所以码表比对的是 009+014 两段清单的并集，不是单一文件。
+        """
         import pathlib
         import re
 
         from bi_agent.runtime.artifacts import TERMINATION_REASONS
 
-        sql = (pathlib.Path(__file__).parents[1] / "sql"
-               / "009_query_provenance.sql").read_text(encoding="utf-8")
-        block = sql.split("query_runs_termination_reason CHECK", 1)[1].split(");", 1)[0]
-        in_sql = set(re.findall(r"'([a-z_]+)'", block))
+        sql_dir = pathlib.Path(__file__).parents[1] / "sql"
+        in_sql: set[str] = set()
+        for name in ("009_query_provenance.sql", "014_multi_source_contract.sql"):
+            sql = (sql_dir / name).read_text(encoding="utf-8")
+            block = sql.split("query_runs_termination_reason CHECK", 1)[1].split(");", 1)[0]
+            in_sql |= set(re.findall(r"'([a-z_]+)'", block))
 
         self.assertEqual(in_sql, set(TERMINATION_REASONS),
-                         "终止原因码表必须与 009 的 CHECK 一致")
+                         "终止原因码表必须与迁移里的 CHECK 一致")
 
 
 class MemoryQueryRunStoreTests(unittest.TestCase):

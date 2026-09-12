@@ -23,8 +23,11 @@ import httpx
 
 from .catalog import EntityKind, bump_catalog_version, ensure_refs
 from .config import load_sync_settings
-from .data_quality import reconcile_source_quality
+from .data_quality import QUALITY_RULE, reconcile_source_quality
 from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
+from .sources import (
+    AFTERSALE_SOURCE, OUTSTOCK_SOURCE, ShopRecord, TRADE_LIST_SOURCE,
+    capabilities_from_evidence, platform_order_sources, resolve_order_source)
 
 logger = logging.getLogger(__name__)
 
@@ -32,19 +35,16 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 # 业务时间下限：早于此的支付/完成时间只可能是 ERP 占位值，不参与时间窗口归属。
 BUSINESS_TIME_FLOOR = datetime(2010, 1, 1, tzinfo=BEIJING)
 
-ORDER_SOURCE = "erp.trade.list.query"
-# 官方 erp.trade.list.query 明确排除淘系、拼多多订单；淘系（淘宝/天猫）改走
-# 交易模块销售出库通道，只有非敏感字段（收件人/买家昵称/平台支付金额等不返回）。
-OUTSTOCK_SOURCE = "erp.trade.outstock.simple.query"
-AFTERSALE_SOURCE = "erp.aftersale.list.query"
+# 三个通道名只有一个真源：bi_agent/sources.py 的注册表。本模块继续从那里引用，
+# 避免同步与查询两侧各自维护一份平台路由表。
+ORDER_SOURCE = TRADE_LIST_SOURCE
+# 官方 erp.trade.list.query 明确排除淘系、拼多多订单；两类平台改走交易模块销售
+# 出库通道，只有非敏感字段（收件人/买家昵称/平台支付金额等不返回）。
 ITEM_SOURCE = "item.list.query"
 
-# 平台→订单源路由：键为 bi.shops.platform（小写），未命中回退默认源。
-# sync_state 主键含 source，淘系出库通道的覆盖/水位与抖音通道互不干扰。
-ORDER_SOURCE_BY_PLATFORM = {
-    "tb": OUTSTOCK_SOURCE,
-    "tm": OUTSTOCK_SOURCE,
-}
+# 平台→订单源路由：直接取自注册表。sync_state 主键含 source，出库通道与交易通道的
+# 覆盖/水位互不干扰；未命中的平台不再回退默认源（见 `_shop_order_source`）。
+ORDER_SOURCE_BY_PLATFORM = platform_order_sources()
 
 # ---------------------------------------------------------------------------
 # PII 红线（2026-09-12 淘系接入约定）：下列字段在出库/售后响应中出现（部分
@@ -1420,17 +1420,21 @@ def _require_single_shop(settings) -> str:
 
 
 def _shop_order_source(conn, shop_id: str) -> str:
-    """按 bi.shops.platform 路由订单源；tb/tm→出库通道，其余平台回退默认源。
+    """按 bi.shops.platform 路由订单源；平台未登记就报错退出，不回退默认源。
 
-    店铺档案缺失时报错退出：若静默回退默认源，淘系店会被 trade.list.query
-    “验证为空”造成假覆盖，必须先运行 shops 同步。
+    两个失败模式都踩过，因此这里宁可停机：
+    - 店铺档案缺失时静默回退，淘系店会被 `trade.list.query` “验证为空”造成假覆盖；
+    - 未登记平台回退交易源，同样会把拿不到的数据当成“确实没有”。
     """
     row = conn.execute(
         "SELECT platform FROM bi.shops WHERE shop_id=%s", (shop_id,)).fetchone()
     if row is None:
         raise SystemExit(f"店铺 {shop_id} 不在 bi.shops，请先运行 shops 同步")
-    platform = (row[0] or "").strip().lower()
-    return ORDER_SOURCE_BY_PLATFORM.get(platform, ORDER_SOURCE)
+    source = resolve_order_source(ShopRecord.from_row(shop_id, row[0], ()))
+    if source is None:
+        raise SystemExit(f"店铺 {shop_id} 的平台 {row[0]!r} 未在 sources 注册表登记来源，"
+                         "拒绝回退交易通道")
+    return source
 
 
 def _shop_error(exc: BaseException) -> str:
@@ -1698,6 +1702,76 @@ def _setup_logging(log_dir: str = "logs") -> None:
     root.setLevel(logging.INFO)
 
 
+@dataclass(frozen=True)
+class CapabilityGrant:
+    """一家店的指标能力重算结果。`granted` 只能来自对账证据，不是“同步跑过了”。"""
+
+    shop_id: str
+    platform: str
+    current: frozenset[str]
+    granted: frozenset[str]
+
+    @property
+    def changed(self) -> bool:
+        return self.current != self.granted
+
+
+_SHOP_PROFILES_SQL = """
+SELECT shop_id, platform, capabilities FROM bi.shops WHERE shop_id = ANY(%s)
+ORDER BY shop_id
+"""
+
+_SYNC_STATE_SQL = """
+SELECT shop_id, source, entity, quality_status, quality_rule
+FROM bi.sync_state WHERE shop_id = ANY(%s)
+"""
+
+
+def read_quality_evidence(conn, shop_ids) -> dict[str, dict[tuple[str, str], str]]:
+    """逐店读回 `(source, entity) -> quality_status`。
+
+    只认当前口径版本写下的结论：`quality_rule` 不是 `QUALITY_RULE` 的 passed 降级成
+    unknown（与 `data_quality._effective_quality` 同一规则），否则口径升级后旧对账
+    会长期挂在能力标签上。没有状态行就是未知，不是“确实没数据”。
+    """
+    evidence: dict[str, dict[tuple[str, str], str]] = {str(item): {} for item in shop_ids}
+    for shop_id, source, entity, status, rule in conn.execute(
+            _SYNC_STATE_SQL, ([str(shop_id) for shop_id in shop_ids],)).fetchall():
+        effective = (status if rule == QUALITY_RULE else "unknown")
+        evidence.setdefault(str(shop_id), {})[(str(source), str(entity))] = str(effective)
+    return evidence
+
+
+def recompute_shop_capabilities(conn, shop_ids, *,
+                                apply: bool = False) -> list[CapabilityGrant]:
+    """按已登记的来源与逐源对账证据重算能力标签（默认只报告，不写库）。
+
+    这是 capabilities 的唯一开通入口：同步成功、店铺档案存在、上游返回空都不算证据。
+    证据消失时标签会被回收（包括回收为空白），否则一次意外对账就能永久开门。
+    未登记平台报空白，不静默跳过：运维必须看得到“为什么这家店开不了”。
+    """
+    ids = [str(shop_id) for shop_id in shop_ids]
+    if not ids:
+        return []
+    evidence = read_quality_evidence(conn, ids)
+    grants: list[CapabilityGrant] = []
+    for shop_id, platform, capabilities in conn.execute(
+            _SHOP_PROFILES_SQL, (ids,)).fetchall():
+        record = ShopRecord.from_row(shop_id, platform, capabilities)
+        granted = capabilities_from_evidence(record.platform,
+                                             evidence.get(str(shop_id), {}))
+        grants.append(CapabilityGrant(
+            shop_id=str(shop_id), platform=record.platform,
+            current=frozenset(record.capabilities), granted=frozenset(granted)))
+    if apply:
+        for grant in grants:
+            if not grant.changed:
+                continue
+            conn.execute("UPDATE bi.shops SET capabilities=%s WHERE shop_id=%s",
+                         (sorted(grant.granted), grant.shop_id))
+    return grants
+
+
 def main(argv: list[str] | None = None) -> int:
     _setup_logging()
     parser = argparse.ArgumentParser(prog="bi_agent.sync")
@@ -1718,6 +1792,11 @@ def main(argv: list[str] | None = None) -> int:
     replay.add_argument("--start", required=True)
     replay.add_argument("--end", required=True)
     sub.add_parser("refresh-session")
+    capabilities = sub.add_parser(
+        "capabilities",
+        help="按逐来源对账证据重算指标能力标签（默认只报告差异，--apply 才写库）")
+    capabilities.add_argument("--apply", action="store_true",
+                              help="确实回写 bi.shops.capabilities")
     args = parser.parse_args(argv)
 
     settings = load_sync_settings(os.environ)
@@ -1817,6 +1896,15 @@ def main(argv: list[str] | None = None) -> int:
                                       "entity": args.entity, "accepted": count,
                                       "payment_downgrade_blocked":
                                           GUARD_STATS.payment_downgrade_blocked - before}))
+            elif args.command == "capabilities":
+                grants = recompute_shop_capabilities(conn, sorted(settings.shop_ids),
+                                                     apply=args.apply)
+                for grant in grants:
+                    print(json.dumps({
+                        "action": "capabilities", "shop_id": grant.shop_id,
+                        "platform": grant.platform, "mode": "apply" if args.apply else "report",
+                        "current": sorted(grant.current), "granted": sorted(grant.granted),
+                        "changed": grant.changed}, ensure_ascii=False))
             elif args.command == "refresh-session":
                 _refresh_session(conn, client)
         finally:

@@ -29,6 +29,8 @@ RecoveryAction = Literal[
 GAP_REASONS = frozenset({
     "coverage_incomplete", "data_as_of_unknown", "source_not_onboarded",
     "source_quality_failed", "comparison_coverage_incomplete",
+    # 能力未开通同属缺口：重跑不会开通能力，只有完成逐源取证才行。
+    "capability_unavailable",
 })
 TERMINAL_REASONS = frozenset({
     "forbidden", "deadline_exceeded", "query_timeout", "invalid_date_range",

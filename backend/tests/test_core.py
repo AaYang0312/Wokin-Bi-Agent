@@ -1032,7 +1032,9 @@ class FakeWarehouse:
     def __init__(self, *, daily_rows=(), product_rows=(), shops=(), data_as_of=None,
                  cohort=(None, None), unmatched=0, shop_profiles=(), catalog_version=7,
                  quality_status="passed", quality_rule=QUALITY_RULE,
-                 capabilities=("orders", "aftersales_occurrence", "aftersales_cohort")):
+                 capabilities=("paid_amount", "paid_orders", "erp_documents", "aov",
+                               "quantity", "product_paid_amount", "refund_amount",
+                               "cash_difference", "cohort_refund_rate")):
         self.daily_rows = [tuple(row) for row in daily_rows]
         # 视图列形以 tests.dbfixtures.PRODUCT_DAILY_COLUMNS 为单一真源，这里不再手抄列数：
         # 测试行没给末尾的名称 / 成交快照 / 规格列就按契约补上。
@@ -1045,15 +1047,26 @@ class FakeWarehouse:
                              for row in product_rows]
         self.shop_profiles = [tuple(row) for row in shop_profiles]
         self.catalog_version = catalog_version
-        self.shops = [tuple(row) for row in shops]
+        self.capabilities = tuple(capabilities)
+        # v_shops 现在返回五列（带平台与能力标签）：用例仍按 (店, 开关, 币种) 写，
+        # 健康替身默认“已登记平台 + 全部指标已授予能力”，不把契约变化注入每个离线用例。
+        self.shops = [self._shop_row(row) for row in shops]
         self.data_as_of = data_as_of
         # 替身默认代表“已对账通过的健康库”；真实库默认是 unknown，两边不同。
         self.quality_status = quality_status
         self.quality_rule = quality_rule
-        self.capabilities = tuple(capabilities)
         self.cohort = tuple(cohort)
         self.unmatched = unmatched
         self.statements: list[tuple[str, tuple]] = []
+
+    def _shop_row(self, row: tuple) -> tuple:
+        """把用例写的 (店, 开关, 币种) 补齐成 v_shops 的五列形状。"""
+        row = tuple(row)
+        if len(row) == 3:
+            return row + ("fxg", list(self.capabilities))
+        if len(row) == 4:
+            return row + (list(self.capabilities),)
+        return row
 
     @property
     def info(self):
@@ -1080,11 +1093,11 @@ class FakeWarehouse:
                                version=self.catalog_version)
         if catalog is not None:
             return _FakeResult(catalog.fetchall())
-        if "capabilities FROM reporting.v_shops" in text:
-            # 健廉替身 = 三家实体的来源都已开通，不干扰现有离线用例的 limitations 断言。
-            return _FakeResult([(row[0], list(self.capabilities)) for row in self.shops
-                                if row[0] in params[0]])
         if "FROM reporting.v_shops" in text:
+            if text.startswith("SELECT shop_id, platform"):
+                # 覆盖门禁问的是“这个平台有没有登记来源”，与指标能力分开归因。
+                return _FakeResult([(row[0], row[3]) for row in self.shops
+                                    if row[0] in params[0]])
             return _FakeResult([row for row in self.shops if row[0] in params[0]])
         if "FROM reporting.v_coverage" in text:
             # 生产代码一条 SQL 判完整覆盖：(店铺, 已覆盖段, 缺口段, 截止, 质量)。
@@ -2442,10 +2455,12 @@ class OutstockSourceTests(unittest.TestCase):
     def test_platform_routing_table(self):
         from bi_agent.sync import (
             AFTERSALE_SOURCE, ORDER_SOURCE, ORDER_SOURCE_BY_PLATFORM, OUTSTOCK_SOURCE)
-        self.assertEqual(ORDER_SOURCE_BY_PLATFORM,
-                         {"tb": OUTSTOCK_SOURCE, "tm": OUTSTOCK_SOURCE})
-        self.assertEqual(ORDER_SOURCE_BY_PLATFORM.get("fxg", ORDER_SOURCE), ORDER_SOURCE)
+        # 路由表只有一个真源（sources 注册表）：未登记平台不在表里，也没有默认回退。
+        self.assertEqual({platform for platform, source in ORDER_SOURCE_BY_PLATFORM.items()
+                          if source == OUTSTOCK_SOURCE}, {"tb", "tm", "pdd"})
+        self.assertEqual(ORDER_SOURCE_BY_PLATFORM["fxg"], ORDER_SOURCE)
         self.assertNotIn(AFTERSALE_SOURCE, ORDER_SOURCE_BY_PLATFORM.values())
+        self.assertNotIn("alibabac2m", ORDER_SOURCE_BY_PLATFORM)
 
     def test_shop_order_source_lookup(self):
         from bi_agent.sync import (
@@ -2468,8 +2483,13 @@ class OutstockSourceTests(unittest.TestCase):
 
         self.assertEqual(_shop_order_source(Conn(("tb",)), "166520"), OUTSTOCK_SOURCE)
         self.assertEqual(_shop_order_source(Conn(("TM",)), "166687"), OUTSTOCK_SOURCE)
+        self.assertEqual(_shop_order_source(Conn(("pdd",)), "166712"), OUTSTOCK_SOURCE)
         self.assertEqual(_shop_order_source(Conn(("fxg",)), "166754"), ORDER_SOURCE)
-        self.assertEqual(_shop_order_source(Conn(("",)), "1"), ORDER_SOURCE)
+        # 未登记平台不再回退默认源：宁可不跑同步，也不能把空响应写成完整覆盖。
+        for platform in ("", "1688", "alibabac2m"):
+            with self.subTest(platform=platform):
+                with self.assertRaises(SystemExit):
+                    _shop_order_source(Conn((platform,)), "1")
         with self.assertRaises(SystemExit):
             _shop_order_source(Conn(None), "404")
 

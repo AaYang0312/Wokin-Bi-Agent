@@ -21,20 +21,15 @@ from zoneinfo import ZoneInfo
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 
-# 指标依赖哪些业务实体：覆盖门禁的唯一真源，指标层从这里引用。
-ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
-    "paid_amount": ("orders",),
-    "paid_orders": ("orders",),
-    "erp_documents": ("orders",),
-    "aov": ("orders",),
-    "quantity": ("orders",),
-    "product_paid_amount": ("orders",),
-    "refund_amount": ("orders", "aftersales_occurrence"),
-    "cash_difference": ("orders", "aftersales_occurrence"),
-    "cohort_refund_rate": ("orders", "aftersales_cohort"),
-}
+# 指标→实体依赖定义在 sources 注册表（来源与能力的唯一真源）；本模块继续向外转发，
+# 不养第二份，否则覆盖门禁与指标层会各自演化出口径。
+from bi_agent.sources import (
+    ENTITY_REQUIREMENTS, ShopRecord, resolve_order_source)
 
 # 同一覆盖来源名：同步状态按数据来源记录。
+# 注意：`orders` 在这里仍是单源常量，只反映交易通道。淘系出库通道的逐店来源解析已经
+# 由 `sources.resolve_order_source` 提供，覆盖按 `(source, entity, time_basis)` 取交集
+# 是计划 Task 5.2 的范围；在那之前不得拿本常量当平台可用性证据。
 ENTITY_SOURCES: dict[str, str] = {
     "orders": "erp.trade.list.query",
     "aftersales_occurrence": "erp.aftersale.list.query",
@@ -69,7 +64,7 @@ WHERE shop_id = ANY(%s) AND platform_success AND refund_canonical
 QUALITY_RULE = "kuaimai-reconcile/1"
 
 _CAPABILITIES_SQL = """
-SELECT shop_id, capabilities FROM reporting.v_shops WHERE shop_id = ANY(%s)
+SELECT shop_id, platform FROM reporting.v_shops WHERE shop_id = ANY(%s)
 """
 
 QualityStatus = Literal["unknown", "passed", "failed"]
@@ -275,19 +270,22 @@ def _suggested(covered_windows: tuple[Window, ...], requested: Window,
 
 
 def _unconfigured_shops(conn, shop_ids: Sequence[str], entities: Sequence[str]) -> tuple[str, ...]:
-    """本次请求需要的实体里，哪家店还根本没有开通来源。
+    """本次请求需要的实体里，哪家店还根本没有已登记的取数来源。
 
-    capabilities 由对账维护（见 001 注释与迚接验收记录）：空数组就是
-    “这张店从来没有一份已核验数据”。跟“有覆盖但缺几天”必须分开说。
+    口径与 Task 5.1 能力门禁分开：本函数只回答「这个平台有没有登记来源」。
+    「有来源但该指标未授予能力」由 `metrics._capability_gap` 报
+    `capability_unavailable`，两者不得混成一个原因。旧的 `orders` 一类实体标签
+    不再参与判断：它们只表示采集过实体，不表示任何指标可用（设计 §4）。
+
+    `entities` 保留在签名里：只查订单的查询与查退款的查询以后可以各自解析依赖。
     """
     if not shop_ids or not entities:
         return ()
     rows = conn.execute(_CAPABILITIES_SQL, (list(shop_ids),)).fetchall()
-    needed = set(entities)
     unconfigured: list[str] = []
-    for shop_id, capabilities in rows:
-        have = {str(item) for item in (capabilities or [])}
-        if not needed <= have:
+    for shop_id, platform in rows:
+        record = ShopRecord.from_row(str(shop_id), platform, ())
+        if resolve_order_source(record) is None:
             unconfigured.append(str(shop_id))
     return tuple(sorted(unconfigured))
 

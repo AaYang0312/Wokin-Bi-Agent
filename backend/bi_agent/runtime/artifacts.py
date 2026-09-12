@@ -111,6 +111,8 @@ class RequestIdentity(BaseModel):
         "succeeded", "missing_parameters", "invalid_parameters", "forbidden",
         "coverage_incomplete", "data_as_of_unknown", "source_quality_failed",
         "source_not_onboarded", "revenue_not_attributed", "result_too_large",
+        # 逐指标能力未授予：与来源未开通、缺覆盖分别归因。
+        "capability_unavailable",
         "comparison_coverage_incomplete", "deadline_exceeded", "query_timeout",
         "persistence_failed", "contract_violation", "upstream_unavailable",
         "transient_source_failure", "recovery_exhausted",
