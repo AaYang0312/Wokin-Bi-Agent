@@ -16,7 +16,7 @@
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行 `001 → 002 → 003 → 004 → 005 → 007 → 008 → 009`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在。
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
@@ -27,6 +27,10 @@ psql -d bi_agent -f backend/sql/005_product_dimension.sql
 psql -d bi_agent -f backend/sql/007_catalog_identity.sql
 psql -d bi_agent -f backend/sql/008_data_readiness.sql
 psql -d bi_agent -f backend/sql/009_query_provenance.sql
+psql -d bi_agent -f backend/sql/014_multi_source_contract.sql
+psql -d bi_agent -f backend/sql/015_provenance_basis.sql
+psql -d bi_agent -f backend/sql/016_channel_catalog.sql
+psql -d bi_agent -f backend/sql/017_commerce_views.sql
 ```
 
 单实例：全程持有数据库 advisory 锁，重复启动立即失败。
@@ -106,6 +110,7 @@ psql -d bi_agent -f sql/009_query_provenance.sql
 psql -d bi_agent -f sql/014_multi_source_contract.sql
 psql -d bi_agent -f sql/015_provenance_basis.sql
 psql -d bi_agent -f sql/016_channel_catalog.sql
+psql -d bi_agent -f sql/017_commerce_views.sql
 uv run --env-file ../.env.sync python -m bi_agent.sync shops
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity orders --start <保留历史起日> --end <截止日的下一日>
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity aftersales_occurrence --start <保留历史起日> --end <截止日的下一日>

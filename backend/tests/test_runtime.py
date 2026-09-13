@@ -816,6 +816,16 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
         self.assertEqual(self.store.runs[run_id]["revision"], 0)
         self.assertEqual(self.store.events[run_id], [])
 
+    def test_save_artifact_rejects_type_outside_the_run_domain(self):
+        """领域能发哪种 Artifact 在写库前就拦：只校全局类型白名单等于允许
+        business_query 往自己的运行下发价审载荷，而 009 的 CHECK 是全局的。
+        """
+        run_id = self.store.create_run(self.record)
+        with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
+            self.store.save_artifact(run_id, NewArtifact(
+                artifact_type="price_audit", payload={"status": "ok"}))
+        self.assertEqual(self.store.artifacts, {}, "拒绍不能先写一半")
+
     def test_save_artifact_returns_reference_and_finish_is_terminal(self):
         run_id = self.store.create_run(self.record)
         ref = self.store.save_artifact(run_id, NewArtifact(

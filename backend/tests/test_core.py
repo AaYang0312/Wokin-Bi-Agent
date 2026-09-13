@@ -1865,6 +1865,79 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(hasattr(agent, "_handle_query_business"))
         self.assertFalse(hasattr(agent, "_run_query_business"))
 
+    def test_commerce_tool_is_registered_and_routed_as_one_call(self):
+        """商品 Tool 已注册：一次模型调用 = 一次图执行，主层不逐店循环也不自己算钱。
+
+        本用例只钉住主 Agent 侧的接线：工具已公告、参数原样送达、服务端上下文里
+        拿到的是真实授权集与共享 deadline、图投出的引用载荷原样回到模型，
+        而公开载荷只进展示层。图本身的口径与门禁由 tests.test_commerce 钉。
+        """
+        import bi_agent.agent as agent
+        from bi_agent.agent import SessionState, answer
+        from bi_agent.commerce.graph import CommerceExecution
+        from bi_agent.commerce.models import CommerceDataset, CommerceReport
+        from bi_agent.llm import ToolCall
+        from bi_agent.runtime.models import (ArtifactRef, DomainArtifact, DomainResult,
+                                             DomainStatus)
+        from uuid import uuid4
+
+        self.assertEqual([item["function"]["name"] for item in agent._tool_schemas()],
+                         ["query_business", "analyze_product_performance",
+                          "evaluate_promotion"])
+        captured: dict[str, object] = {}
+        model_payload = {"status": "ok", "data": [{"sales_amount": "550"}],
+                         "excluded_scope": [{"shop_ref": S1_REF,
+                                             "reason": "coverage_incomplete"}]}
+
+        def fake_graph(request, context, **kwargs):
+            captured["request"] = request
+            captured["context"] = context
+            dataset = CommerceDataset(artifact_type="metric_result", result=self.KNOWN)
+            report = CommerceReport(status="ok", datasets=(dataset,))
+            return CommerceExecution(
+                domain_result=DomainResult(
+                    run_id=uuid4(), status=DomainStatus.SUCCESS,
+                    model_payload=model_payload,
+                    artifacts=[DomainArtifact(
+                        ref=ArtifactRef(id=uuid4(), type="metric_result"),
+                        public_payload=model_payload)],
+                    coverage=self.KNOWN.coverage),
+                report=report)
+
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[ToolCall(id="call_c", name="analyze_product_performance",
+                                   arguments={
+                                       "product": {"text": "直钉枪"},
+                                       "start": "2026-09-01", "end": "2026-09-08",
+                                       "metrics": ["sales_amount"]})]),
+            _reply(text="该商品在售7天里卖了550元")]
+        with patch("bi_agent.commerce.tool.run_commerce_graph",
+                   side_effect=fake_graph) as routed:
+            turn = answer("直钉枪最近7天卖得怎么样", SessionState(subject="u1"),
+                          model=model, conn=self._conn(),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+            self.assertEqual(routed.call_count, 1, "一次工具调用只能跑一次图")
+        self.assertEqual(captured["request"].product.text, "直钉枪")
+        context = captured["context"]
+        self.assertEqual(context.allowed_shop_ids, frozenset({"S1"}),
+                         "真实授权集只能由服务端注入")
+        self.assertEqual(dict(context.shop_refs), {"S1": S1_REF})
+        # 图沿用本回合的 30 秒总预算：不是另起一份，也不是把已用掉的时间重置。
+        import time as time_module
+
+        self.assertGreater(context.deadline, time_module.monotonic())
+        self.assertLessEqual(context.deadline,
+                             time_module.monotonic() + agent.TOTAL_BUDGET_SECONDS)
+        self.assertEqual([artifact["status"] for artifact in turn.artifacts], ["ok"])
+        tool_messages = [m for m in turn.state.turns if m.role == "tool"]
+        self.assertIn("550", tool_messages[-1].content or "")
+        self.assertIn("excluded_scope", tool_messages[-1].content or "",
+                      "范围缺口必须随载荷回到模型，不然它会把 partial 说成全量")
+        self.assertNotIn("S1", tool_messages[-1].content or "")
+        self.assertEqual(turn.results[0].data, self.KNOWN.data)
+
     def test_follow_up_keeps_filters_only_dates_change(self):
         from bi_agent.agent import SessionState, answer
 

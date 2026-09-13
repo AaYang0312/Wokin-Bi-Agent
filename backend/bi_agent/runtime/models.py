@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime
 from enum import StrEnum
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal, Protocol, get_args
 from uuid import UUID
 
 from pydantic import (
@@ -19,6 +19,11 @@ from pydantic import (
 )
 
 from bi_agent.catalog import EntityKind, REF_RE, is_safe_display_name
+from bi_agent.commerce.metrics import (
+    COMMERCE_LIMITATION_CODES, COMMERCE_LIMITATION_PATTERNS,
+    COMMERCE_METRIC_DEFINITIONS, COMMERCE_METRIC_UNITS, COMMERCE_METRICS,
+    COMMERCE_PUBLIC_LIMITATIONS, COMMERCE_RESULT_COLUMNS, EXCLUDED_REASONS,
+    METRIC_STATUS_VALUES, OPPORTUNITY_STATUSES, RANKING_SCOPES, TREND_DAYS)
 from bi_agent.metrics import Coverage, METRIC_DEFINITIONS
 from bi_agent.promotion import (
     PROMOTION_DATE_RESULT_COLUMNS,
@@ -36,10 +41,22 @@ from .artifacts import (
     RequestIdentity,
     TERMINATION_REASONS,
 )
-from .domain_registry import ARTIFACT_TYPES, known_domain
+from .domain_registry import (
+    ARTIFACT_TYPES,
+    COMMERCE_NODES,
+    allows_artifact_type,
+    known_domain,
+    spec_for,
+)
 PersistenceNode = Literal[
     "received", "resolve_parameters", "validate_parameters", "authorize_scope",
     "execute_fixed_query", "classify_result", "persist_artifact", "finalize",
+    # 运营图（spec §6）：商品经营报告走这一串节点。节点名与
+    # `runtime.domain_registry` 里该领域的白名单由测试逐项比对，不两边各拄。
+    "resolve_scope", "resolve_product_if_needed", "resolve_metric_basis",
+    "check_capabilities_and_coverage", "freeze_versions", "plan_fixed_queries",
+    "execute_aggregates", "compute_metrics", "build_comparison_and_trend",
+    "classify_findings", "persist_artifacts",
 ]
 ErrorCode = Literal[
     "missing_parameters", "invalid_parameters", "forbidden", "deadline_exceeded",
@@ -71,9 +88,11 @@ PublicMessage = Literal[
     "结果保存失败，请稍后重试。",
 ]
 
-_METRICS = frozenset(METRIC_DEFINITIONS)
-# 口径文案字典：固定指标 + 推广口径（后者以 promotion.py 为真源）。
-_METRIC_DEFINITION_TEXTS: dict[str, str] = {**METRIC_DEFINITIONS, **PROMOTION_METRIC_DEFINITIONS}
+_METRICS = frozenset(METRIC_DEFINITIONS) | COMMERCE_METRICS
+# 口径文案字典：固定指标 + 推广口径 + 商品运营参考指标（均以生产方模块为真源）。
+_METRIC_DEFINITION_TEXTS: dict[str, str] = {
+    **METRIC_DEFINITIONS, **PROMOTION_METRIC_DEFINITIONS,
+    **COMMERCE_METRIC_DEFINITIONS}
 _TOOL_STATUSES = frozenset({
     "ok", "missing_data", "invalid_parameters", "forbidden", "unavailable",
 })
@@ -84,6 +103,19 @@ _RUN_STATUSES = frozenset({
 _DOMAIN_STATUSES = frozenset({"success", "needs_input", "missing_data", "partial", "failed"})
 _GROUP_BY = frozenset({"total", "day", "shop", "product"})
 _COMPARE = frozenset({"none", "previous_period"})
+# 商品运营（契约 v2）的枚举：范围、逐指标状态与口径选择。
+# 取值集合由生产方（commerce.metrics）供给，这里只引用不再手抄。
+_SCOPE_MODES = frozenset({"all_authorized", "selected"})   # 与 ProductScope.mode 同取值
+_METRIC_STATUS_VALUES = METRIC_STATUS_VALUES
+_METRIC_UNITS = frozenset(COMMERCE_METRIC_UNITS.values())
+_SALES_BASES = frozenset({"erp_effective_parent", "verified_payment"})
+_PROFIT_BASES = frozenset({"none", "existing_fields"})
+_REPORT_KINDS = frozenset({"product"})   # comparison 由 Task 8 登记
+_RANKING_SCOPES = RANKING_SCOPES
+_OPPORTUNITY_STATUSES = OPPORTUNITY_STATUSES
+# 排除原因取自注册表词表；逐指标状态的原因取自限制码表
+# （见下方 _STATUS_REASONS），不新造第三种说法。
+_EXCLUDED_REASONS = EXCLUDED_REASONS
 _COVERAGE_STATUSES = frozenset({"complete", "partial", "missing"})
 _PROBLEM_CODES = frozenset({
     "missing_parameters", "invalid_parameters", "invalid_date_range", "invalid_metric",
@@ -109,7 +141,12 @@ _LIMITATION_CODES = frozenset({
     "unmatched_refunds", "matched_cohort_only", "unverified_payments",
     # 跨口径汇总/比较被拒：口径不兼容是参数范围问题。
     "basis_incompatible",
+    # 商品运营面（Task 7）：范围、成本覆盖、单据口径与候选排序各自归因。
+    *COMMERCE_LIMITATION_CODES,
 })
+# 逐指标状态的原因只能用已登记的限制码：状态与限制共用一份词表，
+# 不然同一个缺口会在两处各起一个名字。
+_STATUS_REASONS = _LIMITATION_CODES | _EXCLUDED_REASONS
 # 披露文本里的金额片段：与 _DECIMAL_RE 同一形式，不另加一套数字规则。
 _MONEY = r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?"
 
@@ -127,7 +164,7 @@ _PUBLIC_LIMITATIONS = frozenset({
     "上期覆盖不足，无法比较，仅返回绝对值",
     "比较仅支持total/shop分组",
     "同批支付额为0或无支付，同批退款率不可计算",
-}) | PROMOTION_PUBLIC_LIMITATIONS
+}) | PROMOTION_PUBLIC_LIMITATIONS | COMMERCE_PUBLIC_LIMITATIONS
 _PUBLIC_LIMITATION_PATTERNS = (
     re.compile(r"^存在[0-9]+条未匹配的平台成功退款，退款归属未确认$"),
     re.compile(r"^结果超过[0-9]+组，请缩小日期范围或店铺范围$"),
@@ -158,6 +195,7 @@ _PUBLIC_LIMITATION_PATTERNS = (
         r"（关闭订单行" + _MONEY + r"元；赠品行" + _MONEY + r"元；"
         r"无商品归属" + _MONEY + r"元；其他" + _MONEY + r"元）$"),
     *PROMOTION_LIMITATION_PATTERNS,
+    *COMMERCE_LIMITATION_PATTERNS,
 )
 _STATE_KEYS = frozenset({
     "run_id", "node", "status", "revision", "normalized_request", "problems",
@@ -171,10 +209,18 @@ _EVENT_KEYS = frozenset({
 _NORMALIZED_REQUEST_KEYS = frozenset({
     "shop_refs", "metrics", "start", "end", "group_by", "compare", "top_n", "currency",
     "basis_policy",
+    # 运营图新增：只进引用与业务码，商品文本不进这里（spec §3）。
+    "product_ref", "sku_refs", "platforms", "scope_mode", "sales_basis",
+    "profit_basis", "trend_days", "report_kind", "opportunity_policy_ref",
 })
 _ARTIFACT_KEYS = frozenset({
     "status", "metric_definition", "coverage", "limitations", "data_as_of", "filters",
     "data", "basis", "diagnostics", "entities", "catalog_version",
+    # 契约 v2（spec §3）：范围三面、逐指标状态、趋势窗口、解析结果与恢复线索。
+    # 旧 v1 记录不含这些键，仍必须可读，所以全部是可选键。
+    "requested_scope", "evaluated_scope", "excluded_scope", "metric_statuses",
+    "trend_window", "resolved_product", "comparison", "opportunity", "metric_units",
+    "termination_reason", "candidates",
 })
 # 口径与诊断：名称形如 `platform_payment/v1`、`kuaimai-metrics/2`、`pay_time`。
 # 版本段允许 `v1`、`2` 或日期式 `2026-09-12.1`：只允许纯数字会把已登记口径判成非法。
@@ -185,6 +231,8 @@ _BASIS_ITEM_KEYS = frozenset({
 _BASIS_METRIC_KEYS = frozenset({"metric", "basis", "time_basis", "metric_version"})
 _DIAGNOSIS_KEYS = frozenset({
     "unmatched_refunds", "matched_cohort_only", "unverified_payments",
+    # 单据毛利的覆盖完整性：多少张单据、几张带毛利字段、能不能发布。
+    "erp_document_coverage",
 })
 _DIAGNOSIS_FIELDS = {
     "unmatched_refunds": frozenset({
@@ -192,12 +240,15 @@ _DIAGNOSIS_FIELDS = {
     "unverified_payments": frozenset({
         "total", "amount_undetermined", "amount_known", "known_amount"}),
     "matched_cohort_only": frozenset({"unmatched_count"}),
+    "erp_document_coverage": frozenset({
+        "documents", "documents_with_gross_profit", "publishable"}),
 }
 # 名称只在授权展示层出现：模型载荷带上这两项就是契约违规。
 _PUBLIC_ONLY_ARTIFACT_KEYS = frozenset({"entities", "catalog_version"})
 _FILTER_KEYS = frozenset({
     "start", "end", "shop_refs", "metrics", "group_by", "compare", "top_n", "currency",
-    "basis_policy", "mode",
+    "basis_policy", "mode", "sales_basis", "profit_basis", "platforms", "product_ref",
+    "report_kind", "sales_share_basis",
 })
 
 _LINE_KINDS = frozenset({"sale", "gift", "suite", "combination", "processing"})
@@ -219,7 +270,8 @@ _LABEL_RESULT_VALUES: dict[str, frozenset[str]] = {
     "currency": _CURRENCY_VALUES,
     **PROMOTION_LABEL_VALUES,
 }
-_RESULT_COLUMNS = _METRIC_RESULT_COLUMNS | PROMOTION_RESULT_COLUMNS
+_RESULT_COLUMNS = (_METRIC_RESULT_COLUMNS | PROMOTION_RESULT_COLUMNS
+                   | COMMERCE_RESULT_COLUMNS)
 # 剩下的列一律按十进制/整数严格校验；推广数值列集合作为交叉校验。
 _NUMERIC_RESULT_COLUMNS = (_RESULT_COLUMNS - _REF_RESULT_COLUMNS - _DATE_RESULT_COLUMNS
                            - _TEXT_RESULT_COLUMNS
@@ -228,14 +280,16 @@ assert _NUMERIC_RESULT_COLUMNS & PROMOTION_RESULT_COLUMNS == PROMOTION_NUMERIC_R
 # 投影层（business_query/tool.py）复用同一份白名单，避免二次手抄漂移。
 ARTIFACT_RESULT_COLUMNS = _RESULT_COLUMNS
 ARTIFACT_FILTER_COLUMNS = _FILTER_KEYS
-_NODES = frozenset({
-    "received", "resolve_parameters", "validate_parameters", "authorize_scope",
-    "execute_fixed_query", "classify_result", "persist_artifact", "finalize",
-})
+# 节点白名单直接从 `PersistenceNode` 推导：再把同一享节点集手抄一遍，
+# 总有一天两份会漂移（一份在校验处，一份在类型上）。
+# 各领域取哪一段由 `domain_registry` 决定，Store 在写库前按领域复核。
+_NODES = frozenset(get_args(PersistenceNode))
 # 引用与展示名的形式规则只定义在 bi_agent.catalog 一处，这里复用不拄写。
 _REF_RE = REF_RE
 # 与 catalog 同一形式：平台码是短标识，不是文本。
 _PLATFORM_CODE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,15}$")
+# 版本化策略引用（如 `low-margin/1`）：与口径名同一形式。
+_POLICY_REF_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}/[0-9][0-9._-]{0,15}$")
 _ENTITY_KINDS = frozenset(kind.value for kind in EntityKind)
 _NAME_SOURCES = frozenset({"archive", "trade_snapshot", "shop_profile", "unresolved"})
 _ENTITY_KEYS = frozenset({"ref", "kind", "display_name", "sku_label", "name_source",
@@ -340,6 +394,208 @@ def _string_list(value: object, validator) -> None:
         validator(item)
 
 
+def _platform_code(value: object) -> None:
+    """平台码只能是短标识：不放开成第二条自由文本通道。"""
+    if not isinstance(value, str) or not _PLATFORM_CODE_RE.fullmatch(value):
+        _unsafe_payload()
+
+
+def _policy_ref(value: object) -> None:
+    """版本化策略引用（如 `low-margin/1`）：不认识的写法不进载荷。"""
+    if not isinstance(value, str) or not _POLICY_REF_RE.fullmatch(value):
+        _unsafe_payload()
+
+
+def _bool_flag(value: object) -> None:
+    if not isinstance(value, bool):
+        _unsafe_payload()
+
+
+def _decimal_or_null(value: object) -> None:
+    _numeric_result(value)
+
+
+def _date_pair(value: object) -> None:
+    """[start,end) 的文本对：与 suggested_window 同一形状，两个 ISO 日期。"""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        _unsafe_payload()
+    for item in value:
+        if not isinstance(item, str):
+            _unsafe_payload()
+        _date_string(item)
+
+
+def _requested_scope(value: object) -> None:
+    scope = _mapping(value, allowed=frozenset({"mode", "shop_refs", "platforms"}),
+                     required=frozenset({"mode"}))
+    _string_in(scope["mode"], _SCOPE_MODES)
+    if "shop_refs" in scope:
+        _string_list(scope["shop_refs"], _ref)
+    if "platforms" in scope:
+        _string_list(scope["platforms"], _platform_code)
+
+
+def _evaluated_scope(value: object) -> None:
+    scope = _mapping(value, allowed=frozenset({"shop_refs", "platforms"}),
+                     required=frozenset({"shop_refs"}))
+    _string_list(scope["shop_refs"], _ref)
+    if "platforms" in scope:
+        _string_list(scope["platforms"], _platform_code)
+
+
+def _excluded_scope(value: object) -> None:
+    """获准但本轮没评估的店铺：每店一个原因，缺口日期段可附。
+
+    这里出现的一定是本轮已获准的店铺引用：越权店不会因为被排除而露出来
+    （它们根本不进 evaluated/excluded 两个集合）。
+    """
+    if not isinstance(value, list):
+        _unsafe_payload()
+    seen: set[str] = set()
+    for item in value:
+        entry = _mapping(item, allowed=frozenset({"shop_ref", "platform", "reason",
+                                                  "windows"}),
+                         required=frozenset({"shop_ref", "reason"}))
+        _ref(entry["shop_ref"])
+        if entry["shop_ref"] in seen:
+            _unsafe_payload()      # 同一家店两个说法就有一个是错的
+        seen.add(str(entry["shop_ref"]))
+        if "platform" in entry:
+            _platform_code(entry["platform"])
+        _string_in(entry["reason"], _EXCLUDED_REASONS)
+        if "windows" in entry:
+            if not isinstance(entry["windows"], list):
+                _unsafe_payload()
+            for window in entry["windows"]:
+                if not isinstance(window, str) or not _GAP_RE.fullmatch(window):
+                    _unsafe_payload()
+
+
+def _metric_statuses(value: object) -> None:
+    """逐店逐指标的可评估性：可用 / 缺数据 / 不支持 / 口径不可比。"""
+    if not isinstance(value, list):
+        _unsafe_payload()
+    seen: set[tuple[str, str]] = set()
+    for item in value:
+        entry = _mapping(item, allowed=frozenset({"shop_ref", "metric", "status",
+                                                 "reason"}),
+                         required=frozenset({"metric", "status"}))
+        if "shop_ref" in entry:
+            _ref(entry["shop_ref"])
+        key = (str(entry.get("shop_ref")), str(entry["metric"]))
+        if key in seen:
+            _unsafe_payload()
+        seen.add(key)
+        if entry["metric"] not in _METRICS:
+            _unsafe_payload()
+        _string_in(entry["status"], _METRIC_STATUS_VALUES)
+        if "reason" in entry:
+            _string_in(entry["reason"], _STATUS_REASONS)
+
+
+def _resolved_product(value: object) -> None:
+    """解析结果只留引用与版本：ERP 商品号与匹配用的文本都不在这里。"""
+    product = _mapping(value, allowed=frozenset({"product_ref", "sku_refs",
+                                                 "mapping_version",
+                                                 "catalog_version"}),
+                       required=frozenset({"product_ref"}))
+    _ref(product["product_ref"])
+    if "sku_refs" in product:
+        _string_list(product["sku_refs"], _ref)
+    if "mapping_version" in product:
+        version = product["mapping_version"]
+        if not isinstance(version, str) or not _BASIS_NAME_RE.fullmatch(version):
+            _unsafe_payload()
+    if "catalog_version" in product:
+        _non_negative_int(product["catalog_version"])
+
+
+def _comparison(value: object) -> None:
+    """上期比较：每一格都自带“能不能比”，不可比时差额一律 null。"""
+    block = _mapping(value,
+                     allowed=frozenset({"window", "comparable", "reason", "rows"}),
+                     required=frozenset({"window", "comparable", "rows"}))
+    _date_pair(block["window"])
+    _bool_flag(block["comparable"])
+    if "reason" in block:
+        _string_in(block["reason"], _STATUS_REASONS)
+    if not isinstance(block["rows"], list):
+        _unsafe_payload()
+    for row in block["rows"]:
+        entry = _mapping(row, allowed=frozenset({"shop_ref", "metric", "current",
+                                                "previous", "change",
+                                                "change_ratio"}),
+                         required=frozenset({"metric"}))
+        if "shop_ref" in entry:
+            _ref(entry["shop_ref"])
+        if entry["metric"] not in _METRICS:
+            _unsafe_payload()
+        for key in ("current", "previous", "change", "change_ratio"):
+            if key in entry:
+                _decimal_or_null(entry[key])
+        if not block["comparable"] and any(
+                entry.get(key) is not None
+                for key in ("previous", "change", "change_ratio")):
+            # 不可比却给了差额：把口径变化说成经营变化，正是这条规则要挡的。
+            _unsafe_payload()
+
+
+def _opportunity(value: object) -> None:
+    """重点投放候选：只有排序与可逐项核对的候选，不含阈值结论。"""
+    block = _mapping(value, allowed=frozenset({"status", "ranking_scope",
+                                              "candidates", "flagged"}),
+                     required=frozenset({"status", "ranking_scope"}))
+    _string_in(block["status"], _OPPORTUNITY_STATUSES)
+    _string_in(block["ranking_scope"], _RANKING_SCOPES)
+    if "candidates" in block:
+        if not isinstance(block["candidates"], list):
+            _unsafe_payload()
+        for row in block["candidates"]:
+            entry = _mapping(row, allowed=frozenset({"shop_ref", "sales_amount",
+                                                     "sales_share",
+                                                     "product_gross_profit_reference",
+                                                     "product_gross_margin_reference",
+                                                     "sold_quantity"}),
+                             required=frozenset({"shop_ref"}))
+            _ref(entry["shop_ref"])
+            for key, key_value in entry.items():
+                if key != "shop_ref":
+                    _decimal_or_null(key_value)
+    if "flagged" in block:
+        _string_list(block["flagged"], _ref)
+
+
+def _candidate_cards(value: object) -> None:
+    """needs_input 的候选卡片：只能是一张引用，不能带名字也不能带自由文本。
+
+    名字在这条路径上无法安全解析（本路径不建目录、不发 Artifact），所以只发引用；
+    重复引用会把它说成两个商品，同一个引用只计一次。
+    """
+    if not isinstance(value, list):
+        _unsafe_payload()
+    seen: set[str] = set()
+    for item in value:
+        entry = _mapping(item, allowed=frozenset({"ref"}), required=frozenset({"ref"}))
+        _ref(entry["ref"])
+        if entry["ref"] in seen:
+            _unsafe_payload()
+        seen.add(str(entry["ref"]))
+
+
+def _metric_units(value: object) -> None:
+    """每个指标的计量单位：模型不能靠口径文本自己认单位。"""
+    units = _mapping(value, allowed=frozenset(_METRICS))
+    for metric, unit in units.items():
+        if metric not in COMMERCE_METRICS:
+            _unsafe_payload()
+        _string_in(unit, _METRIC_UNITS)
+
+
+def _termination_code(value: object) -> None:
+    if not isinstance(value, str) or value not in TERMINATION_REASONS:
+        _unsafe_payload()
+
+
 def _coverage(value: object) -> dict[str, object]:
     # suggested_window 不在 required 里：旧 Artifact 没这个字段，必须继续可读。
     coverage = _mapping(
@@ -379,7 +635,10 @@ def _artifact_refs(value: object) -> None:
             UUID(ref["id"])
         except ValueError:
             _unsafe_payload()
-        if ref["type"] != "metric_result":
+        # 类型白名单与 `ArtifactRef` 同源（六类可枚举）：运营图要发布趋势与对比
+        # 数据集，把它们挡在状态之外只会让状态记录少掉真实存在的引用。
+        # 能不能属于本领域由 Store 在写 Artifact 时按 `allows_artifact_type` 复核。
+        if ref["type"] not in ARTIFACT_TYPES:
             _unsafe_payload()
 
 
@@ -387,6 +646,22 @@ def _normalized_request(value: object) -> dict[str, object]:
     request = _mapping(value, allowed=_NORMALIZED_REQUEST_KEYS)
     if "shop_refs" in request:
         _string_list(request["shop_refs"], _ref_or_invalid_shop)
+    if "sku_refs" in request:
+        _string_list(request["sku_refs"], _ref)
+    if "platforms" in request:
+        _string_list(request["platforms"], _platform_code)
+    for key, allowed in (("scope_mode", _SCOPE_MODES), ("sales_basis", _SALES_BASES),
+                         ("profit_basis", _PROFIT_BASES), ("report_kind", _REPORT_KINDS)):
+        if key in request:
+            _string_in(request[key], allowed)
+    if "product_ref" in request:
+        _ref(request["product_ref"])
+    if "opportunity_policy_ref" in request:
+        _policy_ref(request["opportunity_policy_ref"])
+    if "trend_days" in request:
+        _positive_int(request["trend_days"])
+        if request["trend_days"] != TREND_DAYS:
+            _unsafe_payload()
     if "metrics" in request:
         _string_list(request["metrics"], lambda item: _string_in(item, _METRICS))
     for boundary in ("start", "end"):
@@ -536,6 +811,18 @@ def _filters(value: object, *, public: bool) -> None:
         _unsafe_payload()
     if "mode" in filters:
         _string_in(filters["mode"], PROMOTION_MODE_VALUES)
+    if "platforms" in filters:
+        _string_list(filters["platforms"], _platform_code)
+    if "product_ref" in filters:
+        _ref(filters["product_ref"])
+    for key, allowed in (("sales_basis", _SALES_BASES), ("profit_basis", _PROFIT_BASES),
+                         ("report_kind", _REPORT_KINDS)):
+        if key in filters:
+            _string_in(filters[key], allowed)
+    if filters.get("sales_share_basis") != "evaluated_only":
+        # 份额只有"对已评估集合"这一种分母；出现别的取值就是有人偷偷换了分母。
+        if "sales_share_basis" in filters:
+            _unsafe_payload()
 
 
 def _metric_definitions(value: object) -> None:
@@ -571,6 +858,29 @@ def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
         _basis_items(payload["basis"])
     if "diagnostics" in payload:
         _diagnostics(payload["diagnostics"])
+    # 契约 v2（spec §3）：范围三面分开，被排除的店铺与原因逐条可核对。
+    if "requested_scope" in payload:
+        _requested_scope(payload["requested_scope"])
+    if "evaluated_scope" in payload:
+        _evaluated_scope(payload["evaluated_scope"])
+    if "excluded_scope" in payload:
+        _excluded_scope(payload["excluded_scope"])
+    if "metric_statuses" in payload:
+        _metric_statuses(payload["metric_statuses"])
+    if "trend_window" in payload:
+        _date_pair(payload["trend_window"])
+    if "resolved_product" in payload:
+        _resolved_product(payload["resolved_product"])
+    if "comparison" in payload and payload["comparison"] is not None:
+        _comparison(payload["comparison"])
+    if "opportunity" in payload and payload["opportunity"] is not None:
+        _opportunity(payload["opportunity"])
+    if "metric_units" in payload:
+        _metric_units(payload["metric_units"])
+    if "candidates" in payload:
+        _candidate_cards(payload["candidates"])
+    if "termination_reason" in payload:
+        _termination_code(payload["termination_reason"])
     return payload
 
 

@@ -37,28 +37,38 @@ class DomainSpec:
     artifact_types: frozenset[str]
 
 
-# 节点名沿用各自状态机的 PersistenceNode 取值，注册表只列白名单不解释语义，
-# 避免同一份节点集合在 SQL 约束、Pydantic 与这里各抄一遍。
-_COMMERCE_NODES = frozenset({
+# 节点名沿用各自状态机的取值，注册表只列白名单不解释语义，避免同一份节点集合在
+# SQL 约束、Pydantic 与这里各抄一份。`runtime.models.PersistenceNode` 是全局可达
+# 节点集，本模块的每个集合是其中属于某个领域的那一段。
+_BUSINESS_NODES = frozenset({
     "received", "resolve_parameters", "validate_parameters", "authorize_scope",
     "execute_fixed_query", "classify_result", "persist_artifact", "finalize",
 })
-_LISTING_NODES = _COMMERCE_NODES | {"assess_readiness", "audit_prices"}
-_INVENTORY_NODES = _COMMERCE_NODES | {"assess_readiness", "scan_inventory", "evaluate_rules"}
+
+# 经营图（计划 Task 7、spec §6 的固定节点链）。推进顺序由
+# `commerce/graph.py` 的状态机决定，这里只回答"这个领域能不能写这个节点"。
+COMMERCE_NODES = frozenset({
+    "resolve_scope", "resolve_product_if_needed", "resolve_metric_basis",
+    "check_capabilities_and_coverage", "freeze_versions", "plan_fixed_queries",
+    "execute_aggregates", "compute_metrics", "build_comparison_and_trend",
+    "classify_findings", "persist_artifacts", "finalize",
+})
+# 尚未实现的领域继续站在旧节点集上：登记只表示"未登记的节点不许写库"，
+# 不代表它们的图已经存在。Task 9/10 落地时各自换成自己的节点链。
+_LISTING_NODES = _BUSINESS_NODES | {"assess_readiness", "audit_prices"}
+_INVENTORY_NODES = _BUSINESS_NODES | {"assess_readiness", "scan_inventory",
+                                      "evaluate_rules"}
 
 _REGISTRY: dict[str, DomainSpec] = {
     "business_query": DomainSpec(
         name="business_query",
-        nodes=frozenset({
-            "received", "resolve_parameters", "validate_parameters", "authorize_scope",
-            "execute_fixed_query", "classify_result", "persist_artifact", "finalize",
-        }),
+        nodes=_BUSINESS_NODES,
         artifact_types=frozenset({"metric_result"}),
     ),
     # 后三个领域在此登记契约，实现按计划 Task 7–10 落地；登记即表示
     # “未实现的节点/类型不允许提前写入”，而不是允许任意 payload。
     "commerce_performance": DomainSpec(
-        name="commerce_performance", nodes=_COMMERCE_NODES,
+        name="commerce_performance", nodes=COMMERCE_NODES,
         artifact_types=frozenset({"metric_result", "comparison_table", "trend_series",
                                   "chart_spec"}),
     ),
@@ -92,3 +102,15 @@ def allows_artifact_type(domain: str, artifact_type: str) -> bool:
     """领域能否产出这种 Artifact：未知领域与未知类型都直接否。"""
     entry = _REGISTRY.get(domain)
     return entry is not None and artifact_type in entry.artifact_types
+
+
+def allows_node(domain: str, node: object) -> bool:
+    """领域能否把状态推进到这个节点：未知领域与未知节点都直接否。
+
+    与 `allows_artifact_type` 同一条理由——白名单只能在一处枚举，不能因为
+    "数据库那一列没有 CHECK"就在运行层放开。
+    """
+    entry = _REGISTRY.get(domain)
+    if entry is None or not isinstance(node, str):
+        return False
+    return node in entry.nodes

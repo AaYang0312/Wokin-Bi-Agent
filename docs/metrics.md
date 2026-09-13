@@ -59,6 +59,7 @@
 | `cash_difference` | paid_amount − refund_amount；**期间收支差额，不是净利润** | 上两者 |
 | `cohort_refund_rate` | 同批：`[start,end)` 支付商业单在明确截止时刻前的累计退款 / 同批支付额 | aftersales_cohort + 原单匹配 |
 | `quantity` / `product_paid_amount` | 有效非赠品父项数量与已核验行级分摊金额；结果以 `line_kind` 区分 sale/suite/combination/processing，套件不是子SKU排行 | order_items |
+| 商品运营参考指标（`sold_quantity` 等 6 项） | 只由 `analyze_product_performance` 发布；口径、覆盖与拒发规则见 §4.2 | order_items / orders / order_payments |
 | 推广费率/ROAS | **未启用**：无实耗来源；折扣/成本不得替代广告费 | 无 |
 
 ## 4. 已知功能门槛
@@ -78,6 +79,65 @@
 - `budget_scenario`：剩余 = max(0, 预算-已花)；超支单列 = max(0, 已花-预算)；日均 = 剩余/剩余天数（排他截止日起算），周期结束不除零。
 - `actual_budget`/`contribution_cap`：一律 missing_data——真实费用率=同期实耗/同期有效支付（分母0不可计算），预算进度要求费用完整覆盖到昨日，贡献上限 max(0, C-P)；均未具备输入，不实现分支。
 - 假设结果 `basis=用户输入假设`，`coverage.status=missing`（无费用实绩源）、`data_as_of=None`；不得写成“账号实际剩余额度”，也不得称店铺收入/费用为广告归因ROAS。
+
+## 4.2 商品运营参考指标（`backend/bi_agent/commerce/`，计划 Task 7）
+
+入口只有一个：`analyze_product_performance(request, context) -> DomainResult`（图：
+`CommercePerformanceGraph`）。模型只能递业务字段与 `ent-` 引用；身份、授权范围、连接与
+deadline 全部来自服务端 `DomainContext`。旧 `query_business` 不变，两者共用同一份
+结果投影与白名单（`business_query.tool.safe_result_body`），不并存第二套数字出口。
+
+口径文案的唯一真源是 `commerce/metrics.py:COMMERCE_METRIC_DEFINITIONS`（下表是人读版）：
+
+| 指标 | 口径 | 不能是什么 |
+| --- | --- | --- |
+| `sold_quantity` | 有效非赠品销售父项件数（`active`、`line_kind<>'gift'`、按 `paid_at` 归属）；套件/组合/加工以父项计 | 不是子 SKU 件数之和 |
+| `sales_amount` | 同一行集合的行级分摊支付金额合计（退款前）；`allocation_verified=false` 的行只计件数不计数额 | 不是平台账单 GMV，也不是净支付 |
+| `weighted_avg_paid_price` | 成交均价 = 同一行集合的分摊金额 ÷ 件数；件数 0 时 null | 不是日均价或店铺均价的平均 |
+| `product_gross_profit_reference` | `SUM(分摊金额 − 行单位成本 × 件数)`，只含成本与分摊都已核验的普通销售行；**任一行缺成本或行性质为套件/组合/加工 ⇒ 整体 null**；未扣售后、平台费、运费、广告费 | 不是净利润，也不是“已知成本子集的整体” |
+| `product_gross_margin_reference` | 同一行集合的商品毛利参考 ÷ 同集合收入；分母 0 或成本覆盖不全 ⇒ null | 不平均店铺利润率，也不拿已知成本除全部收入 |
+| `erp_gross_profit_reference` | `bi.orders.raw_gross_profit` 按**唯一 ERP 单据**聚合（拆合单不摊平）；一半单据无毛利字段 ⇒ null 并披露覆盖率 | 不摊到商品，不与商品毛利相加或相除 |
+
+不可让步的七条规则（均有用例钉在 `backend/tests/test_commerce.py`）：
+
+1. **两个口径面分开发布**。商品面是 `metric_result` 与 `trend_series`，ERP 单据面与
+   已验证支付面是 `comparison_table`。两面一旦同列，早晚被相加或相除，所以行形本身不允许包
+   含对面列（`project()` 当场拒）。
+2. **JOIN 放大**：单据毛利永不连 `order_items`。`reporting.v_erp_document_daily` 主键即
+   `(shop_id, erp_id)`，一张单三行不会把单头毛利变成三倍。
+3. **缺证据是 null 不是 0**：成本、分摊、覆盖、能力四类缺口各自归因，不拿已知子集冒充整体；
+   已覆盖但没成交的日才是真实 0，趋势缺口留 null 并单独披露（`trend_coverage_incomplete`）。
+4. **销售父项口径与支付口径不混用**。`sales_basis=verified_payment` 下商品面不发布任何
+   数字（已验证支付事实停在商业单粒度），只发支付面并标 `incomparable`；两者不得互除。
+5. **范围三面分列 + 多指标独立判定**。`requested_scope` / `evaluated_scope` /
+   `excluded_scope` 各自存；一家店回答不了报告主面就整店退出合计（原因码取自注册表词表：
+   `capability_ungranted` / `coverage_time_basis_unverified` / `coverage_incomplete` 不互代），
+   但能答的指标不会因为共一个请求里另一个指标缺数据而被收走。`partial` 的合计永不称为
+   “所有店铺合计”，排名与份额只针对已评估集合。
+6. **不自动推导投放结论**。低利润候选只按商品毛利参考额升序排队（率与额两列同发，可逐项
+   核对）；没有版本化阈值与最小样本时 `opportunity.status=unconfigured`、`flagged=[]`，
+   不声称 ROAS、不下预算建议。
+7. **上期比较两侧同口径，且比率只在基期为正时成立**。`comparison.rows` 的本期与上期都按
+   该店该窗口内**全部行性质**聚合（结果表本身仍逐行性质发行，不然“第一行”只是 sale 那一组，
+   而上期是全口径，差额就成了两个集合之差）；`change_ratio` 与其余比率同一规则：基期 ≤ 0 就
+   是 null。商品毛利参考允许为负（上期卖得比成本高），-50 → +60 的真实说法是“转亏为盈
+   +110”，除以负基期得到的 -2.2 会把一次上涨说成下跌 220%；`change` 不要求正基期，照发。
+
+取数与角度边界：商品销售/成本面与 `reporting.v_product_daily` 共用同一套纳入条件
+（`sql/017_commerce_views.sql` 逐字沿用 007），两面数值必须相等；`bi_app` 只拿到四张新
+视图的 SELECT，`bi.order_items` / `bi.orders` / `bi.products` / `bi.entity_refs` /
+`bi.catalog_state` 依旧读不到（用例逐表断言 `InsufficientPrivilege`）。汇总、七日序列与
+上期比较共用一个 REPEATABLE READ 只读快照，覆盖判定与取数不会来自两个数据版本。
+
+本轮仍不得因代码存在就宣称的能力：商品成本覆盖率、上架实际价、库存与售后到商品行的
+分配均未取证，所以只发布上述参考指标而不是净利或退货后商品利润；拼多多依旧只有
+`erp_documents` 单据口径可用，支付族永久解析不通（见 §6 与 2026-09-12 决定）。
+
+回归命令（`backend/`）：
+
+```sh
+.venv/bin/python -m unittest tests.test_commerce tests.test_core tests.test_business_query_graph -v
+```
 
 ## 5. 真实对账结果摘要
 

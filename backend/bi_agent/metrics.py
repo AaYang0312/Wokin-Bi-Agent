@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -306,6 +307,25 @@ def _set_query_budget(conn, deadline: float) -> bool:
     return True
 
 
+@contextlib.contextmanager
+def read_only_snapshot(conn):
+    """Open one REPEATABLE READ, read-only snapshot shared by all aggregate reads.
+
+    汇总、趋势与上期必须来自同一个快照：中间插进一次回填，同一份报告就会把两个数据版本拼在一起。
+    已在外层事务里（测试注入合成数据）时退化为保存点，读一致性由外层保证。
+    """
+    if conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE:
+        with conn.transaction():
+            # 事务首条命令：可重复读，防止同步并发造成前后口径漂移
+            conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            conn.execute("SELECT set_config('transaction_read_only', 'on', true)")
+            yield
+        return
+    with conn.transaction():
+        conn.execute("SELECT set_config('transaction_read_only', 'on', true)")
+        yield
+
+
 class _BudgetExhausted(Exception):
     """取行阶段时间预算耗尽。
 
@@ -441,18 +461,8 @@ def query_business(conn, request: QueryRequest, *, allowed_shop_ids: frozenset[s
             status="unavailable", coverage=Coverage(status="missing", start=None, end=None),
             limitations=["本次查询时间预算已耗尽"], filters=_filters(request))
     try:
-        if conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE:
-            tx = conn.transaction()
-            with tx:
-                # 事务首条命令：可重复读，防止同步并发造成前后口径漂移
-                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                conn.execute("SELECT set_config('transaction_read_only', 'on', true)")
-                return _query_in_transaction(conn, request, now=now, deadline=deadline)
-        else:
-            # 已在外层事务（测试注入合成数据）：保存点即可，读一致怿由外层保证
-            with conn.transaction():
-                conn.execute("SELECT set_config('transaction_read_only', 'on', true)")
-                return _query_in_transaction(conn, request, now=now, deadline=deadline)
+        with read_only_snapshot(conn):
+            return _query_in_transaction(conn, request, now=now, deadline=deadline)
     except psycopg.errors.QueryCanceled:
         return ToolResult(
             status="unavailable", coverage=Coverage(status="missing", start=None, end=None),

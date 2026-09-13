@@ -33,13 +33,13 @@ _PUBLIC_FILTER_COLUMNS = ARTIFACT_FILTER_COLUMNS
 
 def to_model_result(result: ToolResult, catalog: "Catalog") -> dict[str, object]:
     """Return the validated ref-only payload permitted for the model."""
-    payload = _safe_result(result, catalog, model_view=True)
+    payload = safe_result_body(result, catalog, model_view=True)
     return validate_model_payload(payload)
 
 
 def to_public_artifact(result: ToolResult, catalog: "Catalog") -> dict[str, object]:
     """Return the validated public artifact payload: refs plus authorized names."""
-    payload = _safe_result(result, catalog, model_view=False)
+    payload = safe_result_body(result, catalog, model_view=False)
     return validate_artifact_payload(payload)
 
 
@@ -96,7 +96,7 @@ def execute_business_query_tool(
     )
 
 
-def _safe_result(
+def safe_result_body(
     result: ToolResult, catalog: "Catalog", *, model_view: bool
 ) -> dict[str, object]:
     """Keep allowlisted aggregates and replace every ERP identifier with its ref.
@@ -104,6 +104,10 @@ def _safe_result(
     Real names never enter the model view; they ride along only in the public
     artifact as ``entities``. Unknown or unauthorized identifiers raise
     ``CatalogUnauthorized`` so the caller fails closed instead of guessing.
+
+    商品运营域（`commerce/tool.py`）复用这一份投影，不再写第二份：
+    行 -> 引用、filters.shop_ids -> shop_refs、basis 去主键这三件事
+    只要有两处实现，总有一处会漏掉某个 ERP 主键。
     """
     payload = result.model_dump(mode="json")
 

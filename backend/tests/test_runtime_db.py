@@ -193,6 +193,36 @@ class RuntimeStoreValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "^forbidden_values_required$"):
             PostgresQueryRunStore(None, forbidden_values=set())
 
+    def test_artifact_type_must_be_allowed_for_the_run_domain(self):
+        """Postgres 侧同一道门：先看运行记录的领域，不匹配就不发 INSERT。
+
+        只靠 009 的全局类型 CHECK 拦不住“领域对但类型不对”：business_query 发一张
+        price_audit 在数据库看是完全合法的一行。
+        """
+        calls: list[str] = []
+
+        class Row:
+            @staticmethod
+            def fetchone():
+                return ("business_query",)
+
+        class DomainConnection:
+            def execute(self, statement, _parameters):
+                calls.append(" ".join(str(statement).split()))
+                return Row()
+
+        store = PostgresQueryRunStore(DomainConnection(), forbidden_values={"S1"})
+
+        with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
+            store.save_artifact(uuid4(), NewArtifact(
+                artifact_type="price_audit", payload={"status": "ok"}))
+        self.assertEqual(len(calls), 1, "领域不匹配时不能走到 INSERT")
+        self.assertIn("SELECT domain", calls[0])
+
+        store.save_artifact(uuid4(), NewArtifact(payload={"status": "ok"}))
+        self.assertEqual(len(calls), 3, "本领域允许的类型照旧写入")
+        self.assertIn("INSERT INTO bi.query_artifacts", calls[2])
+
     def test_artifact_foreign_key_failure_is_a_safe_missing_run_error(self):
         marker = "repository-secret-marker"
 

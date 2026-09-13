@@ -24,6 +24,8 @@ from .business_query.tool import (
     to_public_artifact as _to_public_artifact,
 )
 from .business_query import BusinessQueryContext
+from .commerce.models import DomainContext
+from .commerce.tool import commerce_request_schema, execute_commerce_tool
 from .catalog import (
     Catalog,
     build_catalog,
@@ -43,14 +45,24 @@ MAX_MODEL_TURNS = 5
 MAX_KEPT_TURNS = 6
 
 _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%Y-%m-%d %H:%M}（Asia/Shanghai）。
-只能使用两个工具：
+只能使用三个工具：
 - query_business：按已确认口径查询经营指标，日期end排他；shop_ids 只能填 ent- 形式的店铺引用，
   可用引用：{ref_doc}。引用与真实店名的对应关系你看不到，也不要猜。
+- analyze_product_performance：查**一个指定商品**在获准店铺内的跨店经营报告与七日趋势；
+  product 只能填 ent- 商品引用或一段商品文字，范围用 scope（all_authorized 或显式引用/平台）。
+  商品文字只用于找候选：命中多个候选时工具返 needs_input 并附候选引用，必须把候选问回用户，
+  不能自己选一个；解析不出商品是 missing_data，**绝不能说成销量为 0**。
 - evaluate_promotion：仅按当前用户明确假设测算预算；当前未取得真实推广消耗。
 支持指标：支付金额、支付订单数、客单价、ERP单据数、退款发生额、期间收支差额、同批退款率、商品销量、商品支付金额。
 支持维度：合计、按日、按店铺、按商品。
 结果里的 shop_ref/product_ref 是实体引用：正文直接引用它们，系统会负责换成经营者可读的名称。
-「销售额」在未确认支付/出库口径前不能直接当支付金额；只能按店铺筛，不能按商品名筛。
+「销售额」在未确认支付/出库口径前不能直接当支付金额；只能按店铺筛，不能按商品名筛
+（要按商品查只能走 analyze_product_performance，它自己会先把文字换成商品引用）。
+商品报告里的 product_gross_profit_reference / product_gross_margin_reference 是**参考指标**：
+只含成本与分摊都已核验的普通销售行，未扣售后、平台费、运费与广告费，不是净利润；
+它与 ERP 单据毛利是两个口径面，不能相加、相除，也不能互相分摊。null 是证据不足，不是 0。
+partial 只覆盖 evaluated_scope 里的店铺，excluded_scope 里每家店都带原因：不能把 partial 的
+合计说成“所有店铺合计”，也不能拿它做全量排名；不含 shop_ref 的行只是已评估集合的合计。
 每个结果都带 basis（统计口径）与 time_basis（时间归属）：同名指标不代表同一口径，
 不能自动同义化。平台/店铺对比只展示 basis 相同且已认证的结果；basis 或 time_basis 不同
 时不要汇总、不要算增长率、不要排名（工具会以 basis_incompatible 拒绝，提示按店铺分列，
@@ -368,6 +380,12 @@ def _tool_schemas() -> list[dict[str, object]]:
                            "跨口径范围要分列时用 basis_policy=separate 且 group_by=shop",
             "parameters": QueryRequest.model_json_schema()}},
         {"type": "function", "function": {
+            "name": "analyze_product_performance",
+            "description": "查一个指定商品在获准店铺范围内的跨店经营报告与七日趋势；"
+                           "product 用 ent- 商品引用或商品文字（歧义会返回 needs_input 与候选，"
+                           "不要自己选）；只能参考的毛利未扣售后/平台费/运费/广告费",
+            "parameters": commerce_request_schema()}},
+        {"type": "function", "function": {
             "name": "evaluate_promotion",
             "description": "仅按当前用户明确假设测算预算；当前未取得真实推广消耗",
             "parameters": PromotionRequest.model_json_schema()}},
@@ -474,6 +492,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     last_error: str | None = None
     error_code: str | None = None
     business_attempt_no = 0
+    commerce_attempt_no = 0
 
     for _ in range(MAX_MODEL_TURNS):
         remaining = deadline - time_module.monotonic()
@@ -561,6 +580,45 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     content=json.dumps(execution.domain_result.model_payload,
                                        ensure_ascii=False)))
                 continue
+            if call.name == "analyze_product_performance":
+                commerce_attempt_no += 1
+                commerce_execution = execute_commerce_tool(call, DomainContext(
+                    subject_id=turn_context.subject_id,
+                    allowed_shop_ids=allowed_shop_ids,
+                    shop_refs=dict(state.shop_refs),
+                    conn=conn,
+                    store=run_store,
+                    chat_id=turn_context.chat_id,
+                    user_message_id=turn_context.user_message_id,
+                    # 一条用户消息就是一个根请求：本回合里的商品图调用不另起身份。
+                    root_request_id=turn_context.user_message_id,
+                    now=now,
+                    deadline=deadline,
+                    attempt_no=commerce_attempt_no))
+                calls_used += 1
+                domain_result = commerce_execution.domain_result
+                if (domain_result.error is not None
+                        and domain_result.error.code
+                        in {"artifact_persistence_failed", "result_contract_violation"}):
+                    last_error = domain_result.error.public_message
+                    error_code = domain_result.error.code
+                    results.clear()
+                    artifacts.clear()
+                    stop_after_batch = True
+                    break
+                if commerce_execution.report is not None:
+                    for dataset in commerce_execution.report.datasets:
+                        # 主数据集进结果列表：兜底摘要与“本轮有没有拿到确定性结果”都看它。
+                        results.append(dataset.result)
+                        break
+                # 图内已按同一目录投出公开载荷：展示层直接复用，不二次投影。
+                artifacts.extend(artifact.public_payload
+                                 for artifact in domain_result.artifacts)
+                messages.append(Message(
+                    role="tool", tool_call_id=call.id,
+                    content=json.dumps(domain_result.model_payload,
+                                       ensure_ascii=False)))
+                continue
             if call.arguments_error is not None or call.arguments is None:
                 if correction_used:
                     last_error = "参数两次非法，已停止本次回答"
@@ -576,7 +634,9 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                 messages.append(Message(role="tool", tool_call_id=call.id,
                                         content=json.dumps(
                                             {"error": "unknown_tool",
-                                             "detail": "只允许query_business/evaluate_promotion"},
+                                             "detail": "只允许query_business/"
+                                                       "analyze_product_performance/"
+                                                       "evaluate_promotion"},
                                             ensure_ascii=False)))
                 continue
             if isinstance(outcome, list):

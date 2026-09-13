@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
+from .domain_registry import allows_artifact_type, allows_node
 from .models import (
     ArtifactRef,
     NewArtifact,
@@ -43,6 +44,7 @@ class MemoryQueryRunStore:
         record = self._revalidate_new_run(record)
         self._validate_normalized_request(record.normalized_request)
         self._validate_state(record.state)
+        self._check_domain_node(record.domain, record.state.get("node"))
         if self._has_run_context(record):
             raise ValueError("duplicate_query_run")
         run_id = uuid4()
@@ -107,11 +109,15 @@ class MemoryQueryRunStore:
         ))
 
     def save_artifact(self, run_id: UUID, artifact: NewArtifact) -> ArtifactRef:
-        self._require_run(run_id)
+        run = self._require_run(run_id)
         artifact = self._revalidate_artifact(artifact)
         self._validate_artifact(artifact.payload)
         if artifact.coverage is not None:
             self._validate_coverage(artifact.coverage)
+        # 领域能产出哪种 Artifact 由 `domain_registry` 一处说了算：只校全局类型白名单的话，
+        # business_query 就能写出 price_audit，“按领域白名单”只剩一句注释。
+        if not allows_artifact_type(str(run["domain"]), artifact.artifact_type):
+            raise ValueError("unsafe_persistence_payload")
         artifact_id = uuid4()
         self.artifacts[artifact_id] = {
             "id": artifact_id,
@@ -172,6 +178,17 @@ class MemoryQueryRunStore:
             payload=deepcopy(completion.payload),
             created_at=now,
         ))
+
+    def _check_domain_node(self, domain: str, node: object) -> None:
+        """未登记领域能写的节点：创建时就拒，不等数据库。
+
+        004 的 `current_node` 是无 CHECK 的文本列，领域与节点的配对只能在
+        进入 Store 的这一处核。`transition` / `finish` 不做同样的反查：
+        既有契约明确要求它们不追加 IO，后续节点由各领域图在建链时
+        自己对照注册表（见 commerce.graph 的固定链与对应用例）。
+        """
+        if node is not None and not allows_node(domain, node):
+            raise ValueError("unsafe_persistence_payload")
 
     def _require_run(self, run_id: UUID) -> dict[str, object]:
         try:

@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from psycopg.types.json import Jsonb
 
 from .artifacts import TERMINATION_REASONS
+from .domain_registry import allows_artifact_type, allows_node
 from .models import (
     ArtifactPersistenceError,
     ArtifactRef,
@@ -73,6 +74,7 @@ class PostgresQueryRunStore:
         record = self._revalidate_new_run(record)
         self._validate_normalized_request(record.normalized_request)
         self._validate_state(record.state)
+        self._check_domain_node(record.domain, record.state.get("node"))
         # 契约校验先行，然后才碰库：带着非法载荷去探测 schema 只是把错因搅浑。
         self._ensure_termination_vocabulary()
         run_id = uuid4()
@@ -223,6 +225,15 @@ class PostgresQueryRunStore:
             self._validate_coverage(artifact.coverage)
         artifact_id = uuid4()
         try:
+            # 领域能产出哪种 Artifact 由 `domain_registry` 一处定：只校全局类型白名单的话，
+            # business_query 就能写出 price_audit，“按领域白名单”只剩一句注释。这条读与
+            # 下面的 INSERT 共用同一套错误映射：读失败不能变成另一种故噪。
+            row = self.conn.execute(
+                "SELECT domain FROM bi.query_runs WHERE id = %s", (run_id,)).fetchone()
+            if row is None:
+                raise RunNotFound()
+            if not allows_artifact_type(str(row[0]), artifact.artifact_type):
+                raise ValueError("unsafe_persistence_payload")
             self.conn.execute(
                 """INSERT INTO bi.query_artifacts (
                        id, run_id, artifact_type, payload, data_as_of, coverage
@@ -277,6 +288,17 @@ class PostgresQueryRunStore:
                 status=completion.status,
                 payload=completion.payload,
             )
+
+    def _check_domain_node(self, domain: str, node: object) -> None:
+        """未登记领域能写的节点：创建时就拒，不等数据库。
+
+        004 的 `current_node` 是无 CHECK 的文本列，领域与节点的配对只能在
+        进入 Store 的这一处核。`transition` / `finish` 不做同样的反查：
+        既有契约明确要求它们不追加 IO，后续节点由各领域图在建链时
+        自己对照注册表（见 commerce.graph 的固定链与对应用例）。
+        """
+        if node is not None and not allows_node(domain, node):
+            raise ValueError("unsafe_persistence_payload")
 
     def _validate_normalized_request(self, value: object) -> None:
         validate_normalized_request(value)

@@ -15,36 +15,60 @@ from typing import Iterable, Literal, Sequence
 from .channel_mapping import CHANNEL_MAPPING_VERSION, ChannelItem, channel_items_for
 from .models import is_safe_display_name, ref_for_key
 
+# 范围内候选商品全集的扫描上限。拿它做“能不能断定引用不存在”的门槛：扫不完时
+# 结果必须是 fail closed 的 `scope_too_large`，而不是“这个引用不认识”。
+MAX_SCOPE_CANDIDATES = 2000
+
 ResolutionStatus = Literal["resolved", "ambiguous", "unresolved"]
 
 # 匹配用「档案名或成交快照任一命中」，但**取用哪个名字**回到 `pick_display_name`
 # 一处决定：SQL 不按列序猜优先级，避免在解析层长出第二套规则。
 # strpos 而非 LIKE：LIKE 的通配字面量会被 psycopg 认成占位符前缀。
+#
+# 读 `reporting.v_product_candidate_lines` 而非 `bi.order_items` + `bi.products`：
+# 聊天 API 以 `bi_app` 身份连接，而 005 把 `bi.products` 从该角色收回（档案采购成本
+# 不得外泄）。解析器以前只在管理员 DSN 的用例里跑过，换到真实部署就会抛
+# permission denied 而不是安全的 `unresolved`。视图列形与原查询逐项对应，
+# 纳入条件也一致（成交行全量，不按 active 筛：没成交过的商品由映射视图补）。
 _CANDIDATE_SQL = """
-SELECT i.product_id,
-       max(p.title) AS archive_name,
-       array_agg(DISTINCT nullif(i.product_name_snapshot, '')) AS snapshot_names,
-       array_agg(DISTINCT nullif(i.sku_label_snapshot, '')) AS sku_labels,
-       array_agg(DISTINCT i.shop_id) AS shop_ids
-FROM bi.order_items i
-LEFT JOIN bi.products p ON p.product_id = i.product_id
-WHERE i.shop_id = ANY(%s) AND i.product_id IS NOT NULL
-  AND (strpos(coalesce(nullif(p.title, ''), ''), %s) > 0
-       OR strpos(coalesce(nullif(i.product_name_snapshot, ''), ''), %s) > 0)
-GROUP BY i.product_id
-ORDER BY i.product_id
+SELECT product_id,
+       max(archive_name) AS archive_name,
+       array_agg(DISTINCT nullif(product_name_snapshot, '')) AS snapshot_names,
+       array_agg(DISTINCT nullif(sku_label_snapshot, '')) AS sku_labels,
+       array_agg(DISTINCT shop_id) AS shop_ids
+FROM reporting.v_product_candidate_lines
+WHERE shop_id = ANY(%s)
+  AND (strpos(coalesce(nullif(archive_name, ''), ''), %s) > 0
+       OR strpos(coalesce(nullif(product_name_snapshot, ''), ''), %s) > 0)
+GROUP BY product_id
+ORDER BY product_id
 """
 
 _REF_LOOKUP_SQL = """
-SELECT i.product_id,
-       max(p.title) AS archive_name,
-       array_agg(DISTINCT nullif(i.product_name_snapshot, '')) AS snapshot_names,
-       array_agg(DISTINCT nullif(i.sku_label_snapshot, '')) AS sku_labels,
-       array_agg(DISTINCT i.shop_id) AS shop_ids
-FROM bi.order_items i
-LEFT JOIN bi.products p ON p.product_id = i.product_id
-WHERE i.shop_id = ANY(%s) AND i.product_id = %s
-GROUP BY i.product_id
+SELECT product_id,
+       max(archive_name) AS archive_name,
+       array_agg(DISTINCT nullif(product_name_snapshot, '')) AS snapshot_names,
+       array_agg(DISTINCT nullif(sku_label_snapshot, '')) AS sku_labels,
+       array_agg(DISTINCT shop_id) AS shop_ids
+FROM reporting.v_product_candidate_lines
+WHERE shop_id = ANY(%s) AND product_id = %s
+GROUP BY product_id
+"""
+
+# 范围内候选商品全集：引用是 (kind, 主键) 的哈希，不能反查，只能在本轮授权范围内
+# 逐个派生后比对（与 `catalog/projection.py` 同源的做法，不把派生规则再抄进 SQL）。
+# 多取一行就是截断证据：扫不完时不能把“没扫到”说成“这个引用不认识”。
+_SCOPE_PRODUCT_IDS_SQL = """
+SELECT DISTINCT product_id
+FROM reporting.v_product_candidate_lines
+WHERE shop_id = ANY(%s)
+ORDER BY product_id
+LIMIT %s
+"""
+
+# 引用存在性探针：只回答“是不是一个已知商品引用”，不回答它对应哪个主键。
+_REF_EXISTS_SQL = """
+SELECT 1 FROM reporting.v_product_refs WHERE ref = %s LIMIT 1
 """
 
 
@@ -155,20 +179,29 @@ def resolve_product(conn, *, selector: Selector, authorized_shop_ids: Iterable[s
 
 def _resolve_by_ref(conn, *, ref: str, shops: Sequence[str],
                     at: date) -> ProductResolution:
-    from .repository import lookup_refs
+    """按引用在**本轮授权范围**内定位 ERP 商品。
 
-    found = lookup_refs(conn, [ref])
-    entry = found.get(ref)
-    if entry is None:
+    引用是 (kind, 主键) 的哈希前缀，不能反推主键，所以在范围内逐个派生后比对；
+    `bi.entity_refs` 不进 reporting 层，007 拒绝向应用身份暴露引用→主键映射。
+    三种结果分得清：“这个引用不认识”、“引用认识但本轮看不到成交/档案行”、
+    “范围内候选多到扫不完”（fail closed，不当成不认识）。
+    """
+    wanted = MAX_SCOPE_CANDIDATES + 1
+    rows = conn.execute(_SCOPE_PRODUCT_IDS_SQL, (list(shops), wanted)).fetchall()
+    if len(rows) >= wanted:
+        # 扫不完就不能断“没这个引用”：宁可拒绝本次解析，也不把越权说成不存在。
+        return ProductResolution("unresolved", reason="scope_too_large")
+    for row in rows:
+        product_id = str(row[0])
+        if ref_for_key("product", product_id) != ref:
+            continue
+        return _resolved(conn, _candidate(conn.execute(
+            _REF_LOOKUP_SQL, (list(shops), product_id)).fetchone()),
+            shops=shops, at=at)
+    if conn.execute(_REF_EXISTS_SQL, (ref,)).fetchone() is None:
         return ProductResolution("unresolved", reason="unknown_ref")
-    kind, natural_key = entry
-    if str(kind) != "product":
-        return ProductResolution("unresolved", reason="wrong_kind")
-    rows = conn.execute(_REF_LOOKUP_SQL, (list(shops), str(natural_key))).fetchall()
-    if not rows:
-        # 引用存在但在本次授权范围里看不到成交/档案行：越权与“没有这个商品”必须分开。
-        return ProductResolution("unresolved", reason="out_of_scope")
-    return _resolved(conn, _candidate(rows[0]), shops=shops, at=at)
+    # 引用存在但在本次授权范围里看不到成交/档案行：越权与“没有这个商品”必须分开。
+    return ProductResolution("unresolved", reason="out_of_scope")
 
 
 def _resolved(conn, candidate: Candidate, *, shops: Sequence[str],
