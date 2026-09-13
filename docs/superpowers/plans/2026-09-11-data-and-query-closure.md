@@ -199,12 +199,12 @@ npm run build
 
 **Interfaces:** `resolve_product(conn, *, selector, authorized_scope, at) -> ProductResolution`；selector 为 spec 第 3 节的 ref / text + sku_refs，结果 status=`resolved|ambiguous|unresolved`，携带 product_ref、sku_refs、mapping_version 与可展示候选。`expand_channel_items(conn, *, product_ref, scope, at) -> ChannelItemSet` 返回获准渠道 listing / SKU 引用和映射状态，不从订单历史推导上架全集。
 
-- [ ] 添加同名异物、多规格、多件装、改名、跨账号同号、新品无成交和未知 ref 的失败用例；先运行下方新模块确认红灯。
-- [ ] 建立 source namespace / company / platform / shop / listing / platform_sku 到 ERP 商品 / SKU 的有效期映射，保留 approved / ambiguous / unresolved；平台商品名只能辅助候选，不能决定合并。
-- [ ] 复用已发布 ent 引用并增加版本化映射，不能批量重算旧引用；碰撞时拒绝映射或显式迁移，兼容旧 Artifact。
-- [ ] 新增获准 reporting 映射视图，让 bi_app 完成实体查询与按引用筛选；始终以授权店铺 / 库存池过滤，不开放整张底层主档。
-- [ ] 增加单商品 / SKU 筛选和跟随查询的安全参数；无历史成交的 SKU 仍可解析，用于价审与库存。SKU 主档字段由已核验来源填充。
-- [ ] 回归后提交 `feat: map products and skus across sales channels`。
+- [x] 添加同名异物、多规格、多件装、改名、跨账号同号、新品无成交和未知 ref 的失败用例；先运行下方新模块确认红灯。
+- [x] 建立 source namespace / company / platform / shop / listing / platform_sku 到 ERP 商品 / SKU 的有效期映射，保留 approved / ambiguous / unresolved；平台商品名只能辅助候选，不能决定合并。
+- [x] 复用已发布 ent 引用并增加版本化映射，不能批量重算旧引用；碰撞时拒绝映射或显式迁移，兼容旧 Artifact。
+- [x] 新增获准 reporting 映射视图，让 bi_app 完成实体查询与按引用筛选；始终以授权店铺 / 库存池过滤，不开放整张底层主档。
+- [x] 增加单商品 / SKU 筛选和跟随查询的安全参数；无历史成交的 SKU 仍可解析，用于价审与库存。SKU 主档字段由已核验来源填充。
+- [x] 回归后提交 `feat: map products and skus across sales channels`。
 
 ```sh
 cd backend
@@ -213,6 +213,9 @@ cd backend
 
 验收数据：同名“接头”的 6mm / 8mm 必须返回两个候选；同一 ERP SKU 映射到淘宝、抖音两个链接可归为同 SKU；另一账号相同数字 ID 不归并；无成交的已映射 listing 必须保留。自动合并仅接受已确认的显式标识映射。
 
+
+> **2026-09-12 执行说明**：迁移编号由 010 顺延为 `016_channel_catalog.sql`——主线已按时间顺序应用到 015（Task 5 多来源契约与血缘版本），保留 010 会让「编号 = 应用顺序」失效。
+> 渠道**上架**链接全集仍需已核验来源（渠道接口 / 官方导出）：本轮映射行只能来自显式标识映射（`manual_map` / `channel_api` / `import`）与成交行的 ERP 身份（`trade_line`，`listing_id` 留空）。`bi.skus` 主档未建：没有已核验来源时凭空建表只会让“已接入”看起来比实际更早，规格文本继续取自成交快照与 `pick_sku_label` 的单点规则。
 ## Task 7：现有表项经营指标与商品运营图（P1，依赖 Task 1/3/4/6）
 
 **Files:** Create `backend/bi_agent/commerce/models.py`、`commerce/metrics.py`、`commerce/repository.py`、`commerce/graph.py`、`commerce/tool.py`、`backend/sql/011_commerce_views.sql`、`backend/tests/test_commerce.py`；Modify `backend/bi_agent/agent.py`、`business_query/tool.py`、`docs/metrics.md`。
