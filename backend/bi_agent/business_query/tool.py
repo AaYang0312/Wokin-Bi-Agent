@@ -24,6 +24,7 @@ from .state import BusinessQueryContext, BusinessQueryExecution, BusinessQueryIn
 if TYPE_CHECKING:
     from bi_agent.catalog import Catalog
     from bi_agent.llm import ToolCall
+    from bi_agent.runtime.models import DomainArtifact
 
 # 白名单单一定义在 runtime/models.py（推广列由 promotion.py 供给），
 # 这里只引用，避免第二份手抄集合与校验端漂移。
@@ -94,6 +95,21 @@ def execute_business_query_tool(
         ),
         graph_context,
     )
+
+
+def artifact_event_payload(artifact: "DomainArtifact") -> dict[str, object]:
+    """展示层事件载荷：Artifact 自身的引用与类型 + 已校验的公开载荷。
+
+    为什么要在展示侧补上自身引用：`chart_spec` 只带 `dataset_ref`（落库 id），不把行
+    拄进自己。服务端一侧的配对由各 Store 在写库前核（同运行、同版本），展示层则拿
+    这个 id 在同一条消息的 Artifact 列表里找被引用的那份数据集。
+    找不到时前端只能明说“数据集未取得”：拿列表顺序猜就是拿展示当证据。
+    """
+    return {
+        "artifact_id": str(artifact.ref.id),
+        "artifact_type": artifact.ref.type,
+        **artifact.public_payload,
+    }
 
 
 def safe_result_body(

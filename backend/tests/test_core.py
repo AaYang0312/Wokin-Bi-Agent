@@ -1883,7 +1883,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual([item["function"]["name"] for item in agent._tool_schemas()],
                          ["query_business", "analyze_product_performance",
-                          "evaluate_promotion"])
+                          "compare_performance", "evaluate_promotion"])
         captured: dict[str, object] = {}
         model_payload = {"status": "ok", "data": [{"sales_amount": "550"}],
                          "excluded_scope": [{"shop_ref": S1_REF,
@@ -1937,6 +1937,71 @@ class AgentTests(unittest.TestCase):
                       "范围缺口必须随载荷回到模型，不然它会把 partial 说成全量")
         self.assertNotIn("S1", tool_messages[-1].content or "")
         self.assertEqual(turn.results[0].data, self.KNOWN.data)
+
+    def test_comparison_tool_is_routed_to_the_same_graph_once(self):
+        """对比 Tool 的接线：主层只调一次图，不逐店循环，也不自己拼下钻范围。
+
+        图本身的分组、排名与图表契约由 tests.test_comparison 钉；这里只钉住
+        `compare_performance` 在提示词与路由里的形状（计划 Task 8）。
+        """
+        import bi_agent.agent as agent
+        from bi_agent.agent import SessionState, answer
+        from bi_agent.commerce.graph import CommerceExecution
+        from bi_agent.commerce.models import CommerceDataset, CommerceReport
+        from bi_agent.llm import ToolCall
+        from bi_agent.runtime.models import (ArtifactRef, DomainArtifact, DomainResult,
+                                             DomainStatus)
+        from uuid import uuid4
+
+        captured: dict[str, object] = {}
+        model_payload = {"status": "ok", "data": [{"platform": "fxg",
+                                                   "sales_amount": "900"}],
+                         "group_statuses": [{"platform": "pdd", "status": "partial",
+                                             "shops_requested": 1, "shops_evaluated": 0,
+                                             "reason": "commerce_scope_excluded"}]}
+
+        def fake_graph(request, context, **kwargs):
+            captured["request"] = request
+            captured["context"] = context
+            captured["report_kind"] = kwargs.get("report_kind")
+            dataset = CommerceDataset(artifact_type="comparison_table",
+                                      result=self.KNOWN)
+            return CommerceExecution(
+                domain_result=DomainResult(
+                    run_id=uuid4(), status=DomainStatus.PARTIAL,
+                    model_payload=model_payload,
+                    artifacts=[DomainArtifact(
+                        ref=ArtifactRef(id=uuid4(), type="comparison_table"),
+                        public_payload=model_payload)],
+                    coverage=self.KNOWN.coverage),
+                report=CommerceReport(status="partial", datasets=(dataset,)))
+
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[ToolCall(id="call_p", name="compare_performance",
+                                   arguments={"scope": {"platforms": ["fxg"]},
+                                              "start": "2026-09-01",
+                                              "end": "2026-09-08",
+                                              "group_by": "shop",
+                                              "metrics": ["sales_amount"]})]),
+            _reply(text="抖音两家店的销售额见下方对比表")]
+        with patch("bi_agent.commerce.tool.run_commerce_graph",
+                   side_effect=fake_graph) as routed:
+            turn = answer("抖音各店支付金额对比", SessionState(subject="u1"),
+                          model=model, conn=self._conn(),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+            self.assertEqual(routed.call_count, 1, "一次工具调用只能跑一次图")
+        self.assertEqual(captured["report_kind"], "comparison")
+        self.assertEqual(captured["request"].group_by, "shop",
+                         "下钻范围按本次入参重新解，不沿用上一轮的已评估集合")
+        self.assertEqual(captured["request"].start, date(2026, 9, 1),
+                         "窗口与口径由服务端上下文原样带到图里")
+        self.assertEqual(captured["context"].allowed_shop_ids, frozenset({"S1"}))
+        tool_messages = [m for m in turn.state.turns if m.role == "tool"]
+        self.assertIn("group_statuses", tool_messages[-1].content or "",
+                      "缺失分组必须随载荷回到模型，不然它会把四个平台说成五个")
+        self.assertNotIn("S1", tool_messages[-1].content or "")
 
     def test_follow_up_keeps_filters_only_dates_change(self):
         from bi_agent.agent import SessionState, answer

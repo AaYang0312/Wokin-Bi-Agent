@@ -706,6 +706,82 @@ class RuntimeStoreDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
         self.assertNotIn("S1", json.dumps(payload, ensure_ascii=False))
         self.assertIn("店铺A", json.dumps(payload, ensure_ascii=False))
 
+    def test_store_persists_chart_pairing_and_refuses_a_stale_or_foreign_dataset(self):
+        """图表与数据集的配对要在**数据库行**上成立，不只是 Python 对象里对得上。
+
+        009 给 `bi.query_artifacts` 加了 `dataset_ref` / `chart_version` 两列与一条 CHECK：
+        不写这两列，chart_spec 那一行要么违反 CHECK，要么留下一张谁也不引用的图。
+        另一条运行里的数据集也不能被本轮的图借去用：那会把别人的数据版本说成自己的。
+        """
+        from datetime import date, timedelta
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.metrics import Coverage
+        from bi_agent.presentation.charts import PersistedDataset, build_chart_spec
+        from bi_agent.runtime.artifacts import CHART_SPEC_VERSION, ChartPairingError
+
+        store = PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})
+        data_as_of = datetime(2026, 9, 8, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+        coverage = Coverage(status="partial", start=date(2026, 9, 1),
+                            end=date(2026, 9, 8),
+                            gaps=["2026-09-04~2026-09-05"])
+
+        def new_run(subject: str):
+            chat_id, message_id = self._seed_user_message(subject=subject)
+            return store.create_run(NewQueryRun(
+                chat_id=chat_id, user_message_id=message_id, subject_id=subject,
+                tool_call_id="call_c", domain="commerce_performance", attempt_no=1,
+                state={"node": "resolve_scope"}))
+
+        run_id = new_run("u1")
+        table = store.save_artifact(run_id, NewArtifact(
+            artifact_type="comparison_table", payload={"status": "ok"},
+            data_as_of=data_as_of, coverage=coverage.model_dump(mode="json")))
+        handle = PersistedDataset(artifact_id=table.id, artifact_type=table.type,
+                                  data_as_of=data_as_of, coverage=coverage)
+        payload = build_chart_spec(
+            handle, kind="bar", x="platform", y="sales_amount",
+            series=("platform",), unit="CNY",
+            metric_basis="sales_amount|platform_payment/v1|pay_time",
+            coverage_ref=handle).as_payload()
+
+        def chart_of(**changes):
+            fields = {"artifact_type": "chart_spec", "payload": dict(payload),
+                      "data_as_of": data_as_of,
+                      "coverage": coverage.model_dump(mode="json"),
+                      "dataset_ref": table.id, "chart_version": CHART_SPEC_VERSION}
+            fields.update(changes)
+            return NewArtifact(**fields)
+
+        chart = store.save_artifact(run_id, chart_of())
+        row = self.conn.execute(
+            "SELECT dataset_ref, chart_version FROM bi.query_artifacts WHERE id=%s",
+            (chart.id,)).fetchone()
+        self.assertEqual(row, (table.id, CHART_SPEC_VERSION),
+                         "引用与版本必须落到列上，否则 009 的配对 CHECK 形同虚设")
+
+        # 换一条运行去引用同一份数据集：图不能跨运行借数据版本。
+        other_run = new_run("u2")
+        with self.assertRaises(ChartPairingError) as refused:
+            store.save_artifact(other_run, chart_of())
+        self.assertEqual(refused.exception.reason, "chart_dataset_other_run")
+
+        # 截止时刻变了就不是同一份数据集：旧引用不能给新数签名。
+        with self.assertRaises(ChartPairingError) as refused:
+            store.save_artifact(run_id, chart_of(
+                data_as_of=data_as_of - timedelta(days=1)))
+        self.assertEqual(refused.exception.reason, "chart_dataset_version_mismatch")
+        with self.assertRaises(ChartPairingError) as refused:
+            store.save_artifact(run_id, chart_of(coverage={
+                "status": "complete", "start": "2026-09-01", "end": "2026-09-08",
+                "gaps": []}))
+        self.assertEqual(refused.exception.reason, "chart_dataset_version_mismatch")
+        # 引用一张图表自己：009 只允许数据集被引用。
+        with self.assertRaises(ChartPairingError) as refused:
+            store.save_artifact(run_id, chart_of(dataset_ref=chart.id, payload={
+                **payload, "dataset_ref": str(chart.id), "coverage_ref": str(chart.id)}))
+        self.assertEqual(refused.exception.reason, "chart_dataset_type_invalid")
+
     def test_store_revalidates_constructed_commands_before_writing(self):
         chat_id, message_id = self._seed_user_message()
         store = PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})

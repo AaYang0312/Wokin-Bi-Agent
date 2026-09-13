@@ -20,11 +20,17 @@ from pydantic import (
 
 from bi_agent.catalog import EntityKind, REF_RE, is_safe_display_name
 from bi_agent.commerce.metrics import (
+    CHART_SERIES_COLUMNS, CHART_X_COLUMNS, CHART_Y_COLUMNS,
     COMMERCE_LIMITATION_CODES, COMMERCE_LIMITATION_PATTERNS,
     COMMERCE_METRIC_DEFINITIONS, COMMERCE_METRIC_UNITS, COMMERCE_METRICS,
     COMMERCE_PUBLIC_LIMITATIONS, COMMERCE_RESULT_COLUMNS, EXCLUDED_REASONS,
-    METRIC_STATUS_VALUES, OPPORTUNITY_STATUSES, RANKING_SCOPES, TREND_DAYS)
+    GROUP_STATUS_VALUES, METRIC_STATUS_VALUES, OPPORTUNITY_STATUSES,
+    PLATFORM_GROUP_CODES, RANKING_SCOPES, RANKING_STATUSES, TREND_DAYS)
 from bi_agent.metrics import Coverage, METRIC_DEFINITIONS
+from bi_agent.presentation.charts import (
+    CHART_BASELINES, CHART_KINDS, CHART_NULL_HANDLES, CHART_PAYLOAD_KEYS,
+    CHART_REQUIRED_PAYLOAD_KEYS, CHART_SERIES_COLUMNS, CHART_SPEC_NAME,
+    CHART_UNITS, CHART_X_COLUMNS, CHART_Y_COLUMNS)
 from bi_agent.promotion import (
     PROMOTION_DATE_RESULT_COLUMNS,
     PROMOTION_LABEL_VALUES,
@@ -37,6 +43,9 @@ from bi_agent.promotion import (
 )
 
 from .artifacts import (
+    BASIS_SIGNATURE_RE,
+    CHART_SPEC_VERSION,
+    DATASET_ARTIFACT_TYPES,
     QueryProvenance,
     RequestIdentity,
     TERMINATION_REASONS,
@@ -101,7 +110,7 @@ _RUN_STATUSES = frozenset({
     "running", "succeeded", "needs_input", "missing_data", "partial", "failed",
 })
 _DOMAIN_STATUSES = frozenset({"success", "needs_input", "missing_data", "partial", "failed"})
-_GROUP_BY = frozenset({"total", "day", "shop", "product"})
+_GROUP_BY = frozenset({"total", "day", "shop", "product", "platform"})
 _COMPARE = frozenset({"none", "previous_period"})
 # 商品运营（契约 v2）的枚举：范围、逐指标状态与口径选择。
 # 取值集合由生产方（commerce.metrics）供给，这里只引用不再手抄。
@@ -110,7 +119,7 @@ _METRIC_STATUS_VALUES = METRIC_STATUS_VALUES
 _METRIC_UNITS = frozenset(COMMERCE_METRIC_UNITS.values())
 _SALES_BASES = frozenset({"erp_effective_parent", "verified_payment"})
 _PROFIT_BASES = frozenset({"none", "existing_fields"})
-_REPORT_KINDS = frozenset({"product"})   # comparison 由 Task 8 登记
+_REPORT_KINDS = frozenset({"product", "comparison"})
 _RANKING_SCOPES = RANKING_SCOPES
 _OPPORTUNITY_STATUSES = OPPORTUNITY_STATUSES
 # 排除原因取自注册表词表；逐指标状态的原因取自限制码表
@@ -212,6 +221,8 @@ _NORMALIZED_REQUEST_KEYS = frozenset({
     # 运营图新增：只进引用与业务码，商品文本不进这里（spec §3）。
     "product_ref", "sku_refs", "platforms", "scope_mode", "sales_basis",
     "profit_basis", "trend_days", "report_kind", "opportunity_policy_ref",
+    # 对比报告的分组规则版本：分组规则换了就是另一个问题，旧结果不许命中。
+    "platform_group_rule",
 })
 _ARTIFACT_KEYS = frozenset({
     "status", "metric_definition", "coverage", "limitations", "data_as_of", "filters",
@@ -221,7 +232,21 @@ _ARTIFACT_KEYS = frozenset({
     "requested_scope", "evaluated_scope", "excluded_scope", "metric_statuses",
     "trend_window", "resolved_product", "comparison", "opportunity", "metric_units",
     "termination_reason", "candidates",
+    # 对比报告（Task 8）：分组状态与“哪些分组进了排名 / 合计”。
+    "group_statuses", "ranking",
 })
+
+# ---------------------------------------------------------------------------
+# 图表载荷（chart_spec）的白名单：与数据集载荷是两个完全不相交的键集。
+# 词表的所有者是 `presentation.charts`（它同时是唯一的构造入口），本模块只引用：
+# 两边各自写一份，迟早会出现在这里能写、在那儿画不出来的列。
+# ---------------------------------------------------------------------------
+
+# UUID 串形式与 Artifact 引用同一规则（`str(UUID)` 的小写 8-4-4-4-12）。
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# `metric_basis` 的形状与血缘口径签名同一规则（`指标|口径|时间归属`）：
+# 同一概念不拄第二份正则，也不给载荷留自由文本通道。
+_METRIC_BASIS_RE = BASIS_SIGNATURE_RE
 # 口径与诊断：名称形如 `platform_payment/v1`、`kuaimai-metrics/2`、`pay_time`。
 # 版本段允许 `v1`、`2` 或日期式 `2026-09-12.1`：只允许纯数字会把已登记口径判成非法。
 _BASIS_NAME_RE = re.compile(r"^[a-z0-9_-]+(?:/[a-z0-9][a-z0-9._-]*)?$")
@@ -233,6 +258,8 @@ _DIAGNOSIS_KEYS = frozenset({
     "unmatched_refunds", "matched_cohort_only", "unverified_payments",
     # 单据毛利的覆盖完整性：多少张单据、几张带毛利字段、能不能发布。
     "erp_document_coverage",
+    # 对比报告请求了几个分组、发布了几家：让“缺了哪几个”能机器核对。
+    "comparison_groups",
 })
 _DIAGNOSIS_FIELDS = {
     "unmatched_refunds": frozenset({
@@ -242,6 +269,8 @@ _DIAGNOSIS_FIELDS = {
     "matched_cohort_only": frozenset({"unmatched_count"}),
     "erp_document_coverage": frozenset({
         "documents", "documents_with_gross_profit", "publishable"}),
+    "comparison_groups": frozenset({
+        "groups_requested", "groups_published", "publishable"}),
 }
 # 名称只在授权展示层出现：模型载荷带上这两项就是契约违规。
 _PUBLIC_ONLY_ARTIFACT_KEYS = frozenset({"entities", "catalog_version"})
@@ -268,6 +297,8 @@ _DATE_RESULT_COLUMNS = frozenset({"day"}) | PROMOTION_DATE_RESULT_COLUMNS
 _LABEL_RESULT_VALUES: dict[str, frozenset[str]] = {
     "line_kind": _LINE_KINDS,
     "currency": _CURRENCY_VALUES,
+    # 对比报告的平台分组键：取值只能是来源注册表里登记过的平台码。
+    "platform": PLATFORM_GROUP_CODES,
     **PROMOTION_LABEL_VALUES,
 }
 _RESULT_COLUMNS = (_METRIC_RESULT_COLUMNS | PROMOTION_RESULT_COLUMNS
@@ -472,17 +503,27 @@ def _excluded_scope(value: object) -> None:
 
 
 def _metric_statuses(value: object) -> None:
-    """逐店逐指标的可评估性：可用 / 缺数据 / 不支持 / 口径不可比。"""
+    """逐店 / 逐平台逐指标的可评估性：可用 / 缺数据 / 不支持 / 口径不可比。
+
+    分组键只能是 `shop_ref` 或 `platform`，事必给此其一：spec §3 把“按店铺 / 平台 /
+  指标列出”当成契约要求，不带分组键的状态条目会被读成“整个报告都这样”，而它
+    其实只说的是某一家店。
+    """
     if not isinstance(value, list):
         _unsafe_payload()
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for item in value:
-        entry = _mapping(item, allowed=frozenset({"shop_ref", "metric", "status",
-                                                 "reason"}),
+        entry = _mapping(item, allowed=frozenset({"shop_ref", "platform", "metric",
+                                                 "status", "reason"}),
                          required=frozenset({"metric", "status"}))
         if "shop_ref" in entry:
             _ref(entry["shop_ref"])
-        key = (str(entry.get("shop_ref")), str(entry["metric"]))
+        if "platform" in entry:
+            _platform_code(entry["platform"])
+        if ("shop_ref" in entry) == ("platform" in entry):
+            _unsafe_payload()      # 两个都给或都不给：同一个状态被说了两件不同的事
+        key = (str(entry.get("shop_ref")), str(entry.get("platform")),
+               str(entry["metric"]))
         if key in seen:
             _unsafe_payload()
         seen.add(key)
@@ -491,6 +532,186 @@ def _metric_statuses(value: object) -> None:
         _string_in(entry["status"], _METRIC_STATUS_VALUES)
         if "reason" in entry:
             _string_in(entry["reason"], _STATUS_REASONS)
+
+
+def _group_statuses(value: object) -> None:
+    """对比报告的分组完整性（spec §8：无数据平台保留原因标签）。
+
+    一个分组只能以店铺引用或平台码为键，而且只出现一次：同一个组给两个说法，
+    其中一个是错的，而读者无从知道是哪一个。
+    """
+    if not isinstance(value, list):
+        _unsafe_payload()
+    seen: set[str] = set()
+    for item in value:
+        entry = _mapping(item, allowed=frozenset({"shop_ref", "platform", "status",
+                                                 "reason", "shops_requested",
+                                                 "shops_evaluated"}),
+                         required=frozenset({"status"}))
+        if ("shop_ref" in entry) == ("platform" in entry):
+            _unsafe_payload()
+        key = str(entry.get("shop_ref") or entry.get("platform"))
+        if key in seen:
+            _unsafe_payload()
+        seen.add(key)
+        if "shop_ref" in entry:
+            _ref(entry["shop_ref"])
+        if "platform" in entry:
+            _platform_code(entry["platform"])
+        _string_in(entry["status"], GROUP_STATUS_VALUES)
+        if "reason" in entry:
+            _string_in(entry["reason"], _STATUS_REASONS)
+        for column in ("shops_requested", "shops_evaluated"):
+            if column in entry:
+                _non_negative_int(entry[column])
+        if (entry.get("shops_evaluated") is not None
+                and entry.get("shops_requested") is not None
+                and entry["shops_evaluated"] > entry["shops_requested"]):
+            # 评估了比获准还多家：这个分组里混进了不获准的店铺。
+            _unsafe_payload()
+
+
+def _ranking(value: object) -> None:
+    """排名块：合计与名次只覆盖完整且同口径的分组集合（spec §3、§8）。
+
+    三条一起成立才能叫 `complete`：同口径、每个已发布分组都有值、分组粒度单一。
+    `missing` 里每家分组都带原因，不会从排名里静默消失，也不会被当成 0。
+    """
+    if not isinstance(value, list):
+        _unsafe_payload()
+    seen: set[str] = set()
+    for item in value:
+        block = _mapping(item, allowed=frozenset({"metric", "status", "reason",
+                                                 "basis", "time_basis",
+                                                 "ranking_scope", "rows", "missing"}),
+                         required=frozenset({"metric", "status", "ranking_scope",
+                                             "rows"}))
+        if block["metric"] not in _METRICS:
+            _unsafe_payload()
+        if str(block["metric"]) in seen:
+            _unsafe_payload()      # 一个指标两份排名就有一份是多余的说法
+        seen.add(str(block["metric"]))
+        _string_in(block["status"], RANKING_STATUSES)
+        _string_in(block["ranking_scope"], RANKING_SCOPES)
+        if "reason" in block:
+            _string_in(block["reason"], _STATUS_REASONS)
+        for column in ("basis", "time_basis"):
+            if column in block and not (isinstance(block[column], str)
+                                        and _BASIS_NAME_RE.fullmatch(block[column])):
+                _unsafe_payload()
+        if block["status"] == "incomparable" and "basis" in block:
+            # 口径不一致时不能再贴一个口径名：那会把“多个口径”说成“一个口径”。
+            _unsafe_payload()
+        rows = block["rows"]
+        if not isinstance(rows, list):
+            _unsafe_payload()
+        grouped: set[str] = set()
+        for row in rows:
+            entry = _mapping(row, allowed=frozenset({"shop_ref", "platform", "value",
+                                                   "rank"}),
+                             required=frozenset({"value", "rank"}))
+            if ("shop_ref" in entry) == ("platform" in entry):
+                _unsafe_payload()
+            key = str(entry.get("shop_ref") or entry.get("platform"))
+            if key in grouped:
+                _unsafe_payload()
+            grouped.add(key)
+            if "shop_ref" in entry:
+                _ref(entry["shop_ref"])
+            if "platform" in entry:
+                _platform_code(entry["platform"])
+            _decimal_or_null(entry["value"])
+            if entry["rank"] is not None:
+                _positive_int(entry["rank"])
+            if block["status"] != "complete" and entry["rank"] is not None:
+                # 集合不完整 / 口径不一致却给了名次：那一个“第一”没有依据。
+                _unsafe_payload()
+            if entry["value"] is None and entry["rank"] is not None:
+                _unsafe_payload()  # 缺值不当 0 参加排名，也不得占一个名次
+        missing = block.get("missing")
+        if missing is not None:
+            if not isinstance(missing, list):
+                _unsafe_payload()
+            for item_value in missing:
+                entry = _mapping(item_value,
+                                 allowed=frozenset({"shop_ref", "platform", "reason"}),
+                                 required=frozenset({"reason"}))
+                if ("shop_ref" in entry) == ("platform" in entry):
+                    _unsafe_payload()
+                if "shop_ref" in entry:
+                    _ref(entry["shop_ref"])
+                if "platform" in entry:
+                    _platform_code(entry["platform"])
+                # 缺口的原因只能说一次：同时带 shop_ref 与 platform 就是把一件事
+                # 报给两个读者，而两份说法早晚会对不上。
+                _string_in(entry["reason"], _STATUS_REASONS)
+        if block["status"] == "complete" and missing is not None:
+            _unsafe_payload()      # 自称完整却又列出缺项
+
+
+def _chart_payload(value: object) -> dict[str, object]:
+    """图表声明载荷：键集与数据集载荷不相交，所以判别是唯一下一行代码。"""
+    payload = _mapping(value, allowed=CHART_PAYLOAD_KEYS,
+                       required=CHART_REQUIRED_PAYLOAD_KEYS)
+    _positive_int(payload["chart_version"])
+    if payload["chart_version"] != CHART_SPEC_VERSION:
+        # 旧形状的载荷不在新列上复用：读回时字段含义已经变了。
+        _unsafe_payload()
+    if payload["spec_version"] != CHART_SPEC_NAME:
+        _unsafe_payload()
+    _string_in(payload["kind"], CHART_KINDS)
+    _string_in(payload["x"], CHART_X_COLUMNS)
+    _string_in(payload["y"], CHART_Y_COLUMNS)
+    _string_in(payload["unit"], CHART_UNITS)
+    _string_in(payload["baseline"], CHART_BASELINES)
+    _string_in(payload["null_values"], CHART_NULL_HANDLES)
+    _string_in(payload["dataset_type"], DATASET_ARTIFACT_TYPES)
+    _string_in(payload["coverage_status"], _COVERAGE_STATUSES)
+    for column in ("dataset_ref", "coverage_ref"):
+        if not isinstance(payload[column], str) \
+                or not _UUID_RE.fullmatch(payload[column]):
+            # 必须是 `str(UUID)` 原样：拿任意文本当引用就是给“指错了数据集”留门。
+            _unsafe_payload()
+    if payload["dataset_ref"] != payload["coverage_ref"]:
+        # 本轮一张图只从一份数据集出数：分开两个引用就是允许“拿 A 的覆盖说 B 的数”。
+        _unsafe_payload()
+    if not isinstance(payload["series"], list):
+        _unsafe_payload()
+    for column in payload["series"]:
+        _string_in(column, CHART_SERIES_COLUMNS)
+    basis = payload["metric_basis"]
+    if not isinstance(basis, str) or not _METRIC_BASIS_RE.fullmatch(basis):
+        # `指标|口径|时间归属`：与血缘签名同一个形状，不开自由文本通道。
+        _unsafe_payload()
+    if basis.split("|", 1)[0] != str(payload["y"]):
+        _unsafe_payload()
+    if payload["unit"] != COMMERCE_METRIC_UNITS[str(payload["y"])]:
+        # 单位由指标决定：允许自填单就能把件、元、率三样东西画到同一根轴上。
+        _unsafe_payload()
+    if payload["kind"] == "bar" and payload["baseline"] != "zero":
+        _unsafe_payload()   # 条形图不零基线就是拿轴长编故事
+    if payload["kind"] == "bar" and payload["x"] == "day":
+        _unsafe_payload()   # 按日的条形图会把缺失日画成“没有这根柱子”
+    if payload["kind"] == "line" and payload["x"] != "day":
+        _unsafe_payload()
+    if payload["kind"] == "scatter":
+        _unsafe_payload()   # 本轮没有 scatter 的生产者：不接受，也不预备
+    for boundary in ("dataset_data_as_of",):
+        _datetime_string(payload[boundary])
+    for boundary in ("coverage_start", "coverage_end"):
+        _date_string(payload[boundary])
+    if not isinstance(payload["coverage_gaps"], list):
+        _unsafe_payload()
+    for gap in payload["coverage_gaps"]:
+        if not isinstance(gap, str) or not _GAP_RE.fullmatch(gap):
+            _unsafe_payload()
+    if "currency" in payload:
+        _string_in(payload["currency"], _CURRENCY_VALUES)
+        if payload["unit"] != "CNY":
+            _unsafe_payload()   # 不系金额的指标不带币种
+    elif payload["unit"] == "CNY":
+        _unsafe_payload()
+    return payload
 
 
 def _resolved_product(value: object) -> None:
@@ -658,6 +879,11 @@ def _normalized_request(value: object) -> dict[str, object]:
         _ref(request["product_ref"])
     if "opportunity_policy_ref" in request:
         _policy_ref(request["opportunity_policy_ref"])
+    if "platform_group_rule" in request:
+        # 分组规则版本是短标识，不是自由文本：与口径名同一规则。
+        if not isinstance(request["platform_group_rule"], str) \
+                or not _BASIS_NAME_RE.fullmatch(request["platform_group_rule"]):
+            _unsafe_payload()
     if "trend_days" in request:
         _positive_int(request["trend_days"])
         if request["trend_days"] != TREND_DAYS:
@@ -867,6 +1093,10 @@ def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
         _excluded_scope(payload["excluded_scope"])
     if "metric_statuses" in payload:
         _metric_statuses(payload["metric_statuses"])
+    if "group_statuses" in payload:
+        _group_statuses(payload["group_statuses"])
+    if "ranking" in payload:
+        _ranking(payload["ranking"])
     if "trend_window" in payload:
         _date_pair(payload["trend_window"])
     if "resolved_product" in payload:
@@ -929,7 +1159,15 @@ def validate_model_payload(value: object) -> dict[str, object]:
     return _public_metric_payload(value, public=False)
 
 
-def validate_artifact_payload(value: object) -> dict[str, object]:
+def validate_artifact_payload(value: object,
+                             artifact_type: str = "metric_result") -> dict[str, object]:
+    """公开 Artifact 载荷校验：按类型判到哪一个独立 schema（spec §3 判别联合）。
+
+    `chart_spec` 与数据集载荷的键集完全不相交（图表不带 `status`/`data`），所以
+    类型就是唯一的判别位；未知类型与不属于本领域的类型仍由各 Store 按注册表拒掉。
+    """
+    if artifact_type == "chart_spec":
+        return _chart_payload(value)
     return _public_metric_payload(value, public=True)
 
 
@@ -945,7 +1183,6 @@ NormalizedRequest = Annotated[dict[str, object], BeforeValidator(validate_normal
 PersistedState = Annotated[dict[str, object], BeforeValidator(validate_persisted_state)]
 EventPayload = Annotated[dict[str, object], BeforeValidator(validate_event_payload)]
 ModelPayload = Annotated[dict[str, object], BeforeValidator(validate_model_payload)]
-ArtifactPayload = Annotated[dict[str, object], BeforeValidator(validate_artifact_payload)]
 CoveragePayload = Annotated[dict[str, object], BeforeValidator(validate_coverage_payload)]
 
 
@@ -1009,7 +1246,15 @@ class DomainArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     ref: ArtifactRef
-    public_payload: ArtifactPayload
+    # 载荷按 `ref.type` 判到哪个 schema：图表载荷与数据集载荷是两份独立契约，
+    # 所以下面用 after-validator 拿类型去分发，而不是在字段上固定一份校验器。
+    public_payload: dict[str, object]
+
+    @model_validator(mode="after")
+    def _payload_matches_artifact_type(self) -> "DomainArtifact":
+        self.public_payload = validate_artifact_payload(self.public_payload,
+                                                       self.ref.type)
+        return self
 
 
 class DomainResult(BaseModel):
@@ -1097,7 +1342,8 @@ class NewArtifact(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     artifact_type: str = "metric_result"
-    payload: ArtifactPayload
+    # 与 `DomainArtifact` 同一规则：载荷形状由类型决定，不在字段上写死一份校验器。
+    payload: dict[str, object]
     data_as_of: datetime | None = None
     coverage: CoveragePayload | None = None
     # 只有 chart_spec 需要这两项；由数据库 CHECK 与本校验双重守住。
@@ -1116,8 +1362,17 @@ class NewArtifact(BaseModel):
         if self.artifact_type == "chart_spec":
             if self.dataset_ref is None or self.chart_version is None:
                 raise ValueError("chart_requires_dataset_version")
+            # 载荷与列必须说同一件事：引用、覆盖引用与版本三对都逐字相同，
+            # 否则“列指向 A、载荷里写 B”就是两份互相矛盾的出处面。
+            # 被引用的数据集是不是**真的存在且同版本**由各 Store 在写库前核
+            # （`runtime.artifacts.verify_chart_pairing`）。
+            if (self.payload.get("dataset_ref") != str(self.dataset_ref)
+                    or self.payload.get("coverage_ref") != str(self.dataset_ref)
+                    or self.payload.get("chart_version") != self.chart_version):
+                raise ValueError("chart_reference_mismatch")
         elif self.dataset_ref is not None or self.chart_version is not None:
             raise ValueError("unexpected_dataset_reference")
+        self.payload = validate_artifact_payload(self.payload, self.artifact_type)
         return self
 
 

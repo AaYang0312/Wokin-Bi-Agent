@@ -180,7 +180,8 @@ export default function App() {
           disabled={controller.current !== null || !selectedId}
           title={active?.title ?? null} updatedAt={active?.updated_at ?? null} chatCount={chats.length}
           narrow={narrow} drawerOpen={sidebarOpen} menuToggleRef={menuToggleRef}
-          onOpenSidebar={() => setSidebarOpen(true)} onSend={send} />
+          onOpenSidebar={() => setSidebarOpen(true)} onSend={send}
+          onDrilldown={(intent) => void send(intent.question)} />
       </div>
     </div>
   )

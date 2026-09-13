@@ -24,15 +24,21 @@ from bi_agent.runtime.models import (
     DomainResult, validate_artifact_payload, validate_model_payload)
 
 from .graph import CommerceExecution, run_commerce_graph
-from .models import CommerceDataset, CommerceReport, DomainContext, ProductPerformanceRequest
+from .models import (
+    CommerceDataset,
+    CommerceReport,
+    DomainContext,
+    PerformanceComparisonRequest,
+    ProductPerformanceRequest,
+)
 
 if TYPE_CHECKING:
     from bi_agent.llm import ToolCall
 
 # 商品运营契约 v2 的附加字段：spec §3 逐条列出的范围 / 状态 / 血缘材料。
 _EXTRAS = ("requested_scope", "evaluated_scope", "excluded_scope", "metric_statuses",
-           "resolved_product", "comparison", "opportunity", "trend_window",
-           "metric_units", "termination_reason")
+           "group_statuses", "ranking", "resolved_product", "comparison", "opportunity",
+           "trend_window", "metric_units", "termination_reason")
 
 
 def _body(dataset: CommerceDataset, catalog: Catalog, report: CommerceReport,
@@ -43,8 +49,13 @@ def _body(dataset: CommerceDataset, catalog: Catalog, report: CommerceReport,
     # 算得出来。两家可算一家缺口时，两份载荷都必须写 partial，不然展示层会拿
     # 着一份“合计”当成全量合计。`forbidden`/故障路径不发数字，也就不进这里。
     body["status"] = report.status if report.status in ("ok", "partial") else "ok"
-    body["evaluated_scope"] = {"shop_refs": [
+    evaluated: dict[str, Any] = {"shop_refs": [
         catalog.shop_ref(shop) for shop in report.evaluated_shop_ids]}
+    # 平台分组：把“哪些平台真的出了完整分组”与 shop_refs 并列给出。
+    # 与 `requested_scope.platforms` 一比就知道哪个平台没数，不靠展示层推分组归属。
+    if report.evaluated_platforms:
+        evaluated["platforms"] = list(report.evaluated_platforms)
+    body["evaluated_scope"] = evaluated
     for key in _EXTRAS:
         if key == "evaluated_scope":
             continue
@@ -95,6 +106,50 @@ def analyze_product_performance(request: ProductPerformanceRequest,
                               tool_call_id=f"commerce:{context.subject_id}").domain_result
 
 
+class UnknownCommerceTool(ValueError):
+    """不认识的运营工具名：报告种类与入参契约的配对只在这张表里成立，不认识就拒。"""
+
+    def __init__(self, name: object) -> None:
+        super().__init__(f"commerce_tool_unknown:{name}")
+
+
+# 工具名 → (报告种类, 入参契约)。两个公开 Tool 跑同一张图，但入参不同：配对收在这一处，
+# 就不会出现"拿商品请求去跑对比报告"那种发出一份看起来是对比表的商品表的错。
+_COMMERCE_TOOLS: Mapping[str, tuple[str, type]] = {
+    "analyze_product_performance": ("product", ProductPerformanceRequest),
+    "compare_performance": ("comparison", PerformanceComparisonRequest),
+}
+
+
+def _pair_for(name: str) -> tuple[str, type]:
+    try:
+        return _COMMERCE_TOOLS[name]
+    except KeyError:
+        raise UnknownCommerceTool(name) from None
+
+
+def _report_kind_for(name: str) -> str:
+    return _pair_for(name)[0]
+
+
+def _commerce_model_for(name: str) -> type:
+    return _pair_for(name)[1]
+
+
+def compare_performance(request: PerformanceComparisonRequest,
+                       context: DomainContext) -> DomainResult:
+    """计划 Task 8 的公开接口：一次调用拿到平台 / 店铺对比表、可选趋势与图表。
+
+    与商品报告共用同一张图、同一次集合查询与同一套门禁：`report_kind=comparison`
+    只换分组粒度，不另开一条执行路径，也不按店铺循环（spec §2、§6）。
+    下钻（点一个平台看它各店）是一次**新**的 compare_performance：范围、窗口与
+    口径按本次入参重新过授权，不沿用上一次的已评估集合。
+    """
+    return run_commerce_graph(report_kind="comparison", request=request,
+                              context=context,
+                              tool_call_id=f"commerce:{context.subject_id}").domain_result
+
+
 def execute_commerce_tool(call: "ToolCall", context: DomainContext) -> CommerceExecution:
     """主 Agent 适配器：把一条模型工具调用换成一次经营图执行。
 
@@ -103,17 +158,23 @@ def execute_commerce_tool(call: "ToolCall", context: DomainContext) -> CommerceE
     """
     arguments = dict(call.arguments) if call.arguments is not None else None
     error = call.arguments_error
-    request: ProductPerformanceRequest | None = None
+    request: ProductPerformanceRequest | PerformanceComparisonRequest | None = None
     if error is None and arguments is not None:
         try:
-            request = ProductPerformanceRequest.model_validate(arguments)
+            request = _commerce_model_for(call.name).model_validate(arguments)
         except Exception as exc:  # noqa: BLE001 - 只取首行，不把校验细节发给模型
             error = str(exc).split("\n")[0]
     elif error is None:
         error = "arguments不是对象"
-    return run_commerce_graph(report_kind="product", request=request, context=context,
+    return run_commerce_graph(report_kind=_report_kind_for(call.name),
+                              request=request, context=context,
                               tool_call_id=call.id, arguments=arguments,
                               arguments_error=error)
+
+
+def comparison_request_schema() -> dict[str, Any]:
+    """`compare_performance` 的模型可见 schema：分组维度与范围同样只有业务码与引用。"""
+    return PerformanceComparisonRequest.model_json_schema()
 
 
 def commerce_request_schema() -> dict[str, Any]:
@@ -122,4 +183,5 @@ def commerce_request_schema() -> dict[str, Any]:
 
 
 __all__ = ["analyze_product_performance", "commerce_request_schema",
+           "comparison_request_schema", "compare_performance",
            "execute_commerce_tool", "model_payload", "project_dataset"]

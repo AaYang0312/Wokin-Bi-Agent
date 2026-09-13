@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import type { ChatMessage } from '../types'
 import type { Align, Block, Inline } from '../richText'
 import { ASCII_TABLE_LANGUAGE, parseRichText } from '../richText'
+import type { DrilldownIntent } from '../types'
 import { ArtifactView } from './ArtifactView'
 import { BrandMark } from './icons'
 
@@ -96,7 +97,13 @@ export function RichContent({ text }: { text: string }) {
   return <div className="rich-content">{parseRichText(text).map(renderBlock)}</div>
 }
 
-export function MessageView({ message }: { message: ChatMessage }) {
+export function MessageView({
+  message, onDrilldown,
+}: {
+  message: ChatMessage
+  /** 图表下钻：外层把它变成一次新的、仍由服务端展开授权的提问。 */
+  onDrilldown?: (intent: DrilldownIntent) => void
+}) {
   return (
     <article className={`message ${message.role}`}>
       <div className="message-label">
@@ -106,7 +113,12 @@ export function MessageView({ message }: { message: ChatMessage }) {
       <div className="message-content">
         {message.role === 'assistant' ? <RichContent text={message.content} /> : message.content}
       </div>
-      {message.artifacts.map((artifact, index) => <ArtifactView artifact={artifact} key={index} />)}
+      {message.artifacts.map((artifact, index) => (
+        <ArtifactView
+          key={index}
+          artifact={artifact}
+          datasets={message.artifacts}
+          onDrilldown={onDrilldown} />))}
     </article>
   )
 }

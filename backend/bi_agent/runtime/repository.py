@@ -10,7 +10,7 @@ from psycopg import errors
 from pydantic import ValidationError
 from psycopg.types.json import Jsonb
 
-from .artifacts import TERMINATION_REASONS
+from .artifacts import TERMINATION_REASONS, verify_chart_pairing
 from .domain_registry import allows_artifact_type, allows_node
 from .models import (
     ArtifactPersistenceError,
@@ -220,7 +220,7 @@ class PostgresQueryRunStore:
 
     def save_artifact(self, run_id: UUID, artifact: NewArtifact) -> ArtifactRef:
         artifact = self._revalidate_artifact(artifact)
-        self._validate_artifact(artifact.payload)
+        self._validate_artifact(artifact.payload, artifact.artifact_type)
         if artifact.coverage is not None:
             self._validate_coverage(artifact.coverage)
         artifact_id = uuid4()
@@ -234,10 +234,26 @@ class PostgresQueryRunStore:
                 raise RunNotFound()
             if not allows_artifact_type(str(row[0]), artifact.artifact_type):
                 raise ValueError("unsafe_persistence_payload")
+            if artifact.artifact_type == "chart_spec":
+                # “图表与数据集同版本”要能从已落库的行里核出来，不能只信调用方：
+                # 与内存 Store 跑同一个 `verify_chart_pairing`，否则内存测试比真实
+                # 部署宽，而数据库那份 CHECK 只能验证两个列非空。
+                dataset = self.conn.execute(
+                    """SELECT id, run_id, artifact_type, data_as_of, coverage
+                       FROM bi.query_artifacts WHERE id = %s""",
+                    (artifact.dataset_ref,)).fetchone()
+                verify_chart_pairing(
+                    None if dataset is None else {
+                        "id": dataset[0], "run_id": dataset[1],
+                        "artifact_type": dataset[2], "data_as_of": dataset[3],
+                        "coverage": dataset[4]},
+                    run_id=run_id, chart_version=int(artifact.chart_version or 0),
+                    data_as_of=artifact.data_as_of, coverage=artifact.coverage)
             self.conn.execute(
                 """INSERT INTO bi.query_artifacts (
-                       id, run_id, artifact_type, payload, data_as_of, coverage
-                   ) VALUES (%s, %s, %s, %s, %s, %s)""",
+                       id, run_id, artifact_type, payload, data_as_of, coverage,
+                       dataset_ref, chart_version
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
                     artifact_id,
                     run_id,
@@ -245,6 +261,8 @@ class PostgresQueryRunStore:
                     Jsonb(artifact.payload),
                     artifact.data_as_of,
                     Jsonb(artifact.coverage),
+                    artifact.dataset_ref,
+                    artifact.chart_version,
                 ),
             )
         except errors.ForeignKeyViolation:
@@ -312,8 +330,9 @@ class PostgresQueryRunStore:
         validate_event_payload(value)
         self._reject_forbidden_values(value)
 
-    def _validate_artifact(self, value: object) -> None:
-        validate_artifact_payload(value)
+    def _validate_artifact(self, value: object, artifact_type: str) -> None:
+        # 载荷形状由类型判到哪一个 schema：图表与数据集是两份独立契约。
+        validate_artifact_payload(value, artifact_type)
         self._reject_forbidden_values(value)
 
     def _validate_coverage(self, value: object) -> None:

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Mapping
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -31,9 +31,15 @@ from .domain_registry import (
 from bi_agent.sources import METRIC_VERSION, POLICY_VERSION, SOURCE_REGISTRY_VERSION
 GRAPH_VERSION = "business_query-graph/2026-09-11.1"
 # 口径签名形状：`指标|口径|时间归属`，三段都取自注册表用过的字符集。
-_BASIS_SIGNATURE_RE = re.compile(r"^[a-z_]+\|[a-z0-9_/]+\|[a-z_]+$")
+# 图表契约（`presentation.charts`）共用同一个形状：同一个概念不拄两份正则。
+BASIS_SIGNATURE_RE = re.compile(r"^[a-z_]+\|[a-z0-9_/]+\|[a-z_]+$")
 QUERY_TEMPLATE_ID = "fixed_metric_query"
 QUERY_TEMPLATE_VERSION = "1"
+# 图表契约自身的版本：与 `bi.query_artifacts.chart_version` 同一个数。
+# 字段形状一变就要推进（旧 Artifact 按旧形状读，覆写等于改历史）；
+# 定义放在这里而不是 `presentation.charts`，因为本模块与 charts 都要拿它校配对，
+# 而 charts 己经仍依赖本模块（反向引用会成环）。
+CHART_SPEC_VERSION = 1
 
 
 def _reject_text(value: object) -> object:
@@ -86,7 +92,7 @@ class QueryProvenance(BaseModel):
     def _basis_is_a_sorted_signature(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         """签名形如 `paid_amount|platform_payment/v1|pay_time`：不带主键、不带方法名。"""
         for item in value:
-            if not isinstance(item, str) or not _BASIS_SIGNATURE_RE.fullmatch(item):
+            if not isinstance(item, str) or not BASIS_SIGNATURE_RE.fullmatch(item):
                 raise ValueError("unsafe_provenance_value")
         return tuple(sorted(set(value)))
 
@@ -189,6 +195,47 @@ def request_fingerprint(*, subject_id: str, allowed_shop_ids: frozenset[str],
         sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":"),
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+class ChartPairingError(ValueError):
+    """图表没能在本次运行里引用到一份同版本数据集。
+
+    两个 Store 在写库前都跑同一个检查；报出的原因码会被上游按码降级成
+    「只发表格 + warning」（spec §7：可选 chart_spec 保存失败允许降级）。
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def verify_chart_pairing(dataset: Mapping[str, object] | None, *, run_id: UUID,
+                         chart_version: int,
+                         data_as_of: datetime | None,
+                         coverage: Mapping[str, object] | None) -> None:
+    """图表与数据集的配对完整性：引用、领域、版本三道一起过。
+
+    spec §8：“dataset 与 spec 指向同一 Artifact 版本”。“同版本”必须能从已落库的
+    行里核出来，而不是靠调用方自报：
+
+    1. 被引用的 Artifact 必须**已经存过**（先存数据集、后存图表不是顺序偏好）；
+    2. 必须属于**同一次运行**：隔运行引用就是把别人的结果说成自己的数据；
+    3. 必须是数据集类型（`DATASET_ARTIFACT_TYPES`）：图表不得引用另一张图表；
+    4. 图表自己的 `data_as_of` 与 `coverage` 必须与被引用数据集逐字相同；
+    5. `chart_version` 必须是当前图表契约版本：旧形状的载荷不在新列上复用。
+    """
+    if dataset is None:
+        raise ChartPairingError("chart_dataset_unresolved")
+    if dataset.get("run_id") != run_id:
+        raise ChartPairingError("chart_dataset_other_run")
+    if dataset.get("artifact_type") not in DATASET_ARTIFACT_TYPES:
+        raise ChartPairingError("chart_dataset_type_invalid")
+    if chart_version != CHART_SPEC_VERSION:
+        raise ChartPairingError("chart_version_unsupported")
+    if dataset.get("data_as_of") != data_as_of:
+        raise ChartPairingError("chart_dataset_version_mismatch")
+    if dataset.get("coverage") != coverage:
+        raise ChartPairingError("chart_dataset_version_mismatch")
 
 
 class ArtifactEnvelope(BaseModel):

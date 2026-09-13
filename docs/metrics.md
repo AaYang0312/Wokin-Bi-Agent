@@ -60,6 +60,7 @@
 | `cohort_refund_rate` | 同批：`[start,end)` 支付商业单在明确截止时刻前的累计退款 / 同批支付额 | aftersales_cohort + 原单匹配 |
 | `quantity` / `product_paid_amount` | 有效非赠品父项数量与已核验行级分摊金额；结果以 `line_kind` 区分 sale/suite/combination/processing，套件不是子SKU排行 | order_items |
 | 商品运营参考指标（`sold_quantity` 等 6 项） | 只由 `analyze_product_performance` 发布；口径、覆盖与拒发规则见 §4.2 | order_items / orders / order_payments |
+| 平台 / 店铺对比值（同一批报告指标） | 只由 `compare_performance` 发布；分组、合计、排名与图表的拒发规则见 §4.3 | 与 §4.2 同一张视图（整店聚合粒度） |
 | 推广费率/ROAS | **未启用**：无实耗来源；折扣/成本不得替代广告费 | 无 |
 
 ## 4. 已知功能门槛
@@ -137,6 +138,48 @@ deadline 全部来自服务端 `DomainContext`。旧 `query_business` 不变，�
 
 ```sh
 .venv/bin/python -m unittest tests.test_commerce tests.test_core tests.test_business_query_graph -v
+```
+
+## 4.3 平台 / 店铺对比与图表契约（`compare_performance` + `presentation/charts.py`，计划 Task 8）
+
+对比报告与商品报告跑**同一张** `CommercePerformanceGraph`（`report_kind=comparison`），只是分组
+维度不同：`group_by=platform` 比平台，`group_by=shop` 比**一个**平台内的店铺。它不新增长期
+投影、也不新建第二张图或第二套算术：整店汇总读的是同一张 `reporting.v_product_cost_daily`
+（SQL 端按 `(shop_id, day, line_kind)` 聚合掉商品维度），算术仍是
+`combine_reference_metrics`，可算性仍是 `_record_statuses` 留下的那份 `available` 集合。
+
+| 契约 | 规则 | 不能是什么 |
+| --- | --- | --- |
+| 分组键 | `platform` 取来源注册表登记过的平台码；`shop_ref` 取目录引用 | 不接受平台中文名，也不接受 ERP 店铺号 |
+| tb / tm | 显式规则 `platform_group_of`：本轮**没有**已批准的版本化合并规则，淘宝与天猫各成一组，`platform_group_rule` 参与请求指纹与血缘 | 不静默并成"淘系"组；真要合并必须先登记版本化规则并推进规则版本 |
+| `group_by=shop` | 范围里必须恰好一个平台（`shop_refs` 与 `platforms` 互斥，交集会拆散分组完整性） | 不允许"拿三个平台的店比店间差距" |
+| 分组发布 | 一个分组里**任一**获准店铺未被评估 ⇒ 该组不发布数字，逐组原因写 `group_statuses`（`partial` + `shops_requested` / `shops_evaluated`），缺的店仍逐家在 `excluded_scope` 里；请求单据口径时两份计数（`erp_documents` / `erp_documents_with_gross_profit`）跟着毛利列一起出 | 不发布"两家店盖成整个平台"的组内合计；也不把缺失组当 0；不给一个 null 藏掉可核对的分母 |
+| 单元格的两种 null | 组内成员店**没有 ERP 单据** = 真实 0 贡献，本列照常发布；有单据但部分不带毛利字段 ⇒ 毛利列 null 且原因是 `erp_document_coverage_incomplete`；整组没有可发布的事实 ⇒ null 且原因是 `comparison_cell_withheld` | 三种情况不写成同一句话：一个指向"该补取数字段"，一个只是"那天确实没卖" |
+| 合计与排名 | 合计与名次共用同一个判定：只有**全部已发布分组都有值且同口径**（`complete`）才一起发；集合不完整时值照发、该列合计与名次全部留 null，缺的分组写进 `missing`（`incomplete`）；口径不一致时连值也不发（`incomparable`，且不再贴单一口径名） | 不平均分组均价或店铺利润率；不把两个口径的柱子排在同一根轴上 |
+| `ChartSpec` | `kind=bar|line|scatter`、`dataset_ref`、`x`、`y`、`series`、`unit`、`metric_basis`、`coverage_ref`；字段全是枚举 / UUID / 已登记列名；`unit` 必须等于该指标登记的单位，`metric_basis` 前缀必须就是被画的指标；趋势图的 `series` 必须点名分组列（`platform` / `shop_ref`）而 `x=day`；scatter 在词表里但本轮**没有取数路径**，构造时按 `chart_kind_unsupported` 拒 | 不含 SVG / HTML / JavaScript 或任何自由文本；不复制行数据；不承诺模型生成图 |
+| 图表配对 | 先落库数据集再落图表；`bi.query_artifacts.dataset_ref` / `chart_version` 真写进列，两个 Store 写库前都跑 `verify_chart_pairing`（同运行、数据集类型、`data_as_of` 与 `coverage` 逐字相同、版本是当前契约版本） | 图表不能引用另一张图，也不能跨运行引用别人的数据集版本 |
+| 下钻 | 平台柱上的一次点击只交出 `DrilldownIntent`（平台码、`[start,end)`、指标、口径签名），外层用它发一次**新的** `compare_performance`；问句里同时写出 `platform=<已登记平台码>`，不只给人读名 | 客户端不缓存、不展开、不"顺手"改窗口或口径；授权由服务端每次重新算；只发中文名会让 `normalize_platform` fail closed，一次下钻退化成"查询参数无效" |
+
+前端渲染侧另有两条自己的铁则：`series` 声明的列决定画几条线（分组趋势的行是"逐分组 × 逐日"，
+不分列就会把甲组最后一天连到乙组第一天），轴的两端只用水里原样出现过的数（负毛利因此自己
+占一段轴，柱形从基线向下长，不会被压成贴着轴底的一像素）；数据集版本按**时刻**比而不是按
+序列化写法比（同一 UTC 瞬间有 `Z` 与 `+00:00` 两种合法写法）。
+
+一次对比 = 一次图执行 = **一条**整店集合查询（`shop_id = ANY(%s)`）：查询条数不随店铺数增长，
+主期间、分组行与七日序列共用同一个 REPEATABLE READ 只读快照。
+
+仍不得因代码存在就宣称的能力：京东、快手、视频号、微购相册的支付窗口都还没有逐店账单对照
+证据（`unmeasured`），抖音是 `certified`、淘系是 `disproved`，所以按现行可比性规则**跨平台**的
+`sales_amount` 往往判为 `incomparable` —— 此时报告只分行给出各分组自己的数，合计与排名留空。
+五平台总览里唯一能拿到完整总览的是"同为未认证支付口径"的那一组，其余一律按缺口披露；
+拼多多继续作为显式缺失组出现（`excluded_scope`，不接入支付）。
+
+回归命令（`backend/`）：
+
+```sh
+.venv/bin/python -m unittest tests.test_comparison tests.test_commerce tests.test_core -v
+uv run --env-file ../.env.test python -m unittest tests.test_runtime_db -v
+cd ../frontend && npm test -- src/components/ChartArtifact.test.tsx src/components/ArtifactView.test.tsx
 ```
 
 ## 5. 真实对账结果摘要

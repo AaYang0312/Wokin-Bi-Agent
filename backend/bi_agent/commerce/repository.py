@@ -63,6 +63,25 @@ LIMIT %s
 """
 
 
+# 分组面（Task 8 对比报告）：与商品面**同一张视图、同一入条件**，只是不再按商品筛，
+# 而在 SQL 端把同一 (店铺, 日, 行性质) 下的**全部商品**合起来。
+# 两件原因：① 一家店的平台对比要的是整店经营量，不是某个商品；
+#           ② 不先在 SQL 端聚合就会先撞 MAX_ROWS（一个中型店一天就能出几百个商品行），
+#              而截断后的合计偏低，比不给数更危险。
+# `line_count` / `cost_line_count` 是求和而不是取最大：成本覆盖判定跨商品仍然是
+# “带成本的行 ÷ 全部行”，粒度变了规则不变。
+_SHOP_GROUPS_SQL = """
+SELECT shop_id, day, line_kind, sum(quantity), sum(gift_quantity),
+       sum(sales_amount), bool_and(allocation_verified), sum(line_count),
+       sum(cost_line_count), sum(cost_quantity), sum(cost_total)
+FROM reporting.v_product_cost_daily
+WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
+GROUP BY shop_id, day, line_kind
+ORDER BY shop_id, day, line_kind
+LIMIT %s
+"""
+
+
 class ProductLine(NamedTuple):
     """`(店铺, 日, 行性质)` 上的商品事实与成本覆盖证据。"""
 
@@ -151,6 +170,30 @@ def load_product_lines(conn, *, shop_ids: list[str], erp_product_id: str,
             for row in raw]
 
 
+def load_shop_day_groups(conn, *, shop_ids: list[str], start: date, end: date,
+                         deadline: float) -> list[ProductLine]:
+    """取获准店铺在 `[start,end)` 内的**整店**销售与成本汇总行（不按商品筛）。
+
+    返回行与 `load_product_lines` 完整同形（同一个 `ProductLine`），所以商品面与
+    对比面共用同一套算术与同一套成本覆盖判定，不养出第二份“什叫成本齐了”。
+    `sku_ids` 恒为空：SKU 明细属于商品面，对比面不回答“哪个规格”。
+
+    一家店仍是**一条集合查询**：按店循环会把 N 家店变成 N 条查询，既耗尽预算
+    也无法保证他们落在同一个快照上（spec §2）。
+    """
+    if not shop_ids:
+        return []
+    if not _set_query_budget(conn, deadline):
+        raise _BudgetExhausted
+    raw = _fetch_capped(conn, _SHOP_GROUPS_SQL, (shop_ids, start, end))
+    return [ProductLine(shop_id=str(row[0]), day=row[1], line_kind=str(row[2]),
+                        quantity=row[3], gift_quantity=row[4], sales_amount=row[5],
+                        allocation_verified=bool(row[6]), line_count=int(row[7]),
+                        cost_line_count=int(row[8]), cost_quantity=row[9],
+                        cost_total=row[10], sku_ids=())
+            for row in raw]
+
+
 def load_document_facts(conn, *, shop_ids: list[str], start: date, end: date,
                         deadline: float) -> dict[str, DocumentFacts]:
     """按唯一 ERP 单据聚合的毛利参考事实（每家店一行）。"""
@@ -189,5 +232,6 @@ __all__ = [
     "load_document_facts",
     "load_payment_facts",
     "load_product_lines",
+    "load_shop_day_groups",
     "shop_profiles",
 ]

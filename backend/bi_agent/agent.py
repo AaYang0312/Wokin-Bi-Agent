@@ -19,13 +19,15 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel, ConfigDict, Field
 
 from .business_query.tool import (
+    artifact_event_payload,
     execute_business_query_tool,
     to_model_result as _to_model_result,
     to_public_artifact as _to_public_artifact,
 )
 from .business_query import BusinessQueryContext
 from .commerce.models import DomainContext
-from .commerce.tool import commerce_request_schema, execute_commerce_tool
+from .commerce.tool import (
+    commerce_request_schema, comparison_request_schema, execute_commerce_tool)
 from .catalog import (
     Catalog,
     build_catalog,
@@ -45,13 +47,18 @@ MAX_MODEL_TURNS = 5
 MAX_KEPT_TURNS = 6
 
 _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%Y-%m-%d %H:%M}（Asia/Shanghai）。
-只能使用三个工具：
+只能使用四个工具：
 - query_business：按已确认口径查询经营指标，日期end排他；shop_ids 只能填 ent- 形式的店铺引用，
   可用引用：{ref_doc}。引用与真实店名的对应关系你看不到，也不要猜。
 - analyze_product_performance：查**一个指定商品**在获准店铺内的跨店经营报告与七日趋势；
   product 只能填 ent- 商品引用或一段商品文字，范围用 scope（all_authorized 或显式引用/平台）。
   商品文字只用于找候选：命中多个候选时工具返 needs_input 并附候选引用，必须把候选问回用户，
   不能自己选一个；解析不出商品是 missing_data，**绝不能说成销量为 0**。
+- compare_performance：按平台（group_by=platform）或按某一平台内的店铺（group_by=shop，
+  scope.platforms 必须恰好给一个平台）比较经营指标。图表卡片上的平台下钻就是再发一次
+  compare_performance：窗口与口径照本轮原值，范围由服务端重新展开授权，**不要**沿用上一轮
+  结果里的店铺清单。缺数的平台不当 0：excluded_scope 与 group_statuses 逐条带着原因，
+  合计与排名只覆盖同口径且完整的分组，口径互不兼容时只能按分组各自转述。
 - evaluate_promotion：仅按当前用户明确假设测算预算；当前未取得真实推广消耗。
 支持指标：支付金额、支付订单数、客单价、ERP单据数、退款发生额、期间收支差额、同批退款率、商品销量、商品支付金额。
 支持维度：合计、按日、按店铺、按商品。
@@ -64,7 +71,7 @@ _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%
 partial 只覆盖 evaluated_scope 里的店铺，excluded_scope 里每家店都带原因：不能把 partial 的
 合计说成“所有店铺合计”，也不能拿它做全量排名；不含 shop_ref 的行只是已评估集合的合计。
 每个结果都带 basis（统计口径）与 time_basis（时间归属）：同名指标不代表同一口径，
-不能自动同义化。平台/店铺对比只展示 basis 相同且已认证的结果；basis 或 time_basis 不同
+不能自动同义化。跨平台 / 店铺对比走 compare_performance，它只展示 basis 相同且已认证的结果；basis 或 time_basis 不同
 时不要汇总、不要算增长率、不要排名（工具会以 basis_incompatible 拒绝，提示按店铺分列，
 必要时用 basis_policy=separate 重新发起 group_by=shop 的查询）。
 未被认证的付款时间口径只能作为可观测样本转述，不得说成“完整支付窗口”。
@@ -386,6 +393,13 @@ def _tool_schemas() -> list[dict[str, object]]:
                            "不要自己选）；只能参考的毛利未扣售后/平台费/运费/广告费",
             "parameters": commerce_request_schema()}},
         {"type": "function", "function": {
+            "name": "compare_performance",
+            "description": "按平台或按店铺比较经营指标：group_by=platform 看跨平台，"
+                           "group_by=shop 必须先在 scope.platforms 里选定恰好一个平台"
+                           "（下钻就发这一句，不本身相信上一轮结果）；"
+                           "合计与排名只覆盖同口径且完整的分组，缺数分组只说原因不当 0",
+            "parameters": comparison_request_schema()}},
+        {"type": "function", "function": {
             "name": "evaluate_promotion",
             "description": "仅按当前用户明确假设测算预算；当前未取得真实推广消耗",
             "parameters": PromotionRequest.model_json_schema()}},
@@ -568,9 +582,10 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                 if execution.tool_result is not None:
                     calls_used += 1
                     results.append(execution.tool_result)
-                    # 图内已按同一目录投出公开载荷：展示层直接复用，不二次投影。
+                    # 图内已按同一目录投出公开载荷：展示层只补上 Artifact 自身引用，
+                    # 不做二次投影（补引用是为了让图表能按 dataset_ref 找到数据集）。
                     artifacts.extend(
-                        artifact.public_payload
+                        artifact_event_payload(artifact)
                         for artifact in execution.domain_result.artifacts
                     )
                     if execution.session_filters:
@@ -580,7 +595,10 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     content=json.dumps(execution.domain_result.model_payload,
                                        ensure_ascii=False)))
                 continue
-            if call.name == "analyze_product_performance":
+            if call.name in {"analyze_product_performance", "compare_performance"}:
+                # 两个运营 Tool 走同一个适配器：报告种类与入参契约的配对在
+                # `commerce.tool` 一处定，主层只负责把服务端上下文递进去。
+                # 一次工具调用 = 一次图执行：主层不逐店循环，也不自己算钱（spec §2）。
                 commerce_attempt_no += 1
                 commerce_execution = execute_commerce_tool(call, DomainContext(
                     subject_id=turn_context.subject_id,
@@ -590,7 +608,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     store=run_store,
                     chat_id=turn_context.chat_id,
                     user_message_id=turn_context.user_message_id,
-                    # 一条用户消息就是一个根请求：本回合里的商品图调用不另起身份。
+                    # 一条用户消息就是一个根请求：本回合里的经营图调用不另起身份。
                     root_request_id=turn_context.user_message_id,
                     now=now,
                     deadline=deadline,
@@ -611,8 +629,8 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                         # 主数据集进结果列表：兜底摘要与“本轮有没有拿到确定性结果”都看它。
                         results.append(dataset.result)
                         break
-                # 图内已按同一目录投出公开载荷：展示层直接复用，不二次投影。
-                artifacts.extend(artifact.public_payload
+                # 同上：只补 Artifact 自身引用，不重新投影一遍。
+                artifacts.extend(artifact_event_payload(artifact)
                                  for artifact in domain_result.artifacts)
                 messages.append(Message(
                     role="tool", tool_call_id=call.id,

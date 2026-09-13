@@ -743,3 +743,80 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
   border-radius: 999px; color: var(--text-3);
   font-size: 10.5px; font-weight: 600; letter-spacing: .04em;
 }
+
+/* ---------------------------------------------------------------------------
+ * 图表卡片（运营工作流计划 Task 8）：手写 SVG，无绘图依赖。
+ *
+ * 图与表两份视图都在文档里（同一条消息的同一批数），CSS 只决定当前看见哪一份：
+ * 切换是呈现层的事，数据不是。缺值用虚线空位与 --text-3 的"不可计算"，
+ * 不给它任何看起来像数据的高度。
+ * ------------------------------------------------------------------------- */
+.chart-artifact .chart-svg-wrap {
+  margin-top: 10px; border: 1px solid var(--hair); border-radius: var(--r-md);
+  background: var(--surface-sunken);
+}
+.chart-artifact svg { display: block; width: 100%; height: auto; }
+.chart-axis { stroke: var(--hair-strong); stroke-width: 1; }
+.chart-tick, .chart-label { fill: var(--text-3); font-size: 10.5px; }
+.chart-label { text-anchor: middle; }
+.chart-bar { fill: var(--accent-grad); }
+.chart-bar-gap { fill: none; stroke: var(--hair-strong); stroke-dasharray: 4 3; }
+.chart-line { stroke: var(--accent-soft); stroke-width: 2; }
+.chart-point { fill: var(--accent-soft); }
+.chart-point.is-missing { fill: none; stroke: var(--hair-strong); }
+.chart-drill { cursor: pointer; }
+.chart-drill:focus-visible rect, .chart-drill:hover rect { stroke: var(--accent-soft); stroke-width: 1.5; }
+
+.chart-switch { display: grid; gap: 8px; margin-top: 12px; }
+.chart-switch > input { accent-color: var(--accent); justify-self: start; }
+.chart-switch > label { color: var(--text-2); font-size: 12px; }
+/* 两份视图都渲染，选中哪一份就显示哪一份：数字只有一份来源。 */
+.chart-view { display: none; }
+.chart-switch > input:nth-of-type(1):checked ~ .chart-view-plot,
+.chart-switch > input:nth-of-type(2):checked ~ .chart-view-table { display: block; }
+.chart-caption {
+  caption-side: top; text-align: left; color: var(--text-3); font-size: 11.5px;
+  padding-bottom: 6px;
+}
+.chart-values {
+  list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px;
+}
+.chart-values li {
+  display: flex; gap: 6px; align-items: baseline; padding: 4px 8px;
+  border: 1px solid var(--hair); border-radius: var(--r-md); background: var(--surface-raised);
+  font-size: 12px;
+}
+.chart-values span { color: var(--text-3); }
+.chart-values strong { color: var(--text-2); font-variant-numeric: tabular-nums; }
+.chart-values strong.missing, td.missing { color: var(--text-3); font-weight: 500; }
+
+/* 系列色与图例：多分组趋势必须一眼分得清哪条线属于哪个分组，
+   颜色只取已通过对比度门禁的既有 token，不新引入色值。 */
+.chart-legend {
+  list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 10px;
+  font-size: 11.5px; color: var(--text-3);
+}
+.chart-legend li { display: flex; align-items: center; gap: 5px; }
+.chart-swatch { display: inline-flex; align-items: center; gap: 5px; }
+.chart-swatch::before {
+  content: ""; width: 14px; height: 2px; border-radius: 2px; background: var(--accent-soft);
+}
+.chart-swatch-0::before { background: var(--accent-soft); }
+.chart-swatch-1::before { background: var(--blue); }
+.chart-swatch-2::before { background: var(--ok); }
+.chart-swatch-3::before { background: var(--orange); }
+.chart-swatch-4::before { background: var(--pink); }
+.chart-swatch-5::before { background: var(--danger); }
+.chart-series-0 { stroke: var(--accent-soft); }
+.chart-series-1 { stroke: var(--blue); }
+.chart-series-2 { stroke: var(--ok); }
+.chart-series-3 { stroke: var(--orange); }
+.chart-series-4 { stroke: var(--pink); }
+.chart-series-5 { stroke: var(--danger); }
+.chart-series-0.fill, .chart-point.chart-series-0 { fill: var(--accent-soft); }
+.chart-point.chart-series-1 { fill: var(--blue); }
+.chart-point.chart-series-2 { fill: var(--ok); }
+.chart-point.chart-series-3 { fill: var(--orange); }
+.chart-point.chart-series-4 { fill: var(--pink); }
+.chart-point.chart-series-5 { fill: var(--danger); }
+.chart-values li[data-series] span { color: var(--text-2); }

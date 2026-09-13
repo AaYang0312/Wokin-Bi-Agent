@@ -1,6 +1,6 @@
 import type { RefObject } from 'react'
 
-import type { Artifact, ChatMessage } from '../types'
+import type { Artifact, ChatMessage, DrilldownIntent } from '../types'
 import { ArtifactView } from './ArtifactView'
 import { Composer } from './Composer'
 import { AlertIcon, BrandMark, ClockIcon, GaugeIcon, MenuIcon } from './icons'
@@ -20,7 +20,7 @@ function shortTime(value: string) {
 
 export function ChatView({
   messages, status, artifacts, error, disabled, title, updatedAt, chatCount, narrow, drawerOpen,
-  onOpenSidebar, onSend, menuToggleRef,
+  onOpenSidebar, onSend, onDrilldown, menuToggleRef,
 }: {
   messages: ChatMessage[]
   status: string | null
@@ -34,6 +34,8 @@ export function ChatView({
   drawerOpen: boolean
   onOpenSidebar: () => void
   onSend: (content: string) => void
+  /** 图表上的平台下钻：和"输入一句新问题"走同一条路，因此仍会在服务端重新授权。 */
+  onDrilldown?: (intent: DrilldownIntent) => void
   menuToggleRef?: RefObject<HTMLButtonElement | null>
 }) {
   const stamp = updatedAt ? shortTime(updatedAt) : null
@@ -71,9 +73,17 @@ export function ChatView({
               ))}
             </div>
           </div>
-        ) : messages.map((message) => <MessageView key={message.id} message={message} />)}
+        ) : messages.map((message) => (
+          <MessageView key={message.id} message={message} onDrilldown={onDrilldown} />
+        ))}
         {status && <p className="stream-status" role="status">{status}</p>}
-        {artifacts.map((artifact, index) => <ArtifactView artifact={artifact} key={index} />)}
+        {artifacts.map((artifact, index) => (
+          <ArtifactView
+            artifact={artifact}
+            datasets={artifacts}
+            onDrilldown={onDrilldown}
+            key={index} />
+        ))}
         {error && <p className="stream-error" role="alert"><AlertIcon size={15} />{error}</p>}
       </div>
 

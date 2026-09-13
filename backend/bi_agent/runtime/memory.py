@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 from pydantic import ValidationError
 
+from .artifacts import verify_chart_pairing
 from .domain_registry import allows_artifact_type, allows_node
 from .models import (
     ArtifactRef,
@@ -111,13 +112,20 @@ class MemoryQueryRunStore:
     def save_artifact(self, run_id: UUID, artifact: NewArtifact) -> ArtifactRef:
         run = self._require_run(run_id)
         artifact = self._revalidate_artifact(artifact)
-        self._validate_artifact(artifact.payload)
+        self._validate_artifact(artifact.payload, artifact.artifact_type)
         if artifact.coverage is not None:
             self._validate_coverage(artifact.coverage)
         # 领域能产出哪种 Artifact 由 `domain_registry` 一处说了算：只校全局类型白名单的话，
         # business_query 就能写出 price_audit，“按领域白名单”只剩一句注释。
         if not allows_artifact_type(str(run["domain"]), artifact.artifact_type):
             raise ValueError("unsafe_persistence_payload")
+        if artifact.artifact_type == "chart_spec":
+            # 图表只能引用**已经存过**的同版本数据集：本 Store 与 Postgres Store
+            # 跑同一个 `verify_chart_pairing`，否则内存测试会比真实部署宽。
+            verify_chart_pairing(
+                self.artifacts.get(artifact.dataset_ref), run_id=run_id,
+                chart_version=int(artifact.chart_version or 0),
+                data_as_of=artifact.data_as_of, coverage=artifact.coverage)
         artifact_id = uuid4()
         self.artifacts[artifact_id] = {
             "id": artifact_id,
@@ -126,6 +134,8 @@ class MemoryQueryRunStore:
             "payload": deepcopy(artifact.payload),
             "data_as_of": artifact.data_as_of,
             "coverage": deepcopy(artifact.coverage) if artifact.coverage is not None else None,
+            "dataset_ref": artifact.dataset_ref,
+            "chart_version": artifact.chart_version,
             "created_at": _now(),
         }
         return ArtifactRef(id=artifact_id, type=artifact.artifact_type)
@@ -224,8 +234,8 @@ class MemoryQueryRunStore:
         validate_event_payload(value)
         self._reject_forbidden_values(value)
 
-    def _validate_artifact(self, value: object) -> None:
-        validate_artifact_payload(value)
+    def _validate_artifact(self, value: object, artifact_type: str) -> None:
+        validate_artifact_payload(value, artifact_type)
         self._reject_forbidden_values(value)
 
     def _validate_coverage(self, value: object) -> None:

@@ -1087,9 +1087,16 @@ class CommerceContractTests(unittest.TestCase):
             _request(opportunity_policy_ref="drop table")
         _request(scope={"platforms": ["fxg"]})
 
-    def test_report_kind_comparison_is_refused_not_downgraded(self):
+    def test_report_kind_pairing_is_refused_not_downgraded(self):
+        """Task 8 之后 comparison 已受支持，但**入参契约必须配对**。
+
+        拿商品请求去跑对比报告会发出一份"看起来是对比表"的商品表；未登记的报告种类
+        也一样：两者都是显式拒绝，不是降级成商品报告。
+        """
         with self.assertRaises(UnsupportedReportKind):
             analyze_as_comparison()
+        with self.assertRaises(UnsupportedReportKind):
+            run_with_kind("listing_price_audit")
 
     def test_termination_codes_stay_inside_the_existing_table(self):
         """本轮不新增终止原因码：新增就要重声明 SQL CHECK 并推部署顺序硬约束。"""
@@ -1136,7 +1143,11 @@ class CommerceContractTests(unittest.TestCase):
 
 
 def analyze_as_comparison() -> None:
-    """把 comparison 报告种类送进图里：应当被显式拒绝。"""
+    """把商品请求送进对比报告种类：报告种类与入参不配对，应当被显式拒绝。"""
+    run_with_kind("comparison")
+
+
+def run_with_kind(report_kind: str) -> None:
     from bi_agent.commerce.graph import run_commerce_graph
 
     context = DomainContext(
@@ -1144,7 +1155,7 @@ def analyze_as_comparison() -> None:
         shop_refs={ref_for_key("shop", "S1"): "S1"}, conn=None, store=None,
         chat_id=uuid4(), user_message_id=uuid4(), root_request_id=uuid4(),
         now=NOW, deadline=time.monotonic() + 30)
-    run_commerce_graph(report_kind="comparison", request=_request(),
+    run_commerce_graph(report_kind=report_kind, request=_request(),
                        context=context, tool_call_id="c")
 
 

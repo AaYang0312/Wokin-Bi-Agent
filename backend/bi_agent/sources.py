@@ -200,6 +200,16 @@ def _capability_set(capabilities: object) -> frozenset[str]:
     return frozenset(items)
 
 
+def platform_codes() -> tuple[str, ...]:
+    """已登记平台码（有序）：「哪些写法算一个平台」的唯一回答处。
+
+    对比报告的分组键取值、模型入参规范化与展示层标签都引用它；
+    调用方自己拄一份清单就会在某个平台接入后漏改——未登记平台 fail closed
+    这条规则也就只剩一句注释。
+    """
+    return tuple(sorted(_REGISTRATIONS))
+
+
 def platform_order_sources() -> dict[str, str]:
     """平台→订单源快照：同步路由与用例遍历共用，不在两处各抄一份。"""
     return {platform: item.order_source

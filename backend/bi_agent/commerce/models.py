@@ -3,8 +3,9 @@
 spec §3：真实身份、授权全集、连接与 deadline 都由服务端上下文提供，
 **不进入模型工具参数**。所以本文件里有两个方向完全不同的对象：
 
-- `ProductPerformanceRequest`：给模型的 JSON schema，字段全是业务语义，
-  店铺 / 商品只能以 `ent-` 引用出现；
+- `ProductPerformanceRequest` / `PerformanceComparisonRequest`：给模型的 JSON schema，
+  字段全是业务语义，店铺 / 商品只能以 `ent-` 引用出现；两个 Tool 跑同一张经营图
+  （spec §6），所以范围 / 指标 / 口径词表也共用同一份；
 - `DomainContext`：服务端在请求内组装的上下文，带真实主键、连接与 Store。
 
 两者都不接受 `extra` 字段：多传一个字段就当合法参数放行，等于给绕过白名单开门。
@@ -27,11 +28,14 @@ from bi_agent.sources import registration
 
 from .metrics import (
     COMMERCE_METRICS,
-    TREND_DAYS,
+    CommerceMetric,
+    ComparisonGroupBy,
     ComparisonMode,
+    PLATFORM_GROUP_RULE,
     ProfitBasis,
     SalesBasis,
     ScopeMode,
+    TREND_DAYS,
 )
 
 
@@ -78,8 +82,14 @@ class ProductSelector(BaseModel):
         return self
 
 
-class ProductScope(BaseModel):
-    """分析范围：全授权或显式选定，均不以「有成交」当全集。"""
+class CommerceScope(BaseModel):
+    """分析范围：全授权或显式选定，均不以「有成交」当全集。
+
+    商品报告与对比报告共用这一份范围契约：同一句“这几个平台”，两个 Tool 不许
+    解出两套含义。`platforms` 与 `shop_refs` 能否同时给由各个 Tool 自己定：
+    商品报告里交集只是“范围空”，对比报告里它会把整组静默拆掉（见
+    `PerformanceComparisonRequest`）。
+    """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -88,7 +98,7 @@ class ProductScope(BaseModel):
     shop_refs: list[str] = Field(default_factory=list, max_length=200)
 
     @model_validator(mode="after")
-    def _selected_needs_targets(self) -> "ProductScope":
+    def _selected_needs_targets(self) -> "CommerceScope":
         codes = [normalize_platform(item) for item in self.platforms]
         self.platforms = sorted(set(codes))
         for ref in self.shop_refs:
@@ -107,13 +117,10 @@ class ProductPerformanceRequest(BaseModel):
                               allow_inf_nan=False)
 
     product: ProductSelector
-    scope: ProductScope = Field(default_factory=ProductScope)
+    scope: CommerceScope = Field(default_factory=CommerceScope)
     start: date
     end: date                       # 排他，沿用固定指标的 [start,end) 口径
-    metrics: list[Literal[
-        "sold_quantity", "sales_amount", "weighted_avg_paid_price",
-        "product_gross_profit_reference", "product_gross_margin_reference",
-        "erp_gross_profit_reference"]] = Field(min_length=1)
+    metrics: list[CommerceMetric] = Field(min_length=1)
     sales_basis: SalesBasis = "erp_effective_parent"
     profit_basis: ProfitBasis = "none"
     trend_days: Literal[7] = TREND_DAYS
@@ -180,10 +187,98 @@ class ProductPerformanceRequest(BaseModel):
         return payload
 
 
+class PerformanceComparisonRequest(BaseModel):
+    """`compare_performance` 的公开输入（spec §4 Tool 目录逐项对应）。
+
+    与商品报告共用指标 / 口径 / 范围词表，不开放第二套指标名。`group_by=shop`
+    要求范围里恰好一个平台：拿一个平台外的店来比“店间差距”，那个差距其实是
+    平台差距，所以这一条在入口就拒，而不是迲到图上再静默剔除。
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True,
+                              allow_inf_nan=False)
+
+    scope: CommerceScope = Field(default_factory=CommerceScope)
+    start: date
+    end: date
+    group_by: ComparisonGroupBy
+    metrics: list[CommerceMetric] = Field(min_length=1)
+    sales_basis: SalesBasis = "erp_effective_parent"
+    profit_basis: ProfitBasis = "none"
+    trend_days: Literal[7] = TREND_DAYS
+    currency: Literal["CNY"] = "CNY"
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "PerformanceComparisonRequest":
+        if self.end <= self.start:
+            raise ValueError("end必须晚于start（排他区间）")
+        if (self.end - self.start).days > MAX_SPAN_DAYS:
+            raise ValueError(f"日期跨度最多{MAX_SPAN_DAYS}天")
+        unknown = sorted({str(metric) for metric in self.metrics} - COMMERCE_METRICS)
+        if unknown:
+            raise ValueError(f"不支持的对比指标：{unknown}")
+        self.metrics = sorted(set(str(metric) for metric in self.metrics))
+        if self.profit_basis == "none" and any(
+                metric.endswith("_reference") for metric in self.metrics):
+            # 与商品报告同一条规则：要不要看毛利必须是用户显式选过的。
+            raise ValueError("请求了毛利参考指标，需显式设置 profit_basis=existing_fields")
+        if self.scope.platforms and self.scope.shop_refs:
+            # 交集会把“不在该平台”的引用静默抖掉，而分组完整性恰好依赖“这组有几家”。
+            raise ValueError("platforms 与 shop_refs 二选一：交集会拆散分组")
+        if self.group_by == "shop":
+            if len(self.scope.platforms) != 1:
+                raise ValueError("shop 分组必须且只能选定一个平台（spec §4）")
+            if self.scope.shop_refs:
+                raise ValueError("shop 分组按平台展开获准店铺，不接受额外 shop_refs")
+        return self
+
+    @property
+    def trend_window(self) -> tuple[date, date]:
+        """趋势区间独立标注为 [end-trend_days, end)，与商品报告同一规则。"""
+        return (self.end - timedelta(days=TREND_DAYS), self.end)
+
+    @property
+    def previous_window(self) -> tuple[date, date] | None:
+        """本轮对比不做上期环比：它需要自己的取数与覆盖判定，本轮没有取。"""
+        return None
+
+    @property
+    def group_column(self) -> str:
+        """分组键在结果行里的列名（行原文形态）：`shop_id` 或 `platform`。"""
+        return "shop_id" if self.group_by == "shop" else "platform"
+
+    @property
+    def group_label(self) -> str:
+        """分组键在已投影行里的列名（`shop_ref` / `platform`）：图表轴用它。"""
+        return "shop_ref" if self.group_by == "shop" else "platform"
+
+    def normalized(self) -> dict[str, object]:
+        """可持久化、可指纹化的规范化请求：只含引用与业务码，不含真实主键。"""
+        payload: dict[str, object] = {
+            "metrics": list(self.metrics),
+            "start": self.start.isoformat(),
+            "end": self.end.isoformat(),
+            "currency": self.currency,
+            "group_by": self.group_by,
+            "sales_basis": self.sales_basis,
+            "profit_basis": self.profit_basis,
+            "trend_days": self.trend_days,
+            "scope_mode": self.scope.mode,
+            "platforms": list(self.scope.platforms),
+            "report_kind": "comparison",
+        }
+        if self.scope.shop_refs:
+            payload["shop_refs"] = list(self.scope.shop_refs)
+        if self.group_by == "platform":
+            # 平台分组规则参与指纹：今天 tb/tm 不合并，明天配了版本化合并规则，
+            # 旧结果就不是同一个问题的答案。
+            payload["platform_group_rule"] = PLATFORM_GROUP_RULE
+        return payload
+
+
 @dataclass
 class DomainContext:
     """一次工具调用的服务端上下文（spec §3 的 DomainContext）。
-
     `deadline` 是 `time.monotonic()` 上的绝对时刻，与固定指标查询共用主层的 30 秒
     总预算：领域图不另起一份预算，也不在重试时重置它。外层（主层 / 恢复路径）在
     发起一次执行之前可以**收紧**它，图内只读不写：预算只会变小，不会被领域图偷偷重置。
@@ -243,13 +338,18 @@ class CommerceReport:
     opportunity: Mapping[str, object] | None = None
     trend_window: tuple[str, str] | None = None
     termination_reason: str | None = None
+    # 对比报告（Task 8）专属：分组完整性与排名范围。两者都是“谁进了合计”的证据：
+    # 缺了它们，一份只覆盖四个分组的合计就会被读成五个分组的合计。
+    group_statuses: tuple[Mapping[str, object], ...] = ()
+    ranking: tuple[Mapping[str, object], ...] = ()
+    # 已发布完整分组（只有平台分组会填）：与 `requested_scope.platforms` 一比就是
+    # “哪个平台没出数”，展示层不需要自己推分组归属。
+    evaluated_platforms: tuple[str, ...] = ()
     # 公开披露文本：没有可发数据集时，这是模型还能读到的唯一说明。
     limitations: tuple[str, ...] = ()
-    # 歧义时的候选卡片：只带引用。候选本身就是按**授权全集**查出来的（见
+    # 歧义 / 参数缺失时的候选卡片：只带引用。候选本身就是按**授权全集**查出来的（见
     # resolve_product_if_needed），所以“有权查看”是构造上成立的，不是事后筛的。
-    # 不发名称：needs_input 路径不发 Artifact，也就没有已授权的目录投影可用。
-    candidates: tuple[Mapping[str, object], ...] = ()
-    # 候选卡片（ambiguous 时）：只带引用。spec §3 把“有权查看的候选”当作 needs_input
-    # 的一部分：只说“有多个候选”而不给可选的东西，用户就没法回答那个问题。
-    # 展示名由已授权解析层换，本层只发引用。
+    # 不发名称：needs_input 路径不发 Artifact，也就没有已授权的目录投影可用；
+    # spec §3 把“有权查看的候选”当作 needs_input 的一部分：只说“有多个候选”而不给
+    # 可选的东西，用户就没法回答那个问题。展示名由已授权解析层换，本层只发引用。
     candidates: tuple[Mapping[str, object], ...] = ()

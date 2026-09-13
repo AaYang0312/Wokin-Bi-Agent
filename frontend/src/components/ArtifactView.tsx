@@ -1,5 +1,16 @@
-import type { Artifact, DisplayEntity } from '../types'
+import type { Artifact, DisplayEntity, DrilldownIntent } from '../types'
+import { ChartArtifact } from './ChartArtifact'
 import { ClockIcon, GaugeIcon, TableIcon } from './icons'
+
+/**
+ * 把下钻意图变成一句新提问：外层只负责把它当普通用户问题发出去。
+ *
+ * 为什么发问题而不是直接调一个“取店铺数据”的接口：授权、范围展开与口径确认都在
+ * 服务端做一次，客户端手里没有任何可以冒充授权结论的东西（spec §8）。
+ */
+export function drilldownQuestion(intent: DrilldownIntent): string {
+  return intent.question
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -27,7 +38,7 @@ const DIMENSION_COLUMNS = new Set([
  * 平台码 → 可读名。后端 PLATFORM_LABELS 才是单一真源（它也用这份表做重名后缀）；
  * 未收录的码原样输出，不猜、不置空。
  */
-const PLATFORM_LABELS: Record<string, string> = {
+export const PLATFORM_LABELS: Record<string, string> = {
   fxg: '抖音', tb: '淘宝', tm: '天猫', pdd: '拼多多', jd: '京东', kuaishou: '快手',
   wxsph: '视频号', '1688': '1688',
 }
@@ -87,11 +98,28 @@ export function cellPlatform(value: unknown, entities: Map<string, DisplayEntity
   return label
 }
 
-function isRef(value: unknown): value is string {
+export function platformLabel(code: string): string {
+  // 未收录的码原样输出：宁可不好读，也不猜一个名字上去。
+  const trimmed = code.trim()
+  return PLATFORM_LABELS[trimmed.toLowerCase()] ?? trimmed
+}
+
+export function isRef(value: unknown): value is string {
   return typeof value === 'string' && /^ent-[0-9a-z]{8}$/.test(value)
 }
 
-export function ArtifactView({ artifact }: { artifact: Artifact }) {
+export function ArtifactView({
+  artifact, datasets = [], onDrilldown,
+}: {
+  artifact: Artifact
+  /**
+   * 同一条消息里已收到的全部 Artifact（含自己）：`chart_spec` 只能按引用去这里取
+   * 被它引用的那份数据集，找不到就不画。
+   */
+  datasets?: Artifact[]
+  /** 图表下钻：只交出一个意图，外层负责把它变成一次**重新授权**的提问。 */
+  onDrilldown?: (intent: DrilldownIntent) => void
+}) {
   const entities = artifactEntities(artifact)
   const rows = Array.isArray(artifact.data) ? artifact.data.filter(
     (row): row is Record<string, unknown> => typeof row === 'object' && row !== null && !Array.isArray(row),
@@ -116,6 +144,15 @@ export function ArtifactView({ artifact }: { artifact: Artifact }) {
   const asOf = typeof artifact.data_as_of === 'string' ? artifact.data_as_of : null
   const coverage = isRecord(artifact.coverage) ? artifact.coverage.status : undefined
   const notes = [...limitations.map(text), ...notices]
+  // 图表卡片走另一个组件：它只引用已落库数据集，不在这里重复一份表格。
+  if (artifact.artifact_type === 'chart_spec') {
+    return (
+      <ChartArtifact
+        artifact={artifact}
+        artifacts={datasets.length > 0 ? datasets : [artifact]}
+        onDrilldown={onDrilldown} />
+    )
+  }
 
   return (
     <section className="artifact" aria-label="经营数据结果">

@@ -23,9 +23,11 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from decimal import ROUND_HALF_UP, Decimal
+from types import MappingProxyType
 from typing import Literal, get_args
 
 from bi_agent.data_quality import money_text
+from bi_agent.sources import platform_codes
 
 # 口径版本：参考指标是本轮新增的面，单独一个版本号参与血缘，
 # 只改商品参考口径时不该让固定指标的血缘版本跟着动。
@@ -98,12 +100,23 @@ COMMERCE_METRIC_UNITS: dict[str, MetricUnit] = {
     "erp_gross_profit_reference": "CNY",
 }
 
+# 图表轴上允许出现的列（spec §8 的 `x` / `y`）：与结果列同一归属，不在展示层重拄。
+# `y` 只能是报告指标：`paid_amount` / `paid_orders` 那一面没有登记过单位契约，
+# 不进轴——宁可少一张图，也不要一张要靠猜单位才能读的图。
+CHART_Y_COLUMNS: frozenset[str] = frozenset(COMMERCE_METRICS)
+CHART_METRIC_UNITS: Mapping[str, MetricUnit] = dict(COMMERCE_METRIC_UNITS)
+# `x` / `series` 只能是分组键或日期：分组键就这两个（店铺、平台），没有自由维度。
+CHART_X_COLUMNS: frozenset[str] = frozenset({"platform", "shop_ref", "day"})
+CHART_SERIES_COLUMNS: frozenset[str] = frozenset({"platform", "shop_ref", "line_kind"})
+
 # ---------------------------------------------------------------------------
 # 投影契约（单一真源，与 promotion.py 同一形状）
 # ---------------------------------------------------------------------------
 
 # 列名 -> 校验类别。`shop_ref`/`day`/`line_kind`/`currency`/`erp_documents`/
 # `paid_amount`/`paid_orders` 已在固定指标侧声明，这里只补商品参考面新增的列。
+# `platform` 是**标签**列：取值只能是注册表登记过的平台码（`runtime.models` 按
+# `PLATFORM_GROUP_CODES` 逐项校验），不给载荷留第二条自由文本通道。
 COMMERCE_COLUMN_KINDS: Mapping[str, str] = {
     "sold_quantity": "decimal",
     "sales_amount": "decimal",
@@ -113,12 +126,16 @@ COMMERCE_COLUMN_KINDS: Mapping[str, str] = {
     "sales_share": "decimal",
     "erp_gross_profit_reference": "decimal",
     "erp_documents_with_gross_profit": "int",
+    "platform": "label",
 }
 COMMERCE_RESULT_COLUMNS = frozenset(COMMERCE_COLUMN_KINDS)
 COMMERCE_NUMERIC_RESULT_COLUMNS = frozenset(
     key for key, kind in COMMERCE_COLUMN_KINDS.items() if kind in ("decimal", "int"))
-# 新增列全部是数值列：不放开成"字符串列由调用方自己保证"。
-assert COMMERCE_NUMERIC_RESULT_COLUMNS == COMMERCE_RESULT_COLUMNS
+# 每一列都必须声明校验类别，不放开成"字符串列由调用方自己保证"：
+# 非数值列只允许 `label`（枚举取值），新增形态必须先在这里登记再使用。
+assert {kind for kind in COMMERCE_COLUMN_KINDS.values()} <= {"decimal", "int", "label"}
+assert COMMERCE_RESULT_COLUMNS == (
+    COMMERCE_NUMERIC_RESULT_COLUMNS | {"platform"})
 
 # 商品面与单据面各自能出现在哪些列上：两面同表的写法一律当场拒绝。
 COMMERCE_PRODUCT_COLUMNS: frozenset[str] = frozenset(
@@ -126,7 +143,7 @@ COMMERCE_PRODUCT_COLUMNS: frozenset[str] = frozenset(
      "product_gross_profit_reference", "product_gross_margin_reference", "sales_share"))
 COMMERCE_DOCUMENT_COLUMNS: frozenset[str] = frozenset(
     ("erp_gross_profit_reference", "erp_documents_with_gross_profit"))
-assert (COMMERCE_PRODUCT_COLUMNS | COMMERCE_DOCUMENT_COLUMNS
+assert (COMMERCE_PRODUCT_COLUMNS | COMMERCE_DOCUMENT_COLUMNS | {"platform"}
         == COMMERCE_RESULT_COLUMNS)
 # 与固定指标 / 推广的列名不得重名：重名就意味着同一个词在两个域里指两件事。
 assert not (COMMERCE_RESULT_COLUMNS
@@ -158,11 +175,72 @@ DOCUMENT_ROWS: tuple[str, ...] = (
 # 已验证支付面：独立一张表，不与单据毛利同行，也不与商品面相加。
 PAYMENT_ROWS: tuple[str, ...] = ("shop_id", "paid_amount", "paid_orders")
 
+# 对比面（Task 8）：一行 = 一个分组（一家店或一个平台）。
+# 与商品面不同，对比行**不逐行性质拆**：一家店的对比值就是它窗口内全部行性质的合计
+# （`_window_value` 同一规则），拆成多行会把"这一组是多少"变成"这几行里挑一行"。
+# 合计行不带分组键，含义与商品面的合计行一致：已评估集合的合计。
+# 具体列形由 `comparison_row_columns` 按本轮请求的指标算：只发被请求的指标列，
+# 不补一份"反正都是 null"的列（一列写着 sales_amount 就会被读成"算过了它"）。
+COMPARISON_METRIC_ORDER: tuple[str, ...] = (
+    "sold_quantity", "sales_amount", "weighted_avg_paid_price",
+    "product_gross_profit_reference", "product_gross_margin_reference",
+    "erp_documents", "erp_documents_with_gross_profit", "erp_gross_profit_reference",
+    "paid_amount", "paid_orders")# 对比趋势：一行 = (分组, 日)。缺失日的数值列一律 null，真实零成交才是 0
+# （与商品面 TREND_ROWS 同一条规则，折线图的断口就来自这些 null）。
+COMPARISON_TREND_SHOP_ROWS: tuple[str, ...] = (
+    "shop_id", "day", "sold_quantity", "sales_amount")
+COMPARISON_TREND_PLATFORM_ROWS: tuple[str, ...] = (
+    "platform", "day", "sold_quantity", "sales_amount")
+
 # 允许出现在原文行里的列：本域新增列 + 复用的既有列 + 主键与名称列。
 COMMERCE_ROW_COLUMNS: frozenset[str] = (
     COMMERCE_RESULT_COLUMNS
     | frozenset({"shop_id", "product_id", "day", "line_kind", "erp_documents",
                  "paid_amount", "paid_orders", *NAME_COLUMNS}))
+
+# `combine_reference_metrics` / `compute_reference_metrics` 的输出列：算术层只产这五列，
+# 对比面与商品面共用。写在这里而不是让调用方手抄：少一列就会在投影处多一个 null。
+COMBINED_VALUE_COLUMNS: tuple[str, ...] = (
+    "sold_quantity", "sales_amount", "weighted_avg_paid_price",
+    "product_gross_profit_reference", "product_gross_margin_reference")
+# 这两列不能相加：均价与率都要从合并后的总额重算（spec §5.2）。
+RATIO_VALUE_COLUMNS: frozenset[str] = frozenset(
+    ("weighted_avg_paid_price", "product_gross_margin_reference"))
+# 计数列保持整数：行里是 int，合计也必须是 int。一列两种类型，早晚有人拿字符串
+# 去比大小或者把它渲染成 "6" 后再四舍五入。
+COUNT_VALUE_COLUMNS: frozenset[str] = frozenset(
+    ("erp_documents", "erp_documents_with_gross_profit", "paid_orders"))
+# 证据列跟着哪个报告指标的口径走：它们不是报告指标，没有自己的口径凭证条目，
+# 可比性只能跟着把它们带进本轮的那个指标。
+COLUMN_GOVERNING_METRIC: Mapping[str, str] = MappingProxyType({
+    "erp_documents": "erp_gross_profit_reference",
+    "erp_documents_with_gross_profit": "erp_gross_profit_reference"})
+# 支付面两列本身就是已登记的能力标签：口径直接按标签解，不借商品面的凭证。
+PAYMENT_CAPABILITY_COLUMNS: frozenset[str] = frozenset({"paid_amount", "paid_orders"})
+# 能进排名块的列：只有报告指标。单据面的两份计数进合计行也进行，但"谁第一"对
+# 一张单据数没有意义，而且它们没有自己的口径凭证条目可比。
+COMPARISON_RANKED_COLUMNS: frozenset[str] = frozenset(COMMERCE_METRICS)
+
+
+def comparison_row_columns(metrics: Sequence[str], *, payments: bool,
+                           documents: bool = False) -> tuple[str, ...]:
+    """本轮对比行的指标列（不含分组键）：按 `COMPARISON_METRIC_ORDER` 定序。
+
+    只发被请求的指标列；支付面两列只在 `sales_basis=verified_payment` 时跟着出
+    （它们是另一份事实集合，不能顶替商品面的 `sales_amount`）。单据面被请求时，
+    两份**计数**跟着一起出：毛利列能不能发布取决于"几张单据 / 几张带毛利字段"，
+    只给一个 null 就把可核对的证据藏起来了（与商品报告 DOCUMENT_ROWS 同一形状）。
+    """
+    wanted = {str(metric) for metric in metrics}
+    if payments:
+        wanted.update(PAYMENT_ROWS[1:])
+    if documents:
+        wanted.update(key for key in DOCUMENT_ROWS[1:] if key != "erp_gross_profit_reference")
+    columns = tuple(key for key in COMPARISON_METRIC_ORDER if key in wanted)
+    unknown = set(columns) - COMMERCE_ROW_COLUMNS
+    if unknown:
+        raise ValueError(f"commerce_column_undeclared:{sorted(unknown)}")
+    return columns
 
 
 def project(declared: tuple[str, ...], values: Mapping[str, object]) -> dict[str, object]:
@@ -197,10 +275,19 @@ COMMERCE_PUBLIC_LIMITATIONS = frozenset({
     "趋势窗口覆盖不足，缺失日按 null 单独留 gap，不滑到另一组七天",
     "授权范围内没有可分析的店铺",
     "商品未解析出来，不能当成销量为 0",
+    # 对比面（Task 8）：分组规则、合计分母、支付面与图表降级各一句固定文本。
+    "淘宝与天猫本轮没有已批准的版本化合并规则，按两个平台分列，不并成一个淘系组",
+    "不含分组键的行是已发布分组的合计，不等于全部获准范围合计",
+    "已验证支付口径下只能按支付面两列对比：报告指标的定义是 ERP 有效销售父项口径",
+    "本轮没有可画的指标：图表只引用同口径的已落库数据集，没有可画集合时只发表格",
+    "有分组的单元格算不出来（本轮没有可发布的事实行），原因见各面覆盖披露",
 })
 
 # 参数化披露：家数 / 行数可变，句式固定。金额片段与 `runtime.models._MONEY` 同源。
 _MONEY = r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?"
+# 分组键片段：平台码（`sources.platform_codes`）或 `ent-` 店铺引用都是这一类短标识，
+# 同一个字符集不拄第二份；店铺主键与真实店名仍然进不了披露文本。
+_GROUP_KEYS = r"[a-z0-9][a-z0-9_-]{0,15}(?:、[a-z0-9][a-z0-9_-]{0,15})*"
 COMMERCE_LIMITATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     # 范围收缩：家数与缺口原因数可变，句式固定；店铺主键不出现在文本里。
     re.compile(r"^[0-9]+ 家获准店铺未列入本次合计，原因见 excluded_scope$"),
@@ -214,6 +301,10 @@ COMMERCE_LIMITATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^[0-9]+ 家店铺在本轮窗口内没有该商品的成交行，按真实 0 计入$"),
     # 商品歧义：家数可变，句式固定；候选主键与匹配文本都不进披露。
     re.compile(r"^[0-9]+ 个候选商品命中同一文本，请改用商品引用后重试$"),
+    # 对比面（Task 8）：家数与分组键可变，句式固定。
+    re.compile(r"^[0-9]+ 个分组仍有获准店铺未被评估，不发布该分组数字："
+               + _GROUP_KEYS + r"$"),
+    re.compile(r"^[0-9]+ 个指标的合计已拒答（有分组拿不出该指标的值或口径不一致）$"),
 )
 
 COMMERCE_LIMITATION_CODES = frozenset({
@@ -234,6 +325,14 @@ COMMERCE_LIMITATION_CODES = frozenset({
     "product_zero_rows",
     "product_not_resolved",
     "empty_scope",
+    # 对比面（Task 8）：分组完整性、合计拒答、图表降级与平台分组规则各归一个码。
+    # 跨组口径不一致沿用既有的 `basis_incompatible`，不另起第二个名字。
+    "comparison_group_partial",
+    "comparison_total_withheld",
+    # 分组可答但本轮没有可发布的事实行：单元格留 null 的独立原因。
+    "comparison_cell_withheld",
+    "comparison_chart_unavailable",
+    "platform_group_rule_unconfigured",
 })
 
 # ---------------------------------------------------------------------------
@@ -246,8 +345,50 @@ ProfitBasis = Literal["none", "existing_fields"]
 ComparisonMode = Literal["none", "previous_period"]
 MetricStatusValue = Literal["available", "missing", "unsupported", "incomparable"]
 METRIC_STATUS_VALUES: frozenset[str] = frozenset(get_args(MetricStatusValue))
+# 对比报告的分组状态（spec §8：无数据平台保留原因标签）。只登记真发得出的两种：
+#   complete —— 本组全部获准店铺都被评估过，该组可以发布数字
+#   partial  —— 本组仍有获准店铺未被评估 -> 不发该组数字，也不进合计与排名
+# 组内口径不一致不是一种分组状态：它就是这一组里某些指标的单元格不可算，
+# 已由 `metric_statuses` 与排名块的 `missing` 说过，不在这里再说一遍。
+GroupStatusValue = Literal["complete", "partial"]
+GROUP_STATUS_VALUES: frozenset[str] = frozenset(get_args(GroupStatusValue))
+# 分组排名范围：只能取已评估集合，不拿它当全量排位。
 RankingScope = Literal["evaluated_only"]
 RANKING_SCOPES: frozenset[str] = frozenset(get_args(RankingScope))
+# 一个指标的排名能走到哪一步（spec §3：“仅对同口径、同窗口、质量合格的子集排序，
+# 并明确排名范围”）：
+#   complete     —— 全部已发布分组同口径且都有值：排名与合计一起发
+#   incomplete   —— 有分组拿不出该指标的值：值照发，名次一个都不给，缺的列在 missing 里
+#   incomparable —— 分组间口径不一致：不排名也不合计，只按各分组自己的口径展示
+RankingStatus = Literal["complete", "incomplete", "incomparable"]
+RANKING_STATUSES: frozenset[str] = frozenset(get_args(RankingStatus))
+ComparisonGroupBy = Literal["platform", "shop"]
+COMPARISON_GROUP_BY: frozenset[str] = frozenset(get_args(ComparisonGroupBy))
+# 分组维度 → 图表的分组键列：轴上的列名只在这一处与分组维度挂钩，
+# 不两处各写一份词表。
+COMPARISON_GROUP_COLUMN: dict[str, str] = {"platform": "platform", "shop": "shop_ref"}
+
+# ---------------------------------------------------------------------------
+# 平台分组规则（显式 tb / tm）
+# ---------------------------------------------------------------------------
+# 已登记的平台码（单一真源是来源注册表）：对比图的分组键取值只能来自这里。
+PLATFORM_GROUP_CODES: frozenset[str] = frozenset(platform_codes())
+# 本轮没有已批准的版本化合并规则：`{}` 就是“不合并”这个决定本身。
+# 一旦配上（例如把 tb/tm 并成一个“淘系”组），这里换成 {"tb": "taoxi", "tm": "taoxi"}
+# 并把 `PLATFORM_GROUP_RULE` 推进到已批准规则的版本号：分组一变，旧 Artifact 的
+# “同一个组”就不再成立。
+PLATFORM_GROUP_MERGES: Mapping[str, str] = MappingProxyType({})
+PLATFORM_GROUP_RULE = "platform-groups/2026-09-14.1"
+# 淘系两家（tb / tm）是这份规则要回答的那个具体问题：两者同时出现在一张对比表里时，
+# 必须把“没合并”说在明面上，不让人自己猜“为什么没有淘系合计”。
+TAOBAO_FAMILY_PLATFORMS: frozenset[str] = frozenset({"tb", "tm"})
+
+
+def platform_group_of(platform: str) -> str:
+    """平台码 → 分组键。本轮恒等：淘宝与天猫各成一组（spec §3）。"""
+    return PLATFORM_GROUP_MERGES.get(platform, platform)
+
+
 OpportunityStatus = Literal["configured", "unconfigured"]
 OPPORTUNITY_STATUSES: frozenset[str] = frozenset(get_args(OpportunityStatus))
 
@@ -401,7 +542,9 @@ def rank_shops(rows: Iterable[Mapping[str, object]], metric: str,
     keyed = [(decimal_of(row, metric), index, row)
              for index, row in enumerate(materialised)]
     # 升序 = 取负后降序：两个方向共用一个比较器，不养出第二份排序规则。
-    sign = Decimal(1) if descending else Decimal(-1)
+    # （取负而不是写两份 key：`descending` 与输出方必须一致，否则同名指标
+    # 会在两个地方被说成"第一"。）
+    sign = Decimal(-1) if descending else Decimal(1)
     present = sorted([item for item in keyed if item[0] is not None],
                      key=lambda item: (sign * item[0],
                                        str(item[2].get("shop_ref") or ""), item[1]))
@@ -427,6 +570,20 @@ def sales_shares(rows: Iterable[Mapping[str, object]], metric: str,
         value = decimal_of(row, metric) if total is not None else None
         row["sales_share"] = money_of(_ratio(value, total)) if value is not None else None
     return materialised
+
+
+def rank_groups(rows: Iterable[Mapping[str, object]], metric: str,
+                *, descending: bool = True) -> list[dict[str, object]]:
+    """对比分组排名：与 `rank_shops` 同一份比较器，只多一个分组键回退。
+
+    店铺分组行带 `shop_ref`，平台分组行带 `platform`；两者共用一个排序，
+    就不会长出第二套"谁第一"的规则。null 仍然不参排（当 0 排会把缺口压到最低档）。
+    """
+    materialised = [{**dict(row), "shop_ref": row.get("shop_ref") or row.get("platform")}
+                    for row in rows]
+    return [{key: value for key, value in row.items() if key != "shop_ref"}
+            if row.get("platform") is not None else row
+            for row in rank_shops(materialised, metric, descending=descending)]
 
 
 def _number(row: Mapping[str, object], key: str) -> tuple[int, Decimal]:
