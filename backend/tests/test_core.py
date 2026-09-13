@@ -1791,6 +1791,8 @@ class PromotionTests(unittest.TestCase):
         from bi_agent.runtime import models
 
         covered = (models._NUMERIC_RESULT_COLUMNS | models._DATE_RESULT_COLUMNS
+                   | models._DATETIME_RESULT_COLUMNS
+                   | models._LISTING_REF_RESULT_COLUMNS
                    | frozenset(models._LABEL_RESULT_VALUES)
                    | models._REF_RESULT_COLUMNS | models._TEXT_RESULT_COLUMNS)
         self.assertEqual(covered, models.ARTIFACT_RESULT_COLUMNS)
@@ -1883,7 +1885,8 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual([item["function"]["name"] for item in agent._tool_schemas()],
                          ["query_business", "analyze_product_performance",
-                          "compare_performance", "evaluate_promotion"])
+                          "compare_performance", "audit_listing_prices",
+                          "evaluate_promotion"])
         captured: dict[str, object] = {}
         model_payload = {"status": "ok", "data": [{"sales_amount": "550"}],
                          "excluded_scope": [{"shop_ref": S1_REF,

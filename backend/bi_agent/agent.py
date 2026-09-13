@@ -36,6 +36,8 @@ from .catalog import (
     shop_display_labels,
 )
 from .llm import ChatModel, Message, ModelError, ModelReply, ToolCall
+from .listing_audit.tool import (
+    execute_listing_audit_tool, listing_audit_request_schema)
 from .metrics import QueryRequest, ToolResult, resolve_period
 from .promotion import PromotionRequest, evaluate_promotion
 from .runtime import MemoryQueryRunStore, PostgresQueryRunStore, QueryRunStore, TurnContext
@@ -47,7 +49,7 @@ MAX_MODEL_TURNS = 5
 MAX_KEPT_TURNS = 6
 
 _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%Y-%m-%d %H:%M}（Asia/Shanghai）。
-只能使用四个工具：
+只能使用五个工具：
 - query_business：按已确认口径查询经营指标，日期end排他；shop_ids 只能填 ent- 形式的店铺引用，
   可用引用：{ref_doc}。引用与真实店名的对应关系你看不到，也不要猜。
 - analyze_product_performance：查**一个指定商品**在获准店铺内的跨店经营报告与七日趋势；
@@ -59,6 +61,17 @@ _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%
   compare_performance：窗口与口径照本轮原值，范围由服务端重新展开授权，**不要**沿用上一轮
   结果里的店铺清单。缺数的平台不当 0：excluded_scope 与 group_statuses 逐条带着原因，
   合计与排名只覆盖同口径且完整的分组，口径互不兼容时只能按分组各自转述。
+- audit_listing_prices：按**用户本轮明确给出的目标价**复核各店 / 各链接的渠道在售价。
+  expected_prices 是必填：目标价只能取自用户当前这句话，**不能**沿用上几轮的价，也不能
+  拿历史成交均价、ERP 档案建议价或采购价去补一个标准。用户没说就是缺价：工具会返
+  needs_input，你把目标价问回来再查。多规格要逐 SKU 给（applies_to=sku / shop_sku），
+  只有用户明说“所有规格统一价”才能用 all_selected。
+  结果逐格带状态：match/mismatch/not_listed/not_on_sale/missing_standard/unmapped/
+  stale/unsupported/unknown。all_correct 只有在每一格都有新鲜、完整且匹配的证据时才
+  成立：缺一家、快照过期或来源未取证都不能说“全部正确”。mismatch 是业务发现，不是
+  故障，不要把同一格重试到匹配为止。当前**没有任何已核验的渠道在售价来源**，该工具
+  只会报 unsupported：这时只能如实说“渠道在售价来源尚未取证，本次无法复核”，不得
+  声称线上全店复核可用，也不得把采集到的价当成复核结论。
 - evaluate_promotion：仅按当前用户明确假设测算预算；当前未取得真实推广消耗。
 支持指标：支付金额、支付订单数、客单价、ERP单据数、退款发生额、期间收支差额、同批退款率、商品销量、商品支付金额。
 支持维度：合计、按日、按店铺、按商品。
@@ -400,6 +413,14 @@ def _tool_schemas() -> list[dict[str, object]]:
                            "合计与排名只覆盖同口径且完整的分组，缺数分组只说原因不当 0",
             "parameters": comparison_request_schema()}},
         {"type": "function", "function": {
+            "name": "audit_listing_prices",
+            "description": "按用户**本轮**明确指定的目标价复核各店/各链接的渠道在售价："
+                           "expected_prices 必填且只能取自当前这句提问（不继承上一轮，不拿"
+                           "建议价/成交均价补标准）；多规格逐 SKU 给价，只有明说统一价才用"
+                           " all_selected；all_correct 只在每一格都有新鲜完整证据时成立，"
+                           "来源未取证时只会报 unsupported",
+            "parameters": listing_audit_request_schema()}},
+        {"type": "function", "function": {
             "name": "evaluate_promotion",
             "description": "仅按当前用户明确假设测算预算；当前未取得真实推广消耗",
             "parameters": PromotionRequest.model_json_schema()}},
@@ -507,6 +528,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     error_code: str | None = None
     business_attempt_no = 0
     commerce_attempt_no = 0
+    listing_attempt_no = 0
 
     for _ in range(MAX_MODEL_TURNS):
         remaining = deadline - time_module.monotonic()
@@ -637,6 +659,43 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     content=json.dumps(domain_result.model_payload,
                                        ensure_ascii=False)))
                 continue
+            if call.name == "audit_listing_prices":
+                # 上架复核走与经营图同一形状的适配器：一次工具调用 = 一次图执行。
+                # 主层不逐店循环、不自己比金额，也不为"缺目标价"发明一份默认标准：
+                # 本轮目标价只能从用户当前这句话里来（计划 Task 9、spec §5.4）。
+                # 不往 session_filters 回写任何东西：把目标价存进会话就是下一轮的
+                # "隐式继承"通道，而那一轮拿到的将是一个没人本轮给过的价。
+                listing_attempt_no += 1
+                listing_execution = execute_listing_audit_tool(call, DomainContext(
+                    subject_id=turn_context.subject_id,
+                    allowed_shop_ids=allowed_shop_ids,
+                    shop_refs=dict(state.shop_refs),
+                    conn=conn,
+                    store=run_store,
+                    chat_id=turn_context.chat_id,
+                    user_message_id=turn_context.user_message_id,
+                    root_request_id=turn_context.user_message_id,
+                    now=now,
+                    deadline=deadline,
+                    attempt_no=listing_attempt_no))
+                calls_used += 1
+                domain_result = listing_execution.domain_result
+                if (domain_result.error is not None
+                        and domain_result.error.code
+                        in {"artifact_persistence_failed", "result_contract_violation"}):
+                    last_error = domain_result.error.public_message
+                    error_code = domain_result.error.code
+                    results.clear()
+                    artifacts.clear()
+                    stop_after_batch = True
+                    break
+                artifacts.extend(artifact_event_payload(artifact)
+                                 for artifact in domain_result.artifacts)
+                messages.append(Message(
+                    role="tool", tool_call_id=call.id,
+                    content=json.dumps(domain_result.model_payload,
+                                       ensure_ascii=False)))
+                continue
             if call.arguments_error is not None or call.arguments is None:
                 if correction_used:
                     last_error = "参数两次非法，已停止本次回答"
@@ -654,6 +713,8 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                                             {"error": "unknown_tool",
                                              "detail": "只允许query_business/"
                                                        "analyze_product_performance/"
+                                                       "compare_performance/"
+                                                       "audit_listing_prices/"
                                                        "evaluate_promotion"},
                                             ensure_ascii=False)))
                 continue
@@ -682,8 +743,11 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                        or fallback_text
                        # 补答也失败时，用已存 Artifact 复述确定性摘要：
                        # 只说指标、窗口、截止与限制，不重新计算任何金额。
+                       # 判据带上 artifacts：上架复核不产生 ToolResult（差异表不是指标行），
+                       # 只看 results 会把"卡片已发出、只是没组织成正文"说成"本轮没拿到结果"。
                        or _deterministic_summary(results)
-                       or (NO_TEXT_WITH_RESULTS if results else NO_TEXT_WITHOUT_RESULTS))
+                       or (NO_TEXT_WITH_RESULTS if (results or artifacts)
+                           else NO_TEXT_WITHOUT_RESULTS))
 
     new_state = state.model_copy(update={
         "filters": filters,

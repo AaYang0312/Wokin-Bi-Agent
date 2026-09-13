@@ -171,6 +171,31 @@ class PostgresQueryRunStore:
                  identity.recovery_count, run_id),
             )
 
+    def record_listing_audit_basis(self, run_id: UUID, *, subject_id: str,
+                                   fingerprint: str | None, roster, expectations,
+                                   price_basis: str, currency: str) -> None:
+        """上架复核（Task 9）的本轮依据：roster + 用户本轮目标价，同一事务落库。
+
+        为什么这条写路径在 Store 而不在复核图里：两张表的 `run_id` 外键指向
+        `bi.query_runs`，而运行记录只由本 Store 写。图绕过 Store 直接写，内存 Store
+        下就会 FK 违反（真实部署反而不会报，因为它用的是本类）——一个只在测试里
+        通过的写入路径不是写入路径。形式校验走 `listing_audit.repository` 那一份，
+        与内存 Store 共用，两种实现不会在"能不能写"上漂移。
+        """
+        from bi_agent.listing_audit.repository import write_audit_basis
+
+        # 运行行的存在性不在这里重查：`run_id` 的外键就是凭据，与 `save_artifact` 同一
+        # 处置——违反时报 RunNotFound，而不是给一个不存在的运行记上依据。
+        try:
+            write_audit_basis(self.conn, run_id=run_id, subject_id=subject_id,
+                              fingerprint=fingerprint, roster=roster,
+                              expectations=expectations, price_basis=price_basis,
+                              currency=currency)
+        except errors.ForeignKeyViolation:
+            raise RunNotFound() from None
+        except errors.Error:
+            raise ArtifactPersistenceError() from None
+
     def find_reusable_run(self, *, subject_id: str, fingerprint: str) -> UUID | None:
         """只有同一指纹的成功运行才可复用：指纹已含授权范围与数据版本。"""
         row = self.conn.execute(

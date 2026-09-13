@@ -20,7 +20,7 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 import psycopg
 
 from .dbfixtures import connect_test_db
-from .fakeconn import P1_REF, S1_REF, S2_REF
+from .fakeconn import P1_REF, S1_REF, S2_REF, price_audit_payload
 from bi_agent.runtime import PostgresQueryRunStore
 from bi_agent.runtime.models import (
     ArtifactPersistenceError,
@@ -214,8 +214,9 @@ class RuntimeStoreValidationTests(unittest.TestCase):
         store = PostgresQueryRunStore(DomainConnection(), forbidden_values={"S1"})
 
         with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
+            # 载荷合法：这里唯一该被拦下的理由是"这条运行属于 business_query 领域"。
             store.save_artifact(uuid4(), NewArtifact(
-                artifact_type="price_audit", payload={"status": "ok"}))
+                artifact_type="price_audit", payload=price_audit_payload()))
         self.assertEqual(len(calls), 1, "领域不匹配时不能走到 INSERT")
         self.assertIn("SELECT domain", calls[0])
 

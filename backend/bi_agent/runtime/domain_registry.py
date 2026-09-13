@@ -53,11 +53,21 @@ COMMERCE_NODES = frozenset({
     "execute_aggregates", "compute_metrics", "build_comparison_and_trend",
     "classify_findings", "persist_artifacts", "finalize",
 })
+# 上架复核（计划 Task 9、spec §6 的固定节点链）。推进顺序由
+# `listing_audit/graph.py` 的状态机决定，这里只回答"这个领域能不能写这个节点"。
+# 旧版在这一行挂的是 `_BUSINESS_NODES | {assess_readiness, audit_prices}`——一份
+# "还没实现先占位"的白名单；现在它必须与图上的节点枚举逐项相等（由用例比对），
+# 因为"领域登记了什么节点"就是它能往运行记录里写什么的边界。
+LISTING_NODES = frozenset({
+    "resolve_scope_product_and_skus", "load_expected_listing_roster",
+    "capture_user_expected_prices", "check_listing_source", "load_listing_snapshot",
+    "verify_completeness_and_freshness", "join_expected_and_actual",
+    "compare_decimal_prices", "classify_discrepancies", "persist_audit", "finalize",
+})
 # 尚未实现的领域继续站在旧节点集上：登记只表示"未登记的节点不许写库"，
-# 不代表它们的图已经存在。Task 9/10 落地时各自换成自己的节点链。
-_LISTING_NODES = _BUSINESS_NODES | {"assess_readiness", "audit_prices"}
-_INVENTORY_NODES = _BUSINESS_NODES | {"assess_readiness", "scan_inventory",
-                                      "evaluate_rules"}
+# 不代表它们的图已经存在。Task 10 落地时换成自己的节点链。
+INVENTORY_NODES = frozenset(_BUSINESS_NODES | {"assess_readiness", "scan_inventory",
+                                               "evaluate_rules"})
 
 _REGISTRY: dict[str, DomainSpec] = {
     "business_query": DomainSpec(
@@ -73,11 +83,11 @@ _REGISTRY: dict[str, DomainSpec] = {
                                   "chart_spec"}),
     ),
     "listing_price_audit": DomainSpec(
-        name="listing_price_audit", nodes=_LISTING_NODES,
+        name="listing_price_audit", nodes=LISTING_NODES,
         artifact_types=frozenset({"price_audit", "comparison_table", "chart_spec"}),
     ),
     "inventory_watch": DomainSpec(
-        name="inventory_watch", nodes=_INVENTORY_NODES,
+        name="inventory_watch", nodes=INVENTORY_NODES,
         artifact_types=frozenset({"inventory_alerts", "trend_series", "chart_spec"}),
     ),
 }
@@ -114,3 +124,8 @@ def allows_node(domain: str, node: object) -> bool:
     if entry is None or not isinstance(node, str):
         return False
     return node in entry.nodes
+
+
+__all__ = ["ARTIFACT_TYPES", "COMMERCE_NODES", "DATASET_ARTIFACT_TYPES", "DomainSpec",
+           "DomainUnknown", "INVENTORY_NODES", "LISTING_NODES", "allows_artifact_type",
+           "allows_node", "domains", "known_domain", "spec_for"]

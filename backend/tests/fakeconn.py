@@ -86,3 +86,32 @@ class ShopCatalogConn(CatalogConn):
             return Rows([(shop_id, name) for shop_id, _, name in self.profiles
                          if wanted is None or shop_id in wanted])
         raise AssertionError(f"未预期的SQL：{text}")
+
+
+def price_audit_payload() -> dict:
+    """一份对 `price_audit` 判别契约合法的**最小**载荷（只用合成引用）。
+
+    存在的理由是给"领域能不能发这种 Artifact"那两条用例用：它们要拦的是
+    **领域不匹配**，不是载荷形状。载荷不合法时 NewArtifact 会先一步拒绝，
+    那两条用例就会变成"看起来在检查门禁、其实检查的是另一个东西"。
+    """
+    row = {"shop_ref": S1_REF, "listing_ref": "lst-0123456789ab",
+           "expected_amount": "19.90", "actual_amount": "29.90",
+           "amount_difference": "10", "audit_status": "mismatch",
+           "price_basis": "list_price", "currency": "CNY",
+           "snapshot_at": "2026-09-13T11:40:00+08:00"}
+    return {
+        "status": "partial",
+        "audit": {"expected_items": 1, "evaluated_items": 1, "matched_items": 0,
+                  "all_correct": False, "counts": {"mismatch": 1},
+                  "sources": [{"shop_ref": S1_REF, "source_kind": "official_export",
+                               "enumeration_complete": True, "fresh": True}],
+                  "rule_version": "listing-rules/2026-09-13.1"},
+        "data": [row],
+        "filters": {"currency": "CNY", "price_basis": "list_price", "as_of": "latest",
+                    "expected_prices": [{"applies_to": "all_selected",
+                                         "expected_amount": "19.90",
+                                         "currency": "CNY",
+                                         "price_basis": "list_price"}]},
+        "limitations": [],
+    }

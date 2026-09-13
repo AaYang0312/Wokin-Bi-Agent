@@ -7,6 +7,7 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 
 from pydantic import ValidationError
 
+from .fakeconn import price_audit_payload
 from bi_agent.runtime.models import (
     ArtifactRef,
     ArtifactPersistenceError,
@@ -821,10 +822,12 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
         business_query 往自己的运行下发价审载荷，而 009 的 CHECK 是全局的。
         """
         run_id = self.store.create_run(self.record)
+        # 载荷本身是合法的价审载荷：这里要拦的是"business_query 不许发 price_audit"，
+        # 不是载荷形状。两者混在一起的话，这条用例通过的理由就不是它声称的理由了。
         with self.assertRaisesRegex(ValueError, "^unsafe_persistence_payload$"):
             self.store.save_artifact(run_id, NewArtifact(
-                artifact_type="price_audit", payload={"status": "ok"}))
-        self.assertEqual(self.store.artifacts, {}, "拒绍不能先写一半")
+                artifact_type="price_audit", payload=price_audit_payload()))
+        self.assertEqual(self.store.artifacts, {}, "拒绝不能先写一半")
 
     def test_save_artifact_returns_reference_and_finish_is_terminal(self):
         run_id = self.store.create_run(self.record)

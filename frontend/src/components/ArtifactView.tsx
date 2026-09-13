@@ -32,7 +32,154 @@ function text(value: unknown) {
 const DIMENSION_COLUMNS = new Set([
   'day', 'shop_ref', 'product_ref', 'sku_ref', 'currency', 'basis', 'line_kind', 'mode',
   'notice',
+  // 上架复核的列全部是维度：它们是"一格判定"的组成部分，不是可以求和/求平均的指标。
+  // 拿差额去当指标卡，下一步就会有人把它加起来。范围外也不误入：审计行走自己的卡片。
+  'listing_ref', 'expected_amount', 'actual_amount', 'amount_difference',
+  'audit_status', 'price_basis', 'snapshot_at',
 ])
+
+/**
+ * 上架复核的逐格状态（后端 spec §5.4 的九个取值）。
+ *
+ * 后端只发码，文案在这一侧：同一个词在两个领域里长得不一样时，展示层才是唯一能
+ * 把它说成人话的地方。不在表里的状态**原样输出**，不猜一个中文近义词（与平台码
+ * 同一规则）：猜出来的"通过"会把"未判定"说成好消息。
+ */
+export const AUDIT_STATUS_LABELS: Record<string, string> = {
+  match: '一致',
+  mismatch: '不一致',
+  not_listed: '未上架',
+  not_on_sale: '不在售',
+  missing_standard: '缺目标价',
+  unmapped: '未映射',
+  stale: '快照过期',
+  unsupported: '来源未取证',
+  unknown: '无法判定',
+}
+
+/** 只有这两类算"真比过价"，其余都是证据不足：汇总行必须能分开说。 */
+const AUDIT_JUDGED = new Set(['match', 'mismatch'])
+
+export function auditStatus(status: unknown): string {
+  if (typeof status !== 'string') return '无法判定'
+  return AUDIT_STATUS_LABELS[status] ?? status
+}
+
+function auditNumber(value: unknown): string {
+  // 缺价与"价格为 0"是两件事：null 一律写成缺什么，不写 0，也不写"不可计算"。
+  if (value === null || value === undefined || value === '') return '—'
+  return String(value)
+}
+
+/** 复核汇总块：只认后端给出的字段，缺字段就少说一句，不拿行数据现算一遍分母。 */
+export function auditSummary(artifact: Artifact): {
+  expected: number | null
+  evaluated: number | null
+  allCorrect: boolean | null
+  sources: number
+} {
+  const audit = isRecord(artifact.audit) ? artifact.audit : undefined
+  const num = (key: string) => (typeof audit?.[key] === 'number' ? audit[key] as number : null)
+  return {
+    expected: num('expected_items'),
+    evaluated: num('evaluated_items'),
+    allCorrect: typeof audit?.all_correct === 'boolean' ? audit.all_correct : null,
+    sources: Array.isArray(audit?.sources) ? audit.sources.length : 0,
+  }
+}
+
+/**
+ * 上架复核差异表：一行就是一格期望项，所以行数就是分母。
+ *
+ * 为什么不用通用表格渲染那一段：通用面把"空"当成可缺列，而复核表里 null 是有含义的
+ * （缺目标价 / 未取到实价 / 币种不可比），三种都得写出来。让模型或用户从一片空白里
+ * 去猜是哪一种，正是这一轮要避免的事。
+ */
+function AuditArtifact({ artifact }: { artifact: Artifact }) {
+  const entities = artifactEntities(artifact)
+  const rows = (Array.isArray(artifact.data) ? artifact.data : []).filter(
+    (row): row is Record<string, unknown> => isRecord(row) && typeof row.audit_status === 'string')
+  const summary = auditSummary(artifact)
+  const filters = isRecord(artifact.filters) ? artifact.filters : undefined
+  const priceBasis = typeof filters?.price_basis === 'string'
+    ? filters.price_basis : null
+  const asOf = typeof artifact.data_as_of === 'string' ? artifact.data_as_of : null
+  const limitations = Array.isArray(artifact.limitations) ? artifact.limitations : []
+  const columns: Array<{ key: string; label: string }> = [
+    { key: 'shop_ref', label: '店铺' },
+    { key: 'sku_ref', label: 'SKU' },
+    { key: 'listing_ref', label: '链接' },
+    { key: 'expected_amount', label: '本轮目标价' },
+    { key: 'actual_amount', label: '实际在售价' },
+    { key: 'amount_difference', label: '差额' },
+    { key: 'audit_status', label: '状态' },
+    { key: 'snapshot_at', label: '快照时点' },
+  ]
+  return (
+    <section className="artifact" aria-label="上架价复核差异表">
+      <header className="artifact-head">
+        <span className="artifact-title"><TableIcon size={15} />上架价复核差异表</span>
+        {summary.expected !== null && (
+          <span className="pill">期望 {summary.expected} 项 · 已判定 {summary.evaluated ?? 0} 项</span>
+        )}
+        {summary.allCorrect !== null && (
+          <span className={`pill${summary.allCorrect ? '' : ' pill-warn'}`}>
+            {summary.allCorrect ? '每一格均有新鲜匹配证据' : '未全部通过'}
+          </span>
+        )}
+      </header>
+      {rows.length === 0 && (
+        <p className="limitations">本轮没有可复核的期望项；这不等于该商品没有上架。</p>
+      )}
+      {rows.length > 0 && (
+        <div className="table-wrap">
+          <table>
+            <thead><tr>{columns.map((column) => <th key={column.key}>{column.label}</th>)}</tr></thead>
+            <tbody>{rows.map((row, index) => (
+              <tr key={`${row.shop_ref ?? ''}-${row.listing_ref ?? ''}-${index}`}>
+                {columns.map((column) => {
+                  const value = row[column.key]
+                  const judged = AUDIT_JUDGED.has(String(row.audit_status))
+                  let shown: string | null = null
+                  switch (column.key) {
+                    case 'audit_status': shown = auditStatus(value); break
+                    case 'shop_ref': shown = cellText(value, entities); break
+                    // SKU 沿用全应用同一条取用规则：名称未取得就写"名称未取得"，稳定引用
+                    // 留在 data-ref 上（SKU 主档未建，这一格多数时候就是未取得）。不在这里
+                    // 改用引用当展示文本：那会让同一个引用在两张卡片上有两种读法。
+                    case 'sku_ref': shown = value ? cellText(value, entities) : '—'; break
+                    case 'expected_amount':
+                    case 'actual_amount':
+                    case 'listing_ref':
+                    case 'snapshot_at': shown = auditNumber(value); break
+                    /* 差额只在比过价的那一类状态下发：后端已经这么约束了，这里再挡一次，
+                       是为了不让一份过期快照带出一个看着像当前的差额。 */
+                    case 'amount_difference': shown = judged ? auditNumber(value) : '—'; break
+                  }
+                  return (
+                    <td
+                      key={column.key}
+                      data-ref={isRef(value) ? value : undefined}
+                      data-audit-status={column.key === 'audit_status' ? String(value) : undefined}
+                    >
+                      {shown}
+                    </td>
+                  )
+                })}
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      )}
+      <div className="artifact-meta">
+        {priceBasis && <span>口径：{priceBasis === 'campaign_price' ? '活动价' : '标价'}</span>}
+        {summary.sources > 0 && <span>快照来源：{summary.sources} 家店铺</span>}
+        {asOf && <span><ClockIcon size={13} />快照共同截止：{asOf}</span>}
+      </div>
+      {limitations.length > 0 && <p className="limitations">{limitations.map(text).join('；')}</p>}
+    </section>
+  )
+}
 
 /**
  * 平台码 → 可读名。后端 PLATFORM_LABELS 才是单一真源（它也用这份表做重名后缀）；
@@ -152,6 +299,10 @@ export function ArtifactView({
         artifacts={datasets.length > 0 ? datasets : [artifact]}
         onDrilldown={onDrilldown} />
     )
+  }
+  // 价审卡片走自己的差异表：行数就是分母，而 null 在那张表里是有含义的。
+  if (artifact.artifact_type === 'price_audit') {
+    return <AuditArtifact artifact={artifact} />
   }
 
   return (

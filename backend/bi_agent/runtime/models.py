@@ -26,6 +26,13 @@ from bi_agent.commerce.metrics import (
     COMMERCE_PUBLIC_LIMITATIONS, COMMERCE_RESULT_COLUMNS, EXCLUDED_REASONS,
     GROUP_STATUS_VALUES, METRIC_STATUS_VALUES, OPPORTUNITY_STATUSES,
     PLATFORM_GROUP_CODES, RANKING_SCOPES, RANKING_STATUSES, TREND_DAYS)
+from bi_agent.listing_audit.rules import (
+    APPLIES_TO_VALUES, AUDIT_STATUSES, LISTING_DATETIME_RESULT_COLUMNS,
+    LISTING_LABEL_RESULT_VALUES,
+    LISTING_LIMITATION_CODES, LISTING_LISTING_REF_RESULT_COLUMNS,
+    LISTING_NUMERIC_RESULT_COLUMNS, LISTING_PUBLIC_LIMITATIONS,
+    LISTING_REF_RE, LISTING_REF_RESULT_COLUMNS,
+    LISTING_RESULT_COLUMNS, LISTING_SOURCE_KINDS, MAX_ROSTER_ITEMS, PRICE_BASES)  # noqa: E501
 from bi_agent.metrics import Coverage, METRIC_DEFINITIONS
 from bi_agent.presentation.charts import (
     CHART_BASELINES, CHART_KINDS, CHART_NULL_HANDLES, CHART_PAYLOAD_KEYS,
@@ -66,6 +73,12 @@ PersistenceNode = Literal[
     "check_capabilities_and_coverage", "freeze_versions", "plan_fixed_queries",
     "execute_aggregates", "compute_metrics", "build_comparison_and_trend",
     "classify_findings", "persist_artifacts",
+    # 上架复核图（计划 Task 9、spec §6）：目标价只来自本轮，判定分母是期望 roster。
+    # 链上每一格都对应一个可归因的证据问题，合并节点就等于合并归因。
+    "resolve_scope_product_and_skus", "load_expected_listing_roster",
+    "capture_user_expected_prices", "check_listing_source", "load_listing_snapshot",
+    "verify_completeness_and_freshness", "join_expected_and_actual",
+    "compare_decimal_prices", "classify_discrepancies", "persist_audit",
 ]
 ErrorCode = Literal[
     "missing_parameters", "invalid_parameters", "forbidden", "deadline_exceeded",
@@ -152,6 +165,8 @@ _LIMITATION_CODES = frozenset({
     "basis_incompatible",
     # 商品运营面（Task 7）：范围、成本覆盖、单据口径与候选排序各自归因。
     *COMMERCE_LIMITATION_CODES,
+    # 上架复核（Task 9）：来源 / 快照 / 时效 / 枚举 / 本轮目标价 / 业务发现各自归因。
+    *LISTING_LIMITATION_CODES,
 })
 # 逐指标状态的原因只能用已登记的限制码：状态与限制共用一份词表，
 # 不然同一个缺口会在两处各起一个名字。
@@ -173,7 +188,8 @@ _PUBLIC_LIMITATIONS = frozenset({
     "上期覆盖不足，无法比较，仅返回绝对值",
     "比较仅支持total/shop分组",
     "同批支付额为0或无支付，同批退款率不可计算",
-}) | PROMOTION_PUBLIC_LIMITATIONS | COMMERCE_PUBLIC_LIMITATIONS
+}) | PROMOTION_PUBLIC_LIMITATIONS | COMMERCE_PUBLIC_LIMITATIONS \
+    | LISTING_PUBLIC_LIMITATIONS
 _PUBLIC_LIMITATION_PATTERNS = (
     re.compile(r"^存在[0-9]+条未匹配的平台成功退款，退款归属未确认$"),
     re.compile(r"^结果超过[0-9]+组，请缩小日期范围或店铺范围$"),
@@ -223,6 +239,8 @@ _NORMALIZED_REQUEST_KEYS = frozenset({
     "profit_basis", "trend_days", "report_kind", "opportunity_policy_ref",
     # 对比报告的分组规则版本：分组规则换了就是另一个问题，旧结果不许命中。
     "platform_group_rule",
+    # 上架复核（Task 9）：本轮目标价参与指纹，换价就是换问题；缺它就没有依据可言。
+    "expected_prices", "price_basis", "as_of",
 })
 _ARTIFACT_KEYS = frozenset({
     "status", "metric_definition", "coverage", "limitations", "data_as_of", "filters",
@@ -234,6 +252,8 @@ _ARTIFACT_KEYS = frozenset({
     "termination_reason", "candidates",
     # 对比报告（Task 8）：分组状态与“哪些分组进了排名 / 合计”。
     "group_statuses", "ranking",
+    # 上架复核（Task 9）：期望项分母、判定计数、来源与时效声明。
+    "audit",
 })
 
 # ---------------------------------------------------------------------------
@@ -278,10 +298,18 @@ _FILTER_KEYS = frozenset({
     "start", "end", "shop_refs", "metrics", "group_by", "compare", "top_n", "currency",
     "basis_policy", "mode", "sales_basis", "profit_basis", "platforms", "product_ref",
     "report_kind", "sales_share_basis",
+    # 上架复核：一次复核回答的是「哪个口径、哪个时点、按哪些本轮目标价」。
+    "price_basis", "as_of", "expected_prices",
 })
 
 _LINE_KINDS = frozenset({"sale", "gift", "suite", "combination", "processing"})
 _CURRENCY_VALUES = frozenset({"CNY"})
+# 上架复核的词表由生产方（`listing_audit.rules`）持有：列名、类别与取值集合都在
+# 那一处声明并用断言自校，这里只引用。「新增列必须先声明类型」这条规则才有唯一落点。
+_LISTING_REF_RESULT_COLUMNS: frozenset[str] = LISTING_LISTING_REF_RESULT_COLUMNS
+_DATETIME_RESULT_COLUMNS: frozenset[str] = LISTING_DATETIME_RESULT_COLUMNS
+_PRICE_BASES = frozenset(PRICE_BASES)
+_AUDIT_STATUSES = frozenset(AUDIT_STATUSES)
 
 # 结果列白名单以生产方为单一真源：推广列（含类型与可取集合）从 promotion.py 导出，
 # 本模块只补充固定指标侧的列，不再手抄推广列名。
@@ -290,7 +318,8 @@ _METRIC_RESULT_COLUMNS = frozenset({
     "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
     "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount", "notice",
 })
-_REF_RESULT_COLUMNS = frozenset({"shop_ref", "product_ref"})
+_REF_RESULT_COLUMNS = (frozenset({"shop_ref", "product_ref"})
+                       | LISTING_REF_RESULT_COLUMNS)
 # 文本列只有上限、转义与长数字主键三道限制；不放开成“任意字符串都收”。
 _TEXT_RESULT_COLUMNS = frozenset({"notice"})
 _DATE_RESULT_COLUMNS = frozenset({"day"}) | PROMOTION_DATE_RESULT_COLUMNS
@@ -300,13 +329,19 @@ _LABEL_RESULT_VALUES: dict[str, frozenset[str]] = {
     # 对比报告的平台分组键：取值只能是来源注册表里登记过的平台码。
     "platform": PLATFORM_GROUP_CODES,
     **PROMOTION_LABEL_VALUES,
+    # 上架复核的判定状态与价格口径：只能取 spec §5.4 / §4 的那几个值。
+    **LISTING_LABEL_RESULT_VALUES,
 }
 _RESULT_COLUMNS = (_METRIC_RESULT_COLUMNS | PROMOTION_RESULT_COLUMNS
-                   | COMMERCE_RESULT_COLUMNS)
+                   | COMMERCE_RESULT_COLUMNS | LISTING_RESULT_COLUMNS)
 # 剩下的列一律按十进制/整数严格校验；推广数值列集合作为交叉校验。
-_NUMERIC_RESULT_COLUMNS = (_RESULT_COLUMNS - _REF_RESULT_COLUMNS - _DATE_RESULT_COLUMNS
-                           - _TEXT_RESULT_COLUMNS
-                           - frozenset(_LABEL_RESULT_VALUES))
+# 上架复核那一段的数值列**取声明集而不是取余集**：拿余集当数值兼容，新登记一个
+# 未认识的列就会默默落进"只收十进制"那一档，把任意文本当金额收下来。
+_NUMERIC_RESULT_COLUMNS = ((_RESULT_COLUMNS - _REF_RESULT_COLUMNS - _DATE_RESULT_COLUMNS
+                            - _TEXT_RESULT_COLUMNS - _DATETIME_RESULT_COLUMNS
+                            - _LISTING_REF_RESULT_COLUMNS - LISTING_RESULT_COLUMNS
+                            - frozenset(_LABEL_RESULT_VALUES))
+                           | LISTING_NUMERIC_RESULT_COLUMNS)
 assert _NUMERIC_RESULT_COLUMNS & PROMOTION_RESULT_COLUMNS == PROMOTION_NUMERIC_RESULT_COLUMNS
 # 投影层（business_query/tool.py）复用同一份白名单，避免二次手抄漂移。
 ARTIFACT_RESULT_COLUMNS = _RESULT_COLUMNS
@@ -321,6 +356,25 @@ _REF_RE = REF_RE
 _PLATFORM_CODE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,15}$")
 # 版本化策略引用（如 `low-margin/1`）：与口径名同一形式。
 _POLICY_REF_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}/[0-9][0-9._-]{0,15}$")
+# ---------------------------------------------------------------------------
+# 上架复核（Task 9）的载荷词表。取值集合全部由生产方 `listing_audit.rules` 供给，
+# 本模块只引用：两边各自拄一份，迟早会出现在这里能写、在图上判不出来的状态。
+# ---------------------------------------------------------------------------
+_APPLIES_TO_VALUES = frozenset(APPLIES_TO_VALUES)
+_LISTING_SOURCE_KINDS = frozenset(LISTING_SOURCE_KINDS)
+_AS_OF_VALUES = frozenset({"latest"})
+_EXPECTATION_KEYS = frozenset({"applies_to", "shop_ref", "sku_ref", "expected_amount",
+                               "currency", "price_basis"})
+_AUDIT_SUMMARY_KEYS = frozenset({
+    "expected_items", "evaluated_items", "matched_items", "all_correct", "counts",
+    "sources", "freshness_policy_seconds", "rule_version"})
+_AUDIT_SUMMARY_REQUIRED = frozenset({
+    "expected_items", "evaluated_items", "matched_items", "all_correct", "counts",
+    "sources"})
+_AUDIT_SOURCE_KEYS = frozenset({"shop_ref", "source_kind", "snapshot_at",
+                                "enumeration_complete", "fresh"})
+_AUDIT_SOURCE_REQUIRED = frozenset({"shop_ref", "source_kind", "enumeration_complete",
+                                     "fresh"})
 _ENTITY_KINDS = frozenset(kind.value for kind in EntityKind)
 _NAME_SOURCES = frozenset({"archive", "trade_snapshot", "shop_profile", "unresolved"})
 _ENTITY_KEYS = frozenset({"ref", "kind", "display_name", "sku_label", "name_source",
@@ -380,6 +434,16 @@ def _datetime_string(value: object) -> None:
 def _ref(value: object) -> None:
     """模型与展示层只允许不透明引用；ERP 店铺号与商品号一律拒收。"""
     if not isinstance(value, str) or not _REF_RE.fullmatch(value):
+        _unsafe_payload()
+
+
+def _listing_ref(value: object) -> None:
+    """链接句柄：`(账号范围, 店, 链接, 平台 SKU)` 的单向摘要。
+
+    它故意不是 `ent-` 引用：目录不解析它，也不把它放进 `entities`，因为渠道链接号
+    本身不是可读实体名；而它也不能退回成原文，那会把一个真实渠道主键送进展示路径。
+    """
+    if not isinstance(value, str) or not LISTING_REF_RE.fullmatch(value):
         _unsafe_payload()
 
 
@@ -879,6 +943,12 @@ def _normalized_request(value: object) -> dict[str, object]:
         _ref(request["product_ref"])
     if "opportunity_policy_ref" in request:
         _policy_ref(request["opportunity_policy_ref"])
+    if "expected_prices" in request:
+        _expected_price_entries(request["expected_prices"])
+    if "price_basis" in request:
+        _string_in(request["price_basis"], _PRICE_BASES)
+    if "as_of" in request:
+        _string_in(request["as_of"], _AS_OF_VALUES)
     if "platform_group_rule" in request:
         # 分组规则版本是短标识，不是自由文本：与口径名同一规则。
         if not isinstance(request["platform_group_rule"], str) \
@@ -1004,6 +1074,12 @@ def _result_rows(value: object, *, public: bool) -> None:
                 _numeric_result(result_value)
             elif key in _DATE_RESULT_COLUMNS:
                 _date_string(result_value)
+            elif key in _DATETIME_RESULT_COLUMNS:
+                # 快照时点是「什么时候的价格」：与 `data_as_of` 同一形状。只到日的
+                # 文本不收：那会把一个日期当成一次抓取时刻，时效就没法算了。
+                _datetime_string(result_value)
+            elif key in _LISTING_REF_RESULT_COLUMNS:
+                _listing_ref(result_value)
             elif key in _LABEL_RESULT_VALUES:
                 _string_in(result_value, _LABEL_RESULT_VALUES[key])
             elif key in _REF_RESULT_COLUMNS:
@@ -1041,6 +1117,12 @@ def _filters(value: object, *, public: bool) -> None:
         _string_list(filters["platforms"], _platform_code)
     if "product_ref" in filters:
         _ref(filters["product_ref"])
+    if "expected_prices" in filters:
+        _expected_price_entries(filters["expected_prices"])
+    if "price_basis" in filters:
+        _string_in(filters["price_basis"], _PRICE_BASES)
+    if "as_of" in filters:
+        _string_in(filters["as_of"], _AS_OF_VALUES)
     for key, allowed in (("sales_basis", _SALES_BASES), ("profit_basis", _PROFIT_BASES),
                          ("report_kind", _REPORT_KINDS)):
         if key in filters:
@@ -1109,6 +1191,10 @@ def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
         _metric_units(payload["metric_units"])
     if "candidates" in payload:
         _candidate_cards(payload["candidates"])
+    if "audit" in payload:
+        # 判别位在 `validate_artifact_payload`：数据集类型带了 audit 块也照样在这里
+        # 被逐字段校验，不给任何一支留出"未登记的键先放行"的口子。
+        _audit_summary(payload["audit"])
     if "termination_reason" in payload:
         _termination_code(payload["termination_reason"])
     return payload
@@ -1155,7 +1241,162 @@ def _diagnostics(value: object) -> None:
                 raise ValueError("diagnostics_invalid")
 
 
-def validate_model_payload(value: object) -> dict[str, object]:
+def _expected_price_entries(value: object) -> None:
+    """本轮目标价条目：引用 + 金额 + 口径，一个字段都不能多。
+
+    这些条目同时进 `normalized_request`（参与指纹）与 Artifact 的 `filters`（参与展示）：
+    两处共用一份校验，否则同一句话在两个地方会长出两个形状。
+    """
+    if not isinstance(value, list) or not value:
+        _unsafe_payload()
+    seen: set[tuple] = set()
+    for item in value:
+        entry = _mapping(item, allowed=_EXPECTATION_KEYS,
+                         required=frozenset({"applies_to", "expected_amount",
+                                             "currency", "price_basis"}))
+        _string_in(entry["applies_to"], _APPLIES_TO_VALUES)
+        amount = entry["expected_amount"]
+        if not isinstance(amount, str) or not _DECIMAL_RE.fullmatch(amount):
+            _unsafe_payload()
+        _string_in(entry["currency"], _CURRENCY_VALUES)
+        _string_in(entry["price_basis"], _PRICE_BASES)
+        for key in ("shop_ref", "sku_ref"):
+            if entry.get(key) is not None:
+                _ref(entry[key])
+        if entry["applies_to"] == "all_selected" and any(
+                entry.get(key) for key in ("shop_ref", "sku_ref")):
+            # 统一价又带引用就是同一句话说了两个范围：写回时没人能分清哪个生效。
+            _unsafe_payload()
+        key = (entry["applies_to"], str(entry.get("shop_ref") or ""),
+               str(entry.get("sku_ref") or ""))
+        if key in seen:
+            _unsafe_payload()      # 同一目标项重复声明：那是冲突，不是重复强调
+        seen.add(key)
+
+
+def _audit_summary(value: object) -> None:
+    """复核汇总：分母固定为期望项，判定数不得超过它。
+
+    三条结构不变量：
+
+    1. `counts` 取值只能是 spec §5.4 的九个状态，且总和等于 `expected_items`：
+       每一格都必须有一个状态，「没扫到」不能被抖成「不存在」；
+    2. `evaluated_items` 只算真正比过价的格（match / mismatch），其余都是证据不足；
+    3. `all_correct` 只有在每一格都新鲜、完整且匹配时才能为 true（spec §6）。
+    """
+    summary = _mapping(value, allowed=_AUDIT_SUMMARY_KEYS,
+                       required=_AUDIT_SUMMARY_REQUIRED)
+    for key in ("expected_items", "evaluated_items", "matched_items"):
+        _non_negative_int(summary[key])
+    expected = int(summary["expected_items"])
+    evaluated = int(summary["evaluated_items"])
+    matched = int(summary["matched_items"])
+    if expected > MAX_ROSTER_ITEMS:
+        # 分母超过上限就是有人截过 roster：宁可拒发，也不让人拿一份 Top N 当全量复核。
+        _unsafe_payload()
+    if evaluated > expected or matched > evaluated:
+        _unsafe_payload()
+    counts = _mapping(summary["counts"], allowed=_AUDIT_STATUSES)
+    for status, count in counts.items():
+        _string_in(status, _AUDIT_STATUSES)
+        _non_negative_int(count)
+    if sum(int(count) for count in counts.values()) != expected:
+        _unsafe_payload()
+    if matched != int(counts.get("match", 0)):
+        _unsafe_payload()
+    if evaluated != matched + int(counts.get("mismatch", 0)):
+        _unsafe_payload()
+    _bool_flag(summary["all_correct"])
+    if summary["all_correct"] and not (expected > 0 and evaluated == expected
+                                       and matched == expected):
+        _unsafe_payload()
+    if "freshness_policy_seconds" in summary:
+        _positive_int(summary["freshness_policy_seconds"])
+    if "rule_version" in summary:
+        version = summary["rule_version"]
+        if not isinstance(version, str) or not _BASIS_NAME_RE.fullmatch(version):
+            _unsafe_payload()
+    sources = summary["sources"]
+    if not isinstance(sources, list):
+        _unsafe_payload()
+    seen: set[str] = set()
+    for entry_value in sources:
+        entry = _mapping(entry_value, allowed=_AUDIT_SOURCE_KEYS,
+                         required=_AUDIT_SOURCE_REQUIRED)
+        _ref(entry["shop_ref"])
+        if entry["shop_ref"] in seen:
+            _unsafe_payload()      # 一家店只引用一次快照：两次就是两个时点被当成一个
+        seen.add(str(entry["shop_ref"]))
+        _string_in(entry["source_kind"], _LISTING_SOURCE_KINDS)
+        _bool_flag(entry["enumeration_complete"])
+        _bool_flag(entry["fresh"])
+        if entry.get("snapshot_at") is not None:
+            _datetime_string(entry["snapshot_at"])
+
+
+def _price_audit_payload(value: object, *, public: bool) -> dict[str, object]:
+    """price_audit 载荷：数据集形状 + 自己的 `audit` 块与差异表行规则。
+
+    行数必须等于 `expected_items`：拿「抓到的链接数」当行数，一份只覆盖四家的结果
+    就会看起来像「四家都对了」，而第五家根本没进这张表。
+    """
+    payload = _public_metric_payload(value, public=public)
+    if "audit" not in payload:
+        _unsafe_payload()
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        _unsafe_payload()
+    summary = payload["audit"]
+    assert isinstance(summary, dict)
+    if len(rows) != int(summary["expected_items"]):
+        _unsafe_payload()
+    seen: set[tuple] = set()
+    for row_value in rows:
+        row = _mapping(row_value, allowed=_RESULT_COLUMNS,
+                       required=frozenset({"shop_ref", "audit_status"}))
+        _ref(row["shop_ref"])
+        key = (str(row["shop_ref"]), str(row.get("listing_ref") or ""),
+               str(row.get("sku_ref") or ""))
+        if key in seen:
+            _unsafe_payload()      # 同一格发两行：差额会被读成两个不同的链接
+        seen.add(key)
+        if (row["audit_status"] not in ("match", "mismatch")
+                and row.get("amount_difference") is not None):
+            # 过期 / 不可比 / 缺标准那一格给一个差，就会被当成「当前差异」转述出去。
+            _unsafe_payload()
+        if row["audit_status"] == "match" and row.get("actual_amount") is None:
+            _unsafe_payload()      # 没有实际价的 match 是一个没依据的结论
+        if row["audit_status"] in ("match", "mismatch") and not _prices_agree(
+                row.get("actual_amount"), row.get("expected_amount"),
+                str(row["audit_status"])):
+            # 标签与数字必须相互印证：一个带"0.00 差额、两边同价"的 mismatch 行，
+            # 没人在运行现场能看出它是错的，而模型会拿它去说"对不上"。
+            _unsafe_payload()
+    return payload
+
+
+def _prices_agree(actual: object, expected: object, status: str) -> bool:
+    """判定标签与两侧金额是否互相印证（`compare_price` 的那条规则在出表处再核一次）。
+
+    不拿生产方当凭据：载荷会被读、会被存档、会被别的实现写进来。同一句规则在两处
+    成立，比只在一处成立难被绕过。
+    """
+    from decimal import Decimal, InvalidOperation
+
+    try:
+        left = Decimal(str(actual))
+        right = Decimal(str(expected))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    equal = left == right
+    return equal if status == "match" else not equal
+
+
+def validate_model_payload(value: object,
+                           artifact_type: str = "metric_result") -> dict[str, object]:
+    """给模型的载荷：与公开载荷共用同一判别位，只是不含展示名。"""
+    if artifact_type == "price_audit":
+        return _price_audit_payload(value, public=False)
     return _public_metric_payload(value, public=False)
 
 
@@ -1164,10 +1405,14 @@ def validate_artifact_payload(value: object,
     """公开 Artifact 载荷校验：按类型判到哪一个独立 schema（spec §3 判别联合）。
 
     `chart_spec` 与数据集载荷的键集完全不相交（图表不带 `status`/`data`），所以
-    类型就是唯一的判别位；未知类型与不属于本领域的类型仍由各 Store 按注册表拒掉。
+    类型就是唯一的判别位；`price_audit` 带自己的 `audit` 块并要求每一行都有判定
+    状态，一份 metric_result 形状不能冒充复核结果。未知类型与不属于本领域的
+    类型仍由各 Store 按注册表拒掉。
     """
     if artifact_type == "chart_spec":
         return _chart_payload(value)
+    if artifact_type == "price_audit":
+        return _price_audit_payload(value, public=True)
     return _public_metric_payload(value, public=True)
 
 

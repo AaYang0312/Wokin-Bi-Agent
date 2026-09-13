@@ -149,6 +149,25 @@ class MemoryQueryRunStore:
             run["request_fingerprint"] = identity.request_fingerprint
             run["recovery_count"] = identity.recovery_count
 
+    def record_listing_audit_basis(self, run_id: UUID, *, subject_id: str,
+                                   fingerprint: str | None, roster, expectations,
+                                   price_basis: str, currency: str) -> None:
+        """内存版本轮依据冻结：过**同一份**形式校验，再把元组记在运行上。
+
+        不跟 Postgres 版各写一份校验：那会让内存测试比真实部署宽（戒得掉的形状
+        在这里能存进去，到数据库那边才撞 CHECK），也不会两份词表慢慢漂移。
+        """
+        from bi_agent.listing_audit.repository import validate_audit_basis
+
+        run = self._require_run(run_id)
+        clean_roster, clean_expectations = validate_audit_basis(
+            subject_id=subject_id, fingerprint=fingerprint, roster=roster,
+            expectations=expectations, price_basis=price_basis, currency=currency)
+        run["listing_audit_basis"] = {
+            "subject_id": subject_id, "fingerprint": fingerprint,
+            "roster": clean_roster, "expectations": clean_expectations,
+            "price_basis": price_basis, "currency": currency}
+
     def find_reusable_run(self, *, subject_id: str, fingerprint: str):
         for run in self.runs.values():
             if (run.get("subject_id") == subject_id
