@@ -120,6 +120,35 @@ done
 注意：md5 聚的是行文本，而行文本跟着会话参数（尤其 `DateStyle`）变；两边必须用同一套参数，
 否则哈希不同只是表示法差异，不是数据差异——这也是把 `DateStyle` 改回 `ISO, MDY` 的原因之一。
 
+### 上游迁移补齐（2026-09-13，仓库前进 75 个提交后）
+
+卷里的数据快照是 2026-09-12 从便携版集群原样搬过来的；当天之后上游仓库把代码与 DDL 移进
+`backend/`，迁移文件从 `backend/sql/004_query_runtime.sql` 一路补到 `016_channel_catalog.sql`。
+容器内两个库已按 `docs/runbook.md` 的顺序补齐并复验：
+
+| 库 | 补跑前 | 补跑 | 补跑后 |
+| --- | --- | --- | --- |
+| `bi_agent` | 009（query_provenance 无 basis 三列） | 014 → 015 → 016 | 016 |
+| `bi_agent_test` | 001（缺 002 的 `unified_status` 及其后全部对象） | 002 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 | 016 |
+
+`003_kuaimai_metric_semantics.sql` 只重定义了 `reporting.v_product_daily`，而 005 / 007 已经把它换成
+更宽的版本；PostgreSQL 的 `CREATE OR REPLACE VIEW` 不允许减列，所以 005 / 007 之后不能再覆盖 003——
+它已在 007 的宽版本里（003 的 8 列 + `product_name` / `product_name_snapshot` / `sku_label`）。
+新库仍按 001 → 002 → 003 → … 顺序跑，旧库补迁移时跳过 003。
+
+补跑前各自存了 schema 前快照 `pg_dump -Fc`（`\Projects\pg17\migration-20260912\pre-schema-*.dump`，
+不进 Git），补跑后逐表 `count(*)` 与全行 md5 与补跑前逐字节一致：唯一差异是 016 新建的空表
+`bi.channel_items`，以及 015 新加三列后行文本变化（拿旧列重算 md5 不变）。迁移都是前向、可重跑
+的 DDL，不会重写历史事实；需要重算的数据（例如 `basis='items_merged'` 的支付事实）按 runbook
+显式 `replay`。
+
+重跑方式（缺哪个补哪个，单库执行）：
+
+```powershell
+cd D:\Projects\bi-agent
+psql -h localhost -p 54329 -U postgres -d bi_agent -v ON_ERROR_STOP=1 -f backend\sql\014_multi_source_contract.sql
+```
+
 ## 已知差异
 
 - 数据在 Docker 卷里，不能用资源管理器直接看文件；`D:\Projects\pg17\data` 从此不再更新。

@@ -72,6 +72,13 @@ docker compose start        # 或 up -d；docker compose stop 不会删数据
 宿主端口 `54329`、`postgres` 本机免密（trust），与迁移前的便携版集群一致，所以 `.env.app` / `.env.test` /
 `.env.sync*` 的 DSN 无需修改；若把 `pg_hba.conf` 换成 `scram-sha-256`，所有 DSN 要同步加口令。
 库里的 schema 版本以 `\dt bi.*` 和下面的迁移清单为准，缺哪个补哪个（迁移文件可重复执行）。
+本机（Windows）当前两库都已跑到 **016**：`bi_agent` 拉取前停在 009，2026-09-13 补跑
+014 → 015 → 016；`bi_agent_test` 停在 001，同批补跑 002 → 016（003 只重定义
+`reporting.v_product_daily`，已被 007 的宽版本取代，`CREATE OR REPLACE VIEW` 没法减列，所以跳过）。
+补跑前各自用
+`pg_dump -Fc` 存了 schema 前快照（在仓库外的 `D:\Projects\pg17\migration-20260912\`），
+补跑后逐表 `count(*)` 与全行 md5 与迁移前一致（差异只有 016 新建的空表 `bi.channel_items`
+与 015 新加的三列——拿旧列重算 md5 仍是同一个值）。
 
 DDL 只由管理员执行；`bi_sync` 拥有 `bi` schema 事实表读写权限；`bi_reader` 只有 `reporting` schema 指定视图的 SELECT 权限（默认只读、5 秒超时）。角色密码通过管理员 `\password` 或现有密钥设施设置，SQL 文件不含密码。
 
@@ -98,6 +105,7 @@ psql -d bi_agent -f sql/008_data_readiness.sql
 psql -d bi_agent -f sql/009_query_provenance.sql
 psql -d bi_agent -f sql/014_multi_source_contract.sql
 psql -d bi_agent -f sql/015_provenance_basis.sql
+psql -d bi_agent -f sql/016_channel_catalog.sql
 uv run --env-file ../.env.sync python -m bi_agent.sync shops
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity orders --start <保留历史起日> --end <截止日的下一日>
 uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity aftersales_occurrence --start <保留历史起日> --end <截止日的下一日>

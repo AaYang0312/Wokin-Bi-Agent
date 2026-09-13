@@ -54,7 +54,7 @@ psql -d bi_agent -f backend/sql/004_query_runtime.sql
 
 它创建 `bi_sync`、报表只读身份 `bi_reader` 与 API 身份 `bi_app`，并建立可审计的查询运行记录。API 使用 `bi_app`，只能读取 `reporting` 视图和读写聊天与查询运行表。
 
-本机两个库（`bi_agent`、`bi_agent_test`）已经建好并随命名卷保留，重建容器不需要重跑 DDL；新克隆时按上面顺序在两个库各跑一遍。
+本机两个库（`bi_agent`、`bi_agent_test`）已经建好并随命名卷保留，重建容器不需要重跑 DDL；新克隆时按[运行手册](docs/runbook.md)的完整顺序在两个库各跑一遍（001 → 016）。
 
 ## 数据同步
 
