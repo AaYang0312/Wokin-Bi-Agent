@@ -1,5 +1,5 @@
 """受控 SQL 探索测试（计划 Task 1 契约/依赖/门禁 + Task 2 固定 Tool 优先与编译器 +
-Task 3 AST 策略与攻击语料）。
+Task 3 AST 策略与攻击语料 + Task 4 只读成本门禁与安全投影）。
 
 `ExplorationContractTests` 钉形状：`ExplorationRequest` → `SqlDraft` →
 `ValidatedQueryPlan` → `ExplorationResult`（加 `ExplorationColumn`）五个契约、
@@ -8,9 +8,16 @@ Task 3 AST 策略与攻击语料）。
 （`fixed_tool_for`）与确定性单基表 SELECT 编译（`compile_query`）。
 `ExplorationPolicyTests` 钉 Task 3：`validate_exploration_plan` 对
 `tests/exploration_attacks.jsonl` 里每一条攻击都在**任何数据库调用之前**给出稳定原因码，
-而编译器产出的正例必须通过并拿到 64 位 statement fingerprint。只读执行与成本门禁
-（Task 4）、运行域与 Agent Tool（Task 5）仍不在本文件里——所以本文件不导入 `psycopg`、
-不连库，`DomainContext.conn` 换成一个"碰一下就判红"的替身。
+而编译器产出的正例必须通过并拿到 64 位 statement fingerprint。
+`ExplorationBudgetContractTests` 钉 Task 4 交到契约层的那一份：预算数字、
+`ExplorationBudgetExceeded` 的两个原因码，以及"先 EXPLAIN、后只读执行、最后投影"这条序列。
+`ExplorationProjectionTests` 是纯函数投影用例；`ExplorationRepositoryTests` 走**真库**：
+EXPLAIN 成本、只读事务、`statement_timeout`、`limit+1` 溢出、列名逐项比对与数据库角色拒绝。
+运行域与 Agent Tool（Task 5）仍不在本文件里。
+
+为什么 256 KiB 在投影层判而不在执行层判：`execute_plan` 看到的是**未投影**的行，里面还有真
+店号；把预算绑到那份表示上，要么逼执行层留下原始行，要么逼它偷偷调用投影。两者都不做，
+所以执行层只管行数（`limit+1`）与列身份，投影层只管安全表示的字节数。
 
 反恒真约定（开发流程 §4.1）：每一组拒绝用例都配一条只差那个角度的接受用例，并且断言
 错误落在哪个字段/哪个原因码上；只扫整份序列化载荷里的随机子串不算护栏。策略夹具一律
@@ -24,6 +31,7 @@ import inspect
 import importlib
 import importlib.metadata
 import json
+import os
 import pathlib
 import re
 import time
@@ -31,11 +39,14 @@ import tomllib
 import types
 import typing
 import unittest
-from uuid import UUID
+from unittest import mock
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
+import psycopg
 from pydantic import BaseModel, ValidationError
 
+from tests.dbfixtures import connect_test_db
 from tests.test_core import valid_app_env
 
 BACKEND_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -52,13 +63,11 @@ EXPORTED_CONTRACTS = (
 )
 # 计划 Task 2 的 Produces 清单：两个入口 + 钉死的覆盖矩阵常量。
 TASK_TWO_EXPORTS = ("FIXED_TOOL_METRICS", "compile_query", "fixed_tool_for")
-# Task 3 之后本包只有这五个模块（执行/投影/工具属 Task 4-5）。
+# Task 4 之后本包有七个模块（`graph.py` / `tool.py` 属 Task 5）。
 PACKAGE_MODULES = ["__init__.py", "compiler.py", "eligibility.py", "models.py",
-                   "policy.py"]
-# Task 4-5 才会交付的入口名字：本切片里它们必须不存在。
-NOT_YET_IMPLEMENTED = (
-    "estimate_plan", "execute_plan", "project_result", "execute_exploration_tool",
-)
+                   "policy.py", "projection.py", "repository.py"]
+# Task 5 才会交付的入口名字：本切片里它们必须不存在。
+NOT_YET_IMPLEMENTED = ("execute_exploration_tool",)
 # 计划 Task 3 的 Produces 清单只有一个入口，而且它的 Files 清单不含 `__init__.py`：
 # 包级公共面仍归 Task 2，策略入口只住在 `exploration.policy` 里（Task 5 再接）。
 TASK_THREE_ENTRY_POINT = "validate_exploration_plan"
@@ -489,6 +498,257 @@ def request_locs(**overrides):
     return locs_of(ExplorationRequest, request_values(**overrides))
 
 
+# --- Task 4 夹具：预算数字、门禁语句、真库计划与投影输入 -------------------------
+
+BUDGET_EXCEPTION = "ExplorationBudgetExceeded"
+TASK_FOUR_MODULE_NAMES = ("repository", "projection")
+# Task 4 的三个入口与它们所属的模块（计划 Task 4 的 Interfaces/Produces）。
+TASK_FOUR_ENTRY_POINTS = {"estimate_plan": "repository", "execute_plan": "repository",
+                          "project_result": "projection"}
+# 计划 Task 4 Step 3/4/5 逐字钉死的数字：实现里再一份，两者必须逐字相等。
+PLAN_MAX_ESTIMATED_ROWS = 50_000
+PLAN_MAX_TOTAL_COST = Decimal("100000")
+PLAN_STATEMENT_TIMEOUT_MS = 5_000
+PLAN_MAX_RESULT_BYTES = 262_144
+PLAN_DEADLINE_RESERVE_SECONDS = 0.1
+PLAN_MAX_TEXT_CHARS = 4_000
+# 门禁事务里的三句话（计划 Step 3 的原文形状）。
+READ_ONLY_STATEMENT = "SET TRANSACTION READ ONLY"
+STATEMENT_TIMEOUT_STATEMENT = "SET LOCAL statement_timeout = '5000ms'"
+EXPLAIN_STATEMENT_PREFIX = "EXPLAIN (FORMAT JSON) "
+# 投影对外的唯一店铺列名，与编译器给授权列的输出别名。
+SHOP_ID_COLUMN = "_shop_id"
+SHOP_REF_COLUMN = "shop-ref"
+# 成本门只许说这两个原因（计划 Step 3）。
+BUDGET_REASONS = frozenset({"estimated_rows", "total_cost"})
+# 执行层与投影层的稳定原因码全集：多一个、少一个都判红（Task 5 按码分流，不看文字）。
+EXECUTION_REASONS = frozenset({
+    "alias_unbound", "catalog_version_mismatch", "column_mismatch", "deadline_exceeded",
+    "estimate_unavailable", "multiple_statements", "parameter_invalid",
+    "parameter_mismatch", "plan_not_estimated", "query_rejected", "row_limit_exceeded",
+    "statement_not_select", "statement_timeout",
+})
+PROJECTION_REASONS = frozenset({
+    "column_duplicate", "column_mismatch", "column_not_public", "datetime_naive",
+    "internal_column_forbidden", "raw_identifier", "ref_unregistered", "result_too_large",
+    "row_limit_exceeded", "shop_not_registered", "shop_refs_invalid", "text_too_large",
+    "value_not_finite", "value_type_unsupported",
+})
+# 纯投影用例的输入：真店号只出现在这里（与 `policy_context()` 的夹具店号一致）。
+SHOP_REFS = {"S1": "ent-shop-one", "S2": "ent-shop-two"}
+# 服务端 owns 的四个参数：预算用例里的重查询不带占位符，psycopg 允许多余 key。
+SERVER_PARAMETERS = {"allowed_shop_ids": ["S1"], "end": date(2026, 9, 8), "limit": 100,
+                     "start": date(2026, 9, 1)}
+# 两条“重到必须被成本门拦下”的语句：只碰目录表 `pg_class`，不读任何业务事实行。
+# 余量是三个数量级（Plan Rows≈2×10^8、Total Cost≈2.5×10^6 vs 阈值 5×10^4 / 1×10^5），
+# 所以用例不依赖统计信息的细微波动。带 `count(*)` 的那条根节点只有一行，于是
+# “超行数”与“超成本”两条分支各自可判。
+OVER_ROWS_SQL = ('SELECT a.relname AS "relname" FROM pg_catalog.pg_class a, '
+                 'pg_catalog.pg_class b, pg_catalog.pg_class c')
+OVER_COST_SQL = ('SELECT count(*) AS "n" FROM pg_catalog.pg_class a, '
+                 'pg_catalog.pg_class b, pg_catalog.pg_class c')
+
+
+def server_plan(sql_text, **overrides):
+    """给预算用例造一份形状合法的计划：不进策略，只交给执行层。"""
+    from bi_agent.exploration.models import ValidatedQueryPlan
+
+    values = {"template_version": "exploration-sql/2026-09-14.1",
+              "catalog_version": catalog_version(),
+              "statement_fingerprint": SHA256_HEX,
+              "sql_text": sql_text,
+              "parameters": dict(SERVER_PARAMETERS),
+              "selected_refs": ["metric-cost-total"]}
+    values.update(overrides)
+    return ValidatedQueryPlan(**values)
+
+
+def stub_plan():
+    """纯函数得到的未估算计划：编译器 + 策略，不碰库（`policy_context` 的 conn 一碰就判红）。"""
+    return validate(shell_draft())
+
+
+def project(columns, rows, *, shop_refs=SHOP_REFS):
+    from bi_agent.exploration.projection import project_result
+
+    return project_result(columns, rows, shop_refs=shop_refs)
+
+
+def projection_reason(columns, rows, *, shop_refs=SHOP_REFS):
+    """要求投影拒绍并交出稳定原因码；投影成功就判红。"""
+    try:
+        declared, projected = project(columns, rows, shop_refs=shop_refs)
+    except ValueError as exc:
+        assert type(exc) is ValueError, f"不是裸 ValueError：{type(exc).__name__}"
+        return str(exc)
+    raise AssertionError(f"投影接下了这个结果：{declared} {projected}")
+
+
+def refusal(action):
+    """跑一逐必须被拒的调用，交出稳定原因码文字（预算类异常走不到这里）。"""
+    try:
+        action()
+    except ValueError as exc:
+        assert type(exc) is ValueError, f"不是裸 ValueError：{type(exc).__name__}"
+        return str(exc)
+    raise AssertionError("调用被接下了，本应被拒")
+
+
+def module_source(name):
+    """Task 4 模块源码：用来钉语句序列与“谁不得调谁”。"""
+    module = importlib.import_module(f"bi_agent.exploration.{name}")
+    return pathlib.Path(module.__file__).read_text(encoding="utf-8")
+
+
+class GateScriptTransaction:
+    """计数用的事务上下文：证明每次调用自开自关一个。"""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self):
+        self._conn.entered += 1
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self._conn.exited += 1
+        return False
+
+
+class GateScriptResult:
+    """假结果：EXPLAIN 给一行 JSON，SELECT 给 description 与 fetchmany。"""
+
+    def __init__(self, *, explain=None, description=(), rows=()):
+        self._explain = explain
+        self.description = [types.SimpleNamespace(name=name) for name in description]
+        self._rows = list(rows)
+        self.sizes = []
+
+    def fetchone(self):
+        return None if self._explain is None else (self._explain,)
+
+    def fetchmany(self, size):
+        self.sizes.append(size)
+        return self._rows[:size]
+
+
+class GateScriptConn:
+    """只钉“门禁发了哪几句、事务开合几次”的假连接。
+
+    真 EXPLAIN 数字、真只读、真权限一律走 `ExplorationRepositoryTests` 的真库用例；
+    本替身只用来把语句序列与 `limit+1` 形状钉成字面量。
+    """
+
+    def __init__(self, *, explain_rows=18, explain_cost=647.04, description=(), rows=(),
+                 fail_with=None):
+        self.explain = [{"Plan": {"Plan Rows": explain_rows, "Total Cost": explain_cost}}]
+        self.description = list(description)
+        self.rows = list(rows)
+        self.fail_with = fail_with
+        self.statements = []
+        self.parameters = []
+        self.entered = 0
+        self.exited = 0
+        self.result = None
+
+    def transaction(self):
+        return GateScriptTransaction(self)
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        self.parameters.append(params)
+        if self.fail_with is not None:
+            raise self.fail_with
+        explained = sql.startswith(EXPLAIN_STATEMENT_PREFIX)
+        self.result = GateScriptResult(explain=self.explain if explained else None,
+                                       description=() if explained else self.description,
+                                       rows=() if explained else self.rows)
+        return self.result
+
+
+class GateProbeConn:
+    """把**真库**连接包一层：在门禁自己的事务里反问一句“现在真的只读吗、超时多少”。
+
+    不替被测代码执行任何它自己要发的语句：`transaction()` 与三条语句都原样落到真库，
+    探针只是同一事务里额外两句 `SHOW` 与一次必须被拒的写入。
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.statements = []
+        self.read_only = None
+        self.timeout = None
+        self.write_refused = False
+        self._probed = False
+
+    def transaction(self):
+        return self.conn.transaction()
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        first_real = (sql.startswith(EXPLAIN_STATEMENT_PREFIX) or sql.startswith("SELECT"))
+        if first_real and not self._probed:
+            self._probed = True
+            self.read_only = str(self.conn.execute(
+                "SHOW transaction_read_only").fetchone()[0])
+            self.timeout = str(self.conn.execute("SHOW statement_timeout").fetchone()[0])
+            try:
+                with self.conn.transaction():
+                    self.conn.execute(
+                        "INSERT INTO bi.app_chats(id, subject_id, title) "
+                        "VALUES (%s, 'probe', '探针')", (uuid4(),))
+            except psycopg.errors.ReadOnlySqlTransaction:
+                self.write_refused = True
+            else:
+                raise AssertionError("门禁事务里的写入被接受了：READ ONLY 没生效")
+        return self.conn.execute(sql, params)
+
+
+class ExplorationLivePlanFixture:
+    """真库上的正例计划：店铺与窗口都从 `reporting.v_product_cost_daily` 现有数据里取。
+
+    不写死店号与日期：本层要证明的是“门禁按真实 EXPLAIN 数字放行/拦下”，不是“某个特定
+    店在某个特定周恰好有数据”。没数据就直接判红，不 skip（共享测试库必须已 seeding）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.conn = connect_test_db(self)
+        row = self.conn.execute(
+            "SELECT shop_id, min(day), max(day) FROM reporting.v_product_cost_daily"
+            " GROUP BY shop_id ORDER BY count(distinct day) DESC, shop_id LIMIT 1"
+        ).fetchone()
+        assert row is not None, "测试库里没有 v_product_cost_daily 数据：执行层无法取证"
+        self.shop_id, first, last = str(row[0]), row[1], row[2]
+        assert (last - first).days + 1 <= 300, f"窗口超出预算：{first}..{last}"
+        self.start, self.end = first, last + timedelta(days=1)
+        from bi_agent.catalog import ref_for_key
+
+        self.shop_ref = ref_for_key("shop", self.shop_id)
+
+    def deadline(self) -> float:
+        """与固定指标查询同一形状：`time.monotonic()` 上的绝对时刻。"""
+        return time.monotonic() + 30.0
+
+    def plan_for(self, metrics=("metric-cost-total",), groups=(DAY_COST, SHOP_COST),
+                 limit=100):
+        """编译→策略→可执行计划：与 Task 5 将要接的序列一致。"""
+        draft = compile_for(metrics, groups=list(groups),
+                            allowed_shop_ids=frozenset({self.shop_id}),
+                            start=self.start, end=self.end, limit=limit)
+        return validate(draft, context=policy_context(
+            allowed_shop_ids=frozenset({self.shop_id})))
+
+    def explain_root(self, plan):
+        """独立重现一次 EXPLAIN：门禁报的数必须与它逐项相等，而不是自说自话。"""
+        with self.conn.transaction():
+            self.conn.execute(READ_ONLY_STATEMENT)
+            self.conn.execute(STATEMENT_TIMEOUT_STATEMENT)
+            row = self.conn.execute(EXPLAIN_STATEMENT_PREFIX + plan.sql_text,
+                                    plan.parameters).fetchone()
+        return row[0][0]["Plan"]
+
+
 class ExplorationContractTests(unittest.TestCase):
     # --- 计划 Task 1 Step 1 的种子用例 -------------------------------------------
 
@@ -915,16 +1175,26 @@ class ExplorationContractTests(unittest.TestCase):
         self.assertIs(namespace["compile_query"], compiler.compile_query)
         self.assertIs(namespace["fixed_tool_for"], eligibility.fixed_tool_for)
         self.assertIs(namespace["FIXED_TOOL_METRICS"], eligibility.FIXED_TOOL_METRICS)
-        # models.py 里公开的可调用对象仍然只有那五个契约类。
-        self.assertEqual(
-            sorted(name for name, value in vars(models).items()
-                   if callable(value)
-                   and getattr(value, "__module__", "") == models.__name__
-                   and not name.startswith("_")),
-            sorted(EXPORTED_CONTRACTS))
+        # models.py 里公开的可调用对象：五个契约类 + Task 4 的那一个预算异常。
+        public_models_callables = sorted(
+            name for name, value in vars(models).items()
+            if callable(value)
+            and getattr(value, "__module__", "") == models.__name__
+            and not name.startswith("_"))
+        self.assertEqual(public_models_callables,
+                         sorted(set(EXPORTED_CONTRACTS) | {BUDGET_EXCEPTION}))
+        budget_exception = getattr(models, BUDGET_EXCEPTION)
+        self.assertTrue(issubclass(budget_exception, ValueError))
+        self.assertFalse(issubclass(budget_exception, BaseModel))
+        # Task 4 的执行/投影入口不得进包面：计划的 Files 清单里没有 `__init__.py`。
+        for module_name in TASK_FOUR_MODULE_NAMES:
+            module = importlib.import_module(f"bi_agent.exploration.{module_name}")
+            for name, owner in TASK_FOUR_ENTRY_POINTS.items():
+                self.assertFalse(hasattr(exploration, name), name)
+                self.assertIs(hasattr(module, name), owner == module_name, f"{name}@{owner}")
 
-    def test_package_ships_only_the_task_one_to_three_modules(self):
-        """目录列表钉住：Task 4-5 的执行/投影/工具文件不能提前偷渡。"""
+    def test_package_ships_only_the_task_one_to_four_modules(self):
+        """目录列表钉住：Task 5 的运行域/工具文件不能提前偷渡。"""
         import bi_agent.exploration as exploration
 
         shipped = sorted(path.name for path in
@@ -932,7 +1202,7 @@ class ExplorationContractTests(unittest.TestCase):
         self.assertEqual(shipped, sorted(PACKAGE_MODULES))
 
     def test_this_slice_ships_the_policy_entry_point_and_nothing_else(self):
-        """Task 3 只交 `validate_exploration_plan`；执行/投影/工具仍属 Task 4-5。
+        """策略入口只到 `validate_exploration_plan`；执行/投影已交，工具仍属 Task 5。
 
         计划在 Task 3 的 Files 清单里没有 `exploration/__init__.py`，所以策略入口**不得**
         出现在包级公共面上（Task 5 接运行域时再统一接）；本用例同时钉住这两件事。
@@ -2150,6 +2420,853 @@ class ExplorationDependencyTests(unittest.TestCase):
     def _in_locked_range(cls, text: str) -> bool:
         version = cls._version_tuple(text)
         return SQLGLOT_LOWER_BOUND <= version < SQLGLOT_UPPER_BOUND
+
+
+def repository_entries():
+    """Task 4 执行层入口（延迟导入：纯契约用例不应该依赖 `psycopg` 导入成功）。"""
+    from bi_agent.exploration.repository import estimate_plan, execute_plan
+
+    return estimate_plan, execute_plan
+
+
+def budget_exception():
+    """成本异常类（延迟导入）：`refusal()` 只认裸 `ValueError`，预算类得单独抱。"""
+    from bi_agent.exploration.models import ExplorationBudgetExceeded
+
+    return ExplorationBudgetExceeded
+
+
+class ExplorationBudgetContractTests(unittest.TestCase):
+    """计划 Task 4 交到契约层的那一份：预算数字、两个原因码与三步调用序列。"""
+
+    def test_task_four_budget_numbers_are_the_planned_ones(self):
+        from bi_agent.exploration import models
+
+        self.assertEqual(models.MAX_ESTIMATED_ROWS, PLAN_MAX_ESTIMATED_ROWS)
+        self.assertIsInstance(models.MAX_TOTAL_COST, Decimal)   # 浮点迚不了成本比较
+        self.assertEqual(models.MAX_TOTAL_COST, PLAN_MAX_TOTAL_COST)
+        self.assertEqual(models.STATEMENT_TIMEOUT_MS, PLAN_STATEMENT_TIMEOUT_MS)
+        self.assertEqual(models.MAX_RESULT_BYTES, PLAN_MAX_RESULT_BYTES)
+        self.assertEqual(models.DB_IO_RESERVE_SECONDS, PLAN_DEADLINE_RESERVE_SECONDS)
+        self.assertEqual(models.MAX_TEXT_CHARS, PLAN_MAX_TEXT_CHARS)
+        self.assertEqual((models.SHOP_ID_COLUMN, models.SHOP_REF_COLUMN),
+                         (SHOP_ID_COLUMN, SHOP_REF_COLUMN))
+        # 行数上限不另开一份：请求、执行、投影用的是同一个预算（Task 1 已定）。
+        self.assertLessEqual(models.MAX_ROWS, PLAN_MAX_ESTIMATED_ROWS)
+
+    def test_budget_exception_publishes_exactly_two_reasons(self):
+        from bi_agent.exploration.models import ExplorationBudgetExceeded
+
+        self.assertEqual(BUDGET_REASONS, {"estimated_rows", "total_cost"})
+        for reason in sorted(BUDGET_REASONS):
+            with self.subTest(reason=reason):
+                error = ExplorationBudgetExceeded(reason)
+                self.assertEqual(error.reason, reason)
+                self.assertEqual(str(error), f"exploration_budget_exceeded:{reason}")
+                self.assertIsInstance(error, ValueError)   # Task 5 一道 except ValueError 就够
+        # 没批过的原因码进不来：否则“稳定”只是口头承诺。
+        self.assertEqual(refusal(lambda: ExplorationBudgetExceeded("too_slow")),
+                         "exploration_budget_reason_unknown")
+
+    def test_entry_points_have_the_published_signatures(self):
+        """签名即契约：Task 5 只能按 `estimate → execute → project` 接线。"""
+        import bi_agent.exploration.projection as projection
+        import bi_agent.exploration.repository as repository
+
+        shapes = {"estimate_plan": (["conn", "plan", "deadline"], "ValidatedQueryPlan"),
+                  "execute_plan": (["conn", "plan", "deadline"],
+                                   "tuple[list[str], list[tuple[object, ...]]]"),
+                  "project_result": (["columns", "rows", "shop_refs"],
+                                     "tuple[list[ExplorationColumn], "
+                                     "list[dict[str, object]]]")}
+        for name, (parameters, returned) in shapes.items():
+            holder = repository if name in ("estimate_plan", "execute_plan") else projection
+            with self.subTest(entry=name):
+                signature = inspect.signature(getattr(holder, name))
+                self.assertEqual(list(signature.parameters), parameters)
+                self.assertEqual(signature.return_annotation, returned)
+                # 预算与映射都是关键字参数：调用点不能靠位置传个数字进去。
+                self.assertTrue(signature.parameters[parameters[-1]].kind
+                                is inspect.Parameter.KEYWORD_ONLY, name)
+                if name != "project_result":
+                    # 执行层只认 Task 1 的计划契约；投影层的入参是列与行，不是计划。
+                    self.assertEqual(signature.parameters["plan"].annotation,
+                                     "ValidatedQueryPlan")
+                else:
+                    self.assertEqual(signature.parameters["shop_refs"].annotation,
+                                     "Mapping[str, str]")
+
+    def test_result_budget_lives_in_the_projection_not_the_executor(self):
+        """字节预算只判安全表示：执行层不投影、不调负投影，投影不碰库。"""
+        repository_source = module_source("repository")
+        projection_source = module_source("projection")
+        # 执行层看不到真店号的映射表，也不自己偷跑投影：否则原始行就有了第二个去处。
+        for token in ("project_result", "projection", "shop_refs", "MAX_RESULT_BYTES"):
+            with self.subTest(repository_token=token):
+                self.assertNotIn(token, repository_source)
+        for token in ("psycopg", "EXPLAIN", "conn", "transaction", "execute", "time."):
+            with self.subTest(projection_token=token):
+                self.assertNotIn(token, projection_source)
+        # 行数与列身份在执行层，字节数在投影层：两边各自只认一个常量。
+        self.assertIn("MAX_ROWS", repository_source)
+        self.assertIn("row_limit_exceeded", repository_source)
+        self.assertIn("MAX_RESULT_BYTES", projection_source)
+
+    def test_rejection_reason_sets_are_the_published_ones(self):
+        """`_reject("x")` 与预算异常的字面量就是公用的全部原因码。"""
+        repository_source = module_source("repository")
+        self.assertEqual(set(re.findall(r'_reject\("([a-z_]+)"\)', repository_source)),
+                         set(EXECUTION_REASONS))
+        self.assertEqual(
+            set(re.findall(r'ExplorationBudgetExceeded\("([a-z_]+)"\)', repository_source)),
+            set(BUDGET_REASONS))
+        self.assertEqual(
+            set(re.findall(r'_reject\("([a-z_]+)"\)', module_source("projection"))),
+            set(PROJECTION_REASONS))
+
+    def test_the_authorization_alias_the_projection_honours_is_the_compilers(self):
+        """投影只认编译器给授权列的那个别名：别名改了就得在这里判红。"""
+        from bi_agent.exploration.compiler import INTERNAL_ALIAS_PREFIX
+        from bi_agent.semantic_catalog.registry import CATALOG, catalog_indexes
+
+        draft = compile_for("metric-cost-total", groups=[DAY_COST, SHOP_COST])
+        self.assertIn(f'AS "{SHOP_ID_COLUMN}"', draft.sql_text)
+        self.assertEqual(f"{INTERNAL_ALIAS_PREFIX}shop_id", SHOP_ID_COLUMN)
+        # 目录里另一条授权列（库存池）不拿着同一张映射表混进来。
+        pool = catalog_indexes(CATALOG).fields[POOL_PHYSICAL]
+        self.assertEqual(f"{INTERNAL_ALIAS_PREFIX}{pool.column}", "_pool_id")
+        self.assertEqual(
+            projection_reason(["_pool_id"], [("POOL-1",)]),
+            "exploration_internal_column_forbidden")
+
+
+class ExplorationGateScriptTests(unittest.TestCase):
+    """门禁的语句形状与错误映射：真 EXPLAIN、真只读、真权限在下一个类里。"""
+
+    SCRIPT_DESCRIPTION = ["field_product_cost_daily_day", "metric_cost_total"]
+
+    def setUp(self):
+        self.estimate_plan, self.execute_plan = repository_entries()
+        self.plan = stub_plan()
+        self.deadline = time.monotonic() + 30.0
+
+    # --- helpers ----------------------------------------------------------------
+
+    def script_conn(self, **overrides):
+        defaults = {"description": self.SCRIPT_DESCRIPTION,
+                    "rows": [(date(2026, 9, 1), Decimal("12.30"))]}
+        defaults.update(overrides)
+        return GateScriptConn(**defaults)
+
+    def estimated(self, conn):
+        """先过成本门：拿到唯一能被执行的那份计划。"""
+        return self.estimate_plan(conn, self.plan, deadline=self.deadline)
+
+    # --- 语句序列 --------------------------------------------------------------
+
+    def test_estimate_opens_its_own_read_only_transaction_and_explains_once(self):
+        conn = self.script_conn()
+        estimated = self.estimated(conn)
+        self.assertEqual(conn.statements, [
+            READ_ONLY_STATEMENT, STATEMENT_TIMEOUT_STATEMENT,
+            EXPLAIN_STATEMENT_PREFIX + self.plan.sql_text])
+        self.assertEqual(conn.parameters[2], self.plan.parameters)
+        self.assertEqual(conn.entered, 1)
+        self.assertEqual(conn.exited, 1)
+        self.assertEqual(estimated.estimated_rows, 18)
+        self.assertEqual(estimated.estimated_total_cost, Decimal("647.04"))
+        # 计划不被就地改写：返回的是新对象，原计划仍然是“未估算”。
+        self.assertIsNone(self.plan.estimated_rows)
+
+    def test_execute_opens_its_own_read_only_transaction_and_runs_the_plan(self):
+        gate = self.script_conn()
+        estimated = self.estimated(gate)
+        conn = self.script_conn()
+        columns, rows = self.execute_plan(conn, estimated, deadline=self.deadline)
+        self.assertEqual(conn.statements, [
+            READ_ONLY_STATEMENT, STATEMENT_TIMEOUT_STATEMENT, self.plan.sql_text])
+        self.assertEqual(conn.parameters[2], self.plan.parameters)
+        self.assertEqual(columns, [DAY_COST, "metric-cost-total"])
+        self.assertEqual(rows, [(date(2026, 9, 1), Decimal("12.30"))])
+        # 两次调用各自开、各自关一个事务：不共用门禁的只读上下文。
+        self.assertEqual((gate.entered, gate.exited, conn.entered, conn.exited),
+                         (1, 1, 1, 1))
+
+    def test_execution_fetches_limit_plus_one_and_refuses_overflow(self):
+        conn = self.script_conn(rows=[(date(2026, 9, 1), Decimal("1.00"))] * 3)
+        estimated = self.estimated(conn)
+        self.execute_plan(conn, estimated, deadline=self.deadline)
+        self.assertEqual(conn.result.sizes, [101])             # limit=100 → 取 101
+        # 取到 limit+1 行就是截断事故：不丢行、不部分返回，整条拒。
+        narrow = estimated.model_copy(update={"parameters": {**estimated.parameters,
+                                                             "limit": 2}})
+        overflow = self.script_conn(rows=[(date(2026, 9, 1), Decimal("1.00"))] * 3)
+        self.assertEqual(refusal(lambda: self.execute_plan(overflow, narrow,
+                                                           deadline=self.deadline)),
+                         "exploration_row_limit_exceeded")
+        self.assertEqual(overflow.result.sizes, [3])           # 拒前确实多取了那一行
+        # 只差那一行：limit 回到 3 就正常出数（断言不是恒真）。
+        wide = narrow.model_copy(update={"parameters": {**narrow.parameters,
+                                                        "limit": 3}})
+        enough = self.script_conn(rows=[(date(2026, 9, 1), Decimal("1.00"))] * 3)
+        self.assertEqual(len(self.execute_plan(enough, wide, deadline=self.deadline)[1]), 3)
+
+    def test_internal_aliases_are_passed_through_untouched(self):
+        """授权列不在这层换成 ref：那是投影层唯一的职责（带 shop_refs 才能做）。"""
+        draft = compile_for("metric-cost-total", groups=[DAY_COST, SHOP_COST])
+        plan = validate(draft, context=policy_context())
+        conn = self.script_conn(
+            description=["field_product_cost_daily_day", SHOP_ID_COLUMN, "metric_cost_total"],
+            rows=[(date(2026, 9, 1), "S1", Decimal("12.30"))])
+        columns, rows = self.execute_plan(
+            conn, self.estimate_plan(conn, plan, deadline=self.deadline),
+            deadline=self.deadline)
+        self.assertEqual(columns, [DAY_COST, SHOP_ID_COLUMN, "metric-cost-total"])
+        self.assertEqual(rows[0][1], "S1")     # 未投影的行仍带真店号（投影存在的理由）
+
+    # --- 预算与拒绝 ------------------------------------------------------------
+
+    def test_the_gate_reads_its_budget_from_the_published_constants(self):
+        """阈值改动必须真的被读到：否则常量只是注释。"""
+        budget = budget_exception()
+        over_rows = GateScriptConn(explain_rows=1, explain_cost=1.0)
+        with mock.patch("bi_agent.exploration.repository.MAX_ESTIMATED_ROWS", 0):
+            with self.assertRaises(budget) as caught:
+                self.estimated(over_rows)
+            self.assertEqual(caught.exception.reason, "estimated_rows")
+        over_cost = GateScriptConn(explain_rows=1, explain_cost=1.0)
+        with mock.patch("bi_agent.exploration.repository.MAX_TOTAL_COST", Decimal("0")):
+            with self.assertRaises(budget) as caught:
+                self.estimated(over_cost)
+            self.assertEqual(caught.exception.reason, "total_cost")
+        # 只差阈值：同一个结果不收紧时照旧通过（断言不是恒假）。
+        self.assertIsNotNone(self.estimated(GateScriptConn(explain_rows=1,
+                                                           explain_cost=1.0)))
+
+    def test_explain_output_without_the_two_numbers_is_unavailable(self):
+        for payload in ([{"Plan": {"Plan Rows": 1}}], [], [{"nope": {}}],
+                        [{"Plan": {"Plan Rows": 1, "Total Cost": float("nan")}}],
+                        [{"Plan": {"Plan Rows": True, "Total Cost": 1.0}}]):
+            with self.subTest(payload=payload):
+                conn = GateScriptConn()
+                conn.explain = payload
+                self.assertEqual(refusal(lambda: self.estimated(conn)),
+                                 "exploration_estimate_unavailable")
+                self.assertEqual(conn.entered, 1)
+                self.assertEqual(conn.exited, 1)      # 被拒的事务照样自关
+
+    def test_database_failures_are_mapped_to_stable_codes(self):
+        for failure, expected in (
+                (psycopg.errors.QueryCanceled("canceling statement due to statement timeout"),
+                 "exploration_statement_timeout"),
+                (psycopg.errors.UndefinedTable('relation "reporting.v_x" does not exist'),
+                 "exploration_query_rejected")):
+            with self.subTest(expected=expected):
+                conn = GateScriptConn(fail_with=failure)
+                with self.assertRaises(ValueError) as caught:
+                    self.estimated(conn)
+                self.assertEqual(str(caught.exception), expected)
+                self.assertIs(caught.exception.__cause__, None)   # 带 SQL 的原文不外泄
+                self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_deadline_reserve_touches_no_database(self):
+        """剩余不足 0.1 秒：不排包、不取数、不 BEGIN。"""
+        estimated = self.estimated(self.script_conn())
+        for name, action in (("estimate_plan", lambda conn: self.estimate_plan(
+                                 conn, self.plan, deadline=time.monotonic() + 0.05)),
+                             ("execute_plan", lambda conn: self.execute_plan(
+                                 conn, estimated, deadline=time.monotonic() + 0.05))):
+            with self.subTest(entry=name):
+                self.assertEqual(refusal(lambda: action(RefusingConn())),
+                                 "exploration_deadline_exceeded")
+        # 只差预留：预算足够时同一对入口真的会碰库（否则上面那条是恒假）。
+        conn = self.script_conn()
+        self.estimate_plan(conn, self.plan, deadline=time.monotonic() + 5.0)
+        self.assertEqual(conn.entered, 1)
+
+    def test_deadline_must_be_a_monotonic_number(self):
+        estimate_plan, execute_plan = self.estimate_plan, self.execute_plan
+        for bad in (None, "30", True, float("inf"), float("nan"), date(2026, 9, 1)):
+            with self.subTest(deadline=repr(bad)):
+                with self.assertRaises(TypeError) as caught:
+                    estimate_plan(RefusingConn(), self.plan, deadline=bad)
+                self.assertEqual(str(caught.exception),
+                                 "exploration_deadline_contract_required")
+                with self.assertRaises(TypeError):
+                    execute_plan(RefusingConn(), self.plan, deadline=bad)
+        # 只差预留量：给到 0.2 秒就真的去碰库（否则上面那五条拒绝是恒假）。
+        proceed = self.script_conn()
+        self.assertIsNotNone(estimate_plan(proceed, self.plan,
+                                           deadline=time.monotonic() + 0.2))
+        self.assertEqual(proceed.entered, 1)
+
+    def test_unestimated_plans_never_reach_the_database(self):
+        self.assertEqual(refusal(lambda: self.execute_plan(
+            RefusingConn(), self.plan, deadline=self.deadline)),
+            "exploration_plan_not_estimated")
+
+    def test_over_budget_estimates_cannot_be_forged_past_execution(self):
+        """执行前再比一道：有人 `model_copy` 一个伪估计也迭不过去。"""
+        forged = [
+            ({"estimated_rows": 10 ** 9, "estimated_total_cost": Decimal("1")},
+             "exploration_budget_exceeded:estimated_rows"),
+            ({"estimated_rows": 1, "estimated_total_cost": Decimal("100000.01")},
+             "exploration_budget_exceeded:total_cost"),
+        ]
+        for update, expected in forged:
+            with self.subTest(expected=expected):
+                plan = self.plan.model_copy(update=update)
+                with self.assertRaises(budget_exception()) as caught:
+                    self.execute_plan(RefusingConn(), plan, deadline=self.deadline)
+                self.assertEqual(str(caught.exception), expected)
+
+    def test_plan_shape_guards_run_before_any_database_call(self):
+        """六道前置门都在 `conn` 之前：RefusingConn 一碰就判红。"""
+        from bi_agent.exploration.models import ValidatedQueryPlan
+
+        cases = [
+            ("exploration_statement_not_select",
+             {"sql_text": 'UPDATE bi.orders SET x = 1 AS "n" WHERE 1 = NULL'}),
+            ("exploration_multiple_statements",
+             {"sql_text": 'SELECT 1 AS "n"; DELETE FROM bi.orders'}),
+            ("exploration_alias_unbound", {"sql_text": "SELECT 1"}),
+            ("exploration_alias_unbound",
+             {"sql_text": 'SELECT a AS "one", b AS "one"'}),
+            ("exploration_parameter_mismatch", {"parameters": {"limit": 100}}),
+            ("exploration_parameter_invalid", {"parameters": {**SERVER_PARAMETERS,
+                                                              "limit": 5_000}}),
+            ("exploration_parameter_invalid", {"parameters": {**SERVER_PARAMETERS,
+                                                              "limit": True}}),
+            ("exploration_catalog_version_mismatch",
+             {"catalog_version": "semantic/2020-01-01.1"}),
+        ]
+        for expected, overrides in cases:
+            with self.subTest(reason=expected):
+                plan = self.plan.model_copy(
+                    update={"estimated_rows": None, "estimated_total_cost": None,
+                            **overrides})
+                self.assertIsInstance(plan, ValidatedQueryPlan)
+                for entry in (self.estimate_plan, self.execute_plan):
+                    self.assertEqual(refusal(lambda: entry(RefusingConn(), plan,
+                                                           deadline=self.deadline)),
+                                     expected)
+
+    def test_column_description_mismatch_is_refused(self):
+        conn = self.script_conn()
+        estimated = self.estimated(conn)
+        other = self.script_conn(description=["totally_different", "metric_cost_total"])
+        self.assertEqual(refusal(lambda: self.execute_plan(
+            other, estimated, deadline=self.deadline)), "exploration_column_mismatch")
+        self.assertEqual(other.entered, 1)
+        self.assertEqual(other.exited, 1)          # 失败的事务同样自关
+        self.assertEqual(other.result.sizes, [])   # 列名不对就连一行都不取
+
+    def test_entry_points_reject_foreign_input_objects(self):
+        for bad_plan in (None, "SELECT 1", {}, compile_for("metric-cost-total")):
+            with self.subTest(plan=type(bad_plan).__name__):
+                with self.assertRaises(TypeError) as caught:
+                    self.estimate_plan(RefusingConn(), bad_plan, deadline=self.deadline)
+                self.assertEqual(str(caught.exception),
+                                 "exploration_plan_contract_required")
+
+
+class ExplorationProjectionTests(unittest.TestCase):
+    """计划 Task 4 Step 1/5：内部列换 opaque ref、值按目录声明类型出、公开载荷有上限。"""
+
+    DECIMAL_COLUMN = "metric-cost-total"
+    INTEGER_COLUMN = "metric-paid-orders"
+    DATE_COLUMN = DAY_COST
+    DATETIME_COLUMN = "field-listing-items-captured-at"
+    TEXT_COLUMN = "field-product-cost-daily-line-kind"
+    BOOLEAN_COLUMN = "field-shops-enabled"
+
+    # --- 计划 Step 1 的种子用例 --------------------------------------------------
+
+    def test_internal_shop_id_becomes_ref_and_decimal_becomes_string(self):
+        from bi_agent.exploration.models import ExplorationColumn
+
+        columns, rows = project([SHOP_ID_COLUMN, self.DECIMAL_COLUMN],
+                                [("S1", Decimal("12.30"))], shop_refs=SHOP_REFS)
+        self.assertEqual(rows, [{SHOP_REF_COLUMN: "ent-shop-one",
+                                 self.DECIMAL_COLUMN: "12.30"}])
+        self.assertNotIn("S1", repr(rows))
+        self.assertEqual([(column.ref, column.data_type) for column in columns],
+                         [(SHOP_REF_COLUMN, "ref"), (self.DECIMAL_COLUMN, "decimal")])
+        for column in columns:
+            self.assertIsInstance(column, ExplorationColumn)
+        # 只差映射：没有 shop_refs 就不允许把真店号发出去。
+        self.assertEqual(projection_reason([SHOP_ID_COLUMN, self.DECIMAL_COLUMN],
+                                           [("S9", Decimal("12.30"))]),
+                         "exploration_shop_not_registered")
+
+    # --- 值的表示 --------------------------------------------------------------
+
+    def test_decimal_is_plain_text_and_keeps_its_scale(self):
+        for value, expected in ((Decimal("12.30"), "12.30"), (Decimal("0"), "0"),
+                                (Decimal("-0.005"), "-0.005"), (Decimal("1E+3"), "1000"),
+                                (Decimal("12345678901234567890.12"),
+                                 "12345678901234567890.12")):
+            with self.subTest(value=str(value)):
+                _, rows = project([self.DECIMAL_COLUMN], [(value,)])
+                self.assertEqual(rows, [{self.DECIMAL_COLUMN: expected}])
+
+    def test_non_finite_decimals_are_refused(self):
+        for value in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+            with self.subTest(value=str(value)):
+                self.assertEqual(projection_reason([self.DECIMAL_COLUMN], [(value,)]),
+                                 "exploration_value_not_finite")
+        # 只差有限性：同列同形状的一个有限值照旧通过。
+        self.assertEqual(project([self.DECIMAL_COLUMN], [(Decimal("0.00"),)])[1],
+                         [{self.DECIMAL_COLUMN: "0.00"}])
+
+    def test_dates_and_aware_datetimes_become_iso_text(self):
+        _, rows = project([self.DATE_COLUMN], [(date(2026, 9, 1),)])
+        self.assertEqual(rows, [{self.DATE_COLUMN: "2026-09-01"}])
+        _, rows = project([self.DATETIME_COLUMN],
+                          [(datetime(2026, 9, 12, 8, 30, tzinfo=BEIJING),)])
+        self.assertEqual(rows, [{self.DATETIME_COLUMN: "2026-09-12T08:30:00+08:00"}])
+        # 不换算时区：换了就不是那一句话的口径。
+        moment = datetime(2026, 9, 12, 8, 30, tzinfo=timezone.utc)
+        _, rows = project([self.DATETIME_COLUMN], [(moment,)])
+        self.assertEqual(rows, [{self.DATETIME_COLUMN: "2026-09-12T08:30:00+00:00"}])
+
+    def test_naive_datetimes_are_refused(self):
+        self.assertEqual(projection_reason([self.DATETIME_COLUMN],
+                                           [(datetime(2026, 9, 12, 8, 30),)]),
+                         "exploration_datetime_naive")
+        # 同一列、只差时区：带上就过（不是“整列都拒”）。
+        self.assertEqual(project([self.DATETIME_COLUMN],
+                                 [(datetime(2026, 9, 12, 8, 30, tzinfo=BEIJING),)])[1],
+                         [{self.DATETIME_COLUMN: "2026-09-12T08:30:00+08:00"}])
+
+    def test_temporal_types_cannot_trade_places(self):
+        self.assertEqual(projection_reason([self.DATE_COLUMN],
+                                           [(datetime(2026, 9, 12, 8, 30, tzinfo=BEIJING),)]),
+                         "exploration_value_type_unsupported")
+        self.assertEqual(projection_reason([self.DATETIME_COLUMN], [(date(2026, 9, 1),)]),
+                         "exploration_value_type_unsupported")
+
+    def test_integer_columns_take_integers_and_integral_decimals_only(self):
+        for value, expected in ((7, 7), (Decimal("7"), 7), (Decimal("7E+1"), 70),
+                                (0, 0), (-12, -12)):
+            with self.subTest(value=str(value)):
+                _, rows = project([self.INTEGER_COLUMN], [(value,)])
+                self.assertEqual(rows, [{self.INTEGER_COLUMN: expected}])
+        for value in (Decimal("7.5"), 7.0, True, "7", b"7"):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(projection_reason([self.INTEGER_COLUMN], [(value,)]),
+                                 "exploration_value_type_unsupported")
+
+    def test_boolean_columns_take_only_booleans(self):
+        _, rows = project([self.BOOLEAN_COLUMN], [(True,), (False,)])
+        self.assertEqual(rows, [{self.BOOLEAN_COLUMN: True}, {self.BOOLEAN_COLUMN: False}])
+        for value in (1, 0, Decimal("1"), "true"):
+            with self.subTest(value=repr(value)):
+                self.assertEqual(projection_reason([self.BOOLEAN_COLUMN], [(value,)]),
+                                 "exploration_value_type_unsupported")
+
+    def test_text_columns_are_bounded_and_never_carry_raw_ids(self):
+        _, rows = project([self.TEXT_COLUMN], [("gift",)])
+        self.assertEqual(rows, [{self.TEXT_COLUMN: "gift"}])
+        project([self.TEXT_COLUMN], [("x" * PLAN_MAX_TEXT_CHARS,)])      # 上界本身合法
+        self.assertEqual(projection_reason([self.TEXT_COLUMN], [("x" * (PLAN_MAX_TEXT_CHARS + 1),)]),
+                         "exploration_text_too_large")
+        # 真店号从任何一列回都算泄露：shop_refs 的 key 就是服务端的已知集。
+        self.assertEqual(projection_reason([self.TEXT_COLUMN], [("S1",)]),
+                         "exploration_raw_identifier")
+
+    def test_unsupported_value_types_are_refused(self):
+        for value in (1.5, b"bytes", [1], {"a": 1}, {1, 2}, Decimal, object()):
+            with self.subTest(value=type(value).__name__):
+                self.assertEqual(projection_reason([self.DECIMAL_COLUMN], [(value,)]),
+                                 "exploration_value_type_unsupported")
+
+    def test_null_is_the_only_value_that_projects_to_null(self):
+        columns, rows = project([self.DATE_COLUMN, self.DECIMAL_COLUMN,
+                                 self.TEXT_COLUMN, self.BOOLEAN_COLUMN],
+                                [(None, None, None, None)])
+        self.assertEqual(rows, [{self.DATE_COLUMN: None, self.DECIMAL_COLUMN: None,
+                                 self.TEXT_COLUMN: None, self.BOOLEAN_COLUMN: None}])
+        self.assertEqual([column.data_type for column in columns],
+                         ["date", "decimal", "text", "boolean"])   # 空列不推 type
+
+    # --- 列身份 --------------------------------------------------------------
+
+    def test_public_columns_must_be_projectable_catalog_refs(self):
+        _, rows = project([self.DECIMAL_COLUMN], [(Decimal("1.00"),)])
+        self.assertEqual(rows, [{self.DECIMAL_COLUMN: "1.00"}])
+        for ref in ("metric-cost-total-typo", "field-day"):
+            with self.subTest(ref=ref):
+                self.assertEqual(projection_reason([ref], [(Decimal("1.00"),)]),
+                                 "exploration_ref_unregistered")
+        # 已知但不是输出列的 ref（视图/实体/JOIN）不能当输出列。
+        for ref in (COST_VIEW, "entity-shop", COST_SHOPS_JOIN):
+            with self.subTest(ref=ref):
+                self.assertEqual(projection_reason([ref], [("x",)]),
+                                 "exploration_column_not_public")
+        for ref in ("metric-not-registered", "field-not-registered", "whatever-else",
+                    "catalog"):
+            with self.subTest(ref=ref):
+                self.assertEqual(projection_reason([ref], [("x",)]),
+                                 "exploration_ref_unregistered")
+
+    def test_raw_identifier_columns_cannot_be_published_under_their_own_ref(self):
+        """授权列与 ERP 主键列只能走 `_shop_id`，不然真号就是一条看起来正常的列。"""
+        for ref, value in ((SHOP_COST, "S1"), (PRODUCT_COST, "ERP-9"),
+                           ("field-shop-daily-paid-orders", 3),
+                           (POOL_PHYSICAL, "POOL-1")):
+            with self.subTest(ref=ref):
+                self.assertEqual(projection_reason([ref], [(value,)]),
+                                 "exploration_column_not_public")
+        # 只差写法：同一个店号走 `_shop_id` 就变成 opaque ref。
+        _, rows = project([SHOP_ID_COLUMN], [("S1",)])
+        self.assertEqual(rows, [{SHOP_REF_COLUMN: "ent-shop-one"}])
+
+    def test_underscore_columns_are_all_refused_except_the_authorized_one(self):
+        for column in ("_pool_id", "_erp_id", "_product_id", "_shop_id_2", "_", "_S1",
+                       "_shop_id "):
+            with self.subTest(column=column):
+                self.assertEqual(projection_reason([column], [("anything",)]),
+                                 "exploration_internal_column_forbidden")
+        self.assertEqual(project([SHOP_ID_COLUMN], [("S1",)])[1],
+                         [{SHOP_REF_COLUMN: "ent-shop-one"}])
+
+    def test_duplicate_columns_are_refused(self):
+        cases = [
+            ([self.DECIMAL_COLUMN, self.DECIMAL_COLUMN],
+             [(Decimal("1.00"), Decimal("2.00"))]),
+            ([SHOP_ID_COLUMN, SHOP_ID_COLUMN], [("S1", "S2")]),
+            ([self.DATE_COLUMN, self.DATE_COLUMN],
+             [(date(2026, 9, 1), date(2026, 9, 2))]),
+        ]
+        for columns, rows in cases:
+            with self.subTest(columns=columns):
+                self.assertEqual(projection_reason(columns, rows),
+                                 "exploration_column_duplicate")
+
+    # --- 形状与预算 ----------------------------------------------------------
+
+    def test_row_width_must_match_the_declared_columns(self):
+        self.assertEqual(projection_reason([self.DECIMAL_COLUMN, self.DATE_COLUMN],
+                                           [(Decimal("1.00"),)]),
+                         "exploration_column_mismatch")
+        self.assertEqual(projection_reason([self.DECIMAL_COLUMN],
+                                           [(Decimal("1.00"), date(2026, 9, 1))]),
+                         "exploration_column_mismatch")
+        self.assertEqual(project([self.DECIMAL_COLUMN], [(Decimal("1.00"),)])[1],
+                         [{self.DECIMAL_COLUMN: "1.00"}])
+
+    def test_a_result_without_columns_is_not_a_result(self):
+        self.assertEqual(projection_reason([], []), "exploration_column_mismatch")
+        self.assertEqual(projection_reason([], [("x",)]), "exploration_column_mismatch")
+
+    def test_row_count_stays_within_the_published_budget(self):
+        from bi_agent.exploration.models import MAX_ROWS
+
+        boundary = [(Decimal("1.00"),)] * MAX_ROWS
+        self.assertEqual(len(project([self.DECIMAL_COLUMN], boundary)[1]), MAX_ROWS)
+        self.assertEqual(
+            projection_reason([self.DECIMAL_COLUMN], boundary + [(Decimal("1.00"),)]),
+            "exploration_row_limit_exceeded")
+
+    def test_the_result_budget_is_utf8_bytes_of_the_compact_projection(self):
+        text = "领" * 1000                       # 非 ASCII：字节数 > 字符数，正是预算要看的东西
+        under = [(text,) for _ in range(60)]      # 60 × 3000 B ≈ 180 KB
+        over = [(text,) for _ in range(100)]      # 100 × 3000 B ≈ 300 KB
+        declared, rows = project([self.TEXT_COLUMN], under)
+        measured = len(json.dumps({"columns": [column.model_dump() for column in declared],
+                                   "rows": rows}, ensure_ascii=False,
+                                  separators=(",", ":")).encode("utf-8"))
+        self.assertLessEqual(measured, PLAN_MAX_RESULT_BYTES)
+        self.assertGreater(measured, 100_000)      # 确实是个大载荷，不是一句空话
+        self.assertEqual(projection_reason([self.TEXT_COLUMN], over),
+                         "exploration_result_too_large")
+
+    def test_the_shop_reference_table_must_be_a_reference_table(self):
+        for shop_refs in ({"S1": "ent shop"}, {"S1": "S1"}, {"": "ent-shop-one"},
+                          {"S1": 1}, {"S1": None}, {"S1": "ent-shop-one", "S1 ": "x"}):
+            with self.subTest(shop_refs=repr(shop_refs)):
+                self.assertEqual(
+                    projection_reason([SHOP_ID_COLUMN], [("S1",)], shop_refs=shop_refs),
+                    "exploration_shop_refs_invalid")
+        self.assertEqual(project([SHOP_ID_COLUMN], [("S1",)],
+                                 shop_refs={"S1": "ent-shop-one"})[1],
+                         [{SHOP_REF_COLUMN: "ent-shop-one"}])
+        with self.assertRaises(TypeError):
+            project([SHOP_ID_COLUMN], [("S1",)], shop_refs=None)
+
+    def test_rejections_never_echo_values_refs_or_shop_ids(self):
+        """错误只说原因：投影入参里的任何一个字面量都不许出现在消息里。"""
+        cases = [
+            ([SHOP_ID_COLUMN], [("S1",)], {"OTHER": "ent-shop-one"}),
+            (["metric-not-registered"], [("x",)], SHOP_REFS),
+            ([self.DATE_COLUMN], [(datetime(2026, 9, 12, 8, 30),)], SHOP_REFS),
+            ([self.TEXT_COLUMN], [("秘密提问" * 2_000,)], SHOP_REFS),
+            ([self.DECIMAL_COLUMN], [(123456.78,)], SHOP_REFS),
+            ([self.DECIMAL_COLUMN], [(float("nan"),)], SHOP_REFS),
+        ]
+        for columns, rows, shop_refs in cases:
+            with self.subTest(columns=columns):
+                reason = projection_reason(columns, rows, shop_refs=shop_refs)
+                self.assertTrue(reason.startswith("exploration_"), reason)
+                for leak in ("S1", "OTHER", "metric-not-registered", "秘密", "123456",
+                             "nan", "2026", "ent-shop-one"):
+                    self.assertNotIn(leak, reason)
+
+    def test_projection_input_must_be_sequences_of_rows(self):
+        for columns, rows in ((None, []), ("metric-cost-total", []),
+                              ([self.DECIMAL_COLUMN], {Decimal("1.00")}),
+                              ([self.DECIMAL_COLUMN], ["S1"])):
+            with self.subTest(columns=type(columns).__name__, rows=repr(rows)[:24]):
+                with self.assertRaises(TypeError):
+                    project(columns, rows)
+        self.assertEqual(project([self.DECIMAL_COLUMN], ())[1], [])
+
+    def test_empty_rows_still_publish_declared_columns(self):
+        columns, rows = project([SHOP_ID_COLUMN, self.DECIMAL_COLUMN], [])
+        self.assertEqual([(column.ref, column.data_type) for column in columns],
+                         [(SHOP_REF_COLUMN, "ref"), (self.DECIMAL_COLUMN, "decimal")])
+        self.assertEqual(rows, [])
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ExplorationRepositoryTests(ExplorationLivePlanFixture, unittest.TestCase):
+    """计划 Task 4 Step 1/3/4/6：真库上的成本门、只读执行、列比对与数据库角色。"""
+
+    # --- EXPLAIN 成本门 --------------------------------------------------------
+
+    def test_estimate_plan_reports_the_explain_numbers_of_the_real_plan(self):
+        from bi_agent.exploration.models import ValidatedQueryPlan
+
+        estimate_plan, _ = repository_entries()
+        plan = self.plan_for()
+        estimated = estimate_plan(self.conn, plan, deadline=self.deadline())
+        root = self.explain_root(plan)                     # 独立重跑一次 EXPLAIN
+        self.assertIsInstance(estimated, ValidatedQueryPlan)
+        self.assertEqual(estimated.estimated_rows, root["Plan Rows"])
+        self.assertEqual(estimated.estimated_total_cost, Decimal(str(root["Total Cost"])))
+        self.assertLessEqual(estimated.estimated_rows, PLAN_MAX_ESTIMATED_ROWS)
+        self.assertLessEqual(estimated.estimated_total_cost, PLAN_MAX_TOTAL_COST)
+        # 同一句话、同一份参数、同一个指纹：门只贴两个估算值。
+        self.assertEqual(estimated.statement_fingerprint, plan.statement_fingerprint)
+        self.assertEqual(estimated.sql_text, plan.sql_text)
+        self.assertEqual(estimated.parameters, plan.parameters)
+        self.assertEqual(estimated.selected_refs, plan.selected_refs)
+        self.assertIsNot(estimated.parameters, plan.parameters)
+        self.assertIsNone(plan.estimated_rows)
+
+    def test_estimated_rows_over_budget_are_refused(self):
+        estimate_plan, _ = repository_entries()
+        plan = server_plan(OVER_ROWS_SQL)
+        root = self.explain_root(plan)
+        self.assertGreater(root["Plan Rows"], PLAN_MAX_ESTIMATED_ROWS)
+        with self.assertRaises(budget_exception()) as caught:
+            estimate_plan(self.conn, plan, deadline=self.deadline())
+        self.assertEqual(caught.exception.reason, "estimated_rows")
+        self.assertEqual(str(caught.exception), "exploration_budget_exceeded:estimated_rows")
+        self.assertNotIn("pg_class", str(caught.exception))    # 不回显语句
+
+    def test_total_cost_over_budget_is_refused(self):
+        estimate_plan, _ = repository_entries()
+        plan = server_plan(OVER_COST_SQL)
+        root = self.explain_root(plan)
+        # 带 `count(*)` 的根节点只有一行：能走到 total_cost 分支，而不是被行数先拦下。
+        self.assertLessEqual(root["Plan Rows"], PLAN_MAX_ESTIMATED_ROWS)
+        self.assertGreater(root["Total Cost"], float(PLAN_MAX_TOTAL_COST))
+        with self.assertRaises(budget_exception()) as caught:
+            estimate_plan(self.conn, plan, deadline=self.deadline())
+        self.assertEqual(caught.exception.reason, "total_cost")
+
+    def test_the_gate_consults_the_published_budget_constants(self):
+        """真库、真 EXPLAIN，只改阈值：两个分支各自可判。"""
+        estimate_plan, _ = repository_entries()
+        budget = budget_exception()
+        plan = self.plan_for()
+        with mock.patch("bi_agent.exploration.repository.MAX_ESTIMATED_ROWS", 0):
+            with self.assertRaises(budget) as caught:
+                estimate_plan(self.conn, plan, deadline=self.deadline())
+            self.assertEqual(caught.exception.reason, "estimated_rows")
+        with mock.patch("bi_agent.exploration.repository.MAX_TOTAL_COST", Decimal("0")):
+            with self.assertRaises(budget) as caught:
+                estimate_plan(self.conn, plan, deadline=self.deadline())
+            self.assertEqual(caught.exception.reason, "total_cost")
+        # 只差阈值：不收紧时同一句话照旧通过。
+        self.assertIsNotNone(estimate_plan(self.conn, plan, deadline=self.deadline()))
+
+    def test_gate_opens_a_read_only_timeout_bounded_transaction(self):
+        """真库上反问一句：门禁自己的事务真的只读、真的带 5 秒上限。"""
+        estimate_plan, execute_plan = repository_entries()
+        plan = self.plan_for()
+        for entry in (estimate_plan, execute_plan):
+            with self.subTest(entry=entry.__name__):
+                estimated = estimate_plan(self.conn, plan, deadline=self.deadline())
+                probe = GateProbeConn(self.conn)
+                if entry is estimate_plan:
+                    entry(probe, plan, deadline=self.deadline())
+                else:
+                    entry(probe, estimated, deadline=self.deadline())
+                self.assertEqual(probe.read_only, "on")
+                self.assertEqual(probe.timeout, "5s")
+                self.assertTrue(probe.write_refused)
+                self.assertEqual(probe.statements, [
+                    READ_ONLY_STATEMENT, STATEMENT_TIMEOUT_STATEMENT,
+                    EXPLAIN_STATEMENT_PREFIX + plan.sql_text if entry is estimate_plan
+                    else plan.sql_text])
+
+    def test_statement_timeout_really_cancels_a_slow_query(self):
+        """真取消：5 秒到点，而不只是一个映别。"""
+        estimate_plan, execute_plan = repository_entries()
+        slow = server_plan('SELECT pg_sleep(6) AS "n"')
+        estimated = estimate_plan(self.conn, slow, deadline=self.deadline())
+        self.assertLessEqual(estimated.estimated_rows, PLAN_MAX_ESTIMATED_ROWS)
+        started = time.monotonic()
+        with self.assertRaises(ValueError) as caught:
+            execute_plan(self.conn, estimated, deadline=self.deadline() + 30.0)
+        elapsed = time.monotonic() - started
+        self.assertEqual(str(caught.exception), "exploration_statement_timeout")
+        self.assertGreaterEqual(elapsed, PLAN_STATEMENT_TIMEOUT_MS / 1000.0 - 0.5)
+        self.assertLess(elapsed, PLAN_STATEMENT_TIMEOUT_MS / 1000.0 + 5.0)
+        self.assertEqual(self.conn.execute("SELECT 1").fetchone(), (1,))   # 连接仍可用
+
+    # --- 受控执行 --------------------------------------------------------------
+
+    def test_execution_returns_declared_columns_and_their_rows(self):
+        estimate_plan, execute_plan = repository_entries()
+        plan = self.plan_for()
+        columns, rows = execute_plan(self.conn, estimate_plan(self.conn, plan,
+                                                              deadline=self.deadline()),
+                                     deadline=self.deadline())
+        self.assertEqual(columns, [DAY_COST, SHOP_ID_COLUMN, "metric-cost-total"])
+        self.assertGreaterEqual(len(rows), 2)                # 溢出用例需要 limit-1 以上的行数
+        for row in rows:
+            self.assertIsInstance(row, tuple)
+            self.assertEqual(len(row), len(columns))
+            self.assertEqual(row[1], self.shop_id)           # 未投影：真店号仍在行里
+        first = rows[0]
+        self.assertIs(type(first[0]), date)                  # 列序就是声明序：日、店、金额
+        self.assertIs(type(first[2]), Decimal)
+        _, singles = execute_plan(self.conn, estimate_plan(
+            self.conn, self.plan_for(groups=(DAY_COST,)), deadline=self.deadline()),
+            deadline=self.deadline())
+        self.assertEqual([row[0] for row in singles][0], first[0])   # 同一天的两条查询一致
+
+    def test_execution_requires_an_estimated_plan(self):
+        _, execute_plan = repository_entries()
+        self.assertEqual(refusal(lambda: execute_plan(self.conn, self.plan_for(),
+                                                      deadline=self.deadline())),
+                         "exploration_plan_not_estimated")
+
+    def test_row_overflow_is_refused_without_truncation(self):
+        """文本里的字面 LIMIT 与参数不一致：取到 limit+1 行就整条拒，不丢行交数。"""
+        estimate_plan, execute_plan = repository_entries()
+        estimated = estimate_plan(self.conn, self.plan_for(), deadline=self.deadline())
+        _, rows = execute_plan(self.conn, estimated, deadline=self.deadline())
+        overflowing = estimated.model_copy(update={
+            "sql_text": estimated.sql_text.replace("LIMIT %(limit)s", f"LIMIT {len(rows)}"),
+            "parameters": {**estimated.parameters, "limit": len(rows) - 1}})
+        self.assertEqual(refusal(lambda: execute_plan(self.conn, overflowing,
+                                                      deadline=self.deadline())),
+                         "exploration_row_limit_exceeded")
+        # 只差那一行：limit 回到真实行数就正常出数（断言不是恒真）。
+        restored = overflowing.model_copy(update={"parameters": {**overflowing.parameters,
+                                                                "limit": len(rows)}})
+        self.assertEqual(len(execute_plan(self.conn, restored,
+                                          deadline=self.deadline())[1]), len(rows))
+
+    def test_column_description_mismatch_is_refused_on_the_real_database(self):
+        """`CAST(x AS "numeric")` 里的 `AS` 不是输出列：声明与回列逐项比才能发现。"""
+        estimate_plan, execute_plan = repository_entries()
+        plan = self.plan_for(groups=())
+        mutated = plan.model_copy(update={"sql_text": plan.sql_text.replace(
+            'sum(fact."cost_total")', 'cast(sum(fact."cost_total") AS "numeric")')})
+        self.assertIn('AS "numeric"', mutated.sql_text)
+        estimated = estimate_plan(self.conn, mutated, deadline=self.deadline())
+        self.assertEqual(refusal(lambda: execute_plan(self.conn, estimated,
+                                                      deadline=self.deadline())),
+                         "exploration_column_mismatch")
+        # 只差那个 cast：原计划同一入口正常回列。
+        clean = estimate_plan(self.conn, plan, deadline=self.deadline())
+        self.assertEqual(execute_plan(self.conn, clean, deadline=self.deadline())[0],
+                         ["metric-cost-total"])
+
+    def test_database_failures_never_echo_the_statement(self):
+        """缺表之类的事实失败只给稳定码：SQL 原文只能进诊断表。"""
+        _, execute_plan = repository_entries()
+        missing = self.plan_for().model_copy(update={
+            "estimated_rows": 1, "estimated_total_cost": Decimal("1")})
+        missing = missing.model_copy(update={"sql_text": missing.sql_text.replace(
+            '"reporting"."v_product_cost_daily"', '"reporting"."v_not_there"')})
+        with self.assertRaises(ValueError) as caught:
+            execute_plan(self.conn, missing, deadline=self.deadline())
+        self.assertEqual(str(caught.exception), "exploration_query_rejected")
+        self.assertIs(caught.exception.__cause__, None)
+        for leak in ("SELECT", "FROM", "v_product_cost_daily", "v_not_there",
+                     "cost_total", self.shop_id, "%(limit)s"):
+            self.assertNotIn(leak, str(caught.exception))
+
+    # --- 投影接线 --------------------------------------------------------------
+
+    def test_end_to_end_result_publishes_shop_refs_not_raw_ids(self):
+        estimate_plan, execute_plan = repository_entries()
+        estimated = estimate_plan(self.conn, self.plan_for(), deadline=self.deadline())
+        columns, rows = execute_plan(self.conn, estimated, deadline=self.deadline())
+        declared, safe_rows = project(columns, rows, shop_refs={self.shop_id: self.shop_ref})
+        self.assertEqual([(column.ref, column.data_type) for column in declared],
+                         [(DAY_COST, "date"), (SHOP_REF_COLUMN, "ref"),
+                          ("metric-cost-total", "decimal")])
+        self.assertEqual({key for row in safe_rows for key in row},
+                         {DAY_COST, SHOP_REF_COLUMN, "metric-cost-total"})
+        self.assertEqual({row[SHOP_REF_COLUMN] for row in safe_rows}, {self.shop_ref})
+        self.assertNotIn(self.shop_id,
+                         [value for row in safe_rows for value in row.values()])
+        for row, raw in zip(safe_rows, rows):
+            self.assertEqual(row[DAY_COST], raw[0].isoformat())
+            self.assertRegex(row["metric-cost-total"], r"^-?\d+\.\d+$")
+            self.assertEqual(Decimal(row["metric-cost-total"]), raw[2])
+        measured = json.dumps({"columns": [c.model_dump() for c in declared], "rows": safe_rows},
+                              ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.assertLessEqual(len(measured), PLAN_MAX_RESULT_BYTES)
+
+    # --- 数据库角色（计划 Step 1 的种子用例）--------------------------------- --
+
+    @unittest.skipUnless(os.getenv("BI_TEST_READER_DSN"), "未配置测试库的只读角色 DSN")
+    def test_write_statement_is_refused_by_database_role(self):
+        """只读角色的拒绍必须真的在库里跑过：不 mock、不比空、不降级成文字检查。
+
+        每一条拒绍各用一个连接：库里报错会把当前事务置为 aborted，同一事务里再发一句
+        拿到的是 `InFailedSqlTransaction`，那就不再是“角色被拒”的证据。
+        """
+        with psycopg.connect(os.environ["BI_TEST_READER_DSN"]) as conn:
+            self.assertEqual(conn.info.user, "bi_reader")
+            self.assertTrue(conn.info.dbname.endswith("_test"))
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("DELETE FROM bi.orders")
+        for statement in ("SELECT count(*) FROM bi.orders",
+                          "INSERT INTO bi.shops(shop_id) VALUES ('forbidden')",
+                          "SELECT pg_read_file('/etc/passwd')"):
+            with self.subTest(statement=statement), \
+                    psycopg.connect(os.environ["BI_TEST_READER_DSN"]) as conn:
+                with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                    conn.execute(statement)
+        # 只差对象：获准的 reporting 视图照旧能读（拒绍不是“这个连接什么都查不了”）。
+        with psycopg.connect(os.environ["BI_TEST_READER_DSN"]) as conn:
+            conn.execute("SELECT count(*) FROM reporting.v_product_cost_daily").fetchone()
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ExplorationMultiMetricTests(ExplorationLivePlanFixture, unittest.TestCase):
+    """两个指标、同一基表：一条只读语句里聚完，不逐指标一圈（N+1）。"""
+
+    def test_a_plan_within_both_budgets_executes_in_one_statement(self):
+        estimate_plan, execute_plan = repository_entries()
+        plan = self.plan_for(metrics=("metric-cost-total", "metric-sales-amount"),
+                             groups=(DAY_COST,))
+        probe = GateProbeConn(self.conn)
+        estimated = estimate_plan(probe, plan, deadline=self.deadline())
+        columns, rows = execute_plan(self.conn, estimated, deadline=self.deadline())
+        self.assertEqual(columns, [DAY_COST, "metric-cost-total", "metric-sales-amount"])
+        self.assertTrue(rows)
+        self.assertEqual(probe.statements.count(READ_ONLY_STATEMENT), 1)
 
 
 if __name__ == "__main__":

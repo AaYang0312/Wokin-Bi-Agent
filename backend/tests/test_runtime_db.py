@@ -21,6 +21,9 @@ import psycopg
 
 from .dbfixtures import connect_test_db
 from .fakeconn import P1_REF, S1_REF, S2_REF, price_audit_payload
+from .test_exploration import (
+    DAY_COST, SHOP_COST, SHOP_ID_COLUMN, SHOP_REF_COLUMN, ExplorationLivePlanFixture,
+    project, repository_entries, server_plan)
 from bi_agent.runtime import PostgresQueryRunStore
 from bi_agent.runtime.models import (
     ArtifactPersistenceError,
@@ -803,3 +806,79 @@ class RuntimeStoreDatabaseTests(RuntimeDatabaseFixture, unittest.TestCase):
         self.assertEqual(self.conn.execute(
             "SELECT count(*) FROM bi.query_runs WHERE user_message_id=%s", (message_id,)
         ).fetchone()[0], 0)
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ExplorationRoleDatabaseTests(ExplorationLivePlanFixture, unittest.TestCase):
+    """计划 Task 4：只读门禁必须在**运行角色**下成立，而不是只在超级用户下。
+
+    上面那些类都以 `postgres` 连接做断言；真实读取按 `bi_app`（API）与 `bi_reader`
+    （只读消费方）跑。只证明超级用户能过门等于什么都没证明：底表拒绝、视图授权与
+    写拒绝全是角色决定的。每条用例各持一个管理员事务并按 Rollback 协议退出。
+    """
+
+    def setUp(self):
+        super().setUp()                                  # 连接、店铺与窗口都来自真库
+        self.conn.execute("SET LOCAL ROLE bi_app")       # 与生产 API 同一身份
+        self.assertEqual(str(self.conn.execute("SELECT current_user").fetchone()[0]),
+                         "bi_app")
+
+    def test_the_gate_reads_reporting_views_as_the_app_role(self):
+        """成本门与只读执行在 bi_app 下过；投影后没有真店号。"""
+        estimate_plan, execute_plan = repository_entries()
+        plan = self.plan_for()
+        estimated = estimate_plan(self.conn, plan, deadline=self.deadline())
+        self.assertIsNotNone(estimated.estimated_rows)
+        columns, rows = execute_plan(self.conn, estimated, deadline=self.deadline())
+        self.assertTrue(rows)
+        declared, safe_rows = project(columns, rows,
+                                      shop_refs={self.shop_id: self.shop_ref})
+        self.assertEqual([column.ref for column in declared],
+                         [DAY_COST, SHOP_REF_COLUMN, "metric-cost-total"])
+        self.assertEqual({row[SHOP_REF_COLUMN] for row in safe_rows}, {self.shop_ref})
+        self.assertNotIn(self.shop_id,
+                         [value for row in safe_rows for value in row.values()])
+
+    def test_base_tables_stay_closed_to_the_gate_and_the_message_stays_clean(self):
+        """`bi_app` 读不到业务底表：门禁把它换成稳定原因码，不外泄语句原文。"""
+        estimate_plan, execute_plan = repository_entries()
+        plan = server_plan('SELECT count(*) AS "n" FROM bi.orders')
+        with self.assertRaises(ValueError) as caught:
+            # EXPLAIN 就要权限：哪一步先拒不重要，重要的是两步都不会把数发出去。
+            execute_plan(self.conn, estimate_plan(self.conn, plan,
+                                                  deadline=self.deadline()),
+                         deadline=self.deadline())
+        self.assertEqual(str(caught.exception), "exploration_query_rejected")
+        self.assertIs(caught.exception.__cause__, None)
+        self.assertTrue(caught.exception.__suppress_context__)
+        for leak in ("SELECT", "FROM", "bi.orders", "count", "%("):
+            self.assertNotIn(leak, str(caught.exception))
+
+    def test_server_files_stay_closed_to_the_gate(self):
+        """`pg_read_file` 一类服务端读取同样只剩稳定码。"""
+        estimate_plan, _ = repository_entries()
+        plan = server_plan("SELECT pg_read_file('/etc/passwd') AS \"n\"")
+        with self.assertRaises(ValueError) as caught:
+            estimate_plan(self.conn, plan, deadline=self.deadline())
+        self.assertEqual(str(caught.exception), "exploration_query_rejected")
+
+    @unittest.skipUnless(os.getenv("BI_TEST_READER_DSN"), "未配置测试库的只读角色 DSN")
+    def test_the_reader_dsn_passes_the_gate_and_still_refuses_writes(self):
+        """同一道门在 `bi_reader` 自己的连接上过；写底表仍被角色拒。
+
+        写断言是这条链上唯一必须**真执行**的拒绝：它单独占一个连接，而且后面不再发
+        语句——库里报错会把当前事务置为 aborted，同一事务里再问一句拿到的就不再是
+        "角色被拒"的证据。
+        """
+        estimate_plan, execute_plan = repository_entries()
+        plan = self.plan_for()
+        with psycopg.connect(os.environ["BI_TEST_READER_DSN"]) as conn:
+            self.assertEqual(conn.info.user, "bi_reader")
+            self.assertTrue(conn.info.dbname.endswith("_test"))
+            estimated = estimate_plan(conn, plan, deadline=self.deadline())
+            columns, rows = execute_plan(conn, estimated, deadline=self.deadline())
+        self.assertEqual(columns, [DAY_COST, SHOP_ID_COLUMN, "metric-cost-total"])
+        self.assertTrue(rows)
+        with psycopg.connect(os.environ["BI_TEST_READER_DSN"]) as conn:
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("DELETE FROM bi.orders")
