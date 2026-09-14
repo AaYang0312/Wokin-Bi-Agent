@@ -29,6 +29,8 @@ from .chats import (
 from .config import AppSettings
 from .agent import encode_sse, run_chat_turn
 from .llm import ChatModel
+from .semantic_catalog import CATALOG
+from .semantic_catalog.schema_check import validate_catalog_schema
 
 
 class EmptyBody(BaseModel):
@@ -36,16 +38,24 @@ class EmptyBody(BaseModel):
 
 
 def create_runtime_app() -> FastAPI:
-    """供 Uvicorn 调用的延迟工厂，避免导入时读取部署环境。"""
+    """供 Uvicorn 调用的延迟工厂，避免导入时读取部署环境。
+
+    门禁开启时（计划 Task 4）：先用**一条** autocommit 连接核对语义目录声明与真实
+    reporting schema，再建模型与 FastAPI app。不一致就让启动失败：带着一份骗人的目录
+    起来，比不起来更危险（它会持续把错视图当成合法候选发给下游）。不降级、不重试、
+    不把失败当成“目录为空”。
+    """
     import os
 
     from .config import load_app_settings, load_model_settings
     from .llm import create_model
 
-    return create_app(
-        load_app_settings(os.environ),
-        create_model(load_model_settings(os.environ)),
-    )
+    settings = load_app_settings(os.environ)
+    if settings.semantic_catalog_enabled:
+        with psycopg.connect(settings.app_dsn.get_secret_value(), autocommit=True) as conn:
+            validate_catalog_schema(conn, CATALOG)
+
+    return create_app(settings, create_model(load_model_settings(os.environ)))
 
 
 def create_app(settings: AppSettings, model: ChatModel | None = None) -> FastAPI:

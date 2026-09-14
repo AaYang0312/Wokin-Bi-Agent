@@ -41,6 +41,130 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(app.state.settings.environment, "development")
         create_model.assert_called_once()
 
+    def _runtime_env(self, **overrides):
+        env = {
+            "APP_ENV": "development",
+            "APP_PUBLIC_ORIGIN": "http://localhost:5173",
+            "BI_APP_DSN": "postgresql://bi_app:password@localhost/bi_agent_test",
+            "BI_SHOP_IDS": "S1",
+            "LLM_PROVIDER": "qwen",
+            "LLM_MODEL": "qwen-test",
+            "QWEN_API_KEY": "test-key",
+        }
+        env.update(overrides)
+        return env
+
+    def _run_runtime_factory(self, env):
+        """跑一次 `create_runtime_app()`，把预检与模型创建换成可计数的替身。
+
+        返回 `(app, calls, connect, validate)`；`calls` 是**有序**事件流，所以“只建
+        一次连接”与“预检在模型与 FastAPI 之前”这两件事都能直接读出来。
+        """
+        from bi_agent.api import create_runtime_app
+
+        calls = []
+
+        class PreflightConn:
+            def __enter__(self):
+                calls.append("preflight-connection")
+                return self
+
+            def __exit__(self, *_details):
+                calls.append("preflight-closed")
+                return False
+
+        def connect(dsn, **kwargs):
+            calls.append("connect")
+            self.assertEqual(dsn, env["BI_APP_DSN"])
+            self.assertEqual(kwargs, {"autocommit": True})
+            return PreflightConn()
+
+        def validate(conn, catalog):
+            calls.append("validate")
+            self.assertIsInstance(conn, PreflightConn)
+            return catalog
+
+        with patch.dict(os.environ, env, clear=True), \
+                patch("bi_agent.api.psycopg.connect", side_effect=connect) as connects, \
+                patch("bi_agent.api.validate_catalog_schema",
+                      side_effect=validate) as validates, \
+                patch("bi_agent.llm.create_model",
+                      side_effect=lambda _settings: calls.append("model")):
+            app = create_runtime_app()
+        return app, calls, connects, validates
+
+    def test_runtime_factory_preflights_the_catalog_once_when_enabled(self):
+        """计划 Task 4 Step 1：flag=true 时建立**一条** autocommit 连接并校验 CATALOG。"""
+        from bi_agent.semantic_catalog import CATALOG
+
+        app, calls, connect, validate = self._run_runtime_factory(
+            self._runtime_env(SEMANTIC_CATALOG_ENABLED="true"))
+        self.assertEqual(calls, ["connect", "preflight-connection", "validate",
+                                 "preflight-closed", "model"])
+        connect.assert_called_once()
+        validate.assert_called_once()
+        self.assertIs(validate.call_args.args[1], CATALOG)
+        self.assertTrue(app.state.settings.semantic_catalog_enabled)
+
+    def test_runtime_factory_makes_no_preflight_connection_when_disabled(self):
+        """默认关闭时：不建连接、不校验、路由面不变——现有 Tool 与用户行为必须照旧。"""
+        for value in (None, "false"):
+            with self.subTest(env_value=value):
+                env = (self._runtime_env() if value is None
+                       else self._runtime_env(SEMANTIC_CATALOG_ENABLED=value))
+                app, calls, connect, validate = self._run_runtime_factory(env)
+                self.assertEqual(calls, ["model"])
+                connect.assert_not_called()
+                validate.assert_not_called()
+                self.assertFalse(app.state.settings.semantic_catalog_enabled)
+
+    def test_the_feature_gate_changes_no_route_or_user_visible_surface(self):
+        """开关只改“要不要预检”，不改 HTTP 面：语义目录本计划不新增任何工具或路由。"""
+        from bi_agent.semantic_catalog import CATALOG
+
+        enabled_app, _, _, enabled_validate = self._run_runtime_factory(
+            self._runtime_env(SEMANTIC_CATALOG_ENABLED="true"))
+        disabled_app, _, _, _ = self._run_runtime_factory(self._runtime_env())
+        self.assertEqual(set(enabled_app.openapi()["paths"]),
+                         set(disabled_app.openapi()["paths"]))
+        self.assertIn("/api/chats", set(disabled_app.openapi()["paths"]))
+        self.assertIs(enabled_validate.call_args.args[1], CATALOG)
+
+    def test_runtime_factory_fails_startup_when_the_preflight_mismatches(self):
+        """目录与真实 schema 不一致 ⇒ 进程起不来，不降级为“目录为空”。"""
+        from bi_agent.api import create_runtime_app
+        from bi_agent.semantic_catalog.schema_check import SchemaMismatch
+
+        events = []
+
+        class PreflightConn:
+            def __enter__(self):
+                events.append("preflight-connection")
+                return self
+
+            def __exit__(self, *_details):
+                events.append("preflight-closed")
+                return False
+
+        env = self._runtime_env(SEMANTIC_CATALOG_ENABLED="true")
+        with patch.dict(os.environ, env, clear=True), \
+                patch("bi_agent.api.psycopg.connect",
+                      side_effect=lambda *_args, **_kwargs: PreflightConn()) as connect, \
+                patch("bi_agent.api.validate_catalog_schema",
+                      side_effect=SchemaMismatch(("field-shop-daily-paid-amount",))), \
+                patch("bi_agent.llm.create_model",
+                      side_effect=lambda _settings: events.append("model")) as create_model:
+            with self.assertRaises(SchemaMismatch) as caught:
+                create_runtime_app()
+
+        self.assertEqual(str(caught.exception),
+                         "semantic_schema_mismatch:field-shop-daily-paid-amount")
+        self.assertNotIn("password", str(caught.exception))
+        connect.assert_called_once()
+        create_model.assert_not_called()
+        # 失败路径也得把连接还回去：预检不在启动里留下挂着的连接。
+        self.assertEqual(events, ["preflight-connection", "preflight-closed"])
+
     def _app(self):
         from bi_agent.api import create_app
         from bi_agent.config import AppSettings

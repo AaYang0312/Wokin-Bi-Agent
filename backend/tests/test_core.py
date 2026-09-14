@@ -39,6 +39,45 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             load_app_settings({**env, "APP_PUBLIC_ORIGIN": "http://bi.example.com"})
 
+    def test_semantic_catalog_gate_defaults_off_and_accepts_only_true_false(self):
+        """计划 Task 4：语义目录默认关闭，开关只认 `true`/`false` 两个写法。
+
+        “看起来像真”的文本（`1` / `yes` / `True`）一律拒绝而不是猜：这一条门禁
+        决定启动时要不要连库做预检，把它误读成“开”或“关”都是用户可见差异。
+        """
+        from bi_agent.config import AppSettings, load_app_settings
+
+        env = {
+            "APP_ENV": "development",
+            "APP_PUBLIC_ORIGIN": "http://localhost:5173",
+            "BI_SHOP_IDS": "S1",
+            "BI_APP_DSN": "postgresql://bi_app:password@localhost/bi_agent",
+        }
+        self.assertFalse(load_app_settings(env).semantic_catalog_enabled)
+        for off in ("false", " false ", "", "   "):
+            with self.subTest(off=off):
+                settings = load_app_settings({**env, "SEMANTIC_CATALOG_ENABLED": off})
+                self.assertFalse(settings.semantic_catalog_enabled)
+        for on in ("true", " true "):
+            with self.subTest(on=on):
+                settings = load_app_settings({**env, "SEMANTIC_CATALOG_ENABLED": on})
+                self.assertTrue(settings.semantic_catalog_enabled)
+        for bad in ("TRUE", "True", "1", "0", "yes", "no", "on", "off", "enabled",
+                    "truthy", "tru", "false 1", ";", "true; DROP TABLE bi.orders"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError, "SEMANTIC_CATALOG_ENABLED"):
+                    load_app_settings({**env, "SEMANTIC_CATALOG_ENABLED": bad})
+        # 模型那一层也是默认关：直接构造 AppSettings 不会自己把门禁推开。
+        self.assertIs(AppSettings.model_fields["semantic_catalog_enabled"].default, False)
+
+    def test_env_example_ships_the_semantic_catalog_gate_closed(self):
+        """`.env.example` 是部署方抄的那份：新门禁必须写在那儿且写=false。"""
+        import pathlib
+
+        text = (pathlib.Path(__file__).resolve().parents[2] / ".env.example"
+                ).read_text(encoding="utf-8")
+        self.assertIn("SEMANTIC_CATALOG_ENABLED=false\n", text)
+
     def test_selected_provider_uses_its_own_key(self):
         from bi_agent.config import load_model_settings
 

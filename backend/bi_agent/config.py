@@ -24,6 +24,8 @@ class AppSettings(BaseModel):
     allowed_subjects: frozenset[str]
     public_origin: str
     auth_subject_header: str
+    # 语义目录启动预检默认关：关掉时启动与聊天行为必须与 Task 1-3 版本一致（计划 Task 4）。
+    semantic_catalog_enabled: bool = False
 
 
 class SyncSettings(BaseModel):
@@ -67,6 +69,23 @@ def _shop_ids(env: Mapping[str, str]) -> frozenset[str]:
     return shops
 
 
+def _flag(env: Mapping[str, str], key: str) -> bool:
+    """feature gate 只认 `true` / `false`：缺省与空白都是“关”。
+
+    不走 Pydantic 的布尔强转也不写 `bool(value)`：`"1"` / `"yes"` / `"True"` 这种
+    “看起来像真”的文本要么静默翻转门禁，要么静默保持关——两者都比直接报错更糟，
+    因为部署方会以为自己在开（或以为自己在关）。
+    """
+    raw = (env.get(key) or "").strip()
+    if not raw:
+        return False
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    raise ValueError(f"{key} 只能是 true 或 false")
+
+
 def load_app_settings(env: Mapping[str, str]) -> AppSettings:
     """加载聊天 API 配置；API 环境不得包含同步凭证。"""
     environment = (_required(env, "APP_ENV") or "development").strip()
@@ -95,6 +114,7 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
         allowed_subjects=allowed,
         public_origin=public_origin,
         auth_subject_header=(env.get("AUTH_SUBJECT_HEADER") or "X-Auth-Request-Sub").strip(),
+        semantic_catalog_enabled=_flag(env, "SEMANTIC_CATALOG_ENABLED"),
     )
 
 

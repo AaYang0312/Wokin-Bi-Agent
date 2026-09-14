@@ -1,4 +1,4 @@
-"""语义目录契约与登记表测试（计划 Task 1 + Task 2 + Task 3）。
+"""语义目录契约与登记表测试（计划 Task 1 + Task 2 + Task 3 + Task 4）。
 
 契约的形状就是它的价值所在：这些类型是后续注册表、检索与受控 SQL 唯一的
 词汇来源，所以"什么算一个合法 ref / 合法版本标识 / 合法基数"必须在这一层
@@ -11,6 +11,10 @@ Task 2 的部分再加一条：登记内容必须**闭包**（没有悬空/错�
 Task 3 的部分：检索必须可复现（同输入同输出、子句换序不变）、可回收（30 题
 gold set 的 Top 5 召回 100%）、不泄密（输出里没有任何 SQL 标识符或真实 ID），
 而且答不了时必须说答不了。
+
+Task 4 的部分：启动预检必须只看元数据、只发计划钉下的那一条查询、不一致时给出
+一个稳定的原因码（不带 SQL 标识符与库内原文），并且在只读角色下证明它没有扩大
+业务事实权限。
 """
 
 from dataclasses import FrozenInstanceError
@@ -21,6 +25,8 @@ import os
 import pathlib
 import re
 import unittest
+
+import psycopg
 
 from pydantic import ValidationError
 
@@ -403,7 +409,9 @@ class SemanticContractTests(unittest.TestCase):
                 # Task 3 的确定性检索入口（计划 Task 3 Step 3 导出）。
                 "normalize_terms", "retrieve_schema_candidates",
             ]))
-        # 启动一致性校验与 feature gate 属 Task 4：它们必须还不存在。
+        # Task 4 的启动预检只从 `bi_agent.semantic_catalog.schema_check` 模块限定导入，
+        # feature gate 只是 `AppSettings` 的字段：包表面（=模型可见的语义词汇）因此
+        # 一个名字都不许多加，下面三条仍然是红线。
         self.assertFalse(hasattr(package, "validate_catalog_schema"))
         self.assertFalse(hasattr(package, "SchemaMismatch"))
         self.assertFalse(hasattr(package, "semantic_catalog_enabled"))
@@ -1641,3 +1649,287 @@ class SemanticRetrievalSafetyTests(unittest.TestCase):
         self.assertEqual(joined.join_path_refs,
                          ("join-product-daily-shops", "join-shop-daily-shops"))
         self.assertFalse(joined.requires_clarification)
+
+
+# --- Task 4：数据库 schema 预检与只读边界 ----------------------------------------
+
+# 计划 Task 4 Step 3 钉下的唯一 introspection 查询：按空白归一化比对，实现既不许改
+# SELECT 列 / WHERE 过滤 / ORDER BY，也不许在这条之外顺手发别的语句。
+INTROSPECTION_SQL = ("SELECT table_schema, table_name, column_name, data_type "
+                     "FROM information_schema.columns "
+                     "WHERE table_schema = 'reporting' "
+                     "ORDER BY table_name, ordinal_position")
+
+
+def normalized(sql):
+    return " ".join(str(sql).split())
+
+
+def real_columns(catalog=None):
+    """把目录“读成”一份与它完全匹配的库内形状。
+
+    类型族里挑第一个成员当实际类型（`integer` 声明可以是 `bigint`）：这样通过用例
+    证明的是“比的是族”，而不是“比的是目录里那个字面量”。
+    """
+    from bi_agent.semantic_catalog import CATALOG, catalog_indexes
+    from bi_agent.semantic_catalog.registry import DATA_TYPE_SQL_FAMILIES
+
+    target = CATALOG if catalog is None else catalog
+    indexes = catalog_indexes(target)
+    columns = {f"{view_entry.schema}.{view_entry.name}": {} for view_entry in target.views}
+    for field_entry in target.fields:
+        owner = indexes.views[field_entry.view_ref]
+        family = sorted(DATA_TYPE_SQL_FAMILIES[field_entry.data_type])
+        columns[f"{owner.schema}.{owner.name}"][field_entry.column] = family[0]
+    return columns
+
+
+class IntrospectionRows:
+    """psycopg 结果对象的最小替身。"""
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class FakeIntrospectionConn:
+    """`reporting` schema 的替身：只回答计划指定的那条查询。
+
+    `tables` 形状是 `{"reporting.v_shop_daily": {"shop_id": "text", ...}}`：少一张视图
+    =库里没有（或当前角色读不到）它，少一列=列不在了，类型不同=类型族变了。任何其它
+    SQL 直接报错，所以“预检顺手多发一条语句”这种退化一定变红，不会静默通过。
+    """
+
+    def __init__(self, tables):
+        self.tables = {key: dict(value) for key, value in tables.items()}
+        self.executed = []
+
+    def rows(self):
+        rows = []
+        for key in sorted(self.tables):
+            schema, _, name = key.partition(".")
+            for column, data_type in self.tables[key].items():
+                rows.append((schema, name, column, data_type))
+        return rows
+
+    def execute(self, sql, params=None, **kwargs):
+        text = normalized(sql)
+        self.executed.append(text)
+        if text != INTROSPECTION_SQL:
+            raise AssertionError(f"预检只准执行计划指定的那条查询，实际：{text}")
+        if params is not None or kwargs:
+            raise AssertionError("计划指定的那条查询不带参数")
+        return IntrospectionRows(self.rows())
+
+
+class SemanticSchemaCheckTests(unittest.TestCase):
+    """`validate_catalog_schema`：一条元数据查询、稳定原因码、失败即不降级。"""
+
+    def validate(self, conn, catalog=None):
+        from bi_agent.semantic_catalog import CATALOG
+        from bi_agent.semantic_catalog.schema_check import validate_catalog_schema
+
+        return validate_catalog_schema(conn, CATALOG if catalog is None else catalog)
+
+    def mismatch(self, conn, catalog=None):
+        from bi_agent.semantic_catalog.schema_check import SchemaMismatch
+
+        with self.assertRaises(SchemaMismatch) as caught:
+            self.validate(conn, catalog)
+        return caught.exception
+
+    # --- 计划 Step 1 的三条形状 ------------------------------------------------
+
+    def test_missing_registered_column_fails_closed(self):
+        """计划 Task 4 Step 1 起步用例：登记的列在库里没了 ⇒ 只报稳定 ref。"""
+        conn = FakeIntrospectionConn({
+            "reporting.v_shop_daily": {"shop_id": "text", "day": "date"},
+            "reporting.v_shops": {"shop_id": "text"},
+        })
+        error = self.mismatch(conn, closed_catalog())
+        self.assertEqual(error.refs, ("field-shop-daily-paid-amount",))
+        self.assertEqual(str(error), "semantic_schema_mismatch:field-shop-daily-paid-amount")
+
+    def test_missing_registered_view_fails_closed(self):
+        conn = FakeIntrospectionConn({"reporting.v_shops": {"shop_id": "text"}})
+        error = self.mismatch(conn, closed_catalog())
+        # 整张视图不在就报视图 ref：把它下面每一列再念一遍只是噪音。
+        self.assertEqual(error.refs, ("view-shop-daily",))
+        self.assertEqual(str(error), "semantic_schema_mismatch:view-shop-daily")
+
+    def test_declared_type_family_must_match_the_real_column(self):
+        tables = real_columns(closed_catalog())
+        tables["reporting.v_shop_daily"]["paid_amount"] = "text"      # 目录声明 decimal
+        error = self.mismatch(FakeIntrospectionConn(tables), closed_catalog())
+        self.assertEqual(error.refs, ("field-shop-daily-paid-amount",))
+        self.assertEqual(str(error), "semantic_schema_mismatch:field-shop-daily-paid-amount")
+
+    def test_the_matching_declaration_passes_with_no_side_effects(self):
+        conn = FakeIntrospectionConn(real_columns())
+        self.assertIsNone(self.validate(conn))
+        # 只读元数据：一次调用恰好一条 SQL，且就是计划钉下的那条。
+        self.assertEqual(conn.executed, [INTROSPECTION_SQL])
+
+    def test_a_type_from_the_declared_family_is_accepted(self):
+        # `integer` 的族里有 bigint/integer/smallint：换成员不是漂移，改族才是。
+        tables = real_columns()
+        tables["reporting.v_shop_daily"]["paid_orders"] = "integer"
+        self.assertIsNone(self.validate(FakeIntrospectionConn(tables)))
+
+    # --- 逐列/逐视图覆盖：84 条声明不许被抽样代替 ------------------------------
+
+    def test_every_registered_field_is_checked_against_the_database(self):
+        from bi_agent.semantic_catalog import CATALOG
+
+        self.assertGreaterEqual(len(CATALOG.fields), 60)
+        for field_entry in CATALOG.fields:
+            with self.subTest(field=field_entry.ref):
+                tables = real_columns()
+                owner = next(view_entry for view_entry in CATALOG.views
+                             if view_entry.ref == field_entry.view_ref)
+                del tables[f"{owner.schema}.{owner.name}"][field_entry.column]
+                error = self.mismatch(FakeIntrospectionConn(tables))
+                self.assertEqual(error.refs, (field_entry.ref,))
+
+    def test_every_registered_view_is_checked_against_the_database(self):
+        from bi_agent.semantic_catalog import CATALOG
+
+        self.assertGreaterEqual(len(CATALOG.views), 8)
+        for view_entry in CATALOG.views:
+            with self.subTest(view=view_entry.ref):
+                tables = real_columns()
+                del tables[f"{view_entry.schema}.{view_entry.name}"]
+                error = self.mismatch(FakeIntrospectionConn(tables))
+                self.assertEqual(error.refs, (view_entry.ref,))
+
+    # --- 映射形状：列名不属于“任意一张视图” ------------------------------------
+
+    def test_a_column_is_credited_only_in_its_own_view(self):
+        # 同名列在别的视图里存在，不能替 `v_shop_daily.paid_amount` 交差。
+        conn = FakeIntrospectionConn({
+            "reporting.v_shop_daily": {"shop_id": "text", "day": "date"},
+            "reporting.v_shops": {"shop_id": "text", "paid_amount": "numeric"},
+        })
+        error = self.mismatch(conn, closed_catalog())
+        self.assertEqual(error.refs, ("field-shop-daily-paid-amount",))
+
+    def test_rows_from_another_schema_never_count(self):
+        # 真实查询带 `WHERE table_schema = 'reporting'`；替身故意回一条 public 的行，
+        # 实现必须按 (schema, view, column) 三元组建映射，而不是只看视图名。
+        conn = FakeIntrospectionConn({
+            "public.v_shop_daily": {"shop_id": "text", "day": "date",
+                                    "paid_amount": "numeric"},
+            "reporting.v_shops": {"shop_id": "text"},
+        })
+        error = self.mismatch(conn, closed_catalog())
+        self.assertEqual(error.refs, ("view-shop-daily",))
+
+    def test_unregistered_views_and_columns_are_not_reported(self):
+        # 库里可以有很多没登记的对象：预检既不能因此失败，也不能因此“顺手登记”。
+        tables = real_columns()
+        tables["reporting.v_channel_items"] = {"shop_id": "text", "quantity": "numeric"}
+        tables["reporting.v_shop_daily"]["capabilities"] = "ARRAY"
+        self.assertIsNone(self.validate(FakeIntrospectionConn(tables)))
+
+    def test_the_query_is_the_plan_one_and_nothing_else_is_executed(self):
+        conn = FakeIntrospectionConn(real_columns())
+        self.validate(conn)
+        self.assertEqual(conn.executed, [INTROSPECTION_SQL])
+        self.assertNotIn("bi.", conn.executed[0])
+        self.assertNotIn(";", conn.executed[0])
+        # 替身本身不是恒真的：任何别的 SQL 都会被它拒绝。
+        with self.assertRaises(AssertionError):
+            conn.execute("SELECT 1")
+
+    def test_an_unclosed_catalog_is_refused_before_any_sql_runs(self):
+        base = closed_catalog()
+        broken = dataclasses.replace(base, views=replaced_item(
+            base, "views", 0, field_refs=("field-shop-daily-shop-id", "field-nope")))
+        conn = FakeIntrospectionConn(real_columns(base))
+        with self.assertRaisesRegex(ValueError, "semantic_catalog_"):
+            self.validate(conn, broken)
+        self.assertEqual(conn.executed, [])
+
+    # --- 消息形状：稳定、可排序、可脱敏 ----------------------------------------
+
+    def test_refs_are_sorted_and_only_the_first_is_in_the_message(self):
+        tables = real_columns()
+        del tables["reporting.v_coverage"]["data_as_of"]              # field-coverage-*
+        del tables["reporting.v_erp_document_daily"]["raw_cost"]      # field-erp-*
+        del tables["reporting.v_shops"]                               # view-shops
+        error = self.mismatch(FakeIntrospectionConn(tables))
+        self.assertEqual(error.refs, ("field-coverage-data-as-of",
+                                      "field-erp-document-daily-raw-cost",
+                                      "view-shops"))
+        self.assertEqual(str(error), "semantic_schema_mismatch:field-coverage-data-as-of")
+        # 同一个缺陷集合必须给出同一个字符串：诊断才能被 grep、被计数、被比较。
+        self.assertEqual(str(self.mismatch(FakeIntrospectionConn(tables))), str(error))
+        self.assertIsInstance(error, ValueError)
+
+    def test_the_message_never_carries_sql_identifiers_or_database_text(self):
+        conn = FakeIntrospectionConn({"reporting.v_shops": {"shop_id": "text"}})
+        message = str(self.mismatch(conn, closed_catalog()))
+        for leak in ("reporting.", "v_shop_daily", "paid_amount", "shop_id", "SELECT",
+                     "information_schema", "password", "postgresql://"):
+            self.assertNotIn(leak, message)
+        self.assertTrue(re.fullmatch(r"semantic_schema_mismatch:[a-z][a-z0-9-]*", message))
+
+    def test_a_ref_built_around_the_contract_still_cannot_reach_the_message(self):
+        """兜底规则不是死代码：形状不符的“ref”一律换成固定码，原文绝不回显。"""
+        base = closed_catalog()
+        smuggled = "v_shop_daily; -- postgresql://app:secret"
+        fields = tuple(
+            patched(item, ref=smuggled) if item.ref == "field-shop-daily-paid-amount"
+            else item for item in base.fields)
+        views = tuple(
+            patched(item, field_refs=tuple(
+                smuggled if ref == "field-shop-daily-paid-amount" else ref
+                for ref in item.field_refs))
+            if item.ref == "view-shop-daily" else item for item in base.views)
+        metrics = tuple(
+            patched(item, required_field_refs=tuple(
+                smuggled if ref == "field-shop-daily-paid-amount" else ref
+                for ref in item.required_field_refs))
+            for item in base.metrics)
+        broken = dataclasses.replace(base, fields=fields, views=views, metrics=metrics)
+        conn = FakeIntrospectionConn({
+            "reporting.v_shop_daily": {"shop_id": "text", "day": "date"},
+            "reporting.v_shops": {"shop_id": "text"},
+        })
+        error = self.mismatch(conn, broken)
+        for leak in ("postgresql", "--", "v_shop_daily", "paid_amount", "secret"):
+            self.assertNotIn(leak, str(error))
+        self.assertEqual(error.refs, ("catalog-entry",))
+        self.assertEqual(str(error), "semantic_schema_mismatch:catalog-entry")
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_READER_DSN"), "未配置测试库的只读角色 DSN")
+class SemanticSchemaCheckDatabaseTests(unittest.TestCase):
+    """计划 Task 4 Step 5：只读角色下预检通过，而 `bi.orders` 依然读不到。
+
+    连接统一走 `tests.dbfixtures.connect_test_db`：库名必须以 `_test` 结尾、主机必须在本机，
+    整段包在显式回滚事务里——预检本身只读元数据，但数据库门禁不能因为“这次不写”就松开。
+    """
+
+    def test_reader_preflight_passes_while_base_tables_stay_closed(self):
+        from tests import dbfixtures
+
+        conn = dbfixtures.connect_test_db(self, "BI_TEST_READER_DSN")
+        self.assertEqual(conn.info.user, "bi_reader")
+        self.assertTrue(conn.info.dbname.endswith("_test"))
+
+        # 1) 声明与真实 schema 一致：整份 CATALOG 通过（启动门禁做的正是这件事）。
+        self.assertIsNone(self.validate(conn))
+        # 2) 预检用的权限没有超出“读获准视图”这条线：视图照旧能查。
+        conn.execute("SELECT count(*) FROM reporting.v_shop_daily").fetchone()
+        # 3) 业务事实底表仍然被拒——预检没有扩大任何事实读取面。
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("SELECT 1 FROM bi.orders LIMIT 1")
+
+    def validate(self, conn):
+        from bi_agent.semantic_catalog import CATALOG
+        from bi_agent.semantic_catalog.schema_check import validate_catalog_schema
+
+        return validate_catalog_schema(conn, CATALOG)
