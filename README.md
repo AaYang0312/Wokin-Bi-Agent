@@ -14,6 +14,16 @@ React/Vite 前端 → /api 代理 → FastAPI → 受限 Agent
 
 前端只调用会话 CRUD 与消息 SSE。`query_business` 和 `evaluate_promotion` 是后端 Agent 的内部工具；没有手动查询、CSV 下载或通用 Text2SQL API。
 
+## 语义目录（默认关闭）
+
+`backend/bi_agent/semantic_catalog/` 是一份版本化的显式目录（`semantic/2026-09-14.1`：11 张已批准的 `reporting.*` 视图、84 个字段、22 个指标、10 个实体、4 条合法 JOIN 边）。它**只**回答“哪些已批准的结构可能表达这个问题”，对经营问题返回至多 5 个视图候选，供**后续**受控 SQL 探索使用（计划 Task 11 后置子项目 B）。
+
+- 只为将来的受控 SQL 提供候选：不执行 SQL、不读业务事实行、不新增 Agent Tool 或路由、不授予任何数据能力，也不改变现有固定 Tool 的路由与门禁。
+- 默认关闭：`SEMANTIC_CATALOG_ENABLED=false`（`.env.example` 就是该值）。显式 `false` 与“变量缺席”两种写法的启动与聊天行为已逐项比对一致（工具名与 schema、发给查询层的规范化请求、运行状态、Artifact 数量与确定性结果载荷），且关闭时不建任何数据库连接；该包只被 `api.py` 的启动预检导入，不新增 Agent Tool 或 HTTP 路由。
+- 打开时启动多做一件事：用 `BI_APP_DSN` 建立一条 autocommit 连接，执行**一条** `information_schema.columns` 只读查询核对声明与真实 schema。不一致就让进程起不来，错误只有 `semantic_schema_mismatch:<稳定 ref>`，不带 SQL 标识符、列名、数据库原文或 DSN；绝不降级成“目录为空”。
+- 模型侧只见 kebab-case 语义 ref；SQL 标识符只由服务端 `resolve_sql_identifier()` 解析。底表 `bi.*` 永不进目录，也不因该功能获得任何新授权。
+- 目前只完成本地开发与本地验收（[验收记录](docs/superpowers/research/2026-09-14-semantic-catalog-acceptance.md)）；启用步骤、前置检查与回退方式见[运行手册](docs/runbook.md)。生产启用仍以 Task 11 统一发布门禁为前置，该门禁尚未通过。
+
 ## 本地启动
 
 需要 Python 3.11、Node.js 22、PostgreSQL 17。复制 `.env.example` 为 `.env.app`，只填写 API 所需的 `BI_APP_DSN`、店铺范围和一个模型 provider 配置；不要在其中放同步 DSN 或快麦凭证。

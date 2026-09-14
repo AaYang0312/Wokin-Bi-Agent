@@ -209,6 +209,59 @@ cd ../frontend && npm test -- src/components/ChartArtifact.test.tsx src/componen
 并同时要期间；`certified` / `unmeasured` / `disproved` 三种说法分开，出库通道明写“非平台账单 GMV”，
 拼多多明写“无支付口径能力”。登记过口径仍然不等于结果可用。
 
+## 4.5 语义目录首版登记面（`backend/bi_agent/semantic_catalog/`，计划 Task 11 后置子项目 A）
+
+目录版本 `semantic/2026-09-14.1`，门禁 `SEMANTIC_CATALOG_ENABLED` **默认关闭**。它只回答“哪些已批准的结构可能表达这个问题”，为**后续**受控 SQL 探索提供至多 5 个候选视图；不执行 SQL、不读业务事实行、不新增 Agent Tool，也不改变下面任何一条口径与能力门禁。模型与检索只见 kebab-case ref；SQL 标识符只由服务端 `resolve_sql_identifier()` 解析，`bi.*` 底表永不进目录。
+
+首版登记的 11 张 `reporting.*` 视图（共 84 字段 / 22 指标 / 10 实体）：
+
+| view ref | SQL 视图 | 粒度 | 授权列 ref | 登记指标数 | 领域 |
+| --- | --- | --- | --- | --- | --- |
+| `view-shops` | `reporting.v_shops` | 店铺 | `field-shops-shop-id` | 0（只档案列） | 全部四领域 |
+| `view-shop-daily` | `reporting.v_shop_daily` | 店铺 / 日 / 币种 | `field-shop-daily-shop-id` | 5 | business_query, commerce_performance |
+| `view-product-daily` | `reporting.v_product_daily` | 店铺 / 日 / 商品 / 行性质 | `field-product-daily-shop-id` | 3 | 同上 |
+| `view-product-cost-daily` | `reporting.v_product_cost_daily` | 店铺 / 日 / 商品 / 行性质 | `field-product-cost-daily-shop-id` | 4 | commerce_performance |
+| `view-erp-document-daily` | `reporting.v_erp_document_daily` | 店铺 / ERP 单据 | `field-erp-document-daily-shop-id` | 2 | commerce_performance |
+| `view-payments` | `reporting.v_payments` | 店铺 / 商业单 | `field-payments-shop-id` | 1 | business_query, commerce_performance |
+| `view-refunds` | `reporting.v_refunds` | 店铺 / 退款单 | `field-refunds-shop-id` | 1 | 同上 |
+| `view-coverage` | `reporting.v_coverage` | 来源 / 实体 / 店铺 | `field-coverage-shop-id` | 0（只覆盖与质量列） | 全部四领域 |
+| `view-listing-items` | `reporting.v_listing_snapshot_items` | 快照 / 链接 / SKU | `field-listing-items-shop-id` | 2 | listing_price_audit |
+| `view-physical-stock-items` | `reporting.v_physical_stock_items` | 快照 / 库存池 / 仓库 / SKU / 单位 | `field-physical-stock-items-pool-id` | 3 | inventory_watch |
+| `view-channel-stock-items` | `reporting.v_channel_stock_items` | 快照 / 店铺 / 链接 / SKU / 单位 | `field-channel-stock-items-shop-id` | 1 | inventory_watch |
+
+首批只登记这四条边，全部是 N:1 到店铺档案、两侧各用自己的授权列、允许聚合粒度只有 `shop`：
+
+| JOIN ref | 左 → 右 | 键 | 基数 |
+| --- | --- | --- | --- |
+| `join-shop-daily-shops` | `view-shop-daily` → `view-shops` | `field-shop-daily-shop-id` = `field-shops-shop-id` | `many_to_one` |
+| `join-product-daily-shops` | `view-product-daily` → `view-shops` | `field-product-daily-shop-id` = `field-shops-shop-id` | `many_to_one` |
+| `join-product-cost-daily-shops` | `view-product-cost-daily` → `view-shops` | `field-product-cost-daily-shop-id` = `field-shops-shop-id` | `many_to_one` |
+| `join-erp-document-daily-shops` | `view-erp-document-daily` → `view-shops` | `field-erp-document-daily-shop-id` = `field-shops-shop-id` | `many_to_one` |
+
+**故意没有直接 JOIN 的三对（不登记，登记就等于允许把不同粒度 / 不同口径的行乘在一起）**：
+
+- `view-payments` ↔ `view-refunds`：支付与退款分属两个时间口径（`paid_at` 与 `platform_completed_at`），一行乘一行会造出不存在的“同单退款”。两者各自与 `view-shop-daily` 的聚合面也不得相加：一个是明细面、一个是日聚合面。
+- 商品毛利 ↔ 单据毛利（`view-product-cost-daily` ↔ `view-erp-document-daily`）：商品面按 `(店铺, 日, 商品, 行性质)`、单据面按 `(店铺, ERP 单据)`；一张单多行会把单头毛利乘几倍（§4.2 第 2 条）。要对照只能像现有 Tool 那样两面分列各自展示：目录里这两张视图之间没有登记边，一起点名会被当作断开的图处理——不给半条路径，并要求澄清。
+- 实物库存 ↔ 渠道库存（`view-physical-stock-items` ↔ `view-channel-stock-items`）：实物按库存池去重、渠道逐店各一行，三店共 100 件一边 JOIN 就变 300（§4.4 “两级库存”）。两侧连授权列都不同（`pool_id` 与 `shop_id`）。
+
+三条红线的后果：“把支付流水和退款单逐笔对上”、“比较商品毛利和 ERP 单据毛利”、“实物库存与渠道库存一起看”均返回 `requires_clarification=true` 与空 `join_path_refs`（gold set S23 / S25 / S11）；目录不为了“给个候选”而退到一个看似的视图。
+
+不可回退的门禁归属（目录不接管、也不稀释）：
+
+- **能力与覆盖门禁仍是 `sources.py` + `bi.shops.capabilities` 的职权**：目录选中某个视图不代表该店该指标能出数，也不代表可以跑 SQL；`capability_unavailable` / `coverage_incomplete` / `coverage_time_basis_unverified` 全部在下游运行层判定。
+- **basis 门禁照旧**：目录里只有支付口径的金额列（首批登记的 reporting 视图里没有任何“ERP 出库金额”列），所以“按出库口径看销售额”只能要求澄清（gold set S07），不能退回 `paid_amount`；`销售额` / `GMV` 这类通用词单独出现时也算口径未定（§3 与 §4.4 “「销售额」的澄清”）。
+- **拼多多保持不支持**：目录不收录任何支付能力，也不因 `erp_documents` 单据列的存在而打开支付族；PDD 仍只以 `excluded_scope` / `capability_unavailable` 出现（§6 与 2026-09-12 决定）。本计划未新增任何 pdd 连接器、登记、凭证或 onboarding 路径。
+- 未登记面：数组与 multirange 列（`v_shops.capabilities`、`v_product_cost_daily.sku_ids`、`v_coverage.covered`）首批不登记（契约里没有 array/multirange 类型，伪装成 `text` 会让启动预检在真实 schema 上永远失败）；ERP 主键类列一律标 `internal`，不进模型可见选择。
+- 上架价与库存依旧“无已核验来源 ⇒ 真实部署只能 `unsupported`”：目录登记了 `view-listing-items` / `view-physical-stock-items` / `view-channel-stock-items` 只意味着“这些结构已批准可用于将来的候选”，不意味着来源就绪（§4.4 “真实就绪”与 §1 的启用状态列）。检索不读库（启动预检只读一条 `information_schema.columns`）。
+
+回归命令（`backend/`）：
+
+```sh
+uv run --locked --env-file ../.env.test python -m unittest tests.test_semantic_catalog -v
+```
+
+30 题 gold set 的逐题结果、Top 5 召回率与“门禁关闭时行为不变”的对比证据见 [语义目录与 Schema 检索本地验收记录](superpowers/research/2026-09-14-semantic-catalog-acceptance.md)。
+
 ## 5. 真实对账结果摘要
 
 ### 合成基准（已通过，冻结时刻 2026-09-08 09:00+08）

@@ -379,7 +379,7 @@ npm run build
 
 五项均已完成设计与实施计划，**不表示功能已经实现**。生产实现统一以 Task 11 日期化发布验收通过为前置；持续库存通知还必须先通过真实库存来源验收。
 
-- **语义目录 / Schema 检索：** [实施计划](2026-09-14-semantic-catalog-and-schema-retrieval.md)。用版本化显式目录和确定性 Top 5 检索评测视图召回、JOIN 路径与粒度，不自动登记数据库对象。
+- **语义目录 / Schema 检索：** 状态：计划完成；实现以 Task 11 门禁为前置（本地开发与本地验收已完成，生产启用未执行）。[实施计划](2026-09-14-semantic-catalog-and-schema-retrieval.md)、[本地验收记录](../research/2026-09-14-semantic-catalog-acceptance.md)。用版本化显式目录和确定性 Top 5 检索评测视图召回、JOIN 路径与粒度，不自动登记数据库对象。
 - **受控 SQL 探索：** [实施计划](2026-09-14-controlled-sql-exploration.md)。在语义目录之后交付，只承接固定 Tool 无法表达且能力/覆盖完整的问题，使用服务端 SQL 编译、AST、只读权限与预算纵深防御。
 - **approved 查询学习记忆：** [实施计划](2026-09-14-approved-query-memory.md)。在受控 SQL 之后交付，只有人工 approved、授权与版本精确匹配的槽位化样例进入 few-shot，不自动学习聊天或一次性业务值。
 - **隔离分析 Agent：** [实施计划](2026-09-14-isolated-analysis-agent.md)。Task 11 之后可独立实施，只分析仍获授权的不可变数据集 Artifact；确定性代码计算数值，模型无工具地解释 findings。

@@ -245,6 +245,81 @@ uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --all-shops 
 库存那一侧还需一条**服务端**的库存池授权来源（与店铺授权相互独立）：现在主 Agent 递进去的
 池授权集永远是空集，所以聊天路径只能给店铺可售预警，实物总量恒为未判定。
 
+## 语义目录与 Schema 检索（默认关闭）
+
+`backend/bi_agent/semantic_catalog/` 是 Task 11 后置子项目 A：版本化目录 + 确定性 Top 5 检索。它只为**后续**受控 SQL 探索提供候选结构，本身不执行 SQL、不读业务事实行、不新增 Agent Tool 或 HTTP 路由、不授予任何数据能力；逐店逐指标的能力门禁（`backend/bi_agent/sources.py`）与口径（basis）契约（`docs/metrics.md` 第 3 节与第 6 节）仍是唯一权威，权限判定也仍由服务端上下文给出，模型递不进身份。拼多多继续按 2026-09-12 决定不接入，目录不为它开任何口。
+
+### 门禁与取值
+
+| `SEMANTIC_CATALOG_ENABLED` | 行为 |
+| --- | --- |
+| 缺省 / 空串 / 纯空白 / `false` | 关。不建预检连接、不发那条查询、不校验目录；“显式 false”与“变量缺席”两种写法的启动与聊天行为已逐项比对一致（见[验收记录](superpowers/research/2026-09-14-semantic-catalog-acceptance.md) §6），且本包在 Agent / 查询层没有任何调用路径 |
+| `true` | 开。`create_runtime_app()` 先建**一条** `BI_APP_DSN` 的 autocommit 连接，跑完预检再建模型与 FastAPI app |
+| 其它写法（`1` / `0` / `yes` / `True` / `on` / 带分号等） | 启动即失败：`SEMANTIC_CATALOG_ENABLED 只能是 true 或 false` |
+
+严格性在 loader（`config.load_app_settings`）里；直接构造 `AppSettings` 只是 `semantic_catalog_enabled` 默认 `False`，loader 不是它的校验入口，所以部署侧只该用环境变量这一条路径。`.env.example` 带的是 `SEMANTIC_CATALOG_ENABLED=false`。
+
+### 启用前置（本机与目标环境同一顺序）
+
+1. **迁移必须齐**：本机 `*_test` 与目标库都按完整顺序 `001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019`（编号 006 已作废）。目录声明对应的最新定义迁移：
+
+| 登记视图 | 列定义来源（最新） |
+| --- | --- |
+| `reporting.v_shops`、`v_shop_daily`、`v_payments`、`v_refunds` | `001_init.sql` |
+| `reporting.v_product_daily` | `007_catalog_identity.sql`（003 的窄版本已被取代） |
+| `reporting.v_coverage` | `008_data_readiness.sql` |
+| `reporting.v_product_cost_daily`、`v_erp_document_daily` | `017_commerce_views.sql` |
+| `reporting.v_listing_snapshot_items` | `018_listing_audit.sql` |
+| `reporting.v_physical_stock_items`、`v_channel_stock_items` | `019_inventory_snapshots.sql` |
+
+   预检是“缺哪报哪”的：库停在旧版时启动直接失败并报缺的 view / field ref，不会带着一份骗人的目录起来。本计划**不新增迁移**，也不改任何已应用 SQL。
+2. **授权核对**（只读，管理员执行）：11 张登记视图对 `bi_app` 与 `bi_reader` 只有 SELECT，且 `bi_app` 对 `bi.*` 事实表仍无 SELECT。
+
+```powershell
+psql -d bi_agent -c "SELECT table_name, grantee, privilege_type " \
+                   "FROM information_schema.table_privileges " \
+                   "WHERE table_schema='reporting' AND grantee IN ('bi_app','bi_reader') " \
+                   "ORDER BY table_name, grantee;"
+psql -d bi_agent -c "SELECT table_name, privilege_type " \
+                   "FROM information_schema.table_privileges " \
+                   "WHERE table_schema='bi' AND grantee='bi_app' ORDER BY table_name;"
+```
+
+第二条只应看到聊天与运行追踪表（`app_chats`、`app_messages`、`query_runs`、`query_run_events`、`query_artifacts`、`query_diagnostics`、`query_provenance`、`expected_listing_rosters`、`price_audit_expectations`）；出现 `orders` / `order_items` / `shops` / `sync_state` 等事实表就是权限漂移，先撤销再谈启用。本机 `bi_agent_test` 实测：11 张登记视图均为 `bi_app=SELECT, bi_reader=SELECT`，`bi_app` 在 `bi.*` 上只有上述聊天/运行表。
+3. **用只读角色自证预检不扩权**（本机测试库）：
+
+```powershell
+Set-Location backend
+uv run --locked --env-file ../.env.test python -m unittest tests.test_semantic_catalog.SemanticSchemaCheckDatabaseTests -v
+uv run --locked --env-file ../.env.test python -m unittest tests.test_semantic_catalog -v
+```
+
+前者在 `bi_reader` 下跑完整 `validate_catalog_schema(conn, CATALOG)` 并要求 `SELECT 1 FROM bi.orders LIMIT 1` 抛 `InsufficientPrivilege`；后者含目录闭包、检索与 30 题 gold set（107 项，需 `*_test` 的两项在有 DSN 时跑）。
+
+### 启用步骤
+
+本机：`.env.app` 写 `SEMANTIC_CATALOG_ENABLED=true` → 按原命令启动 `uv run --env-file ../.env.app uvicorn bi_agent.api:create_runtime_app --factory --host 127.0.0.1 --port 8001` → 确认预检通过（不打印任何 SQL 原文，只有成功启动或一个稳定错码）→ 跑 26 题离线验收与一次聊天冒烟。
+
+目标环境：先逐条完成上面 1–3 的核对（DDL 与 GRANT 只由管理员执行），再按现有单实例发布流程改配置并重启一个实例；预检失败即发布失败，不得绕过、不得重试到启动成功。本轮**未在任何非本机环境启用过该门禁**（见[验收记录](superpowers/research/2026-09-14-semantic-catalog-acceptance.md)的未执行清单）。
+
+打开后仍不变的：`/api` 路由集合（7 条）与 Agent Tool 清单（6 个）不变；语义目录没有对外入口、没有后台任务、不写任何表。
+
+### 启动失败与回退（安全错误契约）
+
+| 观察到的错误文本 | 含义 | 处置 |
+| --- | --- | --- |
+| `semantic_schema_mismatch:<第一个排序后的稳定 ref>` | 目录声明与库里 `reporting` 真实结构不一致：整张视图缺失报视图 ref（如 `semantic_schema_mismatch:view-shop-daily`），缺列或类型族不符报字段 ref（如 `semantic_schema_mismatch:field-shop-daily-paid-amount`）；完整清单在异常的 `refs` 属性上，同样只含 ref | 库落后 → 补跑迁移；登记列真的被改/删 → 由实现方修正目录声明并升 `SEMANTIC_CATALOG_VERSION`。**不**手工改库去迁就声明，也**不**删登记让启动通过 |
+| `semantic_schema_mismatch:catalog-entry` | 传进来的目录条目 ref 形状不合法（只有绕过契约层构造目录才会出现）；原文绝不回显 | 当代码缺陷处理：排查构造目录的代码，而不是改环境变量 |
+| `semantic_catalog_*`（例：`semantic_catalog_duplicate_ref:view-shops`） | 目录自身不闭包（悬空 ref、字段错归属、可放大基数、未写防放大理由等），导入时就失败 | 回到登记层修，修完重跑 `tests.test_semantic_catalog` |
+| `SEMANTIC_CATALOG_ENABLED 只能是 true 或 false` | 配置写法不被接受 | 改成 `true` / `false`，或删除该变量（缺省即关） |
+| `semantic_catalog_version_mismatch` | 递进来的 `current_versions.semantic_catalog_version` 不是当前目录版本 | 不是启动失败而是**检索时**拒绝（本轮无生产调用方）：旧目录快照只用于解释历史 Artifact，不能用来为新问题选候选 |
+
+这些文本之外不会有任何其他细节：消息里永不出现 SQL 标识符、列名、数据库返回原文、DSN、密码或请求体（`AppSettings.app_dsn` 是 `SecretStr`）。失败时进程不监听端口，也不会降级为“目录为空 / 这次先不检索”。
+
+回退 = 把 `SEMANTIC_CATALOG_ENABLED` 改回 `false`（或删掉该变量）后重启：不建预检连接、不发那条查询、不校验目录。已实测“显式 false”与“变量缺席”逐项相同（工具名与 schema 摘要、发给查询层的规范化请求、运行状态、事件数、Artifact 数量与类型、确定性结果载荷、聊天正文）；回退不需要跑迁移、不需要清库，因为本功能不写任何表。
+
+不得做的“恢复”动作：不要为了让启动成功而 `CREATE VIEW` / 改列名去凑声明；不要把门禁关掉后就宣布问题已解决（先分清是“库落后”还是“目录写错”）；不要拿离线 26/26 或本地预检通过当作可发布给运营用户的依据——Task 11 统一发布门禁 4–7 项仍是 open。
+
 ## 同源部署
 
 发布 `frontend/dist` 静态文件。反向代理将 `/api/*` 转发到 `127.0.0.1:8000`，其余路径提供 SPA 回退；关闭 SSE 路径的响应缓冲。FastAPI 仅运行于回环地址且使用单 worker：
