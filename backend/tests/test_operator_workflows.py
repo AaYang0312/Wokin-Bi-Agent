@@ -483,12 +483,15 @@ class OperatorFixture(unittest.TestCase):
     def _threshold_policy(self, *, sku: str, level: str, quantity: str,
                           pool_key: str | None = None, shop_key: str | None = None,
                           version: str = "operator-default/1") -> None:
+        # 生效日同样要显式钉在本轮冻结时钟上：那一列不给就落库 `current_date`，真实时间
+        # 一跨过 NOW 后图上按 `at=context.now.date()` 就再也取不到策略（与 test_inventory
+        # 的 _threshold 同一约束）。
         inventory_repository.insert_threshold_policy(
             self.conn, policy_id=f"pol-{self.tag}-{sku}-{level}-{version}",
             policy_version=version, level=level, erp_sku_id=self._sku(sku),
             pool_id=pool_key and self.pools[pool_key],
             shop_id=shop_key and self.shops[shop_key],
-            quantity=quantity, unit="piece",
+            quantity=quantity, unit="piece", effective_at=NOW.date(),
             evidence=f"policy-import-t11-{self.tag}")
 
     # -- 上下文 -------------------------------------------------------------

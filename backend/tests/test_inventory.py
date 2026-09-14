@@ -1650,12 +1650,16 @@ class InventoryGraphTests(unittest.TestCase):
                    version: str = "sku-default/1") -> None:
         # `version` 就是图上 `threshold_policy_ref` 要匹配的那个字符串：引用与落库版本
         # 必须是同一个值，否则"用哪一版阈值"这件事在两边各有解释权。
+        # `effective_at` 也必须显式给：那一列不给就落库 `current_date`（数据库自己的今天），
+        # 而图上取策略用的 `at` 是本轮冻结时钟 NOW。真实时间一跨过 NOW，已配置的策略就永远
+        # "还没生效"，策略引用那一途整批变红（这一约束钉在
+        # test_configured_policy_fixture_is_anchored_to_the_case_clock 上）。
         repository.insert_threshold_policy(
             self.conn, policy_id=f"pol-{self.tag}-{sku_key}-{level}-{version}",
             policy_version=version, level=level,
             erp_sku_id=self._sku(sku_key), pool_id=pool_key and self.pools[pool_key],
             shop_id=shop_key and self.shops[shop_key], quantity=quantity, unit=unit,
-            evidence=f"policy-import-t10-{self.tag}")
+            effective_at=NOW.date(), evidence=f"policy-import-t10-{self.tag}")
 
     def _allow(self, *keys: str) -> frozenset[str]:
         return frozenset(self.shops[key] for key in keys)
@@ -1877,6 +1881,30 @@ class InventoryGraphTests(unittest.TestCase):
         self.assertEqual(by_sku[_sku_ref(self._sku("SKU2"))]["inventory_status"],
                          "unconfigured")
         self.assertNotIn("缺少版本化阈值配置", _limitation_text(payload))
+
+    def test_configured_policy_fixture_is_anchored_to_the_case_clock(self):
+        """策略夹具的生效日钉在本轮冻结时钟上，而不是数据库自己的 current_date。
+
+        图上取策略用的是 `at = context.now.date()`，而 `bi.inventory_threshold_policies.effective_at`
+        不显式给就落库 `current_date`。真实时间一跨过用例里的 NOW，那条策略就永远"还没生效"，
+        "经营者配过了"被报成"未配置阈值"——上面整批策略用例会在与代码无关的日子里集体变红。
+        """
+        self._shop("1")
+        self._pool("a", shops=("1",))
+        self._threshold(sku_key="SKU1", level="low_replenish", quantity="20")
+        stored, db_today = self.conn.execute(
+            "SELECT effective_at, current_date FROM bi.inventory_threshold_policies "
+            "WHERE policy_id = %s",
+            (f"pol-{self.tag}-SKU1-low_replenish-sku-default/1",)).fetchone()
+        self.assertEqual(stored, NOW.date(), "生效日必须由夹具给出，不能跟数据库的当天走")
+        # 同一天就是本用例冻结的那个时钟：取不到，策略引用那一途就永远报"未配置"。
+        loaded = repository.load_thresholds(
+            self.conn, erp_sku_ids=[self._sku("SKU1")],
+            pool_ids=[self.pools["a"]], shop_ids=[self.shops["1"]],
+            at=NOW.date(), version="sku-default/1")
+        self.assertEqual([(rule.level, rule.quantity, rule.version) for rule in loaded],
+                         [("low_replenish", "20.0000", "sku-default/1")],
+                         f"冻结时钟那一次必须取到已配置策略（库里今天是 {db_today}）")
 
     def test_configured_and_inline_thresholds_are_mutually_exclusive(self):
         self._shared_three_shops()
