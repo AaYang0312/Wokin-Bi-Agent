@@ -26,6 +26,9 @@ class AppSettings(BaseModel):
     auth_subject_header: str
     # 语义目录启动预检默认关：关掉时启动与聊天行为必须与 Task 1-3 版本一致（计划 Task 4）。
     semantic_catalog_enabled: bool = False
+    # 受控 SQL 探索默认关：关闭时 Tool 列表、数据库读与聊天结果必须与当前版本一致。
+    # 它只能建在已发布的语义目录之上，依赖关系在 `load_app_settings()` 里判。
+    controlled_sql_enabled: bool = False
 
 
 class SyncSettings(BaseModel):
@@ -107,14 +110,24 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
                  "KUAI_MAI_ACCESS_TOKEN", "KUAI_MAI_REFRESH_TOKEN")
     if any((env.get(key) or "").strip() for key in forbidden):
         raise ValueError("聊天 API 环境不得包含同步凭证")
+    # 先验完原有必填项再判门禁：缺 DSN 的报错顺位不能因为新门禁而后移。
+    app_dsn = SecretStr(_required(env, "BI_APP_DSN"))
+    shop_ids = _shop_ids(env)
+    semantic_catalog_enabled = _flag(env, "SEMANTIC_CATALOG_ENABLED")
+    controlled_sql_enabled = _flag(env, "CONTROLLED_SQL_ENABLED")
+    if controlled_sql_enabled and not semantic_catalog_enabled:
+        # 探索层的 SQL 标识符只能从语义目录的稳定 ref 解析：目录关着就没有解析路径，
+        # 只能当场失败，不能“退化成不带目录的 SQL”（总设计 §6.1、计划 Task 1）。
+        raise ValueError("CONTROLLED_SQL_REQUIRES_SEMANTIC_CATALOG")
     return AppSettings(
-        app_dsn=SecretStr(_required(env, "BI_APP_DSN")),
-        shop_ids=_shop_ids(env),
+        app_dsn=app_dsn,
+        shop_ids=shop_ids,
         environment=environment,  # type: ignore[arg-type]
         allowed_subjects=allowed,
         public_origin=public_origin,
         auth_subject_header=(env.get("AUTH_SUBJECT_HEADER") or "X-Auth-Request-Sub").strip(),
-        semantic_catalog_enabled=_flag(env, "SEMANTIC_CATALOG_ENABLED"),
+        semantic_catalog_enabled=semantic_catalog_enabled,
+        controlled_sql_enabled=controlled_sql_enabled,
     )
 
 

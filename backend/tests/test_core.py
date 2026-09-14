@@ -20,6 +20,20 @@ from bi_agent.data_quality import QUALITY_RULE
 from tests.fakeconn import S1_REF, ShopCatalogConn, catalog_rows
 
 
+def valid_app_env() -> dict[str, str]:
+    """一份最小合法的 API 环境：feature gate 用例只在它上面改一两个开关。
+
+    计划 Task 1 的探索契约用例也复用这一份（`tests.test_exploration`），免得同一个
+    “合法环境”在一堆文件里有五六种写法。
+    """
+    return {
+        "APP_ENV": "development",
+        "APP_PUBLIC_ORIGIN": "http://localhost:5173",
+        "BI_SHOP_IDS": "S1",
+        "BI_APP_DSN": "postgresql://bi_app:password@localhost/bi_agent",
+    }
+
+
 class ConfigTests(unittest.TestCase):
     def test_app_settings_use_the_chat_role_and_trusted_origin(self):
         from bi_agent.config import load_app_settings
@@ -47,12 +61,7 @@ class ConfigTests(unittest.TestCase):
         """
         from bi_agent.config import AppSettings, load_app_settings
 
-        env = {
-            "APP_ENV": "development",
-            "APP_PUBLIC_ORIGIN": "http://localhost:5173",
-            "BI_SHOP_IDS": "S1",
-            "BI_APP_DSN": "postgresql://bi_app:password@localhost/bi_agent",
-        }
+        env = valid_app_env()
         self.assertFalse(load_app_settings(env).semantic_catalog_enabled)
         for off in ("false", " false ", "", "   "):
             with self.subTest(off=off):
@@ -77,6 +86,94 @@ class ConfigTests(unittest.TestCase):
         text = (pathlib.Path(__file__).resolve().parents[2] / ".env.example"
                 ).read_text(encoding="utf-8")
         self.assertIn("SEMANTIC_CATALOG_ENABLED=false\n", text)
+
+    def test_controlled_sql_gate_defaults_off_and_accepts_only_true_false(self):
+        """计划 Task 1：受控 SQL 默认关，开关沿用 `_flag` 的 true/false 严格解析。
+
+        两个门禁的依赖关系（受控 SQL 需要语义目录）不能让“看起来像真”的文本提前过关：
+        所以坏值报的仍是本变量自己的名字。
+        """
+        from bi_agent.config import load_app_settings
+
+        env = valid_app_env()
+        self.assertFalse(load_app_settings(env).controlled_sql_enabled)
+        for off in ("false", " false ", "", "   "):
+            with self.subTest(off=off):
+                settings = load_app_settings({**env, "CONTROLLED_SQL_ENABLED": off})
+                self.assertFalse(settings.controlled_sql_enabled)
+        for on in ("true", " true "):
+            with self.subTest(on=on):
+                settings = load_app_settings({
+                    **env,
+                    "SEMANTIC_CATALOG_ENABLED": "true",
+                    "CONTROLLED_SQL_ENABLED": on,
+                })
+                self.assertTrue(settings.controlled_sql_enabled)
+        for bad in ("TRUE", "True", "1", "0", "yes", "no", "on", "off", "enabled",
+                    "truthy", "tru", "false 1", ";", "true; DROP TABLE bi.orders"):
+            with self.subTest(bad=bad):
+                # 故意把目录开着：报错只能来自本变量的严格解析，不是依赖门禁。
+                with self.assertRaisesRegex(ValueError, "CONTROLLED_SQL_ENABLED"):
+                    load_app_settings({
+                        **env,
+                        "SEMANTIC_CATALOG_ENABLED": "true",
+                        "CONTROLLED_SQL_ENABLED": bad,
+                    })
+
+    def test_controlled_sql_requires_the_semantic_catalog_gate(self):
+        """受控 SQL 只能建在语义目录之上：目录关着开 SQL 就稳定报错，不静默降级。"""
+        from bi_agent.config import load_app_settings
+
+        env = valid_app_env()
+        for catalog_off in (None, "", "false", " false "):
+            with self.subTest(catalog_off=catalog_off):
+                broken = {**env, "CONTROLLED_SQL_ENABLED": "true"}
+                if catalog_off is not None:
+                    broken["SEMANTIC_CATALOG_ENABLED"] = catalog_off
+                with self.assertRaises(ValueError) as caught:
+                    load_app_settings(broken)
+                self.assertEqual(
+                    str(caught.exception), "CONTROLLED_SQL_REQUIRES_SEMANTIC_CATALOG")
+                self.assertNotIn("postgresql", str(caught.exception))
+        both = load_app_settings({**env, "SEMANTIC_CATALOG_ENABLED": "true",
+                                 "CONTROLLED_SQL_ENABLED": "true"})
+        self.assertTrue(both.semantic_catalog_enabled)
+        self.assertTrue(both.controlled_sql_enabled)
+        # 反向不成立：目录可以单独开（它不依赖探索层）。
+        only_catalog = load_app_settings({**env, "SEMANTIC_CATALOG_ENABLED": "true"})
+        self.assertTrue(only_catalog.semantic_catalog_enabled)
+        self.assertFalse(only_catalog.controlled_sql_enabled)
+        # 依赖错不能抢在严格解析前面：坏值先报“只能是 true 或 false”。
+        with self.assertRaises(ValueError) as caught:
+            load_app_settings({**env, "CONTROLLED_SQL_ENABLED": "TRUE"})
+        self.assertIn("CONTROLLED_SQL_ENABLED 只能是 true 或 false", str(caught.exception))
+
+    def test_absent_and_false_controlled_sql_gates_give_identical_settings(self):
+        """变量缺席与显式 false 必须给出同一份配置，且不新增其它设置项。"""
+        from bi_agent.config import AppSettings, load_app_settings
+
+        absent = load_app_settings(valid_app_env())
+        explicit = load_app_settings({**valid_app_env(), "CONTROLLED_SQL_ENABLED": "false"})
+        self.assertEqual(absent, explicit)
+        self.assertEqual(
+            set(AppSettings.model_fields),
+            {"app_dsn", "shop_ids", "environment", "allowed_subjects", "public_origin",
+             "auth_subject_header", "semantic_catalog_enabled",
+             "controlled_sql_enabled"})
+        self.assertIs(AppSettings.model_fields["controlled_sql_enabled"].default, False)
+
+    def test_env_example_ships_the_controlled_sql_gate_closed(self):
+        """`.env.example` 是部署方抄的那份：新门禁必须写在那儿且只写一次。"""
+        import pathlib
+
+        text = (pathlib.Path(__file__).resolve().parents[2] / ".env.example"
+                ).read_text(encoding="utf-8")
+        self.assertIn("CONTROLLED_SQL_ENABLED=false\n", text)
+        for key in ("CONTROLLED_SQL_ENABLED", "SEMANTIC_CATALOG_ENABLED"):
+            with self.subTest(key=key):
+                assignments = [line for line in text.splitlines()
+                               if line.startswith(f"{key}=")]
+                self.assertEqual(assignments, [f"{key}=false"])
 
     def test_selected_provider_uses_its_own_key(self):
         from bi_agent.config import load_model_settings
