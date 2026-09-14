@@ -297,6 +297,11 @@ class DomainContext:
     now: datetime
     deadline: float
     attempt_no: int = 1
+    # 库存池授权（计划 Task 3 / Task 10，spec §3、§5.5）：与店铺授权**相互独立**。
+    # 默认空集不是"没传到"，而是"本轮没有任何池被授权"：实物那一格就只能报缺授权。
+    # 它不从 allowed_shop_ids 推导——拿到三家店不等于能看全公司仓库。放在最后是为了
+    # 不打断前面那些必填字段的构造顺序（老调用点一律按关键字传参）。
+    allowed_inventory_pool_ids: frozenset[str] = frozenset()
 
     @property
     def ref_to_shop_id(self) -> Mapping[str, str]:

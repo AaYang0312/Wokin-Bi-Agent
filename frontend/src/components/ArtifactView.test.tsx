@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-import { ArtifactView, artifactEntities, auditSummary, auditStatus, cellText } from './ArtifactView'
+import { ArtifactView, artifactEntities, auditSummary, auditStatus, cellText,
+  inventoryLevel, inventoryStatus, inventorySummary } from './ArtifactView'
 import type { Artifact } from '../types'
 
 const SHOP_REF = 'ent-59f71124'
@@ -302,5 +303,215 @@ describe('ArtifactView 上架价复核', () => {
           matched_items: 0, all_correct: false, counts: {}, sources: [] } }} />)
     expect(empty).toContain('本轮没有可复核的期望项')
     expect(empty).not.toContain('全部正确')
+  })
+})
+
+/**
+ * 库存两级预警卡片（运营工作流计划 Task 10）。
+ *
+ * 要钉住的三件事：两个口径各说各的话（永不并成一张可相加的表）、null 与 0 分得开、
+ * "全部安全"只在后端声称时才出现。
+ */
+describe('ArtifactView 库存两级预警', () => {
+  const SHOP_A = 'ent-59f71124'
+  const SHOP_B = 'ent-00000002'
+  const SKU_A = 'ent-1111aaaa'
+  const POOL_A = 'pl-0123456789ab'
+  const WH_A = 'wh-998877665544'
+
+  const stockArtifact: Artifact = {
+    artifact_type: 'inventory_alerts',
+    status: 'partial',
+    data_as_of: '2026-09-14T11:40:00+08:00',
+    inventory: {
+      expected_items: 3, evaluated_items: 2, scanned_items: 3, truncated: false,
+      all_safe: false, counts: { low: 1, normal: 1, unconfigured: 1 },
+      levels: ['physical_total', 'shop_sellable'],
+      pools: [{ pool_ref: POOL_A, connection_kind: 'shared', fresh: true,
+        scan_complete: true, snapshot_at: '2026-09-14T11:40:00+08:00' }],
+      excluded_pools: [{ pool_ref: 'pl-ffffffffffff', reason: 'pool_not_authorized' }],
+      threshold_source: 'this_turn',
+      rule_version: 'inventory-rules/2026-09-14.1',
+    },
+    filters: {
+      products: 'selected', levels: ['physical_total', 'shop_sellable'], as_of: 'latest',
+      thresholds: [{ level: 'low_replenish', sku_ref: SKU_A, quantity: '20', unit: 'piece' }],
+    },
+    limitations: ['存在低于阈值的实物库存，给出补货候选'],
+    data: [
+      { level: 'physical_total', sku_ref: SKU_A, pool_ref: POOL_A, warehouse_ref: WH_A,
+        quantity: '5', threshold: '20', unit: 'piece', batch_count: 2,
+        inventory_status: 'low', snapshot_at: '2026-09-14T11:40:00+08:00' },
+      { level: 'shop_sellable', sku_ref: SKU_A, shop_ref: SHOP_A, channel_quantity: '0',
+        threshold: '20', unit: 'piece', inventory_status: 'low',
+        snapshot_at: '2026-09-14T11:40:00+08:00' },
+      { level: 'shop_sellable', sku_ref: SKU_A, shop_ref: SHOP_B, channel_quantity: '50',
+        unit: 'piece', inventory_status: 'unconfigured',
+        snapshot_at: '2026-09-14T11:40:00+08:00' },
+    ],
+    entities: [
+      { ref: SHOP_A, kind: 'shop', display_name: '钉枪工厂店', name_source: 'shop_profile',
+        platform: 'tb' },
+      { ref: SHOP_B, kind: 'shop', display_name: '元发五金店', name_source: 'shop_profile',
+        platform: 'jd' },
+      { ref: SKU_A, kind: 'sku', name_source: 'unresolved' },
+    ],
+    catalog_version: 7,
+  }
+
+  const html = renderToStaticMarkup(<ArtifactView artifact={stockArtifact} />)
+
+  it('renders the two levels as separate blocks, never as one addable table', () => {
+    expect(html).toContain('库存两级预警')
+    expect(html).toContain('实物可用库存')
+    expect(html).toContain('店铺渠道可售')
+    // 两个口径各自一个分块：并排进同一张表就会有人把它们加起来。
+    expect(html.match(/data-level="/g)).toHaveLength(2)
+    expect(html).toContain('data-level="physical_total"')
+    // 实物块里没有店铺列，渠道块里没有池/仓库列。
+    const physical = html.slice(html.indexOf('data-level="physical_total"'),
+      html.indexOf('data-level="shop_sellable"'))
+    expect(physical).not.toContain('<th>店铺</th>')
+    const channel = html.slice(html.indexOf('data-level="shop_sellable"'))
+    expect(channel).not.toContain('<th>库存池</th>')
+    expect(channel).not.toContain('<th>实物可用量</th>')
+  })
+
+  it('keeps zero, missing and not-judged apart', () => {
+    // 取整行（从 <tr 起），不依赖列顺序：只看状态标记之后的片段会漏掉同一行里
+    // 排在状态前面的数量列，那种断言过了也不证明任何东西。
+    const rowOf = (marker: string) => {
+      const at = html.indexOf(marker)
+      const start = html.lastIndexOf('<tr', at)
+      return html.slice(start, html.indexOf('</tr>', at))
+    }
+    // 渠道可售为 0：那是真实零，不是缺数据。
+    // 钉的是"店 A 那一格渠道可售 = 0"，不是任意一个 low 行：实物那一格也是 low，
+    // 用状态当锚点会指错行。
+    const zeroRow = rowOf(`data-ref="${SHOP_A}"`)
+    // 真实零必须原样写出，不能与缺数据混同
+    expect(zeroRow).toContain('>0<')
+    expect(zeroRow).toContain('低于阈值')
+    // 缺阈值那一格仍给出已知的 50 件，但不给结论。
+    const unconfigured = rowOf('data-inventory-status="unconfigured"')
+    expect(unconfigured).toContain('50')
+    expect(unconfigured).toContain('未配阈值')
+    // 缺阈值时阈值列不能留空也不能写 0
+    expect(unconfigured).toContain('>—<')
+  })
+
+  it('labels all seven statuses without inventing a friendly safe verdict', () => {
+    expect(inventoryStatus('low')).toBe('低于阈值')
+    expect(inventoryStatus('normal')).toBe('正常')
+    expect(inventoryStatus('unconfigured')).toBe('未配阈值')
+    expect(inventoryStatus('unknown')).toBe('无法判定')
+    expect(inventoryStatus('stale')).toBe('快照过期')
+    expect(inventoryStatus('data_anomaly')).toBe('数据异常')
+    expect(inventoryStatus('unsupported')).toBe('来源未取证')
+    // 未登记状态原样输出：猜近义词就是把"没判过"说成已知结论。
+    expect(inventoryStatus('looks_ok')).toBe('looks_ok')
+    expect(inventoryLevel('physical_total')).toBe('实物可用库存')
+    expect(inventoryLevel('who_knows')).toBe('who_knows')
+    expect(html).not.toContain('都安全')
+  })
+
+  it('shows the threshold source and the pool authorization gap', () => {
+    expect(html).toContain('阈值来源：本轮用户给出')
+    expect(html).toContain('库存池：1 个')
+    // "有个池没算进来"必须说出来：只说少了几格，没人知道要去补池授权。
+    expect(html).toContain('未计入的池：1 个')
+    expect(html).toContain('池授权独立于店铺授权')
+    expect(html).toContain('存在低于阈值的实物库存')
+  })
+
+  it('resolves shop names and keeps pool handles as opaque text', () => {
+    expect(html).toContain('钉枪工厂店')
+    expect(html).toContain('元发五金店')
+    // 池句柄不是目录实体：它原样展示，供经营者对着后台核，不参与名称解析。
+    expect(html).toContain(POOL_A)
+    expect(html.match(/ent-[0-9a-z]{8}(?!"|')/g)).toBeNull()
+  })
+
+  it('announces truncation because not-shown is not the same as no-risk', () => {
+    // 分块构造，避免 JSX 里三层花括号互相遮蔽。
+    const wide: Artifact = {
+      ...stockArtifact,
+      inventory: { ...(stockArtifact.inventory as object), truncated: true,
+        expected_items: 30, evaluated_items: 30, scanned_items: 30 },
+    }
+    const truncated = renderToStaticMarkup(<ArtifactView artifact={wide} />)
+    expect(truncated).toContain('已按风险截断展示')
+  })
+
+  it('says all-safe only when the payload claims it', () => {
+    const safeArtifact: Artifact = {
+      ...stockArtifact,
+      status: 'ok',
+      inventory: { ...(stockArtifact.inventory as object), all_safe: true,
+        counts: { normal: 3 }, evaluated_items: 3 },
+      data: (stockArtifact.data as object[]).map(
+        (row) => ({ ...row, inventory_status: 'normal' })),
+    }
+    const safe = renderToStaticMarkup(<ArtifactView artifact={safeArtifact} />)
+    expect(safe).toContain('全部安全（证据齐备）')
+    expect(safe).not.toContain('未全部安全')
+    // 缺汇总块时宁可不显示分母，也不从行数"算"一个出来。
+    const bare = renderToStaticMarkup(<ArtifactView
+      artifact={{ artifact_type: 'inventory_alerts', status: 'ok', data: [] }} />)
+    expect(bare).not.toContain('期望 ')
+    expect(bare).toContain('本轮没有可判定的库存项')
+    expect(bare).not.toContain('全部安全')
+  })
+
+  it('reads the summary without recomputing any denominator', () => {
+    expect(inventorySummary(stockArtifact)).toEqual({
+      expected: 3, evaluated: 2, scanned: 3, truncated: false, allSafe: false,
+      pools: 1, excludedPools: 1 })
+    expect(inventorySummary({})).toEqual({ expected: null, evaluated: null,
+      scanned: null, truncated: null, allSafe: null, pools: 0, excludedPools: 0 })
+  })
+})
+
+describe('ArtifactView 库存卡片列集合', () => {
+  it('never renders a column that the level cannot fill', () => {
+    // 上一轮 Review 抓到的那类"看着像数据"的空列：实物块里出现"渠道可售量"，
+    // 或渠道块里出现"库存池"，都会被读成"那一家没货"。
+    const sku = 'ent-1111aaaa'
+    const artifact: Artifact = {
+      artifact_type: 'inventory_alerts',
+      status: 'partial',
+      inventory: {
+        expected_items: 2, evaluated_items: 2, scanned_items: 2, truncated: false,
+        all_safe: false, counts: { low: 2 },
+        levels: ['physical_total', 'shop_sellable'],
+        pools: [{ pool_ref: 'pl-0123456789ab', connection_kind: 'shared', fresh: true,
+          scan_complete: true }],
+        threshold_source: 'this_turn',
+      },
+      filters: { products: 'selected', levels: ['physical_total', 'shop_sellable'],
+        as_of: 'latest' },
+      limitations: [],
+      data: [
+        { level: 'physical_total', sku_ref: sku, pool_ref: 'pl-0123456789ab',
+          warehouse_ref: 'wh-0123456789ab', quantity: '5', threshold: '20',
+          unit: 'piece', batch_count: 1, inventory_status: 'low' },
+        { level: 'shop_sellable', sku_ref: sku, shop_ref: 'ent-59f71124',
+          channel_quantity: '0', threshold: '20', unit: 'piece',
+          inventory_status: 'low' },
+      ],
+      entities: [],
+    }
+    const html = renderToStaticMarkup(<ArtifactView artifact={artifact} />)
+    const physical = html.slice(html.indexOf('data-level="physical_total"'),
+      html.indexOf('data-level="shop_sellable"'))
+    const channel = html.slice(html.indexOf('data-level="shop_sellable"'))
+    expect(physical).not.toContain('<th>渠道可售量</th>')
+    expect(physical).not.toContain('<th>店铺</th>')
+    expect(channel).not.toContain('<th>库存池</th>')
+    expect(channel).not.toContain('<th>实物可用量</th>')
+    expect(channel).not.toContain('<th>批次数</th>')
+    // 各自的数都还在。
+    expect(physical).toContain('>5<')
+    expect(channel).toContain('>0<')
   })
 })

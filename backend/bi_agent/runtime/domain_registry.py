@@ -64,10 +64,17 @@ LISTING_NODES = frozenset({
     "verify_completeness_and_freshness", "join_expected_and_actual",
     "compare_decimal_prices", "classify_discrepancies", "persist_audit", "finalize",
 })
-# 尚未实现的领域继续站在旧节点集上：登记只表示"未登记的节点不许写库"，
-# 不代表它们的图已经存在。Task 10 落地时换成自己的节点链。
-INVENTORY_NODES = frozenset(_BUSINESS_NODES | {"assess_readiness", "scan_inventory",
-                                               "evaluate_rules"})
+# 库存预警（计划 Task 10、spec §6 的固定节点链）。推进顺序由
+# `inventory/graph.py` 的状态机决定，这里只回答"这个领域能不能写这个节点"。
+# 与价审图同一做派：必须与图上的节点枚举逐项相等（由用例比对），因为"领域登记了
+# 什么节点"就是它能往运行记录里写什么的边界。
+INVENTORY_NODES = frozenset({
+    "resolve_full_catalog_and_scope", "authorize_inventory_pools",
+    "load_inventory_policy", "check_source_capabilities", "load_snapshots",
+    "check_completeness_and_freshness", "normalize_units_and_deduplicate_pools",
+    "compute_total_and_shop_levels", "evaluate_thresholds", "classify_actions",
+    "persist_alerts", "finalize",
+})
 
 _REGISTRY: dict[str, DomainSpec] = {
     "business_query": DomainSpec(
@@ -84,11 +91,14 @@ _REGISTRY: dict[str, DomainSpec] = {
     ),
     "listing_price_audit": DomainSpec(
         name="listing_price_audit", nodes=LISTING_NODES,
-        artifact_types=frozenset({"price_audit", "comparison_table", "chart_spec"}),
+        artifact_types=frozenset({"price_audit"}),
     ),
+    # 只登记这张图真写得出的类型。本文件自己的规则就是"未实现的类型不允许提前写入"：
+    # 留着 trend_series / chart_spec，等于允许以后有人往预警运行下发一张没有数据集
+    # 支撑的图表声明。（价审领域同样只发 price_audit。）
     "inventory_watch": DomainSpec(
         name="inventory_watch", nodes=INVENTORY_NODES,
-        artifact_types=frozenset({"inventory_alerts", "trend_series", "chart_spec"}),
+        artifact_types=frozenset({"inventory_alerts"}),
     ),
 }
 

@@ -568,6 +568,22 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
   font-variant-numeric: tabular-nums;
 }
 .artifact-meta svg { color: var(--text-3); flex: 0 0 auto; }
+
+/* 卡片上的"这件事还没做完"标记：用琥珀色而不是红色——红色在本应用里表示故障，
+   而缺阈值 / 截断 / 未授权池都是待补的证据，不是坏了。 */
+.pill-warn { border-color: rgba(240, 178, 64, .5); color: #f0b240; }
+.pill-warn svg { color: #f0b240; }
+
+/* 两级库存卡片：两个口径各自成块。并排成一张连续表，下一步就有人把它们加起来。 */
+.inventory-level { margin-top: 12px; }
+.inventory-level + .inventory-level { margin-top: 16px; }
+.inventory-level-title {
+  margin: 0 0 6px;
+  color: var(--text-2);
+  font-size: 11.5px; font-weight: 600; letter-spacing: .04em;
+  text-transform: none;
+}
+
 /* 口径行：数据卡之前先说清这些数是什么口径，混口径时提高可见度。 */
 .basis-note {
   margin: 0;

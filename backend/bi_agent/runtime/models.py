@@ -26,6 +26,16 @@ from bi_agent.commerce.metrics import (
     COMMERCE_PUBLIC_LIMITATIONS, COMMERCE_RESULT_COLUMNS, EXCLUDED_REASONS,
     GROUP_STATUS_VALUES, METRIC_STATUS_VALUES, OPPORTUNITY_STATUSES,
     PLATFORM_GROUP_CODES, RANKING_SCOPES, RANKING_STATUSES, TREND_DAYS)
+from bi_agent.inventory.rules import (
+    AUDIT_LEVELS as INVENTORY_LEVELS,
+    INVENTORY_DATETIME_RESULT_COLUMNS, INVENTORY_INT_RESULT_COLUMNS,
+    INVENTORY_LABEL_RESULT_VALUES, INVENTORY_LIMITATION_CODES,
+    INVENTORY_POOL_REF_RESULT_COLUMNS, INVENTORY_PUBLIC_LIMITATIONS,
+    INVENTORY_QUANTITY_RESULT_COLUMNS, INVENTORY_REF_RESULT_COLUMNS,
+    INVENTORY_RESULT_COLUMNS, INVENTORY_UNIT_RESULT_COLUMNS,
+    INVENTORY_WAREHOUSE_REF_RESULT_COLUMNS, POOL_REF_RE, ROW_STATUSES,
+    SHOP_CONNECTIONS, STORAGE_UNITS, THRESHOLD_LEVELS as INVENTORY_THRESHOLD_LEVELS,
+    UNIT_PRECISIONS, WAREHOUSE_REF_RE, MAX_DISPLAY_ITEMS as MAX_INVENTORY_DISPLAY_ITEMS)
 from bi_agent.listing_audit.rules import (
     APPLIES_TO_VALUES, AUDIT_STATUSES, LISTING_DATETIME_RESULT_COLUMNS,
     LISTING_LABEL_RESULT_VALUES,
@@ -79,6 +89,12 @@ PersistenceNode = Literal[
     "capture_user_expected_prices", "check_listing_source", "load_listing_snapshot",
     "verify_completeness_and_freshness", "join_expected_and_actual",
     "compare_decimal_prices", "classify_discrepancies", "persist_audit",
+    # 库存预警图（计划 Task 10、spec §6）：两个口径各自取源、各自判新鲜，永不相加。
+    "resolve_full_catalog_and_scope", "authorize_inventory_pools",
+    "load_inventory_policy", "check_source_capabilities", "load_snapshots",
+    "check_completeness_and_freshness", "normalize_units_and_deduplicate_pools",
+    "compute_total_and_shop_levels", "evaluate_thresholds", "classify_actions",
+    "persist_alerts",
 ]
 ErrorCode = Literal[
     "missing_parameters", "invalid_parameters", "forbidden", "deadline_exceeded",
@@ -167,6 +183,8 @@ _LIMITATION_CODES = frozenset({
     *COMMERCE_LIMITATION_CODES,
     # 上架复核（Task 9）：来源 / 快照 / 时效 / 枚举 / 本轮目标价 / 业务发现各自归因。
     *LISTING_LIMITATION_CODES,
+    # 库存预警（Task 10）：两个口径的来源 / 快照 / 时效 / 扫描 / 单位 / 阈值各自归因。
+    *INVENTORY_LIMITATION_CODES,
 })
 # 逐指标状态的原因只能用已登记的限制码：状态与限制共用一份词表，
 # 不然同一个缺口会在两处各起一个名字。
@@ -189,7 +207,7 @@ _PUBLIC_LIMITATIONS = frozenset({
     "比较仅支持total/shop分组",
     "同批支付额为0或无支付，同批退款率不可计算",
 }) | PROMOTION_PUBLIC_LIMITATIONS | COMMERCE_PUBLIC_LIMITATIONS \
-    | LISTING_PUBLIC_LIMITATIONS
+    | LISTING_PUBLIC_LIMITATIONS | INVENTORY_PUBLIC_LIMITATIONS
 _PUBLIC_LIMITATION_PATTERNS = (
     re.compile(r"^存在[0-9]+条未匹配的平台成功退款，退款归属未确认$"),
     re.compile(r"^结果超过[0-9]+组，请缩小日期范围或店铺范围$"),
@@ -241,6 +259,9 @@ _NORMALIZED_REQUEST_KEYS = frozenset({
     "platform_group_rule",
     # 上架复核（Task 9）：本轮目标价参与指纹，换价就是换问题；缺它就没有依据可言。
     "expected_prices", "price_basis", "as_of",
+    # 库存预警（Task 10）：本轮阈值同样参与指纹——换个阈值再问不是同一个问题。
+    "levels", "products", "sku_refs", "product_refs", "thresholds",
+    "threshold_policy_ref",
 })
 _ARTIFACT_KEYS = frozenset({
     "status", "metric_definition", "coverage", "limitations", "data_as_of", "filters",
@@ -254,6 +275,8 @@ _ARTIFACT_KEYS = frozenset({
     "group_statuses", "ranking",
     # 上架复核（Task 9）：期望项分母、判定计数、来源与时效声明。
     "audit",
+    # 库存预警（Task 10）：期望项与扫描事实分列，池声明与阈值来源随行可核对。
+    "inventory",
 })
 
 # ---------------------------------------------------------------------------
@@ -300,6 +323,9 @@ _FILTER_KEYS = frozenset({
     "report_kind", "sales_share_basis",
     # 上架复核：一次复核回答的是「哪个口径、哪个时点、按哪些本轮目标价」。
     "price_basis", "as_of", "expected_prices",
+    # 库存预警：一次预警回答的是「哪两个口径、按哪些本轮阈值、用了哪一版策略」。
+    "levels", "products", "sku_refs", "product_refs", "thresholds",
+    "threshold_policy_ref",
 })
 
 _LINE_KINDS = frozenset({"sale", "gift", "suite", "combination", "processing"})
@@ -307,9 +333,19 @@ _CURRENCY_VALUES = frozenset({"CNY"})
 # 上架复核的词表由生产方（`listing_audit.rules`）持有：列名、类别与取值集合都在
 # 那一处声明并用断言自校，这里只引用。「新增列必须先声明类型」这条规则才有唯一落点。
 _LISTING_REF_RESULT_COLUMNS: frozenset[str] = LISTING_LISTING_REF_RESULT_COLUMNS
-_DATETIME_RESULT_COLUMNS: frozenset[str] = LISTING_DATETIME_RESULT_COLUMNS
+_DATETIME_RESULT_COLUMNS: frozenset[str] = (LISTING_DATETIME_RESULT_COLUMNS
+                                            | INVENTORY_DATETIME_RESULT_COLUMNS)
+_INVENTORY_UNITS: frozenset[str] = INVENTORY_UNIT_RESULT_COLUMNS
+_INVENTORY_QUANTITIES: frozenset[str] = INVENTORY_QUANTITY_RESULT_COLUMNS
+_INVENTORY_INTS: frozenset[str] = INVENTORY_INT_RESULT_COLUMNS
 _PRICE_BASES = frozenset(PRICE_BASES)
 _AUDIT_STATUSES = frozenset(AUDIT_STATUSES)
+# 库存预警同一做派：列名、类别与取值集都由 `inventory.rules` 持有并自校。
+_POOL_RE = POOL_REF_RE
+_WAREHOUSE_RE = WAREHOUSE_REF_RE
+_INVENTORY_STATUSES = frozenset(ROW_STATUSES)
+_INVENTORY_LEVELS = frozenset(INVENTORY_LEVELS)
+_INVENTORY_CONNECTIONS = frozenset(SHOP_CONNECTIONS)
 
 # 结果列白名单以生产方为单一真源：推广列（含类型与可取集合）从 promotion.py 导出，
 # 本模块只补充固定指标侧的列，不再手抄推广列名。
@@ -319,7 +355,7 @@ _METRIC_RESULT_COLUMNS = frozenset({
     "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount", "notice",
 })
 _REF_RESULT_COLUMNS = (frozenset({"shop_ref", "product_ref"})
-                       | LISTING_REF_RESULT_COLUMNS)
+                       | LISTING_REF_RESULT_COLUMNS | INVENTORY_REF_RESULT_COLUMNS)
 # 文本列只有上限、转义与长数字主键三道限制；不放开成“任意字符串都收”。
 _TEXT_RESULT_COLUMNS = frozenset({"notice"})
 _DATE_RESULT_COLUMNS = frozenset({"day"}) | PROMOTION_DATE_RESULT_COLUMNS
@@ -331,17 +367,22 @@ _LABEL_RESULT_VALUES: dict[str, frozenset[str]] = {
     **PROMOTION_LABEL_VALUES,
     # 上架复核的判定状态与价格口径：只能取 spec §5.4 / §4 的那几个值。
     **LISTING_LABEL_RESULT_VALUES,
+    # 库存预警的口径、判定态与候选动作：只能取 spec §5.5 / §6 的那几个值。
+    **INVENTORY_LABEL_RESULT_VALUES,
 }
 _RESULT_COLUMNS = (_METRIC_RESULT_COLUMNS | PROMOTION_RESULT_COLUMNS
-                   | COMMERCE_RESULT_COLUMNS | LISTING_RESULT_COLUMNS)
+                   | COMMERCE_RESULT_COLUMNS | LISTING_RESULT_COLUMNS
+                   | INVENTORY_RESULT_COLUMNS)
 # 剩下的列一律按十进制/整数严格校验；推广数值列集合作为交叉校验。
 # 上架复核那一段的数值列**取声明集而不是取余集**：拿余集当数值兼容，新登记一个
 # 未认识的列就会默默落进"只收十进制"那一档，把任意文本当金额收下来。
 _NUMERIC_RESULT_COLUMNS = ((_RESULT_COLUMNS - _REF_RESULT_COLUMNS - _DATE_RESULT_COLUMNS
                             - _TEXT_RESULT_COLUMNS - _DATETIME_RESULT_COLUMNS
                             - _LISTING_REF_RESULT_COLUMNS - LISTING_RESULT_COLUMNS
+                            - INVENTORY_RESULT_COLUMNS - INVENTORY_INT_RESULT_COLUMNS
                             - frozenset(_LABEL_RESULT_VALUES))
-                           | LISTING_NUMERIC_RESULT_COLUMNS)
+                           | LISTING_NUMERIC_RESULT_COLUMNS
+                           | INVENTORY_QUANTITY_RESULT_COLUMNS)
 assert _NUMERIC_RESULT_COLUMNS & PROMOTION_RESULT_COLUMNS == PROMOTION_NUMERIC_RESULT_COLUMNS
 # 投影层（business_query/tool.py）复用同一份白名单，避免二次手抄漂移。
 ARTIFACT_RESULT_COLUMNS = _RESULT_COLUMNS
@@ -397,6 +438,31 @@ def _mapping(value: object, *, allowed: frozenset[str],
 
 def _string_in(value: object, allowed: frozenset[str]) -> None:
     if not isinstance(value, str) or value not in allowed:
+        _unsafe_payload()
+
+
+def _pool_ref(value: object) -> None:
+    """库存池句柄：`(账号范围, 池号)` 的单向摘要。
+
+    它不是 `ent-` 引用：目录不解析它也不把它放进 `entities`。拿它冒充 `ent-`，
+    就是把一个真实 ERP 池号送进了展示路径。
+    """
+    if not isinstance(value, str) or not POOL_REF_RE.fullmatch(value):
+        _unsafe_payload()
+
+
+def _warehouse_ref(value: object) -> None:
+    if not isinstance(value, str) or not WAREHOUSE_REF_RE.fullmatch(value):
+        _unsafe_payload()
+
+
+def _quantity_or_null(value: object) -> None:
+    """库存数量：只收不带指数、不带千分位的十进制文本（或 null = 没读到）。"""
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, str):
+        _unsafe_payload()
+    if not re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", value):
         _unsafe_payload()
 
 
@@ -945,6 +1011,18 @@ def _normalized_request(value: object) -> dict[str, object]:
         _policy_ref(request["opportunity_policy_ref"])
     if "expected_prices" in request:
         _expected_price_entries(request["expected_prices"])
+    if "thresholds" in request:
+        _inventory_threshold_entries(request["thresholds"])
+    if "levels" in request:
+        _string_list(request["levels"], lambda item: _string_in(item, _INVENTORY_LEVELS))
+    if "products" in request:
+        _string_in(request["products"], frozenset({"all", "selected"}))
+    if "sku_refs" in request:
+        _string_list(request["sku_refs"], _ref)
+    if "product_refs" in request:
+        _string_list(request["product_refs"], _ref)
+    if "threshold_policy_ref" in request:
+        _policy_ref(request["threshold_policy_ref"])
     if "price_basis" in request:
         _string_in(request["price_basis"], _PRICE_BASES)
     if "as_of" in request:
@@ -1070,7 +1148,11 @@ def _result_rows(value: object, *, public: bool) -> None:
         if not row:
             _unsafe_payload()
         for key, result_value in row.items():
-            if key in _NUMERIC_RESULT_COLUMNS:
+            # 库存数量列排在通用数值分支之前：它们在 _NUMERIC 里也有席位（`quantity`
+            # 是固定指标的列名），走那一支就会把裸 JSON 整数当成合法数量收下来。
+            if key in INVENTORY_QUANTITY_RESULT_COLUMNS:
+                _quantity_or_null(result_value)
+            elif key in _NUMERIC_RESULT_COLUMNS:
                 _numeric_result(result_value)
             elif key in _DATE_RESULT_COLUMNS:
                 _date_string(result_value)
@@ -1080,6 +1162,14 @@ def _result_rows(value: object, *, public: bool) -> None:
                 _datetime_string(result_value)
             elif key in _LISTING_REF_RESULT_COLUMNS:
                 _listing_ref(result_value)
+            elif key in INVENTORY_POOL_REF_RESULT_COLUMNS:
+                _pool_ref(result_value)
+            elif key in INVENTORY_WAREHOUSE_REF_RESULT_COLUMNS:
+                _warehouse_ref(result_value)
+            elif key in INVENTORY_INT_RESULT_COLUMNS:
+                _non_negative_int(result_value)
+            elif key in INVENTORY_UNIT_RESULT_COLUMNS:
+                _inventory_unit(result_value)
             elif key in _LABEL_RESULT_VALUES:
                 _string_in(result_value, _LABEL_RESULT_VALUES[key])
             elif key in _REF_RESULT_COLUMNS:
@@ -1119,6 +1209,18 @@ def _filters(value: object, *, public: bool) -> None:
         _ref(filters["product_ref"])
     if "expected_prices" in filters:
         _expected_price_entries(filters["expected_prices"])
+    if "thresholds" in filters:
+        _inventory_threshold_entries(filters["thresholds"])
+    if "levels" in filters:
+        _string_list(filters["levels"], lambda item: _string_in(item, _INVENTORY_LEVELS))
+    if "products" in filters:
+        _string_in(filters["products"], frozenset({"all", "selected"}))
+    if "sku_refs" in filters:
+        _string_list(filters["sku_refs"], _ref)
+    if "product_refs" in filters:
+        _string_list(filters["product_refs"], _ref)
+    if "threshold_policy_ref" in filters:
+        _policy_ref(filters["threshold_policy_ref"])
     if "price_basis" in filters:
         _string_in(filters["price_basis"], _PRICE_BASES)
     if "as_of" in filters:
@@ -1195,6 +1297,8 @@ def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
         # 判别位在 `validate_artifact_payload`：数据集类型带了 audit 块也照样在这里
         # 被逐字段校验，不给任何一支留出"未登记的键先放行"的口子。
         _audit_summary(payload["audit"])
+    if "inventory" in payload:
+        _inventory_summary(payload["inventory"])
     if "termination_reason" in payload:
         _termination_code(payload["termination_reason"])
     return payload
@@ -1241,6 +1345,212 @@ def _diagnostics(value: object) -> None:
                 raise ValueError("diagnostics_invalid")
 
 
+_INVENTORY_SUMMARY_KEYS = frozenset({
+    "expected_items", "evaluated_items", "scanned_items", "truncated", "all_safe",
+    "counts", "levels", "pools", "excluded_pools", "threshold_source",
+    "freshness_policy_seconds", "rule_version"})
+_INVENTORY_SUMMARY_REQUIRED = frozenset({
+    "expected_items", "evaluated_items", "scanned_items", "truncated", "all_safe",
+    "counts", "levels", "pools", "threshold_source"})
+_INVENTORY_POOL_KEYS = frozenset({"pool_ref", "connection_kind", "fresh",
+                                 "scan_complete", "snapshot_at"})
+_INVENTORY_POOL_REQUIRED = frozenset({"pool_ref", "connection_kind", "fresh",
+                                     "scan_complete"})
+_INVENTORY_THRESHOLD_KEYS = frozenset({"level", "sku_ref", "quantity", "unit",
+                                       "shop_ref", "pool_ref"})
+_INVENTORY_THRESHOLD_REQUIRED = frozenset({"level", "sku_ref", "quantity", "unit"})
+_INVENTORY_THRESHOLD_SOURCES = frozenset({"this_turn", "configured", "none"})
+_INVENTORY_ACTIONS = frozenset({"", "replenish", "quota_adjust"})
+
+
+def _inventory_threshold_entries(value: object) -> None:
+    """本轮阈值条目：一个档位只能作用在它对应的那个口径上。"""
+    if not isinstance(value, list):
+        _unsafe_payload()
+    seen: set[tuple] = set()
+    for item in value:
+        entry = _mapping(item, allowed=_INVENTORY_THRESHOLD_KEYS,
+                         required=_INVENTORY_THRESHOLD_REQUIRED)
+        _string_in(entry["level"], INVENTORY_THRESHOLD_LEVELS)
+        _ref(entry["sku_ref"])
+        _quantity_or_null(entry["quantity"])
+        if entry.get("quantity") is None:
+            _unsafe_payload()
+        _inventory_unit(entry["unit"])
+        for key in ("shop_ref",):
+            if entry.get(key) is not None:
+                _ref(entry[key])
+        if entry.get("pool_ref") is not None:
+            _pool_ref(entry["pool_ref"])
+        # 档位与作域成对：配额阈值带池、补货阈值带店，都是问错了问题。
+        if entry["level"] == "low_quota" and entry.get("pool_ref") is not None:
+            _unsafe_payload()
+        if entry["level"] == "low_replenish" and entry.get("shop_ref") is not None:
+            _unsafe_payload()
+        key = (entry["level"], str(entry["sku_ref"]), str(entry.get("shop_ref") or ""),
+               str(entry.get("pool_ref") or ""))
+        if key in seen:
+            _unsafe_payload()      # 同一目标项重复声明：那是冲突，不是重复强调
+        seen.add(key)
+
+
+def _inventory_summary(value: object) -> None:
+    """预警汇总：期望项是分母，`scanned_items` 是扫描事实，`truncated` 只描述展示。
+
+    四条结构不变量：
+
+    1. `counts` 总和等于 `expected_items`：每一格都必须有一个状态，没扫到不能被
+       抖成"不存在"；
+    2. `scanned_items == expected_items`：没扫完就不得把分母说成已扫数（扫描事实与
+       展示截断是三件事，不能合并）；
+    3. `all_safe` 要求每一格都已判且都是 normal，且无截断、池声明全部取尽；
+    4. 一个口径都没判成时，`all_safe` 与 `truncated` 都不能为真。
+    """
+    summary = _mapping(value, allowed=_INVENTORY_SUMMARY_KEYS,
+                       required=_INVENTORY_SUMMARY_REQUIRED)
+    for key in ("expected_items", "evaluated_items", "scanned_items"):
+        _non_negative_int(summary[key])
+    expected = int(summary["expected_items"])
+    if int(summary["scanned_items"]) != expected:
+        # 扫描事实与期望分母不一致，就是有人把"没扫完"当"没这么多格"
+        _unsafe_payload()
+    if int(summary["evaluated_items"]) > expected:
+        _unsafe_payload()
+    counts = _mapping(summary["counts"], allowed=_INVENTORY_STATUSES)
+    for status, count in counts.items():
+        _string_in(status, _INVENTORY_STATUSES)
+        _non_negative_int(count)
+    if sum(int(count) for count in counts.values()) != expected:
+        _unsafe_payload()
+    judged = int(counts.get("low", 0)) + int(counts.get("normal", 0))
+    if int(summary["evaluated_items"]) != judged:
+        _unsafe_payload()
+    _bool_flag(summary["truncated"])
+    # 截断只能是"期望项多于展示上限"：一个 3 格的结果声称被截断，说明有人拿展示数
+    # 当成了分母，那时"没展示的"其实根本不存在。
+    if summary["truncated"] != (expected > MAX_INVENTORY_DISPLAY_ITEMS):
+        _unsafe_payload()
+    _bool_flag(summary["all_safe"])
+    # 「全部安全」只能等于「每一格都判成了 normal」：拿「都判过了」当「都安全」会把
+    # low 说成好消息，那是一级预警最不能犯的错。
+    if summary["all_safe"] and not (expected > 0
+                                    and counts == {"normal": expected}
+                                    and not summary["truncated"]):
+        _unsafe_payload()
+    _string_in(summary["threshold_source"], _INVENTORY_THRESHOLD_SOURCES)
+    levels = summary["levels"]
+    if not isinstance(levels, list) or not levels:
+        _unsafe_payload()
+    for level in levels:
+        _string_in(level, _INVENTORY_LEVELS)
+    if len(set(levels)) != len(levels):
+        _unsafe_payload()
+    if "freshness_policy_seconds" in summary:
+        _positive_int(summary["freshness_policy_seconds"])
+    if "rule_version" in summary:
+        version = summary["rule_version"]
+        if not isinstance(version, str) or not _BASIS_NAME_RE.fullmatch(version):
+            _unsafe_payload()
+    pools = summary["pools"]
+    if not isinstance(pools, list):
+        _unsafe_payload()
+    # 被排除的池：只允许句柄 + 一个固定原因。原因词表在这里钉死，是为了不让
+    # "为什么没算进来"变成一句自由文本。
+    for entry_value in summary.get("excluded_pools") or []:
+        entry = _mapping(entry_value, allowed=frozenset({"pool_ref", "reason"}),
+                         required=frozenset({"pool_ref", "reason"}))
+        _pool_ref(entry["pool_ref"])
+        _string_in(entry["reason"], frozenset({"pool_not_authorized"}))
+    seen: set[str] = set()
+    for entry_value in pools:
+        entry = _mapping(entry_value, allowed=_INVENTORY_POOL_KEYS,
+                         required=_INVENTORY_POOL_REQUIRED)
+        _pool_ref(entry["pool_ref"])
+        if entry["pool_ref"] in seen:
+            _unsafe_payload()      # 一个池说两次：其中一次一定是错的
+        seen.add(str(entry["pool_ref"]))
+        _string_in(entry["connection_kind"], SHOP_CONNECTIONS)
+        _bool_flag(entry["fresh"])
+        _bool_flag(entry["scan_complete"])
+        if entry.get("snapshot_at") is not None:
+            _datetime_string(entry["snapshot_at"])
+        # "全部安全"要求每一批声明都新鲜且取尽：一个过期或未扫完的池在场时，
+        # 汇总说"都安全"就是拿好消息盖住坏消息。
+        if summary["all_safe"] and not (entry["fresh"] and entry["scan_complete"]):
+            _unsafe_payload()
+
+
+def _inventory_alert_rows(payload: dict[str, object]) -> None:
+    """预警行：行数等于期望项，且两个口径永不互相冒充。"""
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        _unsafe_payload()
+    summary = payload["inventory"]
+    assert isinstance(summary, dict)
+    expected = int(summary["expected_items"])
+    if len(rows) != min(expected, MAX_INVENTORY_DISPLAY_ITEMS):
+        # 行数由展示上限决定，而分母由扫描事实决定：两者不一致必须是截断。
+        if not summary["truncated"]:
+            _unsafe_payload()
+    seen: set[tuple] = set()
+    for row_value in rows:
+        row = _mapping(row_value, allowed=_RESULT_COLUMNS,
+                       required=frozenset({"level", "sku_ref", "inventory_status"}))
+        _ref(row["sku_ref"])
+        _string_in(row["level"], _INVENTORY_LEVELS)
+        _string_in(row["inventory_status"], _INVENTORY_STATUSES)
+        key = (str(row["level"]), str(row.get("shop_ref") or ""), str(row["sku_ref"]),
+               str(row.get("pool_ref") or ""), str(row.get("warehouse_ref") or ""))
+        if key in seen:
+            _unsafe_payload()      # 同一格发两行：一个预警会被当成两个
+        seen.add(key)
+        physical = row["level"] == "physical_total"
+        # 实物行不按店说话，渠道行不按池说话：两个口径一旦在同一行上共存，
+        # 就没人能看出它到底是哪个总量。
+        if physical and row.get("shop_ref") is not None:
+            _unsafe_payload()
+        if not physical and (row.get("pool_ref") is not None
+                             or row.get("warehouse_ref") is not None):
+            _unsafe_payload()
+        if physical and row.get("channel_quantity") is not None:
+            _unsafe_payload()
+        if not physical and row.get("quantity") is not None:
+            _unsafe_payload()
+        _quantity_or_null(row.get("quantity"))
+        _quantity_or_null(row.get("channel_quantity"))
+        _quantity_or_null(row.get("threshold"))
+        _inventory_unit(row.get("unit"))
+        # 批次数是"这一格由几批拼出来"的事实：缺这个键等于不说它是几批拼的。
+        if "batch_count" not in row:
+            _unsafe_payload()
+        _non_negative_int(row["batch_count"])
+        if row.get("snapshot_at") is not None:
+            _datetime_string(row["snapshot_at"])
+        action = row.get("action")
+        if action is not None:
+            _string_in(action, _INVENTORY_ACTIONS)
+        # 只有判定态能带候选动作；一个 `unknown` 带"补货"就是无依据的动作建议
+        if action not in (None, "") and row["inventory_status"] not in ("low",
+                                                                        "data_anomaly"):
+            _unsafe_payload()
+        if row["inventory_status"] == "normal" and action not in (None, ""):
+            _unsafe_payload()
+        # 预警结论必须有阈值在场：没阈值就只能报 unconfigured。报 low / normal 就是
+        # 拿一个经营者没给过的标准下定论。
+        if (row["inventory_status"] in ("low", "normal")
+                and row.get("threshold") is None):
+            _unsafe_payload()
+
+
+def _inventory_alerts_payload(value: object, *, public: bool) -> dict[str, object]:
+    """inventory_alerts 载荷：数据集形状 + 自己的 `inventory` 块与预警行规则。"""
+    payload = _public_metric_payload(value, public=public)
+    if "inventory" not in payload:
+        _unsafe_payload()
+    _inventory_alert_rows(payload)
+    return payload
+
+
 def _expected_price_entries(value: object) -> None:
     """本轮目标价条目：引用 + 金额 + 口径，一个字段都不能多。
 
@@ -1272,6 +1582,17 @@ def _expected_price_entries(value: object) -> None:
         if key in seen:
             _unsafe_payload()      # 同一目标项重复声明：那是冲突，不是重复强调
         seen.add(key)
+
+
+def _inventory_unit(value: object) -> None:
+    """单位只收存储层枚举过的那几个（`STORAGE_UNITS`）。
+
+    不收未登记的自由文本：那才会把"件/箱"混成一个总数。但 `kit` 这类**存得进来、
+    只是没有换算精度**的单位必须在词表里——否则一格异常会让整份预警发不出去，
+    而 019 与判定层都明说了这类行是可以存在的。
+    """
+    if not isinstance(value, str) or value not in STORAGE_UNITS:
+        _unsafe_payload()
 
 
 def _audit_summary(value: object) -> None:
@@ -1397,6 +1718,8 @@ def validate_model_payload(value: object,
     """给模型的载荷：与公开载荷共用同一判别位，只是不含展示名。"""
     if artifact_type == "price_audit":
         return _price_audit_payload(value, public=False)
+    if artifact_type == "inventory_alerts":
+        return _inventory_alerts_payload(value, public=False)
     return _public_metric_payload(value, public=False)
 
 
@@ -1413,6 +1736,8 @@ def validate_artifact_payload(value: object,
         return _chart_payload(value)
     if artifact_type == "price_audit":
         return _price_audit_payload(value, public=True)
+    if artifact_type == "inventory_alerts":
+        return _inventory_alerts_payload(value, public=True)
     return _public_metric_payload(value, public=True)
 
 

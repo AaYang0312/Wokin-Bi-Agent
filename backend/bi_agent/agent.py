@@ -36,6 +36,8 @@ from .catalog import (
     shop_display_labels,
 )
 from .llm import ChatModel, Message, ModelError, ModelReply, ToolCall
+from .inventory.tool import (
+    execute_inventory_tool, inventory_request_schema)
 from .listing_audit.tool import (
     execute_listing_audit_tool, listing_audit_request_schema)
 from .metrics import QueryRequest, ToolResult, resolve_period
@@ -49,7 +51,7 @@ MAX_MODEL_TURNS = 5
 MAX_KEPT_TURNS = 6
 
 _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%Y-%m-%d %H:%M}（Asia/Shanghai）。
-只能使用五个工具：
+只能使用六个工具：
 - query_business：按已确认口径查询经营指标，日期end排他；shop_ids 只能填 ent- 形式的店铺引用，
   可用引用：{ref_doc}。引用与真实店名的对应关系你看不到，也不要猜。
 - analyze_product_performance：查**一个指定商品**在获准店铺内的跨店经营报告与七日趋势；
@@ -72,6 +74,16 @@ _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%
   故障，不要把同一格重试到匹配为止。当前**没有任何已核验的渠道在售价来源**，该工具
   只会报 unsupported：这时只能如实说“渠道在售价来源尚未取证，本次无法复核”，不得
   声称线上全店复核可用，也不得把采集到的价当成复核结论。
+- inspect_inventory：两级库存预警。`physical_total`（实物 / ERP 可用库存，按库存池+仓库
+  +SKU+批次+单位去重后各算一次）与 `shop_sellable`（店铺渠道可售）是两个口径，各自的来源、
+  时效与阈值都分开：渠道显示数永不加成实物总量，共享池被三家店各展示 100 时实物仍是 100。
+  阈值只能来自已配置的版本化策略或用户本轮明确给出的 `thresholds`（两者互斥）；两者都没有
+  时这一格是 unconfigured，绝不替经营者设一个数。判定是 quantity <= threshold，等于也算 low。
+  缺数量是 unknown、快照过期是 stale、负库存是 data_anomaly，四者都不能被说成"安全"。
+  实物那格的候选是补货，店铺那格的候选是调整店铺配额：两者不能互换，也都只是建议，本轮不
+  执行任何调整、采购或外部通知。库存池授权与店铺授权相互独立：未获准的池不进总量也不进明细。
+  当前**没有任何已核验的库存来源**，该工具只会报 unsupported：只能如实说"库存来源尚未取证，
+  本次无法预警"，不得声称线上库存可用。
 - evaluate_promotion：仅按当前用户明确假设测算预算；当前未取得真实推广消耗。
 支持指标：支付金额、支付订单数、客单价、ERP单据数、退款发生额、期间收支差额、同批退款率、商品销量、商品支付金额。
 支持维度：合计、按日、按店铺、按商品。
@@ -421,6 +433,13 @@ def _tool_schemas() -> list[dict[str, object]]:
                            "来源未取证时只会报 unsupported",
             "parameters": listing_audit_request_schema()}},
         {"type": "function", "function": {
+            "name": "inspect_inventory",
+            "description": "两级库存预警：physical_total（按池+仓库+SKU+批次+单位去重的实物可用量）"
+                           "与 shop_sellable（店铺渠道可售）是两个口径，永不加成同一个总量；"
+                           "阈值只能来自已配置策略或本轮 thresholds（互斥），缺阈值是 unconfigured，"
+                           "quantity <= threshold 算 low；来源未取证时只会报 unsupported",
+            "parameters": inventory_request_schema()}},
+        {"type": "function", "function": {
             "name": "evaluate_promotion",
             "description": "仅按当前用户明确假设测算预算；当前未取得真实推广消耗",
             "parameters": PromotionRequest.model_json_schema()}},
@@ -529,6 +548,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     business_attempt_no = 0
     commerce_attempt_no = 0
     listing_attempt_no = 0
+    inventory_attempt_no = 0
 
     for _ in range(MAX_MODEL_TURNS):
         remaining = deadline - time_module.monotonic()
@@ -659,6 +679,41 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     content=json.dumps(domain_result.model_payload,
                                        ensure_ascii=False)))
                 continue
+            if call.name == "inspect_inventory":
+                # 库存预警走同一形状的适配器：一次工具调用 = 一次图执行。
+                # 不往 session_filters 回写任何东西：本轮阈值存进会话，下一轮的
+                # "unconfigured" 就有了隐式继承通道。池授权也只从服务端递进去。
+                inventory_attempt_no += 1
+                inventory_execution = execute_inventory_tool(call, DomainContext(
+                    subject_id=turn_context.subject_id,
+                    allowed_shop_ids=allowed_shop_ids,
+                    shop_refs=dict(state.shop_refs),
+                    conn=conn,
+                    store=run_store,
+                    chat_id=turn_context.chat_id,
+                    user_message_id=turn_context.user_message_id,
+                    root_request_id=turn_context.user_message_id,
+                    now=now,
+                    deadline=deadline,
+                    attempt_no=inventory_attempt_no))
+                calls_used += 1
+                domain_result = inventory_execution.domain_result
+                if (domain_result.error is not None
+                        and domain_result.error.code
+                        in {"artifact_persistence_failed", "result_contract_violation"}):
+                    last_error = domain_result.error.public_message
+                    error_code = domain_result.error.code
+                    results.clear()
+                    artifacts.clear()
+                    stop_after_batch = True
+                    break
+                artifacts.extend(artifact_event_payload(artifact)
+                                 for artifact in domain_result.artifacts)
+                messages.append(Message(
+                    role="tool", tool_call_id=call.id,
+                    content=json.dumps(domain_result.model_payload,
+                                       ensure_ascii=False)))
+                continue
             if call.name == "audit_listing_prices":
                 # 上架复核走与经营图同一形状的适配器：一次工具调用 = 一次图执行。
                 # 主层不逐店循环、不自己比金额，也不为"缺目标价"发明一份默认标准：
@@ -715,6 +770,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                                                        "analyze_product_performance/"
                                                        "compare_performance/"
                                                        "audit_listing_prices/"
+                                                       "inspect_inventory/"
                                                        "evaluate_promotion"},
                                             ensure_ascii=False)))
                 continue

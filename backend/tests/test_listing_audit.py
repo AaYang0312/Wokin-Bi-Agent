@@ -2239,18 +2239,24 @@ class ListingAuditAgentWiringTests(unittest.TestCase):
     被测对象。
     """
 
-    def test_tool_is_announced_as_the_fifth_business_tool(self):
+    def test_tool_is_announced_next_to_the_other_business_tools(self):
+        """价审 Tool 在公告列表里，且排在经营 Tool 之后、推广 Tool 之前。
+
+        Task 10 加了库存 Tool 之后，这里断言的是"本域的 Tool 仍在列表中且顺序稳定"，
+        完整六元组顺序由 `tests.test_inventory` 钉（一份名单只在一处当权威）。
+        """
         import bi_agent.agent as agent
 
         names = [item["function"]["name"] for item in agent._tool_schemas()]
-        self.assertEqual(names, ["query_business", "analyze_product_performance",
-                                 "compare_performance", "audit_listing_prices",
-                                 "evaluate_promotion"])
+        self.assertIn("audit_listing_prices", names)
+        self.assertEqual(names.index("audit_listing_prices"),
+         names.index("compare_performance") + 1)
+        self.assertEqual(names[-1], "evaluate_promotion")
 
     def test_prompt_says_the_target_price_must_come_from_this_turn(self):
         from bi_agent.agent import _SYSTEM_PROMPT
 
-        self.assertIn("五个工具", _SYSTEM_PROMPT)
+        self.assertIn("个工具", _SYSTEM_PROMPT)
         self.assertIn("audit_listing_prices", _SYSTEM_PROMPT)
         # 三条模型必须自己承担的说法：本轮取值、缺价要问、未取证不称可用。
         self.assertIn("本轮", _SYSTEM_PROMPT)

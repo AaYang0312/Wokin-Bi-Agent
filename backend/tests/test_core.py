@@ -1793,6 +1793,10 @@ class PromotionTests(unittest.TestCase):
         covered = (models._NUMERIC_RESULT_COLUMNS | models._DATE_RESULT_COLUMNS
                    | models._DATETIME_RESULT_COLUMNS
                    | models._LISTING_REF_RESULT_COLUMNS
+                   | models.INVENTORY_POOL_REF_RESULT_COLUMNS
+                   | models.INVENTORY_WAREHOUSE_REF_RESULT_COLUMNS
+                   | models.INVENTORY_UNIT_RESULT_COLUMNS
+                   | models.INVENTORY_INT_RESULT_COLUMNS
                    | frozenset(models._LABEL_RESULT_VALUES)
                    | models._REF_RESULT_COLUMNS | models._TEXT_RESULT_COLUMNS)
         self.assertEqual(covered, models.ARTIFACT_RESULT_COLUMNS)
@@ -1886,7 +1890,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual([item["function"]["name"] for item in agent._tool_schemas()],
                          ["query_business", "analyze_product_performance",
                           "compare_performance", "audit_listing_prices",
-                          "evaluate_promotion"])
+                          "inspect_inventory", "evaluate_promotion"])
         captured: dict[str, object] = {}
         model_payload = {"status": "ok", "data": [{"sales_amount": "550"}],
                          "excluded_scope": [{"shop_ref": S1_REF,

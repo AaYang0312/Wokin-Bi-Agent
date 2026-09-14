@@ -89,6 +89,182 @@ export function auditSummary(artifact: Artifact): {
 }
 
 /**
+ * 库存预警的逐格状态（后端 spec §5.5 的六个取值 + 门禁态 unsupported）。
+ *
+ * 不在表里的状态**原样输出**：猜一个近义词就是把"没判过"说成一个已知结论。
+ */
+export const INVENTORY_STATUS_LABELS: Record<string, string> = {
+  low: '低于阈值',
+  normal: '正常',
+  unconfigured: '未配阈值',
+  unknown: '无法判定',
+  stale: '快照过期',
+  data_anomaly: '数据异常',
+  unsupported: '来源未取证',
+}
+
+/** 两个口径的中文名。"实物"与"渠道可售"说反会把补货与调配额两个动作互换。 */
+export const INVENTORY_LEVEL_LABELS: Record<string, string> = {
+  physical_total: '实物可用库存',
+  shop_sellable: '店铺渠道可售',
+}
+
+export function inventoryStatus(status: unknown): string {
+  if (typeof status !== 'string') return '无法判定'
+  return INVENTORY_STATUS_LABELS[status] ?? status
+}
+
+export function inventoryLevel(level: unknown): string {
+  if (typeof level !== 'string') return '未知口径'
+  return INVENTORY_LEVEL_LABELS[level] ?? level
+}
+
+/**
+ * 预警汇总：只认后端给的字段，缺字段就少说一句。
+ *
+ * 分母、扫描数、截断与"全部安全"全部是后端事实。展示层从行数去推分母，就会把
+ * "只展示了 20 行"说成"整个目录就 20 个 SKU"——而没展示的那批才是真正的高风险。
+ */
+export function inventorySummary(artifact: Artifact): {
+  expected: number | null
+  evaluated: number | null
+  scanned: number | null
+  truncated: boolean | null
+  allSafe: boolean | null
+  pools: number
+  excludedPools: number
+} {
+  const block = isRecord(artifact.inventory) ? artifact.inventory : undefined
+  const num = (key: string) => (typeof block?.[key] === 'number' ? block[key] as number : null)
+  const flag = (key: string) => (typeof block?.[key] === 'boolean' ? block[key] as boolean : null)
+  return {
+    expected: num('expected_items'),
+    evaluated: num('evaluated_items'),
+    scanned: num('scanned_items'),
+    truncated: flag('truncated'),
+    allSafe: flag('all_safe'),
+    pools: Array.isArray(block?.pools) ? (block.pools as unknown[]).length : 0,
+    excludedPools: Array.isArray(block?.excluded_pools)
+      ? (block.excluded_pools as unknown[]).length : 0,
+  }
+}
+
+/**
+ * 两级库存预警卡片。
+ *
+ * 为什么不复用通用表格：那张表把空值当成"可以少的列"，而这里的 null 各有含义
+ * （没记录 / 没阈值 / 来源没取证），三种必须分开写。也要把两个口径分块列出：
+ * 把实物与渠道可售排进同一张连续表里，下一个人就会把它们加起来。
+ */
+function InventoryAlertsArtifact({ artifact }: { artifact: Artifact }) {
+  const entities = artifactEntities(artifact)
+  const summary = inventorySummary(artifact)
+  const rows = (Array.isArray(artifact.data) ? artifact.data : []).filter(
+    (row): row is Record<string, unknown> => isRecord(row)
+      && typeof row.inventory_status === 'string')
+  const byLevel = (level: string) => rows.filter((row) => row.level === level)
+  const limitations = Array.isArray(artifact.limitations) ? artifact.limitations : []
+  const thresholdSource = isRecord(artifact.inventory)
+    && typeof artifact.inventory.threshold_source === 'string'
+    ? artifact.inventory.threshold_source : null
+  const asOf = typeof artifact.data_as_of === 'string' ? artifact.data_as_of : null
+  const columns: Array<{ key: string; label: string }> = [
+    { key: 'sku_ref', label: 'SKU' },
+    { key: 'shop_ref', label: '店铺' },
+    { key: 'pool_ref', label: '库存池' },
+    { key: 'warehouse_ref', label: '仓库' },
+    { key: 'quantity', label: '实物可用量' },
+    { key: 'channel_quantity', label: '渠道可售量' },
+    { key: 'threshold', label: '阈值' },
+    { key: 'unit', label: '单位' },
+    { key: 'batch_count', label: '批次数' },
+    { key: 'inventory_status', label: '状态' },
+    { key: 'snapshot_at', label: '快照时点' },
+  ]
+  const renderLevel = (level: string) => {
+    const levelRows = byLevel(level)
+    if (levelRows.length === 0) return null
+    // 每个口径只列自己那一列：共用一张表头就会在实物块里出现一列永远为空的
+    // "渠道可售量"，而空列在读表的人眼里就是"这些 SKU 渠道没货"。
+    const hidden = level === 'physical_total'
+      ? new Set(['shop_ref', 'channel_quantity'])
+      : new Set(['pool_ref', 'warehouse_ref', 'quantity', 'batch_count'])
+    const visible = columns.filter((column) => !hidden.has(column.key))
+    return (
+      <section className="inventory-level" data-level={level} key={level}>
+        <h4 className="inventory-level-title">{inventoryLevel(level)}</h4>
+        <div className="table-wrap">
+          <table>
+            <thead><tr>{visible.map((column) => <th key={column.key}>{column.label}</th>)}</tr></thead>
+            <tbody>{levelRows.map((row, index) => (
+              <tr key={`${row.sku_ref ?? ''}-${row.shop_ref ?? ''}-${index}`}>
+                {visible.map((column) => {
+                  const value = row[column.key]
+                  let shown: string
+                  if (column.key === 'inventory_status') shown = inventoryStatus(value)
+                  // 店铺与 SKU 都走同一条名称规则：名称未取得就写"名称未取得"，稳定引用
+                  // 留在 data-ref 上。把引用直接印在表里，等于让一个 opaque 主键冒充数据。
+                  else if (column.key === 'shop_ref' || column.key === 'sku_ref')
+                    shown = value ? cellText(value, entities) : '—'
+                  else if (column.key === 'batch_count') {
+                    shown = typeof value === 'number' ? String(value) : '—'
+                  } else shown = auditNumber(value)
+                  return (
+                    <td
+                      key={column.key}
+                      data-ref={isRef(value) ? value : undefined}
+                      data-inventory-status={column.key === 'inventory_status'
+                        ? String(value) : undefined}
+                    >{shown}</td>
+                  )
+                })}
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </section>
+    )
+  }
+  return (
+    <section className="artifact" aria-label="库存两级预警">
+      <header className="artifact-head">
+        <span className="artifact-title"><GaugeIcon size={15} />库存两级预警</span>
+        {summary.expected !== null && (
+          <span className="pill">期望 {summary.expected} 项 · 已判定 {summary.evaluated ?? 0} 项</span>
+        )}
+        {summary.allSafe !== null && (
+          <span className={`pill${summary.allSafe ? '' : ' pill-warn'}`}>
+            {summary.allSafe ? '全部安全（证据齐备）' : '未全部安全'}
+          </span>
+        )}
+        {summary.truncated === true && (
+          // 截断必须写在卡片上：没展示不等于没风险。
+          <span className="pill pill-warn">已按风险截断展示</span>
+        )}
+      </header>
+      {rows.length === 0 && (
+        <p className="limitations">本轮没有可判定的库存项；这不等于这些 SKU 没有库存。</p>
+      )}
+      {/* 两个口径分块渲染：并排进同一张连续表，下一步就有人把它们加起来。 */}
+      {renderLevel('physical_total')}
+      {renderLevel('shop_sellable')}
+      <div className="artifact-meta">
+        {thresholdSource && (
+          <span>阈值来源：{thresholdSource === 'this_turn' ? '本轮用户给出'
+            : thresholdSource === 'configured' ? '已配置策略' : '未配置'}</span>
+        )}
+        {summary.pools > 0 && <span>库存池：{summary.pools} 个</span>}
+        {summary.excludedPools > 0 && (
+          <span>未计入的池：{summary.excludedPools} 个（池授权独立于店铺授权）</span>
+        )}
+        {asOf && <span><ClockIcon size={13} />快照共同截止：{asOf}</span>}
+      </div>
+      {limitations.length > 0 && <p className="limitations">{limitations.map(text).join('；')}</p>}
+    </section>
+  )
+}
+
+/**
  * 上架复核差异表：一行就是一格期望项，所以行数就是分母。
  *
  * 为什么不用通用表格渲染那一段：通用面把"空"当成可缺列，而复核表里 null 是有含义的
@@ -303,6 +479,10 @@ export function ArtifactView({
   // 价审卡片走自己的差异表：行数就是分母，而 null 在那张表里是有含义的。
   if (artifact.artifact_type === 'price_audit') {
     return <AuditArtifact artifact={artifact} />
+  }
+  // 库存预警卡片走自己的两级视图：两个口径永不并成一张表。
+  if (artifact.artifact_type === 'inventory_alerts') {
+    return <InventoryAlertsArtifact artifact={artifact} />
   }
 
   return (
