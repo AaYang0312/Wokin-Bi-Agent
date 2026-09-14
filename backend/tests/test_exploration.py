@@ -1,29 +1,38 @@
-"""受控 SQL 探索测试（计划 Task 1 契约/依赖/门禁 + 计划 Task 2 固定 Tool 优先与编译器）。
+"""受控 SQL 探索测试（计划 Task 1 契约/依赖/门禁 + Task 2 固定 Tool 优先与编译器 +
+Task 3 AST 策略与攻击语料）。
 
 `ExplorationContractTests` 钉形状：`ExplorationRequest` → `SqlDraft` →
 `ValidatedQueryPlan` → `ExplorationResult`（加 `ExplorationColumn`）五个契约、
 `sqlglot` 这一条锁定的依赖，以及 `AppSettings.controlled_sql_enabled` 门禁。
 `ExplorationCompilerTests` 钉 Task 2 的两件纯服务端事：固定 Tool 优先
-（`fixed_tool_for`）与确定性单基表 SELECT 编译（`compile_query`）。AST 策略（Task 3）、
-只读执行与投影（Task 4）、运行域与 Agent Tool（Task 5）仍不在本文件里——所以本文件
-不导入 `psycopg`，不连库，也不解析任何 SQL。
+（`fixed_tool_for`）与确定性单基表 SELECT 编译（`compile_query`）。
+`ExplorationPolicyTests` 钉 Task 3：`validate_exploration_plan` 对
+`tests/exploration_attacks.jsonl` 里每一条攻击都在**任何数据库调用之前**给出稳定原因码，
+而编译器产出的正例必须通过并拿到 64 位 statement fingerprint。只读执行与成本门禁
+（Task 4）、运行域与 Agent Tool（Task 5）仍不在本文件里——所以本文件不导入 `psycopg`、
+不连库，`DomainContext.conn` 换成一个"碰一下就判红"的替身。
 
-反恒真约定（开发流程 §4.1）：每一组拒绝用例都配一条只差那个字段的接受用例，并且断言
-错误落在哪个字段上；只扫整份序列化载荷里的随机子串不算护栏。
+反恒真约定（开发流程 §4.1）：每一组拒绝用例都配一条只差那个角度的接受用例，并且断言
+错误落在哪个字段/哪个原因码上；只扫整份序列化载荷里的随机子串不算护栏。策略夹具一律
+用**目录全集**当本轮选择，因此攻击被拒只能来自 SQL 结构本身，不是来自窄选择集。
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+import hashlib
 import inspect
 import importlib
 import importlib.metadata
 import json
 import pathlib
 import re
+import time
 import tomllib
 import types
 import typing
 import unittest
+from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ValidationError
 
@@ -43,13 +52,43 @@ EXPORTED_CONTRACTS = (
 )
 # 计划 Task 2 的 Produces 清单：两个入口 + 钉死的覆盖矩阵常量。
 TASK_TWO_EXPORTS = ("FIXED_TOOL_METRICS", "compile_query", "fixed_tool_for")
-# Task 2 之后本包仍然只有这四个模块（策略/执行/投影/工具属 Task 3-5）。
-PACKAGE_MODULES = ["__init__.py", "compiler.py", "eligibility.py", "models.py"]
-# Task 3-5 才会交付的入口名字：本切片里它们必须不存在。
+# Task 3 之后本包只有这五个模块（执行/投影/工具属 Task 4-5）。
+PACKAGE_MODULES = ["__init__.py", "compiler.py", "eligibility.py", "models.py",
+                   "policy.py"]
+# Task 4-5 才会交付的入口名字：本切片里它们必须不存在。
 NOT_YET_IMPLEMENTED = (
-    "validate_exploration_plan", "estimate_plan", "execute_plan", "project_result",
-    "execute_exploration_tool",
+    "estimate_plan", "execute_plan", "project_result", "execute_exploration_tool",
 )
+# 计划 Task 3 的 Produces 清单只有一个入口，而且它的 Files 清单不含 `__init__.py`：
+# 包级公共面仍归 Task 2，策略入口只住在 `exploration.policy` 里（Task 5 再接）。
+TASK_THREE_ENTRY_POINT = "validate_exploration_plan"
+
+# --- Task 3 攻击语料与策略夹具 -------------------------------------------------
+ATTACK_CORPUS_PATH = BACKEND_ROOT / "tests" / "exploration_attacks.jsonl"
+# 语料行数钉死（计划要求至少 20）：少一行就是有人删了用例，不是删了缺陷。
+ATTACK_CORPUS_ROWS = 46
+ATTACK_ROW_FIELDS = frozenset({"id", "sql", "reason"})
+ATTACK_ID_RE = re.compile(r"^A[0-9]{2}$")
+ATTACK_REASON_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+# 原因码只有一种拼法：`exploration_` 前缀 + 语料里的 reason。
+POLICY_CODE_PREFIX = "exploration_"
+# 计划 Task 3 Step 1 逐字给出的五条种子攻击：语料必须原样收着它们。
+PLAN_SEED_ATTACKS = (
+    ("A01", "SELECT * FROM reporting.v_shop_daily", "star_forbidden"),
+    ("A02", "SELECT 1; DELETE FROM bi.orders", "multiple_statements"),
+    ("A03", "WITH x AS (DELETE FROM bi.orders RETURNING *) SELECT * FROM x",
+     "cte_forbidden"),
+    ("A04", "SELECT pg_read_file('/etc/passwd')", "function_forbidden"),
+    ("A05", "SELECT sum(p.amount) FROM reporting.v_payments p "
+     "CROSS JOIN reporting.v_refunds r", "cross_join_forbidden"),
+)
+POLICY_NOW = datetime(2026, 9, 14, 12, tzinfo=timezone.utc)
+# 带另一个时区的同一时刻：策略要求“带时区”，不要求“必须是 UTC”。
+BEIJING = ZoneInfo("Asia/Shanghai")
+POLICY_SHOP_IDS = frozenset({"S1", "S2"})
+# 计划 Task 3 Step 4 的 fingerprint 输入清单：五项，不多不少。
+FINGERPRINT_FIELDS = frozenset({"normalized_sql", "parameter_names", "selected_refs",
+                                "scope_fingerprint", "catalog_version"})
 SHA256_HEX = "a" * 64
 
 # --- Task 2 夹具用的目录真 ref ---------------------------------------------------
@@ -211,6 +250,174 @@ def compile_error(metric_refs, groups=(), **kwargs):
 def dequoted(sql_text):
     """只把双引号去掉：用来按字面复现计划种子里那两段未加引号的模板文本。"""
     return sql_text.replace('"', "")
+
+
+# --- Task 3 夹具 ---------------------------------------------------------------
+
+def attack_rows():
+    """读 `tests/exploration_attacks.jsonl`：逐行 JSON，形状不合规当场判红。
+
+    这里只校形状（三项、id 形状、行数），“攻击必须被拒”是策略用例的事；
+    形状不钉住，语料被改少一行、多一个字段都能静默溜过。
+    """
+    text = ATTACK_CORPUS_PATH.read_text(encoding="utf-8")
+    assert text.endswith("\n"), "攻击语料必须以 LF 结尾"
+    assert "\r" not in text, "攻击语料不得含 CR"
+    rows = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        assert line.strip(), f"第 {number} 行为空行"
+        row = json.loads(line)
+        assert isinstance(row, dict), f"第 {number} 行不是对象"
+        assert frozenset(row) == ATTACK_ROW_FIELDS, f"第 {number} 行字段不对：{sorted(row)}"
+        assert isinstance(row["id"], str) and ATTACK_ID_RE.match(row["id"]), row["id"]
+        assert isinstance(row["sql"], str) and row["sql"].strip(), row["id"]
+        assert isinstance(row["reason"], str) and ATTACK_REASON_RE.match(row["reason"]), row
+        rows.append(row)
+    return rows
+
+
+def policy_source():
+    """策略模块源码：用来要每条语料 reason 都是策略真的会抛的那个码。"""
+    import bi_agent.exploration.policy as policy
+
+    return pathlib.Path(policy.__file__).read_text(encoding="utf-8")
+
+
+def catalog_version() -> str:
+    """当前发布目录版本：测试不拄第二份字面量。"""
+    from bi_agent.semantic_catalog.registry import SEMANTIC_CATALOG_VERSION
+
+    return SEMANTIC_CATALOG_VERSION
+
+
+def parameter_keys() -> tuple[str, ...]:
+    """编译器 owns 的四个参数 key：策略与编译器必须用同一套名字。"""
+    from bi_agent.exploration.compiler import PARAMETER_KEYS
+
+    return PARAMETER_KEYS
+
+
+class RefusingConn:
+    """任何属性访问都判红的“连接”替身：策略层碰一下库就失败。
+
+    计划 Task 3 的验收是“20/20 攻击在数据库执行前拒”；只断“抛了错”不够，
+    还得证明抛错之前根本没碰过 conn/store。
+    """
+
+    def __getattr__(self, name):
+        raise AssertionError(f"exploration policy touched the database via {name}")
+
+
+def full_selection(**overrides):
+    """本轮选择 = 已发布目录的全部 ref。
+
+    攻击语料拿它跑，是为了让“被拒”只能来自 SQL 结构本身：选择集宽到目录全集还有
+    地方可拒，才是策略在干活。
+    """
+    from bi_agent.semantic_catalog.models import SemanticSelection
+    from bi_agent.semantic_catalog.registry import CATALOG
+
+    values = {
+        "catalog_version": CATALOG.version,
+        "entity_refs": tuple(sorted(entity.ref for entity in CATALOG.entities)),
+        "metric_refs": tuple(sorted(metric.ref for metric in CATALOG.metrics)),
+        "view_refs": tuple(sorted(view.ref for view in CATALOG.views)),
+        "field_refs": tuple(sorted(field.ref for field in CATALOG.fields)),
+        "join_path_refs": tuple(sorted(join.ref for join in CATALOG.joins)),
+        "missing_concepts": (),
+        "requires_clarification": False,
+    }
+    values.update(overrides)
+    return SemanticSelection(**values)
+
+
+def policy_context(**overrides):
+    """计划 Task 3 消费的 `DomainContext`：真形状、假 conn、带时区时刻。
+
+    `conn`/`store` 是 RefusingConn：策略不排包、不取数、不看成本，所以任何一次属性
+    访问都是越界。
+    """
+    from bi_agent.commerce.models import DomainContext
+
+    values = {
+        "subject_id": "subject-one", "allowed_shop_ids": POLICY_SHOP_IDS,
+        "shop_refs": {"S1": "ent-shop-one", "S2": "ent-shop-two"},
+        "conn": RefusingConn(), "store": RefusingConn(),
+        "chat_id": UUID(int=11), "user_message_id": UUID(int=12),
+        "root_request_id": UUID(int=13), "now": POLICY_NOW,
+        "deadline": time.monotonic() + 30.0, "attempt_no": 1,
+    }
+    values.update(overrides)
+    return DomainContext(**values)
+
+
+def shell_draft(**overrides):
+    """攻击语料的草案壳子：编译器真正产出的单基表带分组查询。
+
+    每条攻击只改 `sql_text`（parameters/selected_refs 保持不变），所以被拒原因
+    只能来自 SQL 结构，不是来自“参数也没填对”。
+    """
+    from bi_agent.exploration.models import SqlDraft
+
+    compiled = compile_for("metric-cost-total", groups=[DAY_COST])
+    values = {"sql_text": compiled.sql_text,
+              "parameters": dict(compiled.parameters),
+              "selected_refs": list(compiled.selected_refs)}
+    values.update(overrides)
+    return SqlDraft(**values)
+
+
+def attack_draft(row):
+    """语料行 → 待校草案：只换 SQL 文本。"""
+    return shell_draft(sql_text=row["sql"])
+
+
+def ordered_sql(modifier=None):
+    """草案壳子的 ORDER BY 写法：`modifier=None` 就是编译器原样。"""
+    sql = shell_draft().sql_text
+    if modifier is None:
+        return sql
+    mutated = sql.replace('ORDER BY fact."day"', f'ORDER BY fact."day" {modifier}')
+    assert mutated != sql, modifier
+    return mutated
+
+
+def validate(draft, *, selection=None, context=None):
+    """直接跑策略：不捕异常，只给“必须通过”的正例用。"""
+    from bi_agent.exploration.policy import validate_exploration_plan
+
+    return validate_exploration_plan(
+        draft, selection=full_selection() if selection is None else selection,
+        context=policy_context() if context is None else context)
+
+
+def policy_reason(draft, *, selection=None, context=None):
+    """要求策略拒接并交出稳定原因码；通过就判红。"""
+    try:
+        plan = validate(draft, selection=selection, context=context)
+    except ValueError as exc:
+        assert type(exc) is ValueError, f"不是裸 ValueError：{type(exc).__name__}"
+        return str(exc)
+    raise AssertionError(f"策略放行了这个草案：{plan.statement_fingerprint}")
+
+
+def expected_fingerprint(sql_text, parameters, selected_refs, allowed_shop_ids,
+                         catalog_version):
+    """独立重现计划 Task 3 Step 4 的 fingerprint：JSON 五项 + SHA-256。
+
+    在测试里再算一遍而不是从策略里取：两者一致才能说明持久化载荷里没有真店号
+    （授权集合只以摘要出现），以及指纹形状就是计划钉的那个形状。
+    """
+    scope = hashlib.sha256(json.dumps(sorted(allowed_shop_ids),
+                                      separators=(",", ":")).encode("utf-8")).hexdigest()
+    payload = {"normalized_sql": " ".join(sql_text.split()),
+               "parameter_names": sorted(parameters),          # 只取 key 名
+               "selected_refs": list(selected_refs),
+               "scope_fingerprint": scope,
+               "catalog_version": catalog_version}
+    assert frozenset(payload) == FINGERPRINT_FIELDS
+    return hashlib.sha256(json.dumps(payload, sort_keys=True,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def draft_values(**overrides):
@@ -716,33 +923,55 @@ class ExplorationContractTests(unittest.TestCase):
                    and not name.startswith("_")),
             sorted(EXPORTED_CONTRACTS))
 
-    def test_package_ships_only_the_task_one_and_two_modules(self):
-        """目录列表钉住：Task 3-5 的策略/执行/工具文件不能提前偷渡。"""
+    def test_package_ships_only_the_task_one_to_three_modules(self):
+        """目录列表钉住：Task 4-5 的执行/投影/工具文件不能提前偷渡。"""
         import bi_agent.exploration as exploration
 
         shipped = sorted(path.name for path in
                          pathlib.Path(exploration.__file__).parent.glob("*.py"))
         self.assertEqual(shipped, sorted(PACKAGE_MODULES))
 
-    def test_this_slice_ships_no_policy_or_execution_entry_point(self):
-        """Task 3-5 的名字现在必须不存在：本切片不校验 AST、不连库、不执行 SQL。"""
+    def test_this_slice_ships_the_policy_entry_point_and_nothing_else(self):
+        """Task 3 只交 `validate_exploration_plan`；执行/投影/工具仍属 Task 4-5。
+
+        计划在 Task 3 的 Files 清单里没有 `exploration/__init__.py`，所以策略入口**不得**
+        出现在包级公共面上（Task 5 接运行域时再统一接）；本用例同时钉住这两件事。
+        """
         import bi_agent.exploration as exploration
         import bi_agent.exploration.compiler as compiler
         import bi_agent.exploration.eligibility as eligibility
         import bi_agent.exploration.models as models
+        import bi_agent.exploration.policy as policy
 
+        holders = (exploration, models, compiler, eligibility, policy)
         for name in NOT_YET_IMPLEMENTED:
             with self.subTest(name=name):
-                for holder in (exploration, models, compiler, eligibility):
+                for holder in holders:
                     self.assertFalse(hasattr(holder, name), f"{holder.__name__}.{name}")
-        # 编译入口的形状：没有 conn / parameters / 超时参数可用。
-        parameters = inspect.signature(compiler.compile_query).parameters
-        self.assertEqual(list(parameters), ["request", "selection", "allowed_shop_ids"])
+        # 入口只住在 policy 里，包面逐字不变。
+        self.assertTrue(callable(getattr(policy, TASK_THREE_ENTRY_POINT, None)))
+        self.assertFalse(hasattr(exploration, TASK_THREE_ENTRY_POINT))
+        self.assertFalse(hasattr(models, TASK_THREE_ENTRY_POINT))
+        self.assertFalse(hasattr(compiler, TASK_THREE_ENTRY_POINT))
+        self.assertFalse(hasattr(eligibility, TASK_THREE_ENTRY_POINT))
+        # 入口的形状：`validate_exploration_plan(draft, *, selection, context)`。
+        # 模块带 `from __future__ import annotations`，所以这里比注解名字而不是对象：
+        # 计划 Interfaces 里写的消费方就是这三个契约，换一个都得改测试。
+        parameters = inspect.signature(policy.validate_exploration_plan).parameters
+        self.assertEqual(list(parameters), ["draft", "selection", "context"])
+        self.assertTrue(parameters["draft"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD)
         self.assertTrue(parameters["selection"].kind is inspect.Parameter.KEYWORD_ONLY)
-        self.assertTrue(parameters["allowed_shop_ids"].kind
-                        is inspect.Parameter.KEYWORD_ONLY)
-        self.assertFalse(hasattr(compiler, "execute"))
-        self.assertFalse(hasattr(compiler, "policy"))
+        self.assertTrue(parameters["context"].kind is inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual({name: str(parameters[name].annotation) for name in parameters},
+                         {"draft": "SqlDraft", "selection": "SemanticSelection",
+                          "context": "DomainContext"})
+        self.assertEqual(policy.validate_exploration_plan.__annotations__["return"],
+                         "ValidatedQueryPlan")
+        # 本切片不连库、不执行：入口只有一个，`conn` / `store` 从头到尾不被访问
+        # （见 RefusingConn：碰一下就判红）。
+        self.assertFalse(hasattr(policy, "estimate_plan"))
+        self.assertFalse(hasattr(policy, "execute"))
+        self.assertFalse(hasattr(policy, "execute_plan"))
 
     # --- helpers ----------------------------------------------------------------
 
@@ -1261,6 +1490,593 @@ class ExplorationCompilerTests(unittest.TestCase):
                           "statement_timeout"):
                 with self.subTest(module=module.__name__, token=token):
                     self.assertNotIn(token, source)
+
+
+class ExplorationPolicyTests(unittest.TestCase):
+    """计划 Task 3 Step 1/5：攻击语料 runner + 编译器正例 + 稳定错误与指纹。"""
+
+    # --- 语料形状 ---------------------------------------------------------------
+
+    def test_attack_corpus_has_the_exact_frozen_shape(self):
+        rows = attack_rows()
+        self.assertEqual(len(rows), ATTACK_CORPUS_ROWS)
+        self.assertGreaterEqual(len(rows), 20)          # 计划的硬下限
+        self.assertEqual([row["id"] for row in rows],
+                         [f"A{number:02d}" for number in range(1, len(rows) + 1)])
+        self.assertEqual(len({row["id"] for row in rows}), len(rows))
+        for row in rows:
+            with self.subTest(row=row["id"]):
+                self.assertEqual(frozenset(row), ATTACK_ROW_FIELDS)
+                self.assertTrue(ATTACK_ID_RE.match(row["id"]))
+                self.assertTrue(ATTACK_REASON_RE.match(row["reason"]))
+                self.assertNotIn(POLICY_CODE_PREFIX, row["reason"])   # 前缀只写一次
+        # 计划的覆盖面：写操作、注释混淆、多语句、函数逃逸、越权视图、笛卡尔积、
+        # 未登记 JOIN、集合运算、无授权谓词都必须有至少一行。
+        reasons = {row["reason"] for row in rows}
+        for reason in ("dml_forbidden", "ddl_forbidden", "copy_forbidden",
+                       "command_forbidden", "lock_forbidden", "sql_text_unsafe",
+                       "multiple_statements", "function_forbidden", "table_forbidden",
+                       "cross_join_forbidden", "join_not_registered",
+                       "set_operation_forbidden", "subquery_forbidden", "cte_forbidden",
+                       "star_forbidden", "authorization_predicate_missing",
+                       "window_predicate_missing", "limit_required", "column_forbidden"):
+            self.assertIn(reason, reasons)
+
+    def test_attack_corpus_keeps_the_plan_seed_rows_verbatim(self):
+        """计划 Step 1 那五行逐字入库：后来的实现不得把它们改得更弱。"""
+        self.assertEqual([(row["id"], row["sql"], row["reason"])
+                          for row in attack_rows()[:len(PLAN_SEED_ATTACKS)]],
+                         list(PLAN_SEED_ATTACKS))
+
+    def test_every_corpus_reason_is_a_code_the_policy_actually_raises(self):
+        """语料的 reason 必须能在策略源码里找到同名码：防两个文件一起写错。"""
+        source = policy_source()
+        for row in attack_rows():
+            with self.subTest(reason=row["reason"]):
+                self.assertIn(f'"{row["reason"]}"', source)
+        self.assertGreaterEqual(len({row["reason"] for row in attack_rows()}), 25)
+
+    # --- 攻击必须全部在碰库之前被拒 --------------------------------------------
+
+    def test_the_policy_fixture_selection_is_the_whole_catalog(self):
+        """护住上面那个“宽选择”前提：它不宽，后面的拒绝就说明不了问题。"""
+        from bi_agent.semantic_catalog.registry import CATALOG
+
+        selection = full_selection()
+        self.assertEqual(set(selection.view_refs), {view.ref for view in CATALOG.views})
+        self.assertEqual(set(selection.field_refs), {field.ref for field in CATALOG.fields})
+        self.assertEqual(set(selection.metric_refs),
+                         {metric.ref for metric in CATALOG.metrics})
+        self.assertEqual(set(selection.join_path_refs),
+                         {join.ref for join in CATALOG.joins})
+        self.assertEqual(selection.catalog_version, CATALOG.version)
+        self.assertFalse(selection.requires_clarification)
+        self.assertEqual(selection.missing_concepts, ())
+
+    def test_the_shell_draft_itself_passes_the_policy(self):
+        """反恒真：语料用的草案壳子本身必须能过，否则“全拒”可以是假拒。"""
+        plan = validate(shell_draft())
+        self.assertEqual(plan.sql_text, shell_draft().sql_text)
+        self.assertRegex(plan.statement_fingerprint, r"^[0-9a-f]{64}$")
+
+    def test_every_attack_is_rejected_before_any_database_call(self):
+        for row in attack_rows():
+            with self.subTest(id=row["id"], reason=row["reason"]):
+                code = policy_reason(attack_draft(row))
+                self.assertEqual(code, POLICY_CODE_PREFIX + row["reason"])
+
+    def test_rejection_reasons_are_distinct_per_attack_class(self):
+        """每条语料只钉一个原因：不能靠一个万能码收完 46 行。"""
+        codes = {row["id"]: policy_reason(attack_draft(row)) for row in attack_rows()}
+        self.assertEqual(len(set(codes.values())), len({row["reason"] for row in attack_rows()}))
+        self.assertEqual(codes["A01"], "exploration_star_forbidden")
+        self.assertEqual(codes["A02"], "exploration_multiple_statements")
+        self.assertEqual(codes["A03"], "exploration_cte_forbidden")
+        self.assertEqual(codes["A04"], "exploration_function_forbidden")
+        self.assertEqual(codes["A05"], "exploration_cross_join_forbidden")
+
+    def test_rejections_never_echo_sql_refs_or_shop_ids(self):
+        """错误只有一个码：不回显 SQL 片段、ref、店号或目录名。"""
+        haystacks = ("SELECT", "select", "DELETE", "DROP", "pg_read_file", "S1", "S2",
+                     "reporting", "bi.orders", "metric-cost-total", DAY_COST, "%(limit)s",
+                     "allowed_shop_ids", "//", "/*")
+        cases = [attack_draft(row) for row in attack_rows()]
+        cases += [
+            shell_draft(sql_text='SELECT 1 -- probe\n; DELETE FROM bi.orders'),
+            shell_draft(sql_text=shell_draft().sql_text.replace('%(limit)s', '%s')),
+            shell_draft(selected_refs=sorted(set(shell_draft().selected_refs)
+                                             | {"view-coverage"})),
+            shell_draft(parameters={**shell_draft().parameters, "limit": 999_999}),
+        ]
+        for index, draft in enumerate(cases):
+            with self.subTest(case=index):
+                code = policy_reason(draft)
+                self.assertEqual(code, POLICY_CODE_PREFIX + code.removeprefix(POLICY_CODE_PREFIX))
+                self.assertTrue(ATTACK_REASON_RE.match(code.removeprefix(POLICY_CODE_PREFIX)))
+                self.assertLessEqual(len(code), 64)
+                for text in (code, repr(ValueError(code))):
+                    for needle in haystacks:
+                        self.assertNotIn(needle, text)
+
+    # --- 正例：编译器输出 ------------------------------------------------------
+
+    def test_compiled_queries_pass_the_policy(self):
+        """计划 Step 5：compiler 生成的 product-cost 查询与平台 JOIN 都是正例。"""
+        cases = {
+            "grouped": compile_for("metric-cost-total", groups=[DAY_COST]),
+            "platform-join": compile_for("metric-cost-total", groups=[SHOPS_PLATFORM]),
+            "total": compile_for("metric-cost-total"),
+            "two-metrics": compile_for(["metric-cost-total", "metric-sales-amount"],
+                                       groups=[DAY_COST, SHOP_COST]),
+            "datetime-window": compile_for("metric-payment-flow-amount",
+                                           groups=[DAY_PAYMENTS]),
+        }
+        fingerprints = {}
+        for name, draft in cases.items():
+            with self.subTest(case=name):
+                plan = validate(draft)
+                self.assertEqual(plan.sql_text, draft.sql_text)
+                self.assertEqual(plan.parameters, draft.parameters)
+                self.assertEqual(plan.selected_refs, draft.selected_refs)
+                self.assertEqual(plan.catalog_version, catalog_version())
+                self.assertRegex(plan.statement_fingerprint, r"^[0-9a-f]{64}$")
+                self.assertEqual(plan.statement_fingerprint, expected_fingerprint(
+                    draft.sql_text, draft.parameters, draft.selected_refs,
+                    POLICY_SHOP_IDS, plan.catalog_version))
+                self.assertIsNone(plan.estimated_rows)
+                self.assertIsNone(plan.estimated_total_cost)
+                self.assertEqual(plan.warnings, [])
+                fingerprints[name] = plan.statement_fingerprint
+        # 形状不同的语句不得共享指纹（除了只换参数值）。
+        self.assertEqual(len(set(fingerprints.values())), len(fingerprints))
+        joined = cases["platform-join"].sql_text
+        self.assertIn("INNER JOIN", joined)
+        self.assertIn("JOIN", validate(cases["platform-join"]).sql_text)
+
+    def test_pool_authorized_view_passes_with_its_own_scope_values(self):
+        """授权列来自目录：库存池视图上用池集合才能过。"""
+        pools = frozenset({"pool-a", "pool-b"})
+        draft = compile_for("metric-physical-available-quantity", allowed_shop_ids=pools)
+        self.assertIn('WHERE fact."pool_id" = ANY(%(allowed_shop_ids)s)', draft.sql_text)
+        plan = validate(draft, context=policy_context(allowed_shop_ids=pools))
+        self.assertEqual(plan.parameters["allowed_shop_ids"], ["pool-a", "pool-b"])
+        self.assertEqual(plan.statement_fingerprint, expected_fingerprint(
+            draft.sql_text, draft.parameters, draft.selected_refs, pools,
+            plan.catalog_version))
+        # 只差授权集合：同一形状必须给出不同指纹（不能拿窄授权计划当宽授权重跑）。
+        narrow = frozenset({"pool-a"})
+        other_draft = compile_for("metric-physical-available-quantity",
+                                 allowed_shop_ids=narrow)
+        other = validate(other_draft, context=policy_context(allowed_shop_ids=narrow))
+        self.assertNotEqual(other.statement_fingerprint, plan.statement_fingerprint)
+        # 而“参数里的集合与服务端授权集合不等”本身就是拒理由。
+        self.assertEqual(policy_reason(draft, context=policy_context(allowed_shop_ids=narrow)),
+                         "exploration_scope_mismatch")
+
+    def test_the_plan_keeps_the_original_sql_for_execution(self):
+        """NULL 只用于解析：执行/指纹拿到的仍是带占位符的原文。"""
+        draft = shell_draft()
+        plan = validate(draft)
+        self.assertNotIn("NULL", plan.sql_text)
+        for name in ("allowed_shop_ids", "start", "end", "limit"):
+            self.assertIn(f"%({name})s", plan.sql_text)
+        self.assertEqual(plan.sql_text, draft.sql_text)
+        self.assertIs(type(plan.parameters["start"]), date)
+        self.assertIs(type(plan.parameters["limit"]), int)
+
+    # --- 指纹 ------------------------------------------------------------------
+
+    def test_fingerprint_is_the_planned_json_sha256_payload(self):
+        import bi_agent.exploration.policy as policy
+
+        draft = shell_draft()
+        plan = validate(draft)
+        self.assertEqual(plan.statement_fingerprint, expected_fingerprint(
+            draft.sql_text, draft.parameters, draft.selected_refs, POLICY_SHOP_IDS,
+            catalog_version()))
+        self.assertEqual(policy.EXPLORATION_TEMPLATE_VERSION, "exploration-sql/2026-09-14.1")
+        self.assertEqual(plan.template_version, policy.EXPLORATION_TEMPLATE_VERSION)
+        self.assertEqual(tuple(policy.PLACEHOLDER_ORDER), ("allowed_shop_ids", "start",
+                                                           "end", "limit"))
+        self.assertEqual(sorted(parameter_keys()), sorted(policy.PLACEHOLDER_ORDER))
+        # 真店号不进指纹输入以外的持久载荷：摘要之外的字段都是 ref/文本/版本。
+        self.assertNotIn("S1", plan.statement_fingerprint)
+        self.assertNotIn("S2", plan.statement_fingerprint)
+        # 指纹不是“裸 SQL 的哈希”：它同时钉住参数名、选择集、授权集合摘要与目录版本。
+        self.assertNotEqual(plan.statement_fingerprint,
+                            hashlib.sha256(draft.sql_text.encode("utf-8")).hexdigest())
+        self.assertNotEqual(plan.statement_fingerprint,
+                            hashlib.sha256(json.dumps(
+                                sorted(POLICY_SHOP_IDS), separators=(",", ":")
+                            ).encode("utf-8")).hexdigest())
+
+    def test_fingerprint_is_a_statement_identity_not_an_invocation_identity(self):
+        """同一形状不同参数值→同一指纹；换授权集合/换形状→不同一。"""
+        from bi_agent.exploration.models import ExplorationRequest
+
+        base = validate(shell_draft())
+        moved = validate(compile_for("metric-cost-total", groups=[DAY_COST],
+                                     start="2026-10-01", end="2026-10-02", limit=7))
+        self.assertEqual(base.statement_fingerprint, moved.statement_fingerprint)
+        self.assertEqual(moved.parameters["limit"], 7)
+        wider_ids = frozenset({"S1", "S2", "S3"})
+        wider = validate(compile_for("metric-cost-total", groups=[DAY_COST],
+                                    allowed_shop_ids=wider_ids),
+                         context=policy_context(allowed_shop_ids=wider_ids))
+        self.assertNotEqual(base.statement_fingerprint, wider.statement_fingerprint)
+        shaped = validate(compile_for("metric-cost-total"))
+        self.assertNotEqual(base.statement_fingerprint, shaped.statement_fingerprint)
+        # 运行时刻、重试次数、会话身份都不参与指纹：指纹必须可重算。
+        for overrides in ({"now": datetime(2030, 1, 1, tzinfo=timezone.utc)},
+                          {"now": datetime(2026, 9, 14, 20, tzinfo=BEIJING)},
+                          {"deadline": time.monotonic() + 0.5},
+                          {"attempt_no": 9}, {"subject_id": "other"},
+                          {"chat_id": UUID(int=99)}):
+            with self.subTest(**{key: type(value).__name__
+                                 for key, value in overrides.items()}):
+                self.assertEqual(validate(shell_draft(),
+                                          context=policy_context(**overrides)
+                                          ).statement_fingerprint,
+                                 base.statement_fingerprint)
+        self.assertIsInstance(ExplorationRequest, type)
+
+    # --- 目录/选择/上下文不匹配 ------------------------------------------------
+
+    def test_only_the_currently_published_catalog_is_accepted(self):
+        from bi_agent.semantic_catalog.registry import CATALOG
+
+        stale = full_selection(catalog_version="semantic/2020-01-01.1")
+        self.assertEqual(policy_reason(shell_draft(), selection=stale),
+                         "exploration_catalog_version_mismatch")
+        self.assertEqual(validate(shell_draft(),
+                                  selection=full_selection()).catalog_version, CATALOG.version)
+
+    def test_tables_columns_and_joins_must_be_in_this_rounds_selection(self):
+        draft = compile_for("metric-cost-total", groups=[SHOPS_PLATFORM])
+        without_edge = full_selection(join_path_refs=())
+        self.assertEqual(policy_reason(draft, selection=without_edge,
+                                       context=policy_context()),
+                         "exploration_join_not_selected")
+        self.assertEqual(validate(draft, selection=full_selection(),
+                                  context=policy_context()).selected_refs,
+                         draft.selected_refs)
+        without_view = full_selection(view_refs=tuple(
+            ref for ref in full_selection().view_refs if ref != COST_VIEW))
+        self.assertEqual(policy_reason(draft, selection=without_view),
+                         "exploration_table_forbidden")
+        without_field = full_selection(field_refs=tuple(
+            ref for ref in full_selection().field_refs if ref != SHOPS_PLATFORM))
+        self.assertEqual(policy_reason(draft, selection=without_field),
+                         "exploration_column_forbidden")
+        without_metric = full_selection(metric_refs=tuple(
+            ref for ref in full_selection().metric_refs if ref != "metric-cost-total"))
+        self.assertEqual(policy_reason(draft, selection=without_metric),
+                         "exploration_ref_not_selected")
+
+    def test_selected_refs_must_be_exactly_the_closure_of_the_statement(self):
+        """多一个、少一个、重复、没排序：都不再是“这句 SQL 到底说了什么”。"""
+        closure = shell_draft().selected_refs
+        cases = (
+            ("extra", sorted(set(closure) | {"view-coverage"})),
+            ("duplicate", sorted(set(closure)) + [closure[0]]),
+            ("unsorted", list(reversed(sorted(closure)))),
+        )
+        for name, refs in cases:
+            with self.subTest(case=name):
+                self.assertEqual(policy_reason(shell_draft(selected_refs=refs)),
+                                 "exploration_ref_unbound")
+        self.assertEqual(validate(shell_draft(selected_refs=closure)).selected_refs, closure)
+
+    def test_a_foreign_or_unbound_ref_in_the_draft_is_refused(self):
+        """ref 进不了草案契约，以及契约内的 ref 在本轮/在本句里都得有交代。"""
+        for refs in (["metric-$sum"], ["reporting.v_shop_daily"]):
+            with self.subTest(refs=refs):
+                with self.assertRaises(ValidationError):
+                    shell_draft(selected_refs=refs)
+        # ref 形状合法但本轮没选它：目录能解，选择集里没有。
+        shell = shell_draft()
+        foreign = "field-coverage-data-as-of"
+        refs = sorted(set(shell.selected_refs) | {foreign})
+        narrow = full_selection(field_refs=tuple(
+            ref for ref in full_selection().field_refs if ref != foreign))
+        self.assertEqual(policy_reason(shell_draft(selected_refs=refs), selection=narrow),
+                         "exploration_ref_not_selected")
+        # ref 合法、本轮也选了，但这句 SQL 里没有它的落点：还是不对。
+        self.assertEqual(policy_reason(shell_draft(
+            selected_refs=sorted(set(shell.selected_refs) | {"entity-shop"}))),
+            "exploration_ref_unbound")
+
+    # --- 参数与授权集合 --------------------------------------------------------
+
+    def test_parameter_keys_must_be_exactly_the_server_set(self):
+        base = dict(shell_draft().parameters)
+        cases = (
+            ("extra", {**base, "offset": 10}),
+            ("missing", {key: value for key, value in base.items() if key != "limit"}),
+            ("renamed", {key: value for key, value in base.items() if key != "start"}
+                        | {"from": base["start"]}),
+        )
+        for name, parameters in cases:
+            with self.subTest(case=name):
+                self.assertEqual(policy_reason(shell_draft(parameters=parameters)),
+                                 "exploration_parameter_mismatch")
+        self.assertEqual(validate(shell_draft(parameters=base)).parameters, base)
+
+    def test_placeholder_names_and_positions_are_bound_together(self):
+        sql = shell_draft().sql_text
+        cases = (
+            ("bare positional", sql.replace("%(allowed_shop_ids)s", "%s"),
+             "exploration_placeholder_invalid"),
+            ("uppercase name", sql.replace("%(allowed_shop_ids)s", "%(AllowedShopIds)s"),
+             "exploration_placeholder_invalid"),
+            ("wrong conversion", sql.replace("%(limit)s", "%(limit)d"),
+             "exploration_placeholder_invalid"),
+            ("swapped window", sql.replace(">= %(start)s", ">= %(end)s")
+                               .replace("< %(end)s", "< %(start)s"),
+             "exploration_parameter_mismatch"),
+            ("limit in ANY", sql.replace("ANY(%(allowed_shop_ids)s)", "ANY(%(limit)s)")
+                             .replace("LIMIT %(limit)s", "LIMIT %(allowed_shop_ids)s"),
+             "exploration_parameter_mismatch"),
+            ("doubled parameter", sql.replace("< %(end)s", "< %(start)s"),
+             "exploration_parameter_mismatch"),
+        )
+        for name, sql_text, expected in cases:
+            with self.subTest(case=name):
+                self.assertNotEqual(sql_text, sql)
+                self.assertEqual(policy_reason(shell_draft(sql_text=sql_text)), expected)
+
+    def test_parameter_values_are_rechecked_server_side(self):
+        from datetime import date as date_type
+
+        base = dict(shell_draft().parameters)
+        cases = (
+            ("limit zero", {**base, "limit": 0}),
+            ("limit above budget", {**base, "limit": 501}),
+            ("limit as text", {**base, "limit": "100"}),
+            ("limit as bool", {**base, "limit": True}),
+            ("start as text", {**base, "start": "2026-09-01) OR 1=1 --"}),
+            ("end as datetime", {**base, "end": datetime(2026, 9, 8, tzinfo=timezone.utc)}),
+            ("window not ordered", {**base, "start": base["end"], "end": base["start"]}),
+            ("window too wide", {**base, "start": date_type(2020, 1, 1),
+                                 "end": date_type(2026, 1, 1)}),
+            ("scope unsorted", {**base, "allowed_shop_ids": ["S2", "S1"]}),
+            ("scope blank member", {**base, "allowed_shop_ids": ["S1", "  "]}),
+            ("scope empty list", {**base, "allowed_shop_ids": []}),
+            ("scope as text", {**base, "allowed_shop_ids": "S1,S2"}),
+            ("scope member not text", {**base, "allowed_shop_ids": ["S1", 7]}),
+        )
+        for name, parameters in cases:
+            with self.subTest(case=name):
+                self.assertEqual(policy_reason(shell_draft(parameters=parameters)),
+                                 "exploration_parameter_invalid")
+        self.assertEqual(validate(shell_draft(parameters=base)).parameters, base)
+
+    def test_scope_must_match_the_server_authorization(self):
+        for context, expected in (
+                (policy_context(allowed_shop_ids=frozenset({"S1"})),
+                 "exploration_scope_mismatch"),
+                (policy_context(allowed_shop_ids=frozenset()), "exploration_scope_empty"),
+                (policy_context(allowed_shop_ids=["S1", "S2"]), "exploration_scope_invalid"),
+                (policy_context(allowed_shop_ids=frozenset({"S1", " "})),
+                 "exploration_scope_invalid"),
+                (policy_context(allowed_shop_ids=frozenset({"S1", None})),
+                 "exploration_scope_invalid")):
+            with self.subTest(scope=repr(context.allowed_shop_ids)):
+                self.assertEqual(policy_reason(shell_draft(), context=context), expected)
+        self.assertEqual(validate(shell_draft(), context=policy_context(
+            allowed_shop_ids=POLICY_SHOP_IDS)).parameters["allowed_shop_ids"], ["S1", "S2"])
+
+    # --- 时间角度 --------------------------------------------------------------
+
+    def test_context_time_must_be_timezone_aware_and_the_budget_a_number(self):
+        for context, expected in (
+                (policy_context(now=datetime(2026, 9, 14, 12)),
+                 "exploration_context_time_naive"),
+                (policy_context(now="2026-09-14T12:00:00Z"), "exploration_context_time_naive"),
+                (policy_context(deadline="30"), "exploration_context_deadline_invalid"),
+                (policy_context(deadline=True), "exploration_context_deadline_invalid"),
+                (policy_context(deadline=float("nan")), "exploration_context_deadline_invalid"),
+                (policy_context(deadline=None), "exploration_context_deadline_invalid")):
+            with self.subTest(now=repr(context.now), deadline=repr(context.deadline)):
+                self.assertEqual(policy_reason(shell_draft(), context=context), expected)
+        # 带时区即可（不要求 UTC）：仓库里既有 BEIJING 的 DomainContext 也是合法上下文。
+        self.assertEqual(validate(shell_draft(), context=policy_context(
+            now=datetime(2026, 9, 14, 20, tzinfo=BEIJING))).statement_fingerprint,
+            validate(shell_draft()).statement_fingerprint)
+
+    # --- 输入契约与不变异 ------------------------------------------------------
+
+    def test_inputs_must_be_the_committed_contracts(self):
+        """三个入参都是已交付契约：递字典/递别的对象不当“形状不对”而当编程错误。"""
+        from bi_agent.exploration.models import ValidatedQueryPlan
+
+        draft = shell_draft()
+        with self.assertRaises(TypeError):
+            validate({"sql_text": draft.sql_text, "parameters": draft.parameters,
+                      "selected_refs": draft.selected_refs})
+        with self.assertRaises(TypeError):
+            validate(draft, selection={"metric_refs": ()})
+        with self.assertRaises(TypeError):
+            validate(draft, selection=full_selection(), context=object())
+        with self.assertRaises(TypeError):
+            validate(request_for("metric-cost-total"))
+        self.assertIsInstance(validate(draft), ValidatedQueryPlan)
+
+    def test_single_statement_shape_rules_are_what_they_say(self):
+        """尾部分号不是第二条语句；多余的字面 NULL 是多开的一条真实值通道。"""
+        from bi_agent.exploration.models import SqlDraft
+
+        sql = shell_draft().sql_text
+        with self.assertRaises(ValidationError):
+            SqlDraft(**{**draft_values(), "sql_text": ""})      # 空文本进不了草案
+        self.assertIn(";", validate(shell_draft(sql_text=f"{sql};")).sql_text)
+        self.assertEqual(policy_reason(shell_draft(sql_text=f"{sql}; {sql}")),
+                         "exploration_multiple_statements")
+        # 输出列里多一个写死的 NULL：四个参数位以外不容得下第五个 NULL。
+        self.assertEqual(policy_reason(shell_draft(
+            sql_text=sql.replace('fact."day" AS "field_product_cost_daily_day"', "NULL"))),
+            "exploration_null_literal_forbidden")
+        # 两个基表直接笛卡尔积：没有 ON 的 JOIN 在目录配边之前就被拒。
+        self.assertEqual(policy_reason(shell_draft(
+            sql_text=sql.replace('WHERE fact."shop_id" = ANY(%(allowed_shop_ids)s)',
+                                 'CROSS JOIN "reporting"."v_shops" AS shops '
+                                 'WHERE fact."shop_id" = ANY(%(allowed_shop_ids)s)'))),
+            "exploration_cross_join_forbidden")
+        self.assertIn("JOIN", validate(
+            compile_for("metric-cost-total", groups=[SHOPS_PLATFORM])).sql_text)
+
+    def test_an_aggregate_free_statement_is_not_an_exploration(self):
+        """受控探索只会发聚合行：只回明细的 SELECT 不在此列（也不该在此列）。"""
+        sql = shell_draft().sql_text
+        bare = sql.replace('fact."day" AS "field_product_cost_daily_day", '
+                           'sum(fact."cost_total") AS "metric_cost_total"',
+                           'fact."day" AS "field_product_cost_daily_day"')
+        self.assertNotEqual(bare, sql)
+        self.assertEqual(policy_reason(shell_draft(sql_text=bare)),
+                         "exploration_aggregate_required")
+        # 只差那一个聚合：把它加回去就是一条合法的聚合探索。
+        self.assertIn("sum(", validate(shell_draft()).sql_text)
+
+    def test_ordering_modifiers_are_not_the_fixed_template(self):
+        """排序旋钮由服务端定：`DESC` 与 `NULLS FIRST` 都不是模板能发的形状。
+
+        `NULLS FIRST` 是这条护栏的回归用例：它曾因为策略读了 `Ordered` 上并不存在的
+        `"nulls"` 键而直接过关（有方向的空值位置会改掉 `LIMIT` 截断后留下哪几组）。
+        postgres 的 `ASC` 默认就是空值在后，所以下面两条等价写法仍在模板语义之内。
+        """
+        sql = shell_draft().sql_text
+        for modifier in ("DESC", "NULLS FIRST"):
+            with self.subTest(modifier=modifier):
+                self.assertEqual(policy_reason(shell_draft(sql_text=ordered_sql(modifier))),
+                                 "exploration_expression_forbidden")
+        self.assertEqual(policy_reason(shell_draft(
+            sql_text=sql.replace('ORDER BY fact."day"', 'ORDER BY 2'))),
+            "exploration_expression_forbidden")
+        for equivalent in ("ASC", "NULLS LAST"):
+            with self.subTest(equivalent=equivalent):
+                mutated = ordered_sql(equivalent)
+                self.assertEqual(validate(shell_draft(sql_text=mutated)).sql_text, mutated)
+        self.assertIn('ORDER BY fact."day"', validate(shell_draft()).sql_text)
+
+    def test_the_order_modifier_guard_reads_the_keys_sqlglot_actually_sets(self):
+        """钉住修饰键名单与 `exp.Ordered.arg_types` 同步：恒假分句就是没有护栏。
+
+        上一轮的缺陷不是“判错了键”而是“判了一个从来不存在的键”：那种分句永远不命中，
+        代码看起来仍然在拦。这里把两个方向都钉住：名单必须覆盖 `arg_types` 里除 `this`
+        以外的全部键；被拦的写法必须真的把名单里的某个键置真；而编译器真正输出的那个
+        `Ordered` 必须一个修饰都不带（否则把判法改成 `is not None` 一类的错法会把正例全误拒）。
+        """
+        import sqlglot
+        from sqlglot import expressions as exp
+
+        import bi_agent.exploration.policy as policy
+
+        self.assertEqual(set(policy.ORDER_MODIFIER_ARGS),
+                         set(exp.Ordered.arg_types) - {"this"})
+        for clause, truthy in (("NULLS FIRST", {"nulls_first"}),
+                               ("DESC", {"desc", "nulls_first"})):
+            with self.subTest(clause=clause):
+                ordered = self._ordered_item(ordered_sql(clause))
+                self.assertEqual({key for key in policy.ORDER_MODIFIER_ARGS
+                                  if ordered.args.get(key)}, truthy)
+                self.assertEqual(policy_reason(shell_draft(sql_text=ordered_sql(clause))),
+                                 "exploration_expression_forbidden")
+        plain = self._ordered_item(shell_draft().sql_text)
+        self.assertEqual([key for key in policy.ORDER_MODIFIER_ARGS if plain.args.get(key)], [])
+        self.assertIsInstance(plain, exp.Ordered)
+        self.assertIsInstance(plain.this, exp.Column)
+        self.assertIsNotNone(sqlglot.__version__)
+
+    @staticmethod
+    def _ordered_item(sql_text):
+        import sqlglot
+
+        normalized = sql_text
+        for name in ("allowed_shop_ids", "start", "end", "limit"):
+            normalized = normalized.replace(f"%({name})s", "NULL")
+        return sqlglot.parse(normalized, read="postgres")[0].args["order"].expressions[0]
+
+    @staticmethod
+    def _ordered_item(sql_text):
+        import sqlglot
+
+        normalized = sql_text
+        for name in ("allowed_shop_ids", "start", "end", "limit"):
+            normalized = normalized.replace(f"%({name})s", "NULL")
+        return sqlglot.parse(normalized, read="postgres")[0].args["order"].expressions[0]
+
+    def test_validation_does_not_mutate_its_inputs(self):
+        """策略是纯函数：不改入参，也不与入参共享可变容器。"""
+        from bi_agent.exploration.models import ValidatedQueryPlan
+
+        draft = shell_draft()
+        before_sql = draft.sql_text
+        before_parameters = {key: str(value)
+                             for key, value in sorted(draft.parameters.items())}
+        before_refs = list(draft.selected_refs)
+        context = policy_context()
+        before_scope = context.allowed_shop_ids
+        plan = validate(draft, context=context)
+        self.assertIsInstance(plan, ValidatedQueryPlan)
+        self.assertEqual(draft.sql_text, before_sql)
+        self.assertEqual({key: str(value) for key, value in sorted(draft.parameters.items())},
+                         before_parameters)
+        self.assertEqual(draft.selected_refs, before_refs)
+        self.assertIs(context.allowed_shop_ids, before_scope)
+        # 计划里的参数与草案不共享容器：事后改草案不得改已发计划。
+        self.assertIsNot(plan.parameters, draft.parameters)
+        self.assertIsNot(plan.parameters["allowed_shop_ids"],
+                         draft.parameters["allowed_shop_ids"])
+        self.assertIsNot(plan.selected_refs, draft.selected_refs)
+        draft.parameters["allowed_shop_ids"].append("S3")
+        draft.parameters["limit"] = 40_000
+        self.assertEqual(plan.parameters["allowed_shop_ids"], ["S1", "S2"])
+        self.assertEqual(plan.parameters["limit"], 100)
+
+    def test_a_mutated_draft_cannot_smuggle_server_values_past_the_policy(self):
+        """参数字典是可变的：策略必须重校取值，不能只信 Task 1 的形状。"""
+        for key, value, expected in (
+                ("limit", 999_999, "exploration_parameter_invalid"),
+                ("allowed_shop_ids", ["S1", "S2", "S9"], "exploration_scope_mismatch"),
+                ("start", "2026-09-01) OR 1=1 --", "exploration_parameter_invalid"),
+                ("end", datetime(2026, 9, 8, tzinfo=timezone.utc),
+                 "exploration_parameter_invalid")):
+            with self.subTest(key=key):
+                draft = shell_draft()
+                draft.parameters[key] = value
+                self.assertEqual(policy_reason(draft), expected)
+
+    # --- 策略不越界 ------------------------------------------------------------
+
+    def test_policy_source_neither_connects_nor_executes(self):
+        """Task 3 只做结构校验：连库、EXPLAIN、超时都是 Task 4/5 的事。
+
+        import 清单用 AST 取（注释里提到 psycopg/EXPLAIN 不算依赖），代码形状则按
+        字面量查：“没拿到 conn/store”比“源码里没有某个词”更难造假。
+        """
+        import ast
+        import bi_agent.exploration.policy as policy
+
+        source = pathlib.Path(policy.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(str(node.module))
+        self.assertTrue({"sqlglot", "hashlib", "json"} <= imported)
+        for forbidden in ("psycopg", "socket", "subprocess", "threading", "http",
+                         "bi_agent.runtime.repository", "bi_agent.exploration.repository"):
+            with self.subTest(module=forbidden):
+                self.assertNotIn(forbidden, imported)
+        # “依赖只有解析库”已由上面的 import 清单证明；下面只能拦代码形状（注释里
+        # 提到 psycopg 的占位符规则不是依赖）。
+        for token in ("import psycopg", "connect(", "cursor", "conn.execute", "transaction",
+                      "statement_timeout", "EXPLAIN (", "context.conn", "context.store",
+                      "context.shop_refs"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, source)
 
 
 class ExplorationDependencyTests(unittest.TestCase):
