@@ -81,11 +81,12 @@ WHERE shop_id = ANY(%s) AND NOT verified
 # 全部视同未核验，能力会被回收——这是刻意的：口径变了，旧凭证不能继续给新口径背书。
 QUALITY_RULE = "kuaimai-reconcile/2"
 
-_CAPABILITIES_SQL = """
+# 授权范围内各店的平台档案。名字上是「平台」而不是「能力」：本查询只回答「这个平台登记了
+# 什么来源与口径」，逐指标能力仍由 `metrics._capability_gap` 判。主层问「销售额能用哪些口径」
+# 时读的也是这一份，所以常量公开并只有一处拼写（`agent.sales_basis_clarification`）。
+SHOP_PLATFORMS_SQL = """
 SELECT shop_id, platform FROM reporting.v_shops WHERE shop_id = ANY(%s)
 """
-
-_PROFILES_SQL = _CAPABILITIES_SQL
 
 QualityStatus = Literal["unknown", "passed", "failed"]
 CoverageStatus = Literal["complete", "partial", "missing"]
@@ -440,7 +441,7 @@ def _unconfigured_shops(conn, shop_ids: Sequence[str], entities: Sequence[str]) 
     """
     if not shop_ids or not entities:
         return ()
-    rows = conn.execute(_CAPABILITIES_SQL, (list(shop_ids),)).fetchall()
+    rows = conn.execute(SHOP_PLATFORMS_SQL, (list(shop_ids),)).fetchall()
     unconfigured: list[str] = []
     for shop_id, platform in rows:
         record = ShopRecord.from_row(str(shop_id), platform, ())
@@ -469,7 +470,7 @@ def assess_query_coverage(conn, request) -> CoverageAssessment:
     entities = required_entities(request.metrics)
     unconfigured = _unconfigured_shops(conn, shop_ids, entities)
     profiles = {str(row[0]): ShopRecord.from_row(row[0], row[1], ())
-                for row in conn.execute(_PROFILES_SQL, (shop_ids,)).fetchall()}
+                for row in conn.execute(SHOP_PLATFORMS_SQL, (shop_ids,)).fetchall()}
 
     # 逐店逐指标解析依赖，再按 (source, entity) 分组一次查完：既不再拿单源常量
     # 当全部平台的来源，也不按店铺逐条往返。同一条依赖去重只查一次。

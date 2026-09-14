@@ -2161,8 +2161,13 @@ class InventoryGraphTests(unittest.TestCase):
         cell = _row_for(payload, level="shop_sellable", shop=_shop_ref(self.tag + "1"))
         self.assertEqual(cell["channel_quantity"], "10", str(cell))
         # 110 = 把两次抓取加成一个"当前可售"；那会把 low 翻成 normal，正好把一个
-        # 该加配额的店判成不用管。这一句就是这条断言的全部意义。
-        self.assertNotIn("110", str(payload["data"]))
+        # 该加配额的店判成不用管。这一句必须按**值**钉：拿整份序列化文本扫 "110"
+        # 会撞进 ent- / pl- / wh- 随机句柄里的同一串数字（既可能假红，也可能假绿）。
+        self.assertEqual(
+            sorted((row["level"], row["quantity"], row["channel_quantity"])
+                   for row in _rows(payload)),
+            [("physical_total", "1000", None), ("shop_sellable", None, "10")],
+            "旧一次抓取的 100 既不被加进来，也不顶替当前值：两档各发自己那一个数")
         self.assertEqual(cell["inventory_status"], "low",
                          "当前可售 10 对阈值 20 必须是 low：混进旧一次就成了 normal")
 

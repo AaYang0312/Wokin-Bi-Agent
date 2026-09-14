@@ -62,9 +62,9 @@ class CatalogConn:
 
 
 class ShopCatalogConn(CatalogConn):
-    """Agent 侧替身：兼顾 _fetch_shops 的两列读取与目录投影的三列读取。
+    """Agent 侧替身：兼顾 `_fetch_shops` 的两列读取、口径候选的平台读取与目录投影的三列读取。
 
-    两边都只读 reporting.v_shops，列数不同，所以按列名分支，不猜顺序。
+    三边都只读 reporting.v_shops，列数不同，所以按列名分支，不猜顺序。
     """
 
     def __init__(self, shops: Sequence[tuple[str, str]] = (("S1", "店铺A"),),
@@ -77,12 +77,17 @@ class ShopCatalogConn(CatalogConn):
 
     def execute(self, sql: str, params: object = None) -> Rows:
         text = " ".join(sql.split())
+        wanted = list(params[0]) if params else None
         if "shop_id, platform, display_name" in text:
             return Rows(self.profiles)
         if "version FROM reporting.v_catalog_version" in text:
             return Rows([(self.version,)])
+        if text.startswith("SELECT shop_id, platform FROM reporting.v_shops"):
+            # 口径候选问的是“这个平台登记了什么来源”（data_quality.SHOP_PLATFORMS_SQL）：
+            # 两列就得回两列，不然店名会站进口径的位置上。
+            return Rows([(shop_id, platform) for shop_id, platform, _ in self.profiles
+                         if wanted is None or shop_id in wanted])
         if "FROM reporting.v_shops" in text:
-            wanted = list(params[0]) if params else None
             return Rows([(shop_id, name) for shop_id, _, name in self.profiles
                          if wanted is None or shop_id in wanted])
         raise AssertionError(f"未预期的SQL：{text}")

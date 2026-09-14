@@ -41,6 +41,8 @@ from .inventory.tool import (
 from .listing_audit.tool import (
     execute_listing_audit_tool, listing_audit_request_schema)
 from .metrics import QueryRequest, ToolResult, resolve_period
+from .data_quality import SHOP_PLATFORMS_SQL
+from .sources import DOCUMENT_BASIS, OUTSTOCK_SOURCE, registration
 from .promotion import PromotionRequest, evaluate_promotion
 from .runtime import MemoryQueryRunStore, PostgresQueryRunStore, QueryRunStore, TurnContext
 
@@ -237,6 +239,63 @@ def _detect_shop_ids(question: str, shops: list[tuple[str, str]],
 
 def _contains_pii(question: str) -> bool:
     return any(pattern.search(question) for pattern in _PII_PATTERNS)
+
+
+# 付款时间口径的三态说法。写成一张表而不是就地拼字符串："没测过"与"测了不成立"给用户
+# 的下一步完全不同（设计 §4、`sources` 模块开头），而两者都不是"这个平台已经就绪"。
+_TIME_CERTIFICATION_NOTE: dict[str, str] = {
+    "certified": "付款时间窗口已认证",
+    "unmeasured": "付款时间口径未逐店对照，只能作为可观测样本",
+    "disproved": "付款时间口径实测不成立，不能按完整支付窗口出数",
+}
+
+
+def platform_basis_note(platform: object) -> str:
+    """一个平台的支付口径候选长什么样：只从来源注册表派生，不写死平台清单。
+
+    注册表是唯一真源，所以新登记一个平台不需要改这里；拿不到登记就是「没有可用口径」，
+    不猜平台名也不猜能力（未登记平台 fail closed，`sources` 模块开头那条规则）。
+    """
+    code = str(platform or "").strip().lower()
+    reg = registration(code)
+    if reg is None:
+        return f"{code or '未登记平台'}：来源未登记，没有可用口径（不回退到其它通道）"
+    if reg.payment_basis is None:
+        # 拼多多按 2026-09-12 决定不接入支付：这里说的是"拿不到支付口径"，
+        # 不是"等授权"——把它写成待办就是重新打开一个已经关掉的决策。
+        return (f"{code}：无支付口径能力（登记的来源给不出支付金额，"
+                f"只有 {DOCUMENT_BASIS} 单据口径）")
+    channel = ("（ERP 销售出库口径，非平台账单 GMV）"
+               if reg.order_source == OUTSTOCK_SOURCE else "")
+    return f"{code}：{reg.payment_basis}{channel}，{_TIME_CERTIFICATION_NOTE[reg.time_certified]}"
+
+
+def sales_basis_candidates(conn, allowed_shop_ids: frozenset[str]) -> list[str]:
+    """授权店铺实际能给出哪些销售额口径（按平台去重、定序）。
+
+    读的是服务端授权集，不是模型给的店：本轮没被授权的店既不进候选也不进份数。
+    """
+    shop_ids = sorted(str(shop_id) for shop_id in allowed_shop_ids)
+    if not shop_ids:
+        return []
+    platforms = {str(row[1] or "").strip().lower() for row in
+                 conn.execute(SHOP_PLATFORMS_SQL, (shop_ids,)).fetchall()}
+    return [platform_basis_note(platform) for platform in sorted(platforms)]
+
+
+def sales_basis_clarification(conn, allowed_shop_ids: frozenset[str]) -> str:
+    """「销售额」的澄清：先说清这些店拿得到哪些口径，再要期间与口径。
+
+    计划 Task 11 的 Q08 把这条澄清从"支付还是出库"二选一升级为**按授权店铺已登记的
+    来源**列出候选：拿得出几种口径是服务端事实，不能靠固定话术宣布（也不能反过来
+    固定成"只支持某平台"）。本函数不取任何数字，也不因为某个口径被登记过就说它已就绪。
+    """
+    candidates = sales_basis_candidates(conn, allowed_shop_ids)
+    listing = ("；".join(candidates)
+               if candidates else "当前授权范围内没有已登记来源的店铺")
+    return ("“销售额”需要先确认两件事：统计期间（哪几天）与口径。"
+            f"授权范围内已登记的口径：{listing}。"
+            "请给出期间与要用的口径（买家已支付金额 / ERP 出库金额）后我再查询。")
 
 
 def _anonymize_question(question: str, shops: list[tuple[str, str]],
@@ -512,12 +571,11 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     # 只报引用：真实店名与 ERP 主键一律不进入提示词。
     ref_doc = "，".join(sorted(set(state.shop_refs.values())))
 
-    # 澄清：销售额口径
+    # 澄清：销售额口径（候选只从授权店铺的已登记来源派生，不拿固定话术宣布可用性）
     if "销售额" in question and "支付" not in question and "出库" not in question \
             and "假设" not in question and "预计" not in question:
         return TurnResult(
-            text="", clarification="“销售额”需要确认口径：指买家已支付金额还是出库金额？"
-                                   "请确认后我再查询。",
+            text="", clarification=sales_basis_clarification(conn, allowed_shop_ids),
             state=state)
 
     values = explicit_assumptions(question)

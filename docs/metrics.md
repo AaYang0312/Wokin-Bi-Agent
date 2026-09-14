@@ -182,6 +182,33 @@ uv run --env-file ../.env.test python -m unittest tests.test_runtime_db -v
 cd ../frontend && npm test -- src/components/ChartArtifact.test.tsx src/components/ArtifactView.test.tsx
 ```
 
+## 4.4 四工作流端到端验收（计划 Task 11，2026-09-14）
+
+入口仍是四个公开 Tool（`analyze_product_performance` / `compare_performance` /
+`audit_listing_prices` / `inspect_inventory`）与旧 `query_business`；本节只记验收结论与口径红线，
+逐条证据在 [Task 11 日期化发布验收报告](superpowers/research/2026-09-14-task-11-release-acceptance.md)。
+
+| 口径 | 结论 | 不能是什么 |
+| --- | --- | --- |
+| 一次完整业务请求 | 一次业务 Tool 调用 = 一次图执行：商品跨店汇总、七日趋势、图表与候选在同一份冻结数据里生成；跳数不随店铺数增长（一条 `shop_id = ANY(%s)` 集合查询），30 秒不够就明说未完成 | 不主 Agent 逐店循环，也不静默缩短窗口 |
+| 上架目标价 | 只取自用户**当前这一句**，冻结为本次审计依据（`bi.price_audit_expectations` 按 `run_id` 存）；本轮没给价 → `needs_input` 且零份依据落库 | 不从上一轮、会话筛选、历史成交均价或 ERP 档案建议价继承一个标准 |
+| 差异表分母 | `expected_items` 固定为用户本轮选定的授权店铺集合 × SKU / 落点展开的期望项；`evaluated_items` 只数真判过的格，未判定逐格带原因（`unknown` / `unsupported` / `stale` / `missing_standard` / `unmapped`） | 不拿采到的项当分母，也不把缺失当 0 或未上架 |
+| “全部正确 / 全部安全” | `all_correct` 要求每一格都新鲜、完整且匹配；`all_safe` 还要求扫描声明完整且未截断 | 缺一家、快照过期、来源未取证或只看 Top N 都不能说 |
+| 两级库存 | 实物按 (池, 仓库, SKU, 批次, 单位) 去重只算一次，渠道可售逐店各一行 | 三个渠道各展示 100 不是 300；配额候选与补货候选不互换 |
+| 真实就绪 | 价审与库存的**来源注册表默认为空**，真实部署只会报 `unsupported`；测试用例里的“正常路径”靠测试进程内登记的**合成**来源 | 合成通过不是真实来源就绪，代码存在不是平台已对账 |
+| 拼多多 | 支付族永久解析不通，只以 `excluded_scope` / `capability_unavailable` 出现；本轮未新增连接器、来源、凭证或 onboarding 代码路径 | 不写“待授权 / 延后”，也不拿出库金额补支付数 |
+
+验收题库从 20 题扩到修订后的 26 题（08 / 15 改预期，新增 21–26），结构化断言现在包含原因码、
+逐店逐指标 basis、退款诊断与覆盖形状。一个刻意的取证映射：原路线图把 Q21 / Q23 / Q25 的示例数字
+挂在淘系店上，但出库通道的付款时间口径已被实测判为 `disproved`（见 §6 与 Q26），所以混口径分列的
+可执行证据改用两家都能答的 `erp_documents`（抖音 6 / 淘系 1，各带自己的时间归属），未匹配退款披露
+留在淘系的 `refund_amount`（50 元，1/2 未匹配、20 元），而“关闭已付款单 100 / 30 / 70 与销量不回活”
+放到具备合成时间口径认证的抖音基准店上。这一映射是为了不同时违背两条规则，不是宣布淘系支付可用。
+
+「销售额」的澄清不再是一句固定的“支付还是出库”：它按本轮授权店铺的平台与来源注册表列出候选口径，
+并同时要期间；`certified` / `unmeasured` / `disproved` 三种说法分开，出库通道明写“非平台账单 GMV”，
+拼多多明写“无支付口径能力”。登记过口径仍然不等于结果可用。
+
 ## 5. 真实对账结果摘要
 
 ### 合成基准（已通过，冻结时刻 2026-09-08 09:00+08）

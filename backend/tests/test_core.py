@@ -7,6 +7,7 @@ import logging
 import unittest
 from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
+from typing import Sequence
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
@@ -2510,6 +2511,93 @@ class AgentTests(unittest.TestCase):
         public_payload = turn.artifacts[0]
         self.assertEqual(public_payload["data"][0]["basis"], "用户输入假设")
         self.assertNotIn("S1", json.dumps(public_payload, ensure_ascii=False))
+
+
+class PlatformProfilesConn:
+    """只回答「授权店的平台档案」这一条读取（`data_quality.SHOP_PLATFORMS_SQL`）。
+
+    口径候选只能从服务端档案派生，所以替身也只给 (shop_id, platform) 两列：
+    多给一列展示名就会被读成平台名，那条 fail closed 用例当场失真。
+    """
+
+    def __init__(self, rows: Sequence[tuple[str, str]] = ()) -> None:
+        self.rows = [tuple(row) for row in rows]
+        self.queries: list[tuple[str, tuple]] = []
+
+    def execute(self, sql: str, params: object = None) -> _FakeResult:
+        text = " ".join(str(sql).split())
+        self.queries.append((text, tuple(params)))
+        if not text.startswith("SELECT shop_id, platform FROM reporting.v_shops"):
+            raise AssertionError(f"口径澄清不该读别的表：{text[:120]}")
+        wanted = set(params[0])
+        return _FakeResult([row for row in self.rows if row[0] in wanted])
+
+
+class SalesBasisClarificationTests(unittest.TestCase):
+    """Q08（修订版）：「销售额」澄清先说授权店铺拿得到哪些口径，再要期间。
+
+    候选由服务端授权档案 + 来源注册表派生：不写真实店号、不猜口径、不把「已登记」
+    说成「已就绪」，也不把可用性固定成某一句平台名（计划 Task 11、设计 §6）。
+    """
+
+    def _clarify(self, rows: Sequence[tuple[str, str]]) -> str:
+        from bi_agent.agent import sales_basis_clarification
+
+        return sales_basis_clarification(
+            PlatformProfilesConn(rows), frozenset(shop for shop, _ in rows))
+
+    def test_single_certified_platform_names_its_basis_and_asks_the_period(self):
+        text = self._clarify([("S1", "fxg")])
+        self.assertIn("统计期间", text)
+        self.assertIn("fxg", text)
+        self.assertIn("platform_payment/v1", text)
+        self.assertIn("付款时间窗口已认证", text)
+        self.assertNotIn("S1", text, "授权集只能决定候选，不能把店号带进澄清文案")
+        self.assertNotIn("可用的销售额是", text, "登记了口径不等于宣布结果可用")
+
+    def test_mixed_scope_lists_every_registered_platform_without_picking_one(self):
+        text = self._clarify([("S1", "fxg"), ("T1", "tb"), ("J1", "jd"),
+                              ("P1", "pdd")])
+        self.assertIn("tb：erp_outstock_payment/v1", text)
+        self.assertIn("非平台账单 GMV", text)
+        self.assertIn("实测不成立", text)
+        self.assertIn("jd", text)
+        self.assertIn("未逐店对照", text)
+        # 顺序只由平台码决定：同一个授权集两次问不能给出两份文案，否则模型会把
+        # 上一次看到的顺序当成事实。
+        self.assertEqual(text, self._clarify([("J1", "jd"), ("P1", "pdd"),
+                                              ("T1", "tb"), ("S1", "fxg")]))
+
+    def test_pdd_stays_unavailable_not_pending(self):
+        """拼多多只说「无支付口径能力」：不写「等授权」「待开通」，也不给它一个金额口径。"""
+        text = self._clarify([("P1", "pdd")])
+        self.assertIn("无支付口径能力", text)
+        self.assertIn("erp_document/v1", text)
+        for wording in ("等待", "即将", "待开通", "待授权", "已可用"):
+            self.assertNotIn(wording, text)
+
+    def test_unregistered_platform_fails_closed_without_fallback(self):
+        text = self._clarify([("X1", "alibabac2m")])
+        self.assertIn("来源未登记，没有可用口径", text)
+        self.assertIn("不回退到其它通道", text)
+
+    def test_empty_authorization_still_asks_instead_of_defaulting(self):
+        text = self._clarify([])
+        self.assertIn("当前授权范围内没有已登记来源的店铺", text)
+        self.assertIn("统计期间", text)
+
+    def test_clarification_happens_before_any_model_turn(self):
+        from bi_agent.agent import SessionState, answer
+
+        model = Mock()
+        turn = answer("我店里销售额怎么样？", SessionState(subject="u1"), model=model,
+                      conn=ShopCatalogConn([("S1", "店铺A")], platform="fxg"),
+                      allowed_shop_ids=frozenset({"S1"}),
+                      now=datetime(2026, 9, 8, 9, tzinfo=ZoneInfo("Asia/Shanghai")))
+        model.complete.assert_not_called()
+        self.assertEqual(turn.results, [])
+        self.assertIn("fxg", turn.clarification or "")
+        self.assertIn("统计期间", turn.clarification or "")
 
 
 class OutstockSourceTests(unittest.TestCase):

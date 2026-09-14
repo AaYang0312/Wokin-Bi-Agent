@@ -12,7 +12,7 @@
 
 `APP_ENV=development` 时身份固定为 `local-development`。生产必须设置 HTTPS 的 `APP_PUBLIC_ORIGIN`、非空 `APP_ALLOWED_SUBJECTS`，并通过反向代理写入 `AUTH_SUBJECT_HEADER`（默认 `X-Auth-Request-Sub`）。代理必须先删除浏览器传来的同名头，再写入 OIDC 的真实 `sub`。
 
-模型只支持 `LLM_PROVIDER=qwen|deepseek`。必须显式给出 `LLM_MODEL`，只填已选择 provider 的密钥；不做自动切换或重试。默认兼容地址是 Qwen 的 `https://dashscope.aliyuncs.com/compatible-mode/v1` 和 DeepSeek 的 `https://api.deepseek.com/v1`。真实联调前确认账号地域、型号和费用；当前两者均标记为“未实测”，直到在合成测试库跑完 smoke 和 20 题。
+模型只支持 `LLM_PROVIDER=qwen|deepseek`。必须显式给出 `LLM_MODEL`，只填已选择 provider 的密钥；不做自动切换或重试。默认兼容地址是 Qwen 的 `https://dashscope.aliyuncs.com/compatible-mode/v1` 和 DeepSeek 的 `https://api.deepseek.com/v1`。真实联调前确认账号地域、型号和费用；当前两者均标记为“未实测”，直到在合成测试库跑完 smoke 和修订后的 26 题（旧 20 题的 14/20 只是历史基线，不代表多来源可用）。
 
 ## 本地开发
 
@@ -225,6 +225,26 @@ uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --all-shops 
 | 抖音 166754 | orders | 已完成至 2026-09-09 | 未部署定时 | 未执行 | unknown | 未跑过 reconcile，无凭证可升 passed |
 | 其余 41 家店铺 | 全部 | 未执行 | 未执行 | 未执行 | unknown | 未进入授权范围，不能拿档案数当覆盖 |
 
+### 渠道在售价与库存的证据采集（Task 9 / 10 的真实开关）
+
+上架价复核与库存预警的**来源门禁不在数据库里**，而在代码内的有限注册表：
+`bi_agent/listing_audit/rules.py` 的 `register_listing_source` 与
+`bi_agent/inventory/rules.py` 的 `register_inventory_source`。默认一条都没有，
+所以真实部署里两个 Tool 只会给出 `unsupported`（而不是“都没上架”或“0 件库存”）。
+
+开一格的完整前置（缺一就保持关闭）：
+
+1. 来源形态：平台授权 API，或带抓取时点与完整性声明的官方导出（ERP 档案建议价 `priceOutput` 不能替代实际在售价）；
+2. 字段与单位：实际 listing / SKU 售价、上架状态、抓取时间、快照完成标志；库存还要可用 / 锁定 / 在途逐个核；
+3. 时效：一个已批准的 freshness policy（超过它就判 `stale`，不判“正确 / 安全”）；
+4. 分页完整性：全量枚举凭据才能判 `not_listed`，扫描声明不完整只能给 `unknown`；
+5. 对账：与渠道后台逐元（价格）/ 逐件（库存）比对结果与差异记录。
+
+取得证据后由服务端登记（不开放给模型入参、不读配置文件），再跑一次只读复核确认逐格状态与
+期望/已评估计数能对上；同步更新 `docs/metrics.md` 的就绪清单与验收报告的逐平台表。
+库存那一侧还需一条**服务端**的库存池授权来源（与店铺授权相互独立）：现在主 Agent 递进去的
+池授权集永远是空集，所以聊天路径只能给店铺可售预警，实物总量恒为未判定。
+
 ## 同源部署
 
 发布 `frontend/dist` 静态文件。反向代理将 `/api/*` 转发到 `127.0.0.1:8000`，其余路径提供 SPA 回退；关闭 SSE 路径的响应缓冲。FastAPI 仅运行于回环地址且使用单 worker：
@@ -240,13 +260,27 @@ uv run --env-file ../.env.app uvicorn bi_agent.api:create_runtime_app --factory 
 
 ```powershell
 Set-Location backend
+# 四工作流与运营场景回归（计划 Task 7–11）
+uv run --env-file ../.env.test python -m unittest tests.test_channel_mapping tests.test_commerce tests.test_comparison tests.test_listing_audit tests.test_inventory tests.test_operator_workflows -v
+# 底座回归
 uv run python -m unittest tests.test_core -v
-uv run --env-file ../.env.test python -m unittest tests.test_db tests.test_api -v
+uv run --env-file ../.env.test python -m unittest tests.test_db tests.test_api tests.test_runtime_db -v
+# 修订后的 26 题离线验收（题库与 runner 已不再是旧 20 题）
 uv run --env-file ../.env.test python -m tests.acceptance --offline
 Set-Location ../frontend
 npm test
 npm run build
 ```
+
+离线验收只能证明协议、口径与确定性执行；它不证明模型理解准确率，也不构成任何平台真实来源已就绪的证据。
+这些套件都写同一个 `bi_agent_test`（外层事务回滚，但种子行、advisory 锁与共享表仍是全局态），
+所以请**逐条顺序跑**。本轮出现过一次“两个套件并发跑时其中一份多一个错误、串行重跑两次均干净”的
+现场，未能稳定复现也不归因；验收报告里引用的数字均来自串行重跑。
+本轮验收结果、逐能力就绪清单与**未执行项**（真实 provider smoke/live、真实接口取证、生产迁移与恢复、
+一周试用）逐条记在 [Task 11 日期化发布验收](superpowers/research/2026-09-14-task-11-release-acceptance.md)；
+门禁七项中只有前三项已完成，因此不得拿本页的命令通过当作“可发布给运营用户试用”。
+上架价复核与库存预警在真实部署里只能返回 `unsupported`：两个领域的来源注册表默认为空，
+只有测试进程内的合成登记会暂时打开它们（跑完即恢复）。
 
 模型、数据库或工具失败时，消息 SSE 返回 `error` 后再返回 `done`；它不会包含调用栈、DSN、请求体或 ERP 标识。会话仅保存用户可见文本和脱敏的聚合附件。
 

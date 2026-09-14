@@ -765,18 +765,30 @@ class ComparisonGraphTests(unittest.TestCase):
         self._sale("2", "E2", day=date(2026, 9, 2), quantity="9", amount="900",
                    source="erp.trade.outstock.simple.query")
 
-        payload = self._run(metrics=["sales_amount"]).model_payload
+        result = self._run(metrics=["sales_amount"])
+        payload = result.model_payload
         excluded = {item["shop_ref"]: item["reason"]
                     for item in payload["excluded_scope"]}
         self.assertEqual(excluded,
                          {ref_for_key("shop", self.shops["2"]):
                           "coverage_time_basis_unverified"})
-        self.assertNotIn("900", json.dumps(payload, ensure_ascii=False),
-                         "出库金额不能被补成支付销售额参与比较")
-        self.assertEqual([row["platform"] for row in
-                          _group_rows(_payload_for(
-                              self._run(metrics=["sales_amount"]),
-                              "comparison_table"))], ["jd"])
+        # 出库金额不能被补成支付销售额参与比较：按**值**钉住本轮真正发出去的数。
+        # 拿整份载荷扫 "900" 会撞进 ent- / pl- 随机句柄里的同一串数字（既可能假红，
+        # 也可能假绿），所以它与 test_operator_workflows.py 里同形的那几处一起改掉。
+        table = _payload_for(result, "comparison_table")
+        self.assertEqual([(row["platform"], row["sales_amount"])
+                          for row in _group_rows(table)], [("jd", "100")],
+                         "被排除的平台不发分组行，也不顶替已评估平台那一行")
+        self.assertEqual([row["sales_amount"] for row in table["data"]
+                          if "platform" not in row and "shop_ref" not in row],
+                         ["100"], "合计只加已评估分组：把出库 900 算进来就是 1000")
+        published = [row["sales_amount"] for artifact in result.artifacts
+                     if artifact.ref.type in ("comparison_table", "trend_series")
+                     for row in artifact.public_payload["data"]
+                     if "sales_amount" in row]
+        self.assertTrue(published, "取值列表为空时下一条断言就会恒真")
+        self.assertNotIn("900", published,
+                         "拼多多的 900 不得出现在对比表或七日序列的任何一格里")
 
     def test_secondary_metric_gap_stays_a_cell_not_a_dropped_group(self):
         """主面可答、次要指标缺能力的分组照发布，缺的那一列留 null 并带原因。
