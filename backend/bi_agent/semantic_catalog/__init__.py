@@ -1,8 +1,9 @@
 """语义目录：只描述已批准的 reporting 视图、字段、指标与合法 JOIN 粒度。
 
-Task 1 交付契约类型；Task 2 交付首版登记内容与服务端解析入口。检索
-（`retrieve_schema_candidates`）与启动一致性校验（`validate_catalog_schema`）
-分属 Task 3/Task 4，此刻还不存在——本包因此不查任何业务事实，也不新增 Agent Tool。
+Task 1 交付契约类型；Task 2 交付首版登记内容与服务端解析入口；Task 3 交付确定性
+检索（`retrieve_schema_candidates` / `normalize_terms`）。启动一致性校验
+（`validate_catalog_schema`）与 feature gate 属 Task 4，此刻还不存在——本包因此不查
+任何业务事实，也不新增 Agent Tool。
 """
 
 from .models import (
@@ -23,6 +24,7 @@ from .registry import (
     resolve_sql_identifier,
     validate_catalog,
 )
+from .retrieval import normalize_terms, retrieve_schema_candidates
 
 __all__ = [
     "CATALOG",
@@ -37,6 +39,8 @@ __all__ = [
     "SemanticView",
     "catalog_for_version",
     "catalog_indexes",
+    "normalize_terms",
     "resolve_sql_identifier",
+    "retrieve_schema_candidates",
     "validate_catalog",
 ]

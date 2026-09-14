@@ -1,4 +1,4 @@
-"""语义目录契约与登记表测试（计划 Task 1 + Task 2）。
+"""语义目录契约与登记表测试（计划 Task 1 + Task 2 + Task 3）。
 
 契约的形状就是它的价值所在：这些类型是后续注册表、检索与受控 SQL 唯一的
 词汇来源，所以"什么算一个合法 ref / 合法版本标识 / 合法基数"必须在这一层
@@ -7,12 +7,19 @@
 Task 2 的部分再加一条：登记内容必须**闭包**（没有悬空/错归属/放大的边），而且
 登记的列名要和已应用迁移的真实 schema 一致——后者是一条连本机测试库的对账，
 缺 DSN 时按仓内现行约定正常 skip（不是 error）。
+
+Task 3 的部分：检索必须可复现（同输入同输出、子句换序不变）、可回收（30 题
+gold set 的 Top 5 召回 100%）、不泄密（输出里没有任何 SQL 标识符或真实 ID），
+而且答不了时必须说答不了。
 """
 
 from dataclasses import FrozenInstanceError
 import copy
 import dataclasses
+import json
 import os
+import pathlib
+import re
 import unittest
 
 from pydantic import ValidationError
@@ -381,7 +388,7 @@ class SemanticContractTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             selection(catalog_version="")
 
-    def test_task_one_surface_exports_models_only(self):
+    def test_package_surface_is_exactly_the_published_contracts(self):
         import bi_agent.semantic_catalog as package
 
         self.assertEqual(
@@ -393,10 +400,13 @@ class SemanticContractTests(unittest.TestCase):
                 "CATALOG", "CATALOGS_BY_VERSION", "SEMANTIC_CATALOG_VERSION",
                 "catalog_for_version", "catalog_indexes", "resolve_sql_identifier",
                 "validate_catalog",
+                # Task 3 的确定性检索入口（计划 Task 3 Step 3 导出）。
+                "normalize_terms", "retrieve_schema_candidates",
             ]))
-        # 检索与启动校验属于 Task 3/4：它们必须还不存在。
-        self.assertFalse(hasattr(package, "retrieve_schema_candidates"))
+        # 启动一致性校验与 feature gate 属 Task 4：它们必须还不存在。
         self.assertFalse(hasattr(package, "validate_catalog_schema"))
+        self.assertFalse(hasattr(package, "SchemaMismatch"))
+        self.assertFalse(hasattr(package, "semantic_catalog_enabled"))
         from bi_agent.semantic_catalog.models import REF_RE as ref_pattern
 
         self.assertEqual(ref_pattern, REF_RE)
@@ -925,3 +935,709 @@ class SemanticRegistrySchemaTests(unittest.TestCase):
         for view_entry in registry.CATALOG.views:
             self.assertIn((view_entry.name, "shop_id") if view_entry.ref != (
                 "view-physical-stock-items") else (view_entry.name, "pool_id"), actual)
+
+
+
+
+# --- Task 3：确定性词项检索与 30 题 gold set -------------------------------------
+
+GOLD_KEYS = ("clarify", "domains", "id", "join_paths", "missing_concepts", "question",
+             "required_metrics", "required_views")
+GOLD_FILE = "semantic_questions.jsonl"
+KNOWN_DOMAINS = frozenset({"business_query", "commerce_performance", "listing_price_audit",
+                           "inventory_watch"})
+MISSING_CODES = frozenset({"profit_grain", "inventory_grain", "price_basis",
+                           "promotion_spend", "traffic", "attribution", "net_profit"})
+
+
+def gold_rows():
+    """逐行读 30 题 gold set（形状由 `SemanticGoldSetTests` 先把关）。"""
+    path = pathlib.Path(__file__).with_name(GOLD_FILE)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines if line.strip()], lines
+
+
+def retrieve(question, domains, *, limit=5, versions=None):
+    from bi_agent.semantic_catalog import retrieve_schema_candidates
+
+    return retrieve_schema_candidates(question, allowed_domains=frozenset(domains),
+                                      current_versions=versions or version_set(),
+                                      limit=limit)
+
+
+def catalog_refs(catalog=None):
+    from bi_agent.semantic_catalog import CATALOG, catalog_indexes
+
+    indexes = catalog_indexes(catalog or CATALOG)
+    return {kind: set(getattr(indexes, kind))
+            for kind in ("entities", "fields", "metrics", "views", "joins")}
+
+
+class SemanticTermTests(unittest.TestCase):
+    """`normalize_terms` 是计分的入口：切块方式一变，30 题的排序就全变。"""
+
+    def test_nfkc_lowercase_and_first_occurrence_order(self):
+        from bi_agent.semantic_catalog import normalize_terms
+
+        self.assertEqual(normalize_terms("Ａ类SKU 与 sku"), ("a", "类", "sku", "与"))
+
+    def test_chinese_run_keeps_the_whole_segment_then_bigrams(self):
+        from bi_agent.semantic_catalog import normalize_terms
+
+        self.assertEqual(normalize_terms("支付金额"), ("支付金额", "支付", "付金", "金额"))
+        self.assertEqual(normalize_terms("库存"), ("库存",))
+        self.assertEqual(normalize_terms("GMV 销量"), ("gmv", "销量"))
+
+    def test_non_string_is_refused_rather_than_stringified(self):
+        from bi_agent.semantic_catalog import normalize_terms
+
+        for value in (None, 7, ["支付金额"]):
+            with self.subTest(kind=type(value).__name__):
+                with self.assertRaises(ValueError):
+                    normalize_terms(value)
+
+    def test_scoring_weights_are_the_ones_the_plan_fixed(self):
+        import bi_agent.semantic_catalog.retrieval as retrieval
+
+        self.assertEqual((retrieval.METRIC_ALIAS_SCORE, retrieval.FIELD_ALIAS_SCORE,
+                          retrieval.ENTITY_ALIAS_SCORE, retrieval.TOKEN_SCORE,
+                          retrieval.DOMAIN_SCORE), (100, 40, 20, 5, 10))
+        self.assertEqual(retrieval.MAX_VIEW_CANDIDATES, 5)
+
+    def test_conflicts_and_missing_vocabulary_are_closed(self):
+        from bi_agent.semantic_catalog.retrieval import CONFLICTS, KNOWN_MISSING_CONCEPTS
+
+        self.assertEqual(dict(CONFLICTS), {
+            frozenset({"metric-product-gross-profit-reference",
+                       "metric-erp-gross-profit-reference"}): "profit_grain",
+            frozenset({"metric-physical-available-quantity",
+                       "metric-channel-sellable-quantity"}): "inventory_grain",
+            frozenset({"metric-transaction-average-price",
+                       "metric-listing-price"}): "price_basis",
+        })
+        self.assertEqual(set(KNOWN_MISSING_CONCEPTS),
+                         {"promotion_spend", "traffic", "attribution", "net_profit"})
+        for table in (CONFLICTS, KNOWN_MISSING_CONCEPTS):
+            with self.assertRaises(TypeError):
+                table["injected"] = "x"
+
+
+class SemanticRetrievalTests(unittest.TestCase):
+    """检索的排序、歧义与脱敏（计划 Step 1 的两条起步用例逐字保留）。"""
+
+    def versions(self):
+        from bi_agent.runtime.versions import VersionSet
+        from bi_agent.semantic_catalog.registry import SEMANTIC_CATALOG_VERSION
+        return VersionSet(
+            schema_version="reporting/2026-09-14.1",
+            semantic_catalog_version=SEMANTIC_CATALOG_VERSION,
+            data_catalog_version=7, metric_version="metrics/2026-09-12.1",
+            policy_version="multi-source-policy/2026-09-12.1",
+            source_registry_version="sources/2026-09-12.1",
+            graph_version="business_query-graph/2026-09-11.1")
+
+    def test_paid_amount_retrieves_shop_daily_without_identifiers(self):
+        from bi_agent.semantic_catalog import retrieve_schema_candidates
+        result = retrieve_schema_candidates(
+            "按店铺看每日支付金额", allowed_domains=frozenset({"business_query"}),
+            current_versions=self.versions(), limit=5)
+        self.assertEqual(result.view_refs[0], "view-shop-daily")
+        self.assertIn("metric-paid-amount", result.metric_refs)
+        self.assertNotIn("v_shop_daily", repr(result))
+
+    def test_conflicting_profit_grains_require_clarification(self):
+        from bi_agent.semantic_catalog import retrieve_schema_candidates
+        result = retrieve_schema_candidates(
+            "比较商品毛利和ERP单据毛利", allowed_domains=frozenset({"commerce_performance"}),
+            current_versions=self.versions())
+        self.assertTrue(result.requires_clarification)
+        self.assertIn("profit_grain", result.missing_concepts)
+
+    def test_longer_alias_wins_so_two_bases_are_never_mixed(self):
+        # `商品销售额` 里含 `销售额`：短命中必须作废，否则两种口径的金额一起被点亮。
+        result = retrieve("商品销售额", ["business_query", "commerce_performance"])
+        self.assertEqual(result.metric_refs, ("metric-sales-amount",))
+        self.assertNotIn("metric-paid-amount", result.metric_refs)
+        self.assertEqual(result.field_refs, ("field-product-cost-daily-sales-amount",))
+
+    def test_a_disallowed_long_word_never_falls_back_to_its_shorter_alias(self):
+        # `商品销售额` 只属于 commerce_performance；在 business_query 轮里既不能发它，
+        # 也不能反过来用 `销售额` 冒充支付金额（静默降级就是发错数）。
+        result = retrieve("商品销售额", ["business_query"])
+        self.assertEqual(result.metric_refs, ())
+        self.assertEqual(result.field_refs, ())
+        self.assertTrue(result.requires_clarification)
+
+    def test_ordering_is_score_then_ref_never_input_order(self):
+        # `支付金额` 与 `收支差` 都只完整命中一次，但前者的长别名（`已支付金额` /
+        # `买家已支付金额`）与问题共享词块 ⇒ 多拿 +5，排序看分数而不是字母序。
+        first = retrieve("支付金额和收支差", ["business_query"])
+        self.assertEqual(first.metric_refs,
+                         ("metric-paid-amount", "metric-cash-difference"))
+        self.assertEqual(retrieve("收支差和支付金额", ["business_query"]).metric_refs,
+                         first.metric_refs)
+
+    def test_equal_scores_break_on_ref(self):
+        # 两个价格指标都只命中一次且没拿到词块分（分数相等）⇒ 只剩 ref 升序。
+        self.assertEqual(retrieve("上架价与活动价", ["listing_price_audit"]).metric_refs,
+                         ("metric-campaign-price", "metric-listing-price"))
+        self.assertEqual(retrieve("活动价与上架价", ["listing_price_audit"]).metric_refs,
+                         ("metric-campaign-price", "metric-listing-price"))
+
+    def test_reordered_clauses_give_the_identical_selection(self):
+        one = retrieve("按平台看支付金额和销量", ["business_query", "commerce_performance"])
+        other = retrieve("销量与支付金额，按平台", ["commerce_performance", "business_query"])
+        self.assertEqual(one, other)
+
+    def test_inventory_measurements_are_ordered_by_score_not_by_mention_order(self):
+        # 同一题里三个量分三档：库存池可用量（长别名 +2 个部分命中）> 入库量 > 锁定量。
+        result = retrieve("按仓库和SKU看库存池可用量、入库量、锁定量与计量单位",
+                          ["inventory_watch"])
+        self.assertEqual(result.metric_refs,
+                         ("metric-physical-available-quantity",
+                          "metric-inbound-quantity", "metric-locked-quantity"))
+
+    def test_selected_metric_carries_every_required_field(self):
+        # 毛利参考的定义是"这一组每行都有成本"，六列证据少一列就不够下游算。
+        result = retrieve("商品毛利", ["commerce_performance"])
+        self.assertEqual(set(result.field_refs), {
+            "field-product-cost-daily-sales-amount", "field-product-cost-daily-cost-total",
+            "field-product-cost-daily-line-count", "field-product-cost-daily-cost-line-count",
+            "field-product-cost-daily-cost-quantity", "field-product-cost-daily-quantity"})
+
+    def test_same_named_columns_are_told_apart_by_their_view(self):
+        # `quantity` 在两张视图里同名：只有成本视图那个叫"成本口径件数"。
+        cost = retrieve("成本口径件数", ["commerce_performance"])
+        self.assertIn("field-product-cost-daily-quantity", cost.field_refs)
+        self.assertNotIn("field-product-daily-quantity", cost.field_refs)
+        sold = retrieve("销量", ["business_query"])
+        self.assertIn("field-product-daily-quantity", sold.field_refs)
+        self.assertNotIn("field-product-cost-daily-quantity", sold.field_refs)
+
+    def test_registered_join_is_returned_only_when_both_sides_are_needed(self):
+        joined = retrieve("按店铺和平台看支付订单数", ["business_query"])
+        self.assertEqual(joined.join_path_refs, ("join-shop-daily-shops",))
+        self.assertFalse(joined.requires_clarification)
+        # 只问事实表：不发边。实体命中（店铺）不把 view-shops 算成"需要"。
+        plain = retrieve("按店铺看每日支付金额", ["business_query"])
+        self.assertEqual(plain.join_path_refs, ())
+        self.assertIn("view-shops", plain.view_refs)
+
+    def test_two_fact_views_are_connected_by_their_own_edges(self):
+        result = retrieve("按平台看支付金额和销量",
+                          ["business_query", "commerce_performance"])
+        self.assertEqual(result.join_path_refs,
+                         ("join-product-daily-shops", "join-shop-daily-shops"))
+        self.assertFalse(result.requires_clarification)
+
+    def test_disconnected_views_are_never_half_joined(self):
+        for question, domains in (
+                ("各店的退款金额和平台原始退款金额分别看", ["business_query"]),
+                ("按币种看支付金额", ["business_query"]),
+                ("商品销售额和销量一起看", ["business_query", "commerce_performance"]),
+                ("商品成本合计和单据成本哪个高", ["commerce_performance"]),
+                ("按店铺看ERP单据数和商品销售额", ["business_query", "commerce_performance"])):
+            with self.subTest(question=question):
+                result = retrieve(question, domains)
+                self.assertGreater(len(result.view_refs), 1)
+                self.assertEqual(result.join_path_refs, ())
+                self.assertTrue(result.requires_clarification)
+
+    def test_no_unregistered_edge_can_ever_be_returned(self):
+        registered = {"join-erp-document-daily-shops", "join-product-cost-daily-shops",
+                      "join-product-daily-shops", "join-shop-daily-shops"}
+        probes = [row["question"] for row in gold_rows()[0]] + [
+            "把支付流水金额和平台原始退款金额对齐", "实物库存与渠道库存哪个低",
+            "上架价与单据毛利", "支付金额、上架价、实物库存与商品销售额一起看"]
+        for question in probes:
+            for domains in (["business_query"], ["business_query", "commerce_performance"],
+                            sorted(KNOWN_DOMAINS)):
+                result = retrieve(question, domains)
+                self.assertLessEqual(set(result.join_path_refs), registered, question)
+
+    def test_outstock_basis_never_becomes_paid_amount(self):
+        # 整句只要通用销售额：这是被批准的拒绝形状——整份候选不发，也不新增原因码。
+        result = retrieve("按出库口径看销售额", ["business_query"])
+        self.assertEqual(result.metric_refs, ())
+        self.assertEqual(result.field_refs, ())
+        self.assertEqual(result.view_refs, ())
+        self.assertEqual(result.entity_refs, ())
+        self.assertEqual(result.join_path_refs, ())
+        self.assertEqual(result.missing_concepts, ())
+        self.assertTrue(result.requires_clarification)
+        self.assertNotIn("metric-paid-amount", repr(result))
+
+    def test_outstock_basis_never_resolves_to_a_product_sales_amount(self):
+        # `商品销售额` 不是通用词，但它同样是支付窗口的数（017 里的 sales_amount 按
+        # paid_at 归日）：点名出库口径时不许拿它顶出库金额。
+        result = retrieve("按出库口径看商品销售额",
+                          ["business_query", "commerce_performance"])
+        self.assertEqual(result.metric_refs, ())
+        self.assertEqual(result.field_refs, ())
+        self.assertEqual(result.view_refs, ())
+        self.assertEqual(result.entity_refs, ())
+        self.assertEqual(result.join_path_refs, ())
+        self.assertEqual(result.missing_concepts, ())
+        self.assertTrue(result.requires_clarification)
+        self.assertNotIn("metric-sales-amount", repr(result))
+
+    def test_outstock_basis_never_resolves_through_the_measure_field(self):
+        # 守卫只能看指标 ref 是不够的：`metric-paid-amount` 只登记在 business_query 下，
+        # 而 `v_shop_daily` 跨两种领域。只允许 commerce_performance 的一轮里，指标被领域
+        # 门禁挡住、剩下的只有 `field-shop-daily-paid-amount`：把它发回去依旧是把支付窗口
+        # 的数当作出库金额。
+        for question in ("按出库口径看销售额", "按出库口径看支付金额"):
+            with self.subTest(question=question):
+                result = retrieve(question, ["commerce_performance"])
+                self.assertEqual(result.metric_refs, ())
+                self.assertEqual(result.field_refs, ())
+                self.assertEqual(result.view_refs, ())
+                self.assertEqual(result.entity_refs, ())
+                self.assertEqual(result.join_path_refs, ())
+                self.assertEqual(result.missing_concepts, ())
+                self.assertTrue(result.requires_clarification)
+                self.assertNotIn("field-shop-daily-paid-amount", repr(result))
+
+    def test_generic_sales_measure_field_is_never_a_settled_basis(self):
+        # 同一轮里没有出库说法、只用了通用词：候选可以留，但口径算未定。
+        result = retrieve("销售额", ["commerce_performance"])
+        self.assertEqual(result.field_refs, ("field-shop-daily-paid-amount",))
+        self.assertTrue(result.requires_clarification)
+
+    def test_outstock_measure_field_guard_leaves_independent_columns_alone(self):
+        # 正向对照：不在那个闭包里的列不受影响。
+        documents = retrieve("按出库口径看ERP单据数", ["business_query"])
+        self.assertEqual(documents.metric_refs, ("metric-erp-documents",))
+        self.assertIn("field-shop-daily-erp-documents", documents.field_refs)
+        self.assertFalse(documents.requires_clarification)
+        allocated = retrieve("商品分摊支付金额", ["commerce_performance"])
+        self.assertEqual(allocated.metric_refs, ("metric-product-paid-amount",))
+        self.assertIn("field-product-daily-product-paid-amount", allocated.field_refs)
+        self.assertFalse(allocated.requires_clarification)
+
+    def test_payment_basis_amount_field_closure_comes_from_the_catalog(self):
+        from bi_agent.semantic_catalog import CATALOG, catalog_indexes
+        import bi_agent.semantic_catalog.retrieval as retrieval
+
+        indexes = catalog_indexes(CATALOG)
+        self.assertEqual(retrieval._payment_basis_amount_field_refs(indexes), frozenset({
+            "field-shop-daily-paid-amount", "field-product-cost-daily-sales-amount",
+            "field-product-daily-product-paid-amount", "field-payments-amount"}))
+        # 新增一个支付窗口金额指标，它的列自动进守卫：不鼓助第二份名单。
+        self.assertTrue(all(ref in {field.ref for field in CATALOG.fields}
+                            for ref in retrieval._payment_basis_amount_field_refs(indexes)))
+
+    def test_outstock_basis_with_an_explicit_payment_flow_still_asks(self):
+        # `支付流水金额` 自己就是支付侧说法：跟出库口径同时出现是自相矛盾的问题，
+        # 候选可以留，但这一轮不能当成口径已确认。
+        result = retrieve("按出库口径看支付流水金额", ["business_query"])
+        self.assertTrue(result.requires_clarification)
+
+    def test_payment_amount_metrics_still_retrieve_without_an_outstock_phrase(self):
+        # 正向对照：没有出库说法时，两个支付窗口金额照常检索，不跟着报澄清。
+        product = retrieve("商品销售额", ["business_query", "commerce_performance"])
+        self.assertEqual(product.metric_refs, ("metric-sales-amount",))
+        self.assertEqual(product.view_refs[0], "view-product-cost-daily")
+        self.assertEqual(product.missing_concepts, ())
+        self.assertFalse(product.requires_clarification)
+        flow = retrieve("支付流水金额按支付时间看", ["business_query"])
+        self.assertEqual(flow.metric_refs, ("metric-payment-flow-amount",))
+        self.assertEqual(flow.view_refs, ("view-payments",))
+        self.assertFalse(flow.requires_clarification)
+
+    def test_payment_window_amount_set_is_closed_and_immutable(self):
+        import bi_agent.semantic_catalog.retrieval as retrieval
+
+        self.assertEqual(retrieval.PAYMENT_BASIS_AMOUNT_METRICS, frozenset({
+            "metric-paid-amount", "metric-sales-amount",
+            "metric-product-paid-amount", "metric-payment-flow-amount"}))
+        with self.assertRaises(AttributeError):
+            retrieval.PAYMENT_BASIS_AMOUNT_METRICS.add("metric-erp-documents")
+
+    def test_outstock_guard_leaves_independent_concepts_alone(self):
+        documents = retrieve("按出库口径看ERP单据数", ["business_query"])
+        self.assertEqual(documents.metric_refs, ("metric-erp-documents",))
+        self.assertEqual(documents.missing_concepts, ())
+        self.assertFalse(documents.requires_clarification)
+        quantity = retrieve("按出库单看销量", ["business_query"])
+        self.assertEqual(quantity.metric_refs, ("metric-sold-quantity",))
+        self.assertFalse(quantity.requires_clarification)
+        # 混着问时：金额被摘走，独立概念必须留着，整轮仍然要澄清。
+        mixed = retrieve("按出库口径看商品销售额和ERP单据数",
+                         ["business_query", "commerce_performance"])
+        self.assertEqual(mixed.metric_refs, ("metric-erp-documents",))
+        self.assertNotIn("metric-sales-amount", mixed.metric_refs)
+        self.assertIn("view-shop-daily", mixed.view_refs)
+        self.assertTrue(mixed.requires_clarification)
+
+    def test_explicit_payment_alias_with_an_outstock_phrase_still_asks(self):
+        # 自相矛盾的问题：列点名了支付，口径又说出库——候选照发，但不能当成已确认。
+        result = retrieve("按出库口径看支付金额", ["business_query"])
+        self.assertEqual(result.metric_refs, ("metric-paid-amount",))
+        self.assertTrue(result.requires_clarification)
+
+    def test_generic_sales_word_alone_is_not_a_settled_basis(self):
+        for question in ("本周销售额是多少", "本周GMV是多少"):
+            with self.subTest(question=question):
+                result = retrieve(question, ["business_query"])
+                self.assertEqual(result.metric_refs, ("metric-paid-amount",))
+                self.assertTrue(result.requires_clarification)
+        settled = retrieve("按店铺看每日支付金额", ["business_query"])
+        self.assertFalse(settled.requires_clarification)
+
+    def test_all_three_conflicts_are_recognised(self):
+        cases = {
+            "profit_grain": ("比较商品毛利和ERP单据毛利", ["commerce_performance"]),
+            "inventory_grain": ("实物库存与渠道库存一起看", ["inventory_watch"]),
+            "price_basis": ("成交均价与上架价哪个更能说明问题",
+                            ["commerce_performance", "listing_price_audit"]),
+        }
+        for code, (question, domains) in cases.items():
+            with self.subTest(code=code):
+                result = retrieve(question, domains)
+                self.assertEqual(result.missing_concepts, (code,))
+                self.assertTrue(result.requires_clarification)
+        # 只点名一边就不算冲突。
+        single = retrieve("商品毛利参考是多少", ["commerce_performance"])
+        self.assertEqual(single.missing_concepts, ())
+        self.assertFalse(single.requires_clarification)
+
+    def test_known_missing_vocabulary_is_recognised_and_never_invented(self):
+        for code, phrase in (("promotion_spend", "广告花费"), ("traffic", "流量"),
+                             ("attribution", "归因"), ("net_profit", "净利润")):
+            with self.subTest(code=code):
+                result = retrieve(f"{phrase}这一轮的支付金额按店铺看", ["business_query"])
+                self.assertEqual(result.missing_concepts, (code,))
+                self.assertTrue(result.requires_clarification)
+        noise = retrieve("zzqqx 库存赔付率 wertyu", ["business_query"])
+        self.assertEqual(noise.missing_concepts, ())
+        self.assertTrue(noise.requires_clarification)
+        for token in ("zzqqx", "wertyu", "库存赔付率"):
+            self.assertNotIn(token, repr(noise))
+
+    def test_limit_is_a_hard_range_and_anchored_views_win_their_slots(self):
+        question = "按平台看支付金额和销量"
+        capped = retrieve(question, ["business_query", "commerce_performance"], limit=1)
+        self.assertEqual(len(capped.view_refs), 1)
+        self.assertIn(capped.view_refs[0],
+                      ("view-shop-daily", "view-product-daily", "view-shops"))
+        self.assertTrue(capped.requires_clarification, "点名了 3 张视图却只发 1 张")
+        self.assertEqual(len(retrieve(question, ["business_query", "commerce_performance"],
+                                      limit=3).view_refs), 3)
+        for bad in (0, 6, -1, True, "5", None):
+            with self.subTest(limit=bad):
+                with self.assertRaises(ValueError):
+                    retrieve("支付金额", ["business_query"], limit=bad)
+
+    def test_anchored_views_come_before_entity_only_fill(self):
+        # 只被实体点到的视图（`view-channel-stock-items` 因为 SKU）可以填充，但不能插到
+        # 被指标/字段锚定的视图前面。
+        result = retrieve("实物库存按SKU和仓库看", ["inventory_watch"])
+        self.assertEqual(result.view_refs,
+                         ("view-physical-stock-items", "view-channel-stock-items"))
+        self.assertEqual(result.metric_refs, ("metric-physical-available-quantity",))
+        self.assertFalse(result.requires_clarification)
+
+    def test_invalid_arguments_are_refused_before_any_work(self):
+        from bi_agent.semantic_catalog import retrieve_schema_candidates
+
+        with self.assertRaises(ValueError):
+            # 不是 frozenset：绕过 `retrieve()` 包一层，直接交给实现。
+            retrieve_schema_candidates("支付金额", allowed_domains={"business_query"},
+                                       current_versions=version_set())
+        with self.assertRaises(ValueError):
+            retrieve("支付金额", ["business_query", "commerce"])  # 未登记领域
+        with self.assertRaises(ValueError):
+            retrieve("   ", ["business_query"])
+        with self.assertRaises(ValueError):
+            retrieve(None, ["business_query"])
+        with self.assertRaises(ValueError):
+            retrieve("支付金额", ["business_query"], versions=object())
+
+    def test_stale_or_unknown_catalog_version_is_refused(self):
+        for version in ("semantic/2026-09-13.1", "semantic/9999-99-99.9"):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(ValueError, "semantic_catalog_version_mismatch"):
+                    retrieve("支付金额", ["business_query"],
+                             versions=version_set(semantic_catalog_version=version))
+
+    def test_no_stale_catalog_can_be_searched_through_a_parameter(self):
+        import inspect
+
+        from bi_agent.semantic_catalog import retrieve_schema_candidates
+
+        self.assertNotIn("catalog", inspect.signature(retrieve_schema_candidates).parameters)
+        self.assertEqual(
+            list(inspect.signature(retrieve_schema_candidates).parameters),
+            ["question", "allowed_domains", "current_versions", "limit"])
+
+    def test_empty_allowed_domains_offers_nothing(self):
+        result = retrieve("按店铺看每日支付金额", [])
+        self.assertEqual((result.view_refs, result.metric_refs, result.field_refs,
+                          result.entity_refs, result.join_path_refs),
+                         ((), (), (), (), ()))
+        self.assertTrue(result.requires_clarification)
+
+    def test_selection_is_immutable_and_leaks_no_identifiers(self):
+        result = retrieve("按平台看支付金额和销量",
+                          ["business_query", "commerce_performance"])
+        with self.assertRaises(FrozenInstanceError):
+            result.view_refs = ()
+        refs = catalog_refs()
+        for attribute, universe in (("entity_refs", refs["entities"]),
+                                    ("metric_refs", refs["metrics"]),
+                                    ("view_refs", refs["views"]),
+                                    ("field_refs", refs["fields"]),
+                                    ("join_path_refs", refs["joins"])):
+            values = getattr(result, attribute)
+            self.assertIsInstance(values, tuple, attribute)
+            self.assertLessEqual(values and set(values) or set(), universe, attribute)
+            self.assertEqual(len(set(values)), len(values), attribute)
+            self.assertNotIn("_", "".join(values), f"{attribute} 带着 SQL 标识符的形状")
+        self.assertIsInstance(result.missing_concepts, tuple)
+        self.assertIsInstance(result.requires_clarification, bool)
+        dumped = repr(result)
+        for leak in ("reporting.", "v_", "bi.", "shop_id", "pool_id", "SELECT", "sku_id"):
+            self.assertNotIn(leak, dumped)
+
+    def test_same_question_retrieves_the_same_selection(self):
+        first = retrieve("上架价与活动价按在售链接看", ["listing_price_audit"])
+        self.assertEqual([retrieve("上架价与活动价按在售链接看", ["listing_price_audit"])
+                          for _ in range(3)], [first] * 3)
+
+    def test_pdd_payment_readiness_is_never_implied(self):
+        result = retrieve("拼多多的支付金额和上架价", sorted(KNOWN_DOMAINS))
+        dumped = repr(result)
+        for token in ("pdd", "拼多多"):
+            self.assertNotIn(token, dumped)
+        self.assertLessEqual(set(result.metric_refs), catalog_refs()["metrics"])
+
+    def test_retrieval_touches_no_database_network_model_or_tool_dispatch(self):
+        import ast
+
+        package = pathlib.Path(__file__).resolve().parents[1] / "bi_agent"
+        tree = ast.parse((package / "semantic_catalog" / "retrieval.py")
+                         .read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                imported.add(node.module.split(".")[0])
+        self.assertLessEqual(imported, {"__future__", "dataclasses", "re", "types",
+                                        "typing", "unicodedata", "bi_agent"}, sorted(imported))
+        for banned in ("psycopg", "httpx", "subprocess", "open"):
+            self.assertNotIn(banned, (package / "semantic_catalog" / "retrieval.py")
+                             .read_text(encoding="utf-8"))
+        # 检索不进固定 Tool 路由：agent / runtime 注册表里没有任何引用。
+        for path in (package / "agent.py", package / "runtime" / "domain_registry.py",
+                     package / "business_query" / "tool.py"):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("retrieve_schema_candidates", text, path.name)
+            self.assertNotIn("semantic_catalog", text, path.name)
+
+
+class SemanticGoldSetTests(unittest.TestCase):
+    """30 题 gold set：Top 5 召回 100%、非法 JOIN 0、形状与脱敏逐行把关。"""
+
+    def check_row(self, row, result):
+        """一题的全部期望；返回人可读的不符清单（空表 = 通过）。"""
+        problems = []
+        if not set(row["required_views"]) <= set(result.view_refs[:5]):
+            problems.append(f"所需视图 {row['required_views']} 不在 Top 5 "
+                            f"{list(result.view_refs)}")
+        for attribute, key in (("metric_refs", "required_metrics"),
+                               ("join_path_refs", "join_paths"),
+                               ("missing_concepts", "missing_concepts")):
+            actual = getattr(result, attribute)
+            if sorted(actual) != sorted(row[key]):
+                problems.append(f"{key}: 期望 {sorted(row[key])} 实得 {sorted(actual)}")
+        if result.requires_clarification != row["clarify"]:
+            problems.append(f"clarify: 期望 {row['clarify']} "
+                            f"实得 {result.requires_clarification}")
+        return problems
+
+    def test_file_is_exactly_thirty_frozen_rows_with_the_fixed_shape(self):
+        rows, lines = gold_rows()
+        self.assertEqual(len(rows), 30)
+        self.assertEqual(len(lines), 30, "gold 文件只准 30 行：不留空行或注释位")
+        self.assertEqual([row["id"] for row in rows], [f"S{index:02d}" for index in range(1, 31)])
+        self.assertEqual(len({row["question"] for row in rows}), 30)
+        for row in rows:
+            self.assertEqual(tuple(sorted(row)), GOLD_KEYS, row["id"])
+            self.assertTrue(row["domains"], row["id"])
+            self.assertLessEqual(set(row["domains"]), KNOWN_DOMAINS, row["id"])
+            self.assertIsInstance(row["clarify"], bool, row["id"])
+            for key in ("required_views", "required_metrics", "join_paths", "missing_concepts"):
+                self.assertIsInstance(row[key], list, row["id"])
+                self.assertEqual(len(set(row[key])), len(row[key]), f"{row['id']} 有重复项")
+
+    def test_gold_rows_never_carry_identifiers_or_source_claims(self):
+        rows = gold_rows()[0]
+        for row in rows:
+            # 题面与期望值都不准出现真实主键、底表名或来源就绪的说法（id 列除外）。
+            text = json.dumps({key: value for key, value in row.items() if key != "id"},
+                              ensure_ascii=False)
+            for leak in ("bi.", "reporting.", "shop_id", "pool_id", "v_", "pdd", "拼多多",
+                         "S1", "TB1", "FX1", "kuaimai", "certified"):
+                self.assertNotIn(leak, text, row["id"])
+
+    def test_every_row_matches_and_top_five_recall_is_complete(self):
+        refs = catalog_refs()
+        rows = gold_rows()[0]
+        failures = []
+        recall: dict[str, bool] = {}
+        for row in rows:
+            result = retrieve(row["question"], row["domains"])
+            problems = self.check_row(row, result)
+            if len(result.view_refs) > 5:
+                problems.append(f"Top 5 被超出：{list(result.view_refs)}")
+            for values, universe in ((row["required_views"], refs["views"]),
+                                     (row["required_metrics"], refs["metrics"]),
+                                     (row["join_paths"], refs["joins"])):
+                if not set(values) <= universe:
+                    problems.append(f"{row['id']} 期望了未登记的 ref")
+            returned = (result.view_refs + result.metric_refs + result.field_refs
+                        + result.entity_refs + result.join_path_refs)
+            for value in returned:
+                if not re.fullmatch(REF_RE, value):
+                    problems.append(f"{row['id']} 返回了非法 ref：{value}")
+            if not set(returned) <= set().union(*refs.values()):
+                problems.append(f"{row['id']} 返回了目录之外的 ref")
+            if not set(result.missing_concepts) <= MISSING_CODES:
+                problems.append(f"{row['id']} 返回了固定表之外的缺失概念")
+            dumped = repr(result)
+            for leak in ("reporting.", "bi.", "v_", "shop_id", "pool_id"):
+                if leak in dumped:
+                    problems.append(f"{row['id']} 输出泄露了 {leak}")
+            recall[row["id"]] = set(row["required_views"]) <= set(result.view_refs[:5])
+            if problems:
+                failures.append(f"{row['id']}: " + "；".join(problems))
+        self.assertEqual(failures, [])
+        needing = [row["id"] for row in rows if row["required_views"]]
+        # 召回率 = 所需视图全部落进 Top 5 的题数 / 有所需视图的题数；必须 100%。
+        # （上面 `failures == []` 已经逐题判过；这里再把它算成一个数，不让分母被动过手脚。）
+        recalled = sum(1 for ref in needing if recall[ref])
+        self.assertEqual(recalled, len(needing))
+        self.assertEqual(recalled / len(needing), 1.0)
+        self.assertEqual(len(needing), 27,
+                         "只有整份拒绝的三题（S07 / S26 / S27）可以没有所需视图")
+
+    def test_gold_set_covers_the_whole_catalog_it_claims_to_test(self):
+        rows = gold_rows()[0]
+        refs = catalog_refs()
+        self.assertEqual({ref for row in rows for ref in row["required_views"]},
+                         refs["views"], "有视图一次都没被要求召回")
+        self.assertEqual({ref for row in rows for ref in row["required_metrics"]},
+                         refs["metrics"], "有指标一次都没被点名")
+        self.assertEqual({domain for row in rows for domain in row["domains"]},
+                         set(KNOWN_DOMAINS))
+        for domain in KNOWN_DOMAINS:
+            # 每个工作流至少三题；更强的覆盖断言是上面那两条：11 张视图与 22 个指标
+            # 必须各自被全部点名一次（不多不少）。
+            self.assertGreaterEqual(sum(1 for row in rows if domain in row["domains"]), 3,
+                                    f"{domain} 覆盖不足")
+        self.assertGreaterEqual(sum(1 for row in rows if row["join_paths"]), 2)
+        self.assertEqual({code for row in rows for code in row["missing_concepts"]},
+                         set(MISSING_CODES))
+        self.assertGreaterEqual(sum(1 for row in rows if row["clarify"]), 12)
+        self.assertGreaterEqual(sum(1 for row in rows if not row["clarify"]), 12)
+        # 三对故意不登记的边都必须真的被拒（join_paths 为空 + 要澄清）。
+        forbidden = [row for row in rows
+                     if row["required_metrics"] and not row["join_paths"] and row["clarify"]]
+        self.assertGreaterEqual(len(forbidden), 5, "非法 JOIN 的用例不足")
+
+    def test_runner_is_not_vacuous(self):
+        rows = gold_rows()[0]
+        result = retrieve(rows[0]["question"], rows[0]["domains"])
+        self.assertEqual(self.check_row(rows[0], result), [])
+        mutations = (
+            ("required_views", lambda row: row.update(required_views=["view-coverage"])),
+            ("required_metrics", lambda row: row.update(required_metrics=[])),
+            ("required_metrics", lambda row: row.update(
+                required_metrics=list(row["required_metrics"]) + ["metric-paid-orders"])),
+            ("join_paths", lambda row: row.update(join_paths=["join-shop-daily-shops"])),
+            ("clarify", lambda row: row.update(clarify=not row["clarify"])),
+            ("missing_concepts", lambda row: row.update(missing_concepts=["traffic"])),
+        )
+        for key, mutate in mutations:
+            with self.subTest(key=key):
+                broken = dict(rows[0])
+                mutate(broken)
+                self.assertTrue(self.check_row(broken, result),
+                                f"改掉 {key} 之后 runner 仍然通过：那条断言是恒真的")
+        # 领域是另一回事：它换的是输入，不是期望值 ⇒ 结果必须跟着变。
+        self.assertNotEqual(retrieve(rows[0]["question"], ["commerce_performance"]), result)
+
+    def test_every_row_is_reproducible(self):
+        for row in gold_rows()[0]:
+            with self.subTest(row["id"]):
+                first = retrieve(row["question"], row["domains"])
+                self.assertEqual(self.check_row(row, retrieve(row["question"],
+                                                              row["domains"])), [])
+                self.assertEqual(first, retrieve(row["question"], row["domains"]))
+
+
+class SemanticRetrievalSafetyTests(unittest.TestCase):
+    """候选闭包、拒绝形状与"不共享状态"：Task 3 最容易在后续 Task 里被改坏的地方。
+    """
+
+    def test_every_returned_ref_is_allowed_by_this_rounds_domains(self):
+        from bi_agent.semantic_catalog import CATALOG, catalog_indexes
+
+        cases = (
+            ("按SKU看上架价", ["business_query"]),
+            ("按SKU看上架价", ["listing_price_audit"]),
+            ("按仓库看实物库存与店铺可售库存", ["inventory_watch"]),
+            ("支付金额、上架价与实物库存一起看", sorted(KNOWN_DOMAINS)),
+            ("商品分摊支付金额与销量", ["commerce_performance"]),
+        )
+        indexes = catalog_indexes(CATALOG)
+        for question, domains in cases:
+            with self.subTest(question=question, domains=domains):
+                result = retrieve(question, domains)
+                allowed = frozenset(domains)
+                self.assertTrue(allowed or not result.view_refs)
+                for ref in result.view_refs:
+                    self.assertTrue(set(indexes.views[ref].domains) & allowed, ref)
+                for ref in result.field_refs:
+                    owner = indexes.views[indexes.fields[ref].view_ref]
+                    self.assertTrue(set(owner.domains) & allowed, ref)
+                for ref in result.metric_refs:
+                    self.assertTrue(set(indexes.metrics[ref].domains) & allowed, ref)
+                for ref in result.entity_refs:
+                    self.assertTrue(set(indexes.entities[ref].domains) & allowed, ref)
+
+    def test_refusal_still_names_the_catalog_it_refused_from(self):
+        result = retrieve("按出库口径看销售额", ["business_query"])
+        from bi_agent.semantic_catalog import CATALOG
+
+        self.assertEqual(result.catalog_version, CATALOG.version)
+        self.assertFalse(any((result.entity_refs, result.metric_refs, result.view_refs,
+                              result.field_refs, result.join_path_refs,
+                              result.missing_concepts)))
+
+    def test_two_calls_do_not_share_state(self):
+        # 口径判定会就地摘除候选：必须只影响当轮那份字典。
+        refused = retrieve("按出库口径看销售额", ["business_query"])
+        normal = retrieve("销售额", ["business_query"])
+        later = retrieve("按出库口径看销售额", ["business_query"])
+        self.assertEqual(refused, later)
+        self.assertEqual(normal.metric_refs, ("metric-paid-amount",))
+        self.assertTrue(normal.requires_clarification)
+        from bi_agent.semantic_catalog import CATALOG
+
+        self.assertEqual(len(CATALOG.metrics), 22)
+
+    def test_a_path_through_the_shop_archive_does_not_legitimise_two_fact_views(self):
+        # 两张事实表都能 N:1 连到店铺档案，但它们之间没有登记边：穿过档案连起来不等于
+        # 有合法 JOIN 路径（那正是首批目录故意不登记 `商品成本 ↔ 单据毛利` 的原因）。
+        result = retrieve("按店铺看支付金额和销量", ["business_query", "commerce_performance"])
+        self.assertEqual(result.join_path_refs, ())
+        self.assertTrue(result.requires_clarification)
+        # 点名平台之后 view-shops 自己成了锚点，这两条边才算真的被需要。
+        joined = retrieve("按店铺和平台看支付金额和销量",
+                          ["business_query", "commerce_performance"])
+        self.assertEqual(joined.join_path_refs,
+                         ("join-product-daily-shops", "join-shop-daily-shops"))
+        self.assertFalse(joined.requires_clarification)
