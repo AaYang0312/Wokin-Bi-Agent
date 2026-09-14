@@ -377,8 +377,10 @@ npm run build
 
 ## 后置子项目
 
-- **语义目录 / Schema 检索：** Task 1/6/7 已先记录实体、指标和关系元数据；下一阶段才增加候选检索与 Schema 选择，评测所需视图召回与 JOIN 粒度。
-- **受控 SQL 探索：** 只承接固定业务模板无法表达的新增问题，不作为这四类工作流前置；继续使用 AST / 只读权限 / 预算 / 有限修复。
-- **学习型记忆：** 只有 approved 且版本匹配的规范化查询进入 few-shot，用户当次目标价不得自动提升为长期标准。
-- **隔离分析 Agent：** 用已持久化且版本一致的数据集做额外经营分析；现有趋势、排名、价差和阈值判断全部由确定性代码完成。
-- **持续库存通知：** 若后续产品需要定时通知，复用 InventoryWatchGraph，增加事件去重、解除 / 再触发、通知渠道与调度；当前不创建自动化。
+五项均已完成设计与实施计划，**不表示功能已经实现**。生产实现统一以 Task 11 日期化发布验收通过为前置；持续库存通知还必须先通过真实库存来源验收。
+
+- **语义目录 / Schema 检索：** [实施计划](2026-09-14-semantic-catalog-and-schema-retrieval.md)。用版本化显式目录和确定性 Top 5 检索评测视图召回、JOIN 路径与粒度，不自动登记数据库对象。
+- **受控 SQL 探索：** [实施计划](2026-09-14-controlled-sql-exploration.md)。在语义目录之后交付，只承接固定 Tool 无法表达且能力/覆盖完整的问题，使用服务端 SQL 编译、AST、只读权限与预算纵深防御。
+- **approved 查询学习记忆：** [实施计划](2026-09-14-approved-query-memory.md)。在受控 SQL 之后交付，只有人工 approved、授权与版本精确匹配的槽位化样例进入 few-shot，不自动学习聊天或一次性业务值。
+- **隔离分析 Agent：** [实施计划](2026-09-14-isolated-analysis-agent.md)。Task 11 之后可独立实施，只分析仍获授权的不可变数据集 Artifact；确定性代码计算数值，模型无工具地解释 findings。
+- **持续库存通知：** [实施计划](2026-09-14-continuous-inventory-notifications.md)。Task 11 与真实库存来源双门禁通过后独立实施；复用 InventoryWatchGraph，以 one-shot CLI、告警状态机、PostgreSQL outbox 和应用内通知中心交付，不创建 Codex 自动化。
