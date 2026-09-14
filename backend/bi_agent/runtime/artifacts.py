@@ -143,6 +143,16 @@ class RequestIdentity(BaseModel):
         "comparison_coverage_incomplete", "deadline_exceeded", "query_timeout",
         "persistence_failed", "contract_violation", "upstream_unavailable",
         "transient_source_failure", "recovery_exhausted",
+        # 受控 SQL 探索（计划 Task 5）：四个原因都发生在 SQL 执行之前或预算线上，与
+        # 「缺参数 / 缺覆盖 / 缺能力」都不同类，不能拿现成的码含糊带过。
+        # 固定 Tool 能表达的问题不许降级成 SQL。
+        "fixed_tool_available",
+        # 语义检索无法唯一定位 schema/ref：要澄清，不是猜一个就发 SQL。
+        "schema_ambiguous",
+        # AST/白名单策略在碰库之前拒掉了这条语句。
+        "sql_policy_rejected",
+        # EXPLAIN 估算行数或总成本超预算。
+        "query_cost_exceeded",
     ] | None = None
 
 
@@ -245,7 +255,7 @@ class ArtifactEnvelope(BaseModel):
 
     artifact_type: Literal[
         "metric_result", "comparison_table", "trend_series", "chart_spec",
-        "price_audit", "inventory_alerts"]
+        "price_audit", "inventory_alerts", "exploration_result"]
     payload: dict[str, object]
     data_as_of: datetime | None = None
     coverage: dict[str, object] | None = None

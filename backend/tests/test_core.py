@@ -2972,5 +2972,334 @@ class OutstockSourceTests(unittest.TestCase):
         self.assertFalse(columns & PII_FORBIDDEN_FIELDS)
 
 
+class ControlledSqlAgentIntegrationTests(unittest.TestCase):
+    """主 Agent 的受控探索接线（计划 Task 5 Step 7）。
+
+    这里只钉主层该钉的四件事：
+      1. `CONTROLLED_SQL_ENABLED` 关着（默认）时 Tool 列表逐字不变，而且根本不进门禁；
+      2. 开着时只在「固定 Tool 表达不了、不澄清、无未注册概念、服务端作用域就绪」
+         四项都过的那一轮才多一项；
+      3. 一次 Tool 调用 = 一个 `DomainContext` = 一次图执行：不逐店循环（开发流程 §4.6），
+         提问由服务端注入，回到模型的那一句里没有 SQL 也没有真店号；
+      4. 固定 Tool 仍然是权威入口：它本轮就会返回 unavailable/missing_data，也不因此
+         众开探索入入口（不能拿固定口径的拒答当“换个工具再试一次”）。
+
+    图自己的九道门与真库执行由 `tests.test_exploration` / `tests.test_runtime_db` 钉。
+    """
+
+    NOW = AgentTests.NOW
+    EXPLORATION_NAMES = ["query_business", "analyze_product_performance",
+                         "compare_performance", "audit_listing_prices",
+                         "inspect_inventory", "evaluate_promotion"]
+    # 已发布目录下的真实行为（不靠 mock 检索）："按天看退款金额" 的指标与分组粒度
+    # 恰好是 query_business 能表达的 → 不开放探索；"各平台销量对比" 没有一份固定契约
+    # 能同时承载这些指标与粒度 → 才开放。提问刻意避开主层的销售额口径澄清分支。
+    FIXED_QUESTION = "按天看退款金额"
+    EXPLORABLE_QUESTION = "各平台销量对比"
+
+    def setUp(self):
+        from bi_agent.catalog import ref_for_key
+        from bi_agent.runtime.memory import MemoryQueryRunStore
+
+        self.shop_id = "S1"
+        self.shop_ref = ref_for_key("shop", "S1")
+        self.run_store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+
+    def _conn(self):
+        return ShopCatalogConn([(self.shop_id, "店铺A")])
+
+    def _tools_sent(self, model):
+        return model.complete.call_args_list[0].args[1]
+
+    def _turn(self, question, *, enabled, model=None, calls=None, allowed=None,
+              run_store=None):
+        from bi_agent.agent import SessionState, answer
+
+        model = Mock() if model is None else model
+        model.complete.side_effect = calls or [_reply(text="好")]
+        turn = answer(question, SessionState(subject="u1"), model=model,
+                      conn=self._conn(),
+                      allowed_shop_ids=(frozenset({self.shop_id})
+                                        if allowed is None else allowed),
+                      now=self.NOW, run_store=self.run_store if run_store is None else run_store,
+                      controlled_sql_enabled=enabled)
+        return turn, model
+
+    # --- 1) 门禁关着：逐字不变 ---------------------------------------------------
+
+    def test_disabled_gate_leaves_the_tool_snapshot_byte_identical(self):
+        import json
+
+        from bi_agent.agent import _tool_schemas
+
+        baseline = json.dumps(_tool_schemas(), ensure_ascii=False, sort_keys=True)
+        with patch("bi_agent.agent._exploration_gate") as gate:
+            _turn, model = self._turn(self.EXPLORABLE_QUESTION, enabled=False,
+                                      calls=[_reply(text="不用查")])
+        gate.assert_not_called()
+        sent = json.dumps(self._tools_sent(model), ensure_ascii=False, sort_keys=True)
+        self.assertEqual(sent, baseline, "feature off 时送给模型的 Tool 列表必须逐字相同")
+        self.assertEqual([item["function"]["name"] for item in self._tools_sent(model)],
+                         self.EXPLORATION_NAMES)
+
+    def test_disabled_gate_also_keeps_unknown_tool_text_unchanged(self):
+        from bi_agent.llm import ToolCall
+
+        _turn, model = self._turn("查点什么", enabled=False, calls=[
+            _reply(calls=[ToolCall(id="c1", name="run_sql",
+                                   arguments={"sql": "SELECT 1"})]),
+            _reply(text="只能用已公工具")])
+        detail = next(message.content for message in
+                      [m for m in (turn.content for turn in [])] if False) \
+            if False else model.complete.call_args_list[1]
+        sent_messages = detail.args[0]
+        tool_message = next(message for message in sent_messages if message.role == "tool")
+        self.assertIn("unknown_tool", tool_message.content)
+        self.assertNotIn("explore_business_data", tool_message.content)
+        for name in self.EXPLORATION_NAMES:
+            self.assertIn(name, tool_message.content)
+
+    # --- 2) 门禁开着：四项都过才多一项 -----------------------------------------
+
+    def test_enabled_gate_adds_the_tool_only_when_no_fixed_tool_expresses_it(self):
+        from bi_agent.agent import _exploration_gate
+
+        entry, versions = _exploration_gate(
+            self.EXPLORABLE_QUESTION, allowed_shop_ids=frozenset({self.shop_id}),
+            shop_refs={self.shop_id: self.shop_ref})
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["function"]["name"], "explore_business_data")
+        self.assertEqual(versions.data_catalog_version, 0)
+        refused, _none = _exploration_gate(
+            self.FIXED_QUESTION, allowed_shop_ids=frozenset({self.shop_id}),
+            shop_refs={self.shop_id: self.shop_ref})
+        self.assertIsNone(refused, "固定 Tool 能表达的问题不得改走 SQL")
+
+    def test_enabled_gate_needs_a_ready_server_scope(self):
+        from bi_agent.agent import _exploration_gate
+
+        for label, kwargs in (("空授权", {"allowed_shop_ids": frozenset(),
+                                        "shop_refs": {}}),
+                             ("缺引用", {"allowed_shop_ids": frozenset({"S1", "S9"}),
+                                       "shop_refs": {"S1": self.shop_ref}})):
+            with self.subTest(case=label):
+                entry, versions = _exploration_gate(self.EXPLORABLE_QUESTION, **kwargs)
+                self.assertIsNone(entry)
+                self.assertIsNone(versions)
+
+    def test_enabled_gate_refuses_clarification_and_missing_concepts(self):
+        from bi_agent.agent import _exploration_gate
+        from tests.test_exploration import selection_for
+
+        for label, kwargs in (("要澄清", {"requires_clarification": True}),
+                             ("未注册概念", {"missing_concepts": ("profit_grain",)}),
+                             ("没指标", {"selected_metrics": []}),
+                             ("没候选视图", {"view_refs": ()})):
+            with self.subTest(case=label):
+                selection = selection_for(["metric-sales-amount"], **kwargs)
+                with patch("bi_agent.exploration.tool.retrieve_schema_candidates",
+                           return_value=selection) as retrieve:
+                    entry, versions = _exploration_gate(
+                        self.EXPLORABLE_QUESTION,
+                        allowed_shop_ids=frozenset({self.shop_id}),
+                        shop_refs={self.shop_id: self.shop_ref})
+                self.assertIsNone(entry)
+                self.assertIsNone(versions)
+                retrieve.assert_called_once()
+
+    def test_enabled_turn_appends_the_exploration_schema_last(self):
+        _turn, model = self._turn(self.EXPLORABLE_QUESTION, enabled=True,
+                                  calls=[_reply(text="先不查")])
+        names = [item["function"]["name"] for item in self._tools_sent(model)]
+        self.assertEqual(names, self.EXPLORATION_NAMES + ["explore_business_data"])
+        self.assertEqual([item["function"]["name"] for item in self._tools_sent(model)[:6]],
+                         self.EXPLORATION_NAMES, "前六项顺序与描述不得变")
+
+    def test_enabled_turn_keeps_the_six_tools_when_exploration_is_refused(self):
+        _turn, model = self._turn(self.FIXED_QUESTION, enabled=True,
+                                  calls=[_reply(text="先不查")])
+        self.assertEqual([item["function"]["name"] for item in self._tools_sent(model)],
+                         self.EXPLORATION_NAMES)
+
+    # --- 3) Tool 调用：一个上下文、一次图、不泄露 SQL ---------------------
+
+    def test_exploration_call_uses_one_context_one_graph_and_leaks_nothing(self):
+        from bi_agent.exploration.graph import ExplorationExecution
+        from bi_agent.llm import ToolCall
+        from uuid import uuid4
+        from bi_agent.runtime.models import (ArtifactRef, DomainArtifact, DomainResult,
+                                             DomainStatus)
+        from tests.test_exploration import (EXPLORATION_PAYLOAD_KEYS, exploration_payload)
+
+        payload = exploration_payload()
+        artifact_id = uuid4()
+        result = DomainResult(
+            run_id=uuid4(), status=DomainStatus.SUCCESS,
+            model_payload=payload,
+            artifacts=[DomainArtifact(
+                ref=ArtifactRef(id=artifact_id, type="exploration_result"),
+                public_payload=payload)])
+        captured: list = []
+
+        def fake_tool(call, context, **kwargs):
+            captured.append((call, context, kwargs))
+            return ExplorationExecution(domain_result=result, plan=None)
+
+        with patch("bi_agent.exploration.tool.execute_exploration_tool",
+                   side_effect=fake_tool):
+            turn, model = self._turn(
+                self.EXPLORABLE_QUESTION, enabled=True, calls=[
+                    _reply(calls=[ToolCall(
+                        id="call_x", name="explore_business_data",
+                        arguments={"requested_metric_refs": ["metric-sales-amount"],
+                                   "question": "自己写的提问"})]),
+                    _reply(text="按引用给了结果")])
+        self.assertEqual(len(captured), 1, "一次 Tool 调用只能跑一次图")
+        _call, context, kwargs = captured[0]
+        self.assertEqual(kwargs["question"], self.EXPLORABLE_QUESTION,
+                         "提问只能取服务端当前那句")
+        self.assertEqual(context.allowed_shop_ids, frozenset({self.shop_id}))
+        self.assertEqual(context.shop_refs, {self.shop_id: self.shop_ref})
+        self.assertEqual(len(turn.artifacts), 1)
+        self.assertEqual(set(turn.artifacts[0]), EXPLORATION_PAYLOAD_KEYS | {"artifact_id",
+                                                                          "artifact_type"})
+        tool_message = next(message for message in
+                            model.complete.call_args_list[1].args[0]
+                            if message.role == "tool")
+        for leak in ("SELECT", "ANY(", '"S1"', "parameters", "sql_text"):
+            self.assertNotIn(leak, tool_message.content, leak)
+        self.assertNotIn(self.shop_id, tool_message.content)
+        # 回给模型的只有稳定引用与列 ref：内容非空才算"这条通道通了"（反恒真）。
+        self.assertIn("metric-cost-total", tool_message.content)
+        self.assertIn("shop-ref", tool_message.content)
+        self.assertEqual(turn.error_code, None)
+
+    def test_invented_exploration_call_when_not_offered_stays_unknown(self):
+        from bi_agent.llm import ToolCall
+
+        with patch("bi_agent.exploration.tool.execute_exploration_tool") as tool:
+            _turn, model = self._turn(self.FIXED_QUESTION, enabled=True, calls=[
+                _reply(calls=[ToolCall(id="c1", name="explore_business_data",
+                                       arguments={"requested_metric_refs": []})]),
+                _reply(text="换固定工具回答")])
+        tool.assert_not_called()
+        detail = next(message.content for message in model.complete.call_args_list[1].args[0]
+                      if message.role == "tool")
+        self.assertIn("unknown_tool", detail)
+        self.assertNotIn("SELECT", detail)
+
+    def test_exploration_needs_input_gets_one_correction_then_stops(self):
+        from bi_agent.agent import SessionState, answer
+        from bi_agent.llm import ToolCall
+        from uuid import uuid4
+        from bi_agent.runtime.models import DomainResult, DomainStatus, ErrorEnvelope
+        from bi_agent.exploration.graph import ExplorationExecution
+
+        refusal = DomainResult(
+            run_id=uuid4(), status=DomainStatus.NEEDS_INPUT,
+            model_payload={"status": "invalid_parameters", "termination_reason":
+                           "schema_ambiguous", "limitations": []},
+            artifacts=[], error=ErrorEnvelope(
+                code="invalid_parameters", stage="select_schema", retryable=False,
+                recovery="correct_parameters", public_message="查询参数无效，请调整后重试。",
+                problems=["invalid_parameters"]))
+        calls_seen: list = []
+
+        with patch("bi_agent.exploration.tool.execute_exploration_tool",
+                   return_value=ExplorationExecution(domain_result=refusal,
+                                                     plan=None)) as tool:
+            model = Mock()
+            bad = ToolCall(id="c1", name="explore_business_data",
+                           arguments={"requested_metric_refs": ["SUM(x)"]})
+            model.complete.side_effect = [
+                _reply(calls=[bad]), _reply(calls=[bad]), _reply(text="已问清")]
+            turn = answer(self.EXPLORABLE_QUESTION, SessionState(subject="u1"), model=model,
+                          conn=self._conn(), allowed_shop_ids=frozenset({self.shop_id}),
+                          now=self.NOW, run_store=self.run_store,
+                          controlled_sql_enabled=True)
+            calls_seen = tool.call_args_list
+        self.assertEqual(len(calls_seen), 2, "第二次非法参数就该停，不是无限重试")
+        self.assertEqual(turn.results, [])
+        self.assertEqual(turn.artifacts, [])
+        self.assertIn("参数两次非法", turn.text or "")
+
+    def test_exploration_persistence_failure_voids_the_turn(self):
+        from bi_agent.exploration.graph import ExplorationExecution
+        from uuid import uuid4
+        from bi_agent.llm import ToolCall
+        from bi_agent.runtime.models import DomainResult, DomainStatus, ErrorEnvelope
+
+        failed = DomainResult(
+            run_id=uuid4(), status=DomainStatus.FAILED,
+            model_payload={"status": "unavailable", "termination_reason":
+                           "persistence_failed", "limitations": []},
+            artifacts=[], error=ErrorEnvelope(
+                code="artifact_persistence_failed", stage="finalize", retryable=True,
+                recovery="retry_later", public_message="结果保存失败，请稍后重试。",
+                problems=["artifact_persistence_failed"]))
+        with patch("bi_agent.exploration.tool.execute_exploration_tool",
+                   return_value=ExplorationExecution(domain_result=failed, plan=None)), \
+                patch("bi_agent.business_query.nodes.metrics.query_business",
+                      return_value=AgentTests.KNOWN):
+            turn, model = self._turn(self.EXPLORABLE_QUESTION, enabled=True, calls=[
+                _reply(calls=[ToolCall(id="c1", name="query_business",
+                                       arguments={"start": "2026-09-01", "end": "2026-09-08",
+                                                  "shop_ids": [self.shop_ref],
+                                                  "metrics": ["paid_amount"]})]),
+                _reply(calls=[ToolCall(id="c2", name="explore_business_data",
+                                       arguments={"requested_metric_refs":
+                                                   ["metric-sales-amount"]})]),
+                _reply(text="收尾")])
+        self.assertEqual(turn.results, [], "存不下的探索不得与已有结果共存")
+        self.assertEqual(turn.artifacts, [])
+        self.assertEqual(turn.error_code, "artifact_persistence_failed")
+        self.assertNotIn("SELECT", turn.text or "")
+
+    # --- 4) 固定 Tool 仍然权威 -------------------------------------------------
+
+    def test_fixed_tool_stays_authoritative_even_when_it_returns_unavailable(self):
+        from bi_agent.llm import ToolCall
+        from bi_agent.metrics import ToolResult
+        from bi_agent.runtime.models import Coverage as _RuntimeCoverage
+
+        unavailable = ToolResult(
+            status="unavailable", data=[], limitations=["来源质量核验未通过，拒绍出数"],
+            coverage=_RuntimeCoverage(status="missing", start=self.NOW.date(),
+                                     end=self.NOW.date(), gaps=[]))
+        with patch("bi_agent.business_query.nodes.metrics.query_business",
+                   return_value=unavailable) as query:
+            turn, model = self._turn(self.FIXED_QUESTION, enabled=True, calls=[
+                _reply(calls=[ToolCall(id="c1", name="query_business",
+                                       arguments={"start": "2026-09-01",
+                                                  "end": "2026-09-08",
+                                                  "shop_ids": [self.shop_ref],
+                                                  "metrics": ["refund_amount"]})]),
+                _reply(text="今天不能出数")])
+            names = [item["function"]["name"] for item in self._tools_sent(model)]
+        query.assert_called_once()
+        self.assertEqual(names, self.EXPLORATION_NAMES,
+                         "固定 Tool 拒答不得换一条 SQL 重问")
+        self.assertNotIn("explore_business_data", str(turn.state.turns))
+
+    def test_non_exploration_paths_are_unchanged_when_the_gate_is_open(self):
+        from tests.test_exploration import EXPLORATION_ARTIFACT_TYPE  # noqa: F401
+        from bi_agent.llm import ToolCall
+
+        with patch("bi_agent.business_query.nodes.metrics.query_business",
+                   return_value=AgentTests.KNOWN) as query:
+            turn, model = self._turn("最近7天店铺A的支付金额", enabled=True, calls=[
+                _reply(calls=[ToolCall(id="c1", name="query_business",
+                                       arguments={"start": "2026-09-01",
+                                                  "end": "2026-09-08",
+                                                  "shop_ids": [self.shop_ref],
+                                                  "metrics": ["paid_amount"]})]),
+                _reply(text="支付金额1000元")])
+        query.assert_called_once()
+        self.assertEqual(len(turn.results), 1)
+        self.assertEqual(len(self.run_store.runs), 1)
+        self.assertEqual(len(self.run_store.artifacts), 1)
+        self.assertNotIn(EXPLORATION_ARTIFACT_TYPE, str(turn.artifacts))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -148,13 +148,24 @@ class PostgresQueryRunStore:
 
     def record_diagnostic(self, run_id: UUID, *, template_id: str, sql_text: str,
                           parameters: dict[str, object]) -> UUID:
-        """受控诊断记录：SQL 与参数只进这里，绝不写进模型消息或事件文本。"""
+        """受控诊断记录：SQL 与参数只进这里，绝不写进模型消息或事件文本。
+
+        写失败长成什么样与内存 Store 同一份契约：运行行不存在（`run_id` 的外键就是
+        凭据）报 `RunNotFound`，其余数据库失败报 `ArtifactPersistenceError`。探索图按这两
+        个异常把一次执行判成 `persistence_failed` 并清空待发布的结果，不能留一个带 SQL
+        字面量的原文往外跑。
+        """
         diagnostic_id = uuid4()
-        self.conn.execute(
-            "INSERT INTO bi.query_diagnostics (id, run_id, template_id, sql_text, parameters) "
-            "VALUES (%s, %s, %s, %s, %s)",
-            (diagnostic_id, run_id, template_id, sql_text, Jsonb(parameters)),
-        )
+        try:
+            self.conn.execute(
+                "INSERT INTO bi.query_diagnostics (id, run_id, template_id, sql_text, parameters) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (diagnostic_id, run_id, template_id, sql_text, Jsonb(parameters)),
+            )
+        except errors.ForeignKeyViolation:
+            raise RunNotFound() from None
+        except errors.Error:
+            raise ArtifactPersistenceError() from None
         return diagnostic_id
 
     def record_provenance(self, run_id: UUID, *, provenance, identity) -> None:

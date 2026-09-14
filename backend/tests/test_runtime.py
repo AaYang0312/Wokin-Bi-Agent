@@ -582,11 +582,12 @@ class ProvenanceContractTests(unittest.TestCase):
         sql_dir = pathlib.Path(__file__).parents[1] / "sql"
         # CHECK 是整段重新声明的（不能只追加），所以最新那份必须逐字等于码表；
         # 只比对 009∪014 的并集会漏掉“新版本删了某个码而库里还留着”。
-        for name in ("009_query_provenance.sql", "014_multi_source_contract.sql"):
+        newest = "020_controlled_sql_exploration.sql"
+        for name in ("009_query_provenance.sql", "014_multi_source_contract.sql", newest):
             sql = (sql_dir / name).read_text(encoding="utf-8")
             block = sql.split("query_runs_termination_reason CHECK", 1)[1].split(");", 1)[0]
             in_sql = set(re.findall(r"'([a-z_]+)'", block))
-            if name.startswith("014"):
+            if name == newest:
                 self.assertEqual(in_sql, set(TERMINATION_REASONS),
                                  f"{name} 的 CHECK 必须与终止原因码表逐项一致")
             self.assertTrue(in_sql <= set(TERMINATION_REASONS),

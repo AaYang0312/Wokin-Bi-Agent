@@ -347,7 +347,8 @@ def encode_sse(event: ChatEvent) -> bytes:
 
 
 def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: ChatModel,
-                  allowed_shop_ids: frozenset[str], now: datetime) -> Iterator[ChatEvent]:
+                  allowed_shop_ids: frozenset[str], now: datetime,
+                  controlled_sql_enabled: bool = False) -> Iterator[ChatEvent]:
     """保存可见消息并输出有限阶段事件；调用方负责会话锁和连接生命周期。"""
     from .chats import (
         load_chat_context,
@@ -380,6 +381,8 @@ def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: Cha
                 user_message_id=saved_user.id,
                 subject_id=subject,
             ),
+            # 默认关：未拿到明确的服务端开关前不开放探索入口。
+            controlled_sql_enabled=controlled_sql_enabled,
         )
         artifacts = list(turn.artifacts)
         if artifacts:
@@ -505,6 +508,22 @@ def _tool_schemas() -> list[dict[str, object]]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# 受控 SQL 探索：主层只转交门禁结论，不认识语义目录
+# ---------------------------------------------------------------------------
+
+EXPLORATION_TOOL_NAME = "explore_business_data"
+# 门禁本身住在 `exploration/tool.py`（那里才是语义目录的消费方）：主层只问
+# "这一轮能不能给模型这个 Tool"，不检索、不读目录、也不碰数据库。固定 Tool 的顺序与
+# 描述因此逐字不变，关着时更是连一行探索代码都不执行（计划 Task 5 Step 7）。
+def _exploration_gate(question: str, *, allowed_shop_ids: frozenset[str],
+                      shop_refs: dict[str, str]):
+    from .exploration.tool import exploration_gate
+
+    return exploration_gate(question, allowed_shop_ids=allowed_shop_ids,
+                            shop_refs=shop_refs)
+
+
 # 工具预算或模型回合上限用尽时的兜底文案：不把内部占位语当成回答。
 NO_TEXT_WITH_RESULTS = ("本轮已取得确定性查询结果（见下方数据），但没能组织成文字总结，"
                        "请重试或换个问法。")
@@ -551,7 +570,8 @@ def _final_text_answer(model: ChatModel, messages: list[Message],
 def answer(question: str, state: SessionState, *, model: ChatModel, conn,
            allowed_shop_ids: frozenset[str], now: datetime,
            run_store: QueryRunStore | None = None,
-           turn_context: TurnContext | None = None) -> TurnResult:
+           turn_context: TurnContext | None = None,
+           controlled_sql_enabled: bool = False) -> TurnResult:
     deadline = time_module.monotonic() + TOTAL_BUDGET_SECONDS
     if run_store is None:
         run_store = MemoryQueryRunStore(forbidden_values=allowed_shop_ids)
@@ -589,6 +609,15 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
             state=state)
 
     tools = _tool_schemas()
+    # 受控 SQL 探索默认关：关着时 `tools` 就是上面那六份的逐字快照（多一个键都算变更）。
+    # 开着也只在本轮问题能进探索门禁时追加一项，固定 Tool 的顺序与描述不变。
+    exploration_entry, exploration_versions = (None, None)
+    if controlled_sql_enabled:
+        exploration_entry, exploration_versions = _exploration_gate(
+            question, allowed_shop_ids=allowed_shop_ids, shop_refs=state.shop_refs)
+        if exploration_entry is not None:
+            tools = tools + [exploration_entry]
+    offered_tools = [str(item["function"]["name"]) for item in tools]
     system = Message(role="system",
                      content=_SYSTEM_PROMPT.format(now=now.astimezone(BEIJING),
                                                    ref_doc=ref_doc or "（无店铺）"))
@@ -607,6 +636,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     commerce_attempt_no = 0
     listing_attempt_no = 0
     inventory_attempt_no = 0
+    exploration_attempt_no = 0
 
     for _ in range(MAX_MODEL_TURNS):
         remaining = deadline - time_module.monotonic()
@@ -809,6 +839,65 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     content=json.dumps(domain_result.model_payload,
                                        ensure_ascii=False)))
                 continue
+            if call.name == EXPLORATION_TOOL_NAME:
+                # 一次探索 Tool 调用 = 一次图执行：主层不逐店循环、不拼 SQL、也不接
+                # 模型自报的提问（当前这句原文由服务端注入）。没被公告就不跑：模型自己
+                # 编出这个 Tool 名拿不到版本号，只能走 unknown_tool。
+                if exploration_entry is None or exploration_versions is None:
+                    messages.append(Message(
+                        role="tool", tool_call_id=call.id,
+                        content=json.dumps({"error": "unknown_tool",
+                                            "detail": "本轮未开放受控探索查询"},
+                                           ensure_ascii=False)))
+                    continue
+                from .exploration.tool import execute_exploration_tool
+
+                exploration_attempt_no += 1
+                execution = execute_exploration_tool(
+                    call, DomainContext(
+                        subject_id=turn_context.subject_id,
+                        allowed_shop_ids=allowed_shop_ids,
+                        shop_refs=dict(state.shop_refs),
+                        conn=conn,
+                        store=run_store,
+                        chat_id=turn_context.chat_id,
+                        user_message_id=turn_context.user_message_id,
+                        root_request_id=turn_context.user_message_id,
+                        now=now,
+                        deadline=deadline,
+                        attempt_no=exploration_attempt_no),
+                    question=question, versions=exploration_versions)
+                domain_result = execution.domain_result
+                if domain_result.status.value == "needs_input":
+                    if correction_used:
+                        last_error = "参数两次非法，已停止本次回答"
+                        stop_after_batch = True
+                        break
+                    correction_used = True
+                    problems = (domain_result.error.problems
+                                if domain_result.error is not None
+                                else ["invalid_parameters"])
+                    messages.append(_correction_message(call.id, problems))
+                    continue
+                if (domain_result.error is not None
+                        and domain_result.error.code
+                        in {"artifact_persistence_failed", "result_contract_violation"}):
+                    # 必需结果存不下不是降级：本轮已经发出去的结论全部作废。
+                    last_error = domain_result.error.public_message
+                    error_code = domain_result.error.code
+                    results.clear()
+                    artifacts.clear()
+                    stop_after_batch = True
+                    break
+                calls_used += 1
+                # 公开载荷只补自身引用；给模型的那一份永远没有 SQL 与真店号。
+                artifacts.extend(artifact_event_payload(artifact)
+                                 for artifact in domain_result.artifacts)
+                messages.append(Message(
+                    role="tool", tool_call_id=call.id,
+                    content=json.dumps(domain_result.model_payload,
+                                       ensure_ascii=False)))
+                continue
             if call.arguments_error is not None or call.arguments is None:
                 if correction_used:
                     last_error = "参数两次非法，已停止本次回答"
@@ -824,12 +913,8 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                 messages.append(Message(role="tool", tool_call_id=call.id,
                                         content=json.dumps(
                                             {"error": "unknown_tool",
-                                             "detail": "只允许query_business/"
-                                                       "analyze_product_performance/"
-                                                       "compare_performance/"
-                                                       "audit_listing_prices/"
-                                                       "inspect_inventory/"
-                                                       "evaluate_promotion"},
+                                             "detail": "只允许"
+                                                       + "/".join(offered_tools)},
                                             ensure_ascii=False)))
                 continue
             if isinstance(outcome, list):

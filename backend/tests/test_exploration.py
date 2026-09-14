@@ -64,8 +64,8 @@ EXPORTED_CONTRACTS = (
 # 计划 Task 2 的 Produces 清单：两个入口 + 钉死的覆盖矩阵常量。
 TASK_TWO_EXPORTS = ("FIXED_TOOL_METRICS", "compile_query", "fixed_tool_for")
 # Task 4 之后本包有七个模块（`graph.py` / `tool.py` 属 Task 5）。
-PACKAGE_MODULES = ["__init__.py", "compiler.py", "eligibility.py", "models.py",
-                   "policy.py", "projection.py", "repository.py"]
+PACKAGE_MODULES = ["__init__.py", "compiler.py", "eligibility.py", "graph.py",
+                   "models.py", "policy.py", "projection.py", "repository.py", "tool.py"]
 # Task 5 才会交付的入口名字：本切片里它们必须不存在。
 NOT_YET_IMPLEMENTED = ("execute_exploration_tool",)
 # 计划 Task 3 的 Produces 清单只有一个入口，而且它的 Files 清单不含 `__init__.py`：
@@ -3267,6 +3267,1507 @@ class ExplorationMultiMetricTests(ExplorationLivePlanFixture, unittest.TestCase)
         self.assertEqual(columns, [DAY_COST, "metric-cost-total", "metric-sales-amount"])
         self.assertTrue(rows)
         self.assertEqual(probe.statements.count(READ_ONLY_STATEMENT), 1)
+
+
+# --- Task 5（阶段一）运行域契约：九节点链、Artifact、原因码与私有诊断 ----------------
+#
+# 本切片只交付「迁移 + 运行层契约」：`graph.py`、`tool.py` 与 Agent 接线属阶段二，
+# 所以这里钉的是领域注册表、`exploration_result` 载荷校验与两个 Store 的持久化契约，
+# 不钉推进行为。断言一律落在结构化字段与稳定原因码上（开发流程 §4.2）。
+
+EXPLORATION_DOMAIN = "controlled_sql_exploration"
+EXPLORATION_ARTIFACT_TYPE = "exploration_result"
+# 计划 Task 5 Step 1 的固定九节点链。顺序就是阶段二图上的推进顺序；注册表只回答
+# 「这个领域能不能往运行记录里写这个节点」，所以两处都钉：集合逐项相等 + 逐个可写。
+EXPLORATION_NODES = (
+    "select_schema", "authorize_scope", "assess_readiness", "compile_query",
+    "validate_ast", "estimate_cost", "execute_readonly", "persist_artifact", "finalize")
+# 计划 Task 5 新增的四个终止原因：四个都发生在 SQL 执行之前或预算线上，与既有
+# 「缺参数 / 缺覆盖 / 缺能力」不同类，不能拿现成的码含糊带过。
+EXPLORATION_TERMINATION_REASONS = frozenset({
+    "fixed_tool_available", "schema_ambiguous", "sql_policy_rejected",
+    "query_cost_exceeded"})
+# 009/014 已登记进库的值：020 重建 CHECK 时一个都不许掉（重建不是收缩）。
+BASELINE_DOMAINS = frozenset({"business_query", "commerce_performance",
+                             "listing_price_audit", "inventory_watch"})
+BASELINE_ARTIFACT_TYPES = frozenset({
+    "metric_result", "comparison_table", "trend_series", "chart_spec", "price_audit",
+    "inventory_alerts"})
+BASELINE_TERMINATION_REASONS = frozenset({
+    "succeeded", "missing_parameters", "invalid_parameters", "forbidden",
+    "coverage_incomplete", "data_as_of_unknown", "source_quality_failed",
+    "source_not_onboarded", "revenue_not_attributed", "result_too_large",
+    "comparison_coverage_incomplete", "deadline_exceeded", "query_timeout",
+    "persistence_failed", "contract_violation", "upstream_unavailable",
+    "transient_source_failure", "recovery_exhausted", "capability_unavailable",
+    "coverage_time_basis_unverified"})
+# 计划 Task 5 Step 4 的载荷字段全集：九个键，全部必填，多一个少一个都判红。
+EXPLORATION_PAYLOAD_KEYS = frozenset({
+    "template_version", "catalog_version", "statement_fingerprint", "columns", "rows",
+    "basis", "coverage", "diagnostics", "limitations"})
+# 阶段二才交付的模块与入口：本阶段它们必须还不存在。
+TASK_FIVE_MODULES = ("graph", "tool")
+TASK_FIVE_ENTRY_POINTS = ("execute_exploration_tool", "explore_business_data")
+# 载荷被拒的原因与两个 Store 同一份：只有一个码，不许现场发明新说法。
+PAYLOAD_REJECTION = "unsafe_persistence_payload"
+COST_METRIC = "metric-cost-total"   # 结果里唯一的金额列
+# 文本列用例：`line_kind` 是目录里已登记的维度列，也是唯一能装自由文本的那一格。
+TEXT_COLUMN = LINE_KIND_COST
+
+
+def exploration_payload(**overrides):
+    """一份合法的 `exploration_result` 载荷：与 Task 4 投影的产出同形状。"""
+    values = {
+        "template_version": "exploration-sql/2026-09-14.1",
+        "catalog_version": "semantic/2026-09-14.1",
+        "statement_fingerprint": SHA256_HEX,
+        "columns": [
+            {"ref": DAY_COST, "data_type": "date"},
+            {"ref": SHOP_REF_COLUMN, "data_type": "ref"},
+            {"ref": COST_METRIC, "data_type": "decimal"},
+        ],
+        "rows": [
+            {DAY_COST: "2026-09-01", SHOP_REF_COLUMN: "ent-shop-one",
+             COST_METRIC: "12.30"},
+            {DAY_COST: "2026-09-02", SHOP_REF_COLUMN: "ent-shop-two",
+             COST_METRIC: "0.00"},
+        ],
+        "basis": [{"metric": COST_METRIC, "basis": "cost/2026-09-12.1"}],
+        "coverage": {"status": "complete", "start": "2026-09-01", "end": "2026-09-08",
+                     "gaps": []},
+        "diagnostics": [{"code": "erp_document_coverage", "documents": 2}],
+        "limitations": ["来源质量未核验（尚无对账记录）"],
+    }
+    values.update(overrides)
+    return values
+
+
+def text_column_payload(**overrides):
+    """只有一个文本列的结果：给「自由文本里能不能藏 SQL」那组用例当底座。"""
+    values = {"columns": [{"ref": TEXT_COLUMN, "data_type": "text"}],
+              "rows": [{TEXT_COLUMN: "sale"}]}
+    values.update(overrides)
+    return exploration_payload(**values)
+
+
+def validate_exploration(payload, *, as_model: bool = False):
+    from bi_agent.runtime.models import validate_artifact_payload, validate_model_payload
+
+    validate = validate_model_payload if as_model else validate_artifact_payload
+    return validate(payload, EXPLORATION_ARTIFACT_TYPE)
+
+
+def rejection_for(payload) -> str:
+    """要求运行层拒掉这份载荷并交出稳定原因码；接下了就判红。"""
+    try:
+        validate_exploration(payload)
+    except ValueError as exc:
+        assert type(exc) is ValueError, f"不是裸 ValueError：{type(exc).__name__}"
+        return str(exc)
+    raise AssertionError("运行层接下了这份探索载荷")
+
+
+def payload_rejection(**overrides) -> str:
+    return rejection_for(exploration_payload(**overrides))
+
+
+def without(payload, key):
+    return {name: value for name, value in payload.items() if name != key}
+
+
+def row_with(**cells):
+    """改第一行的某几格：其余格保持合法，只差被测的那一个角度。"""
+    row = dict(exploration_payload()["rows"][0])
+    row.update(cells)
+    return row
+
+
+class ExplorationDomainContractTests(unittest.TestCase):
+    """领域注册表：九个节点、一种 Artifact、四个原因码，一个都不能多。"""
+
+    def test_registry_declares_exactly_the_nine_fixed_nodes(self):
+        from typing import get_args
+
+        from bi_agent.runtime.domain_registry import spec_for
+        from bi_agent.runtime.models import PersistenceNode
+
+        spec = spec_for(EXPLORATION_DOMAIN)
+        self.assertEqual(spec.name, EXPLORATION_DOMAIN)
+        self.assertEqual(spec.nodes, frozenset(EXPLORATION_NODES))
+        self.assertEqual(len(set(EXPLORATION_NODES)), 9, "固定链就是九格")
+        # 领域白名单必须是运行层全局节点表的子集：两份名单不能各写一半。
+        self.assertTrue(spec.nodes <= frozenset(get_args(PersistenceNode)))
+
+    def test_registry_declares_only_the_exploration_result_artifact(self):
+        from bi_agent.runtime.domain_registry import (
+            ARTIFACT_TYPES, allows_artifact_type, domains, spec_for)
+
+        self.assertIn(EXPLORATION_ARTIFACT_TYPE, ARTIFACT_TYPES)
+        self.assertEqual(spec_for(EXPLORATION_DOMAIN).artifact_types,
+                         frozenset({EXPLORATION_ARTIFACT_TYPE}))
+        self.assertTrue(allows_artifact_type(EXPLORATION_DOMAIN, EXPLORATION_ARTIFACT_TYPE))
+        # 探索领域不产数据集，也不产别的领域的类型。
+        for other in sorted(BASELINE_ARTIFACT_TYPES):
+            self.assertFalse(allows_artifact_type(EXPLORATION_DOMAIN, other), other)
+        # 既有领域也不许借道发探索结果。
+        for domain in sorted(BASELINE_DOMAINS):
+            self.assertFalse(allows_artifact_type(domain, EXPLORATION_ARTIFACT_TYPE), domain)
+        self.assertEqual(domains(), tuple(sorted(BASELINE_DOMAINS | {EXPLORATION_DOMAIN})),
+                         "登记新领域不得改掉既有清单")
+
+    def test_exploration_nodes_are_writable_and_unlisted_nodes_are_not(self):
+        from bi_agent.runtime.domain_registry import allows_node
+        from bi_agent.runtime.models import validate_persisted_state
+
+        for node in EXPLORATION_NODES:
+            with self.subTest(node=node):
+                self.assertTrue(allows_node(EXPLORATION_DOMAIN, node))
+                self.assertEqual(validate_persisted_state({"node": node}), {"node": node})
+        # 图上没有的格子：既不在本领域白名单，也不在全局节点表里。
+        for node in ("execute_arbitrary_sql", "run_sql", "record_diagnostic"):
+            self.assertFalse(allows_node(EXPLORATION_DOMAIN, node), node)
+            with self.assertRaises(ValueError):
+                validate_persisted_state({"node": node})
+        # 节点可以全局合法，但不能借给别的领域：固定指标查询没有编译格。
+        self.assertTrue(allows_node("business_query", "execute_fixed_query"))
+        self.assertFalse(allows_node("business_query", "compile_query"))
+        self.assertFalse(allows_node(EXPLORATION_DOMAIN, "execute_fixed_query"))
+
+    def test_four_new_termination_reasons_join_the_existing_code_table(self):
+        from bi_agent.runtime.artifacts import TERMINATION_REASONS
+        from bi_agent.runtime.models import RunCompletion, RunStatus
+
+        self.assertTrue(EXPLORATION_TERMINATION_REASONS <= TERMINATION_REASONS)
+        # 追加不是替换：014 之前那份码表一项都不许少。
+        self.assertTrue(BASELINE_TERMINATION_REASONS <= TERMINATION_REASONS)
+        self.assertEqual(TERMINATION_REASONS - BASELINE_TERMINATION_REASONS,
+                         EXPLORATION_TERMINATION_REASONS)
+        for reason in sorted(EXPLORATION_TERMINATION_REASONS):
+            with self.subTest(reason=reason):
+                completion = RunCompletion(expected_revision=1, node="finalize",
+                                           status=RunStatus.FAILED, state={},
+                                           termination_reason=reason)
+                self.assertEqual(completion.termination_reason, reason)
+        with self.assertRaises(ValueError):
+            RunCompletion(expected_revision=1, node="finalize", status=RunStatus.FAILED,
+                          state={}, termination_reason="query_was_too_slow")
+
+    def test_exploration_result_is_a_declared_artifact_type_everywhere(self):
+        from bi_agent.runtime.artifacts import ArtifactEnvelope
+        from bi_agent.runtime.models import ArtifactRef, NewArtifact
+
+        ArtifactEnvelope(domain=EXPLORATION_DOMAIN, artifact_type=EXPLORATION_ARTIFACT_TYPE,
+                         payload=exploration_payload())
+        with self.assertRaises(ValidationError):
+            ArtifactEnvelope(domain="business_query",
+                             artifact_type=EXPLORATION_ARTIFACT_TYPE,
+                             payload=exploration_payload())
+        self.assertEqual(ArtifactRef(id=uuid4(), type=EXPLORATION_ARTIFACT_TYPE).type,
+                         EXPLORATION_ARTIFACT_TYPE)
+        # 载荷按类型判到探索那一支：`NewArtifact` 在建对象时已经跑过同一份校验。
+        artifact = NewArtifact(artifact_type=EXPLORATION_ARTIFACT_TYPE,
+                               payload=exploration_payload())
+        self.assertEqual(set(artifact.payload), EXPLORATION_PAYLOAD_KEYS)
+        self.assertIsNone(artifact.dataset_ref)
+        self.assertIsNone(artifact.chart_version)
+
+    def test_exploration_result_is_not_a_chart_dataset(self):
+        """探索结果不是数据集：图表不得引用它，它也不得带数据集配对字段。"""
+        from bi_agent.runtime.domain_registry import DATASET_ARTIFACT_TYPES
+        from bi_agent.runtime.models import NewArtifact
+
+        self.assertNotIn(EXPLORATION_ARTIFACT_TYPE, DATASET_ARTIFACT_TYPES)
+        with self.assertRaises(ValidationError):
+            NewArtifact(artifact_type=EXPLORATION_ARTIFACT_TYPE,
+                        payload=exploration_payload(), dataset_ref=uuid4(),
+                        chart_version=1)
+
+
+
+
+class ExplorationArtifactPayloadTests(unittest.TestCase):
+    """`exploration_result` 的严格载荷契约（计划 Task 5 Step 4）。"""
+
+    def test_the_nine_fields_are_all_required_and_nothing_else_is_accepted(self):
+        self.assertEqual(set(validate_exploration(exploration_payload())),
+                         set(EXPLORATION_PAYLOAD_KEYS))
+        for key in sorted(EXPLORATION_PAYLOAD_KEYS):
+            with self.subTest(missing=key):
+                self.assertEqual(rejection_for(without(exploration_payload(), key)),
+                                 PAYLOAD_REJECTION)
+        for extra, value in (("sql_text", "SELECT 1"),
+                             ("parameters", {"limit": 100}),
+                             ("question", "按店铺看成本"),
+                             ("selected_refs", [COST_METRIC]),
+                             ("shop_ids", ["S1"]),
+                             ("entities", [{"ref": "ent-shop-one"}])):
+            with self.subTest(extra=extra):
+                self.assertEqual(rejection_for(exploration_payload(**{extra: value})),
+                                 PAYLOAD_REJECTION)
+
+    def test_versions_and_fingerprint_keep_the_exploration_contract(self):
+        for bad_version in ("", " exploration-sql/2026-09-14.1", "two words", 1):
+            with self.subTest(template_version=repr(bad_version)[:12]):
+                self.assertEqual(payload_rejection(template_version=bad_version),
+                                 PAYLOAD_REJECTION)
+        for bad_fingerprint in ("a" * 63, "A" * 64, "zz" * 32, None):
+            with self.subTest(fingerprint=str(bad_fingerprint)[:8]):
+                self.assertEqual(payload_rejection(statement_fingerprint=bad_fingerprint),
+                                 PAYLOAD_REJECTION)
+
+    def test_rows_must_carry_exactly_the_declared_columns(self):
+        for label, bad_rows in (("不是列表", "2026-09-01"),
+                               ("行不是对象", [DAY_COST]),
+                               ("少一列", [without(row_with(), DAY_COST)]),
+                               ("多一列", [row_with(**{PRODUCT_COST: "P1"})]),
+                               ("用 SQL 列名", [{"day": "2026-09-01",
+                                                SHOP_REF_COLUMN: "ent-shop-one",
+                                                "cost_total": "12.30"}])):
+            with self.subTest(case=label):
+                self.assertEqual(payload_rejection(rows=bad_rows), PAYLOAD_REJECTION)
+
+    def test_row_count_uses_the_same_budget_as_the_request(self):
+        from bi_agent.exploration.models import MAX_ROWS
+
+        row = row_with()
+        self.assertEqual(len(validate_exploration(
+            exploration_payload(rows=[dict(row) for _ in range(MAX_ROWS)]))["rows"]),
+            MAX_ROWS)
+        self.assertEqual(payload_rejection(
+            rows=[dict(row) for _ in range(MAX_ROWS + 1)]), PAYLOAD_REJECTION)
+
+    def test_columns_must_be_unique_refs_with_a_declared_type(self):
+        for label, bad_columns in (
+                ("没有列", []),
+                ("不是列表", DAY_COST),
+                ("重复列", [{"ref": DAY_COST, "data_type": "date"},
+                          {"ref": DAY_COST, "data_type": "date"},
+                          {"ref": SHOP_REF_COLUMN, "data_type": "ref"},
+                          {"ref": COST_METRIC, "data_type": "decimal"}]),
+                ("缺类型", [{"ref": DAY_COST}]),
+                ("多键", [{"ref": DAY_COST, "data_type": "date", "column": "day"}]),
+                ("未登记类型", [{"ref": DAY_COST, "data_type": "money"}]),
+                ("SQL 列名", [{"ref": "cost_total", "data_type": "decimal"}]),
+                ("表达式冒充 ref", [{"ref": "SUM(cost_total)", "data_type": "decimal"}]),
+                ("店铺列换了类型", [{"ref": SHOP_REF_COLUMN, "data_type": "text"}]),
+                ("普通列冒充 ref", [{"ref": DAY_COST, "data_type": "ref"}])):
+            with self.subTest(case=label):
+                self.assertEqual(payload_rejection(columns=bad_columns), PAYLOAD_REJECTION)
+
+    def test_values_must_match_the_declared_column_type(self):
+        for column, bad in ((DAY_COST, "2026/09/01"), (DAY_COST, "09-01-2026"),
+                            (SHOP_REF_COLUMN, "S1"), (SHOP_REF_COLUMN, "shop 1"),
+                            (COST_METRIC, 12.30), (COST_METRIC, "12,30"),
+                            (COST_METRIC, True)):
+            with self.subTest(column=column, value=repr(bad)[:16]):
+                self.assertEqual(payload_rejection(rows=[row_with(**{column: bad})]),
+                                 PAYLOAD_REJECTION)
+
+    def test_integer_boolean_and_moment_columns_honour_their_declaration(self):
+        for columns, row in (
+                ([{"ref": TEXT_COLUMN, "data_type": "text"},
+                  {"ref": COST_METRIC, "data_type": "integer"}],
+                 {TEXT_COLUMN: "sale", COST_METRIC: True}),
+                ([{"ref": COST_METRIC, "data_type": "boolean"},
+                  {"ref": DAY_COST, "data_type": "date"}],
+                 {COST_METRIC: 1, DAY_COST: "2026-09-01"}),
+                ([{"ref": STATUS_ERP, "data_type": "datetime"}],
+                 {STATUS_ERP: "2026-09-01 12:00:00"}),
+                ([{"ref": STATUS_ERP, "data_type": "datetime"}],
+                 {STATUS_ERP: "2026-09-01T12:00:00"})):
+            with self.subTest(row=repr(row)[:44]):
+                self.assertEqual(payload_rejection(columns=columns, rows=[row]),
+                                 PAYLOAD_REJECTION)
+        # 反例：按声明发就得接受（差一个角度而不是全拒）
+        self.assertEqual(validate_exploration(text_column_payload(
+            columns=[{"ref": TEXT_COLUMN, "data_type": "text"},
+                     {"ref": COST_METRIC, "data_type": "integer"}],
+            rows=[{TEXT_COLUMN: "sale", COST_METRIC: 3}]))["rows"],
+            [{TEXT_COLUMN: "sale", COST_METRIC: 3}])
+        self.assertEqual(validate_exploration(text_column_payload(
+            columns=[{"ref": STATUS_ERP, "data_type": "datetime"}],
+            rows=[{STATUS_ERP: "2026-09-01T12:00:00+08:00"}]))["rows"],
+            [{STATUS_ERP: "2026-09-01T12:00:00+08:00"}])
+
+    def test_nulls_are_allowed_only_where_the_projection_emits_them(self):
+        """空值不是 0：允许出现在除 `shop-ref` 以外的列上。"""
+        self.assertEqual(validate_exploration(exploration_payload(
+            rows=[row_with(**{DAY_COST: None, COST_METRIC: None})]))["rows"],
+            [row_with(**{DAY_COST: None, COST_METRIC: None})])
+        self.assertEqual(payload_rejection(rows=[row_with(**{SHOP_REF_COLUMN: None})]),
+                         PAYLOAD_REJECTION)
+
+    def test_no_sql_shape_reaches_the_public_payload(self):
+        """载荷里任何一处字符串都得过 SQL 形状检查，不只检查键名。"""
+        for value in ("SELECT sum(cost_total) FROM reporting.v_product_cost_daily",
+                      "fact.\"shop_id\" = ANY(%(allowed_shop_ids)s)",
+                      "DROP TABLE bi.orders",
+                      "1; DELETE FROM bi.orders",
+                      "cost -- 注释"):
+            with self.subTest(value=value[:24]):
+                self.assertEqual(rejection_for(text_column_payload(
+                    rows=[{TEXT_COLUMN: value}])), PAYLOAD_REJECTION)
+        for field, value in (
+                ("limitations", ["成本口径见 SELECT 语句"]),
+                ("basis", [{"metric": COST_METRIC,
+                           "basis": "cost/2026-09-12.1; DROP TABLE bi.orders"}]),
+                ("diagnostics", [{"code": "erp_document_coverage",
+                                 "documents": "DELETE FROM bi.orders"}])):
+            with self.subTest(field=field):
+                self.assertEqual(payload_rejection(**{field: value}), PAYLOAD_REJECTION)
+
+    def test_coverage_basis_and_diagnostics_reuse_the_registered_vocabularies(self):
+        """不另起一套平行契约：覆盖走 `Coverage`，诊断走已登记码表。"""
+        self.assertEqual(payload_rejection(coverage={"status": "complete", "gaps": []}),
+                         PAYLOAD_REJECTION)                       # 缺 start/end
+        self.assertEqual(payload_rejection(
+            coverage={"status": "whole", "start": "2026-09-01", "end": "2026-09-08",
+                      "gaps": []}), PAYLOAD_REJECTION)
+        self.assertEqual(payload_rejection(
+            basis=[{"metric": "cost_total", "basis": "cost/2026-09-12.1"}]),
+            PAYLOAD_REJECTION)                                    # 指标必须是稳定 ref
+        self.assertEqual(payload_rejection(basis=[{"metric": COST_METRIC}]),
+                         PAYLOAD_REJECTION)                       # 缺口径名
+        self.assertEqual(payload_rejection(
+            basis=[{"metric": COST_METRIC, "basis": "cost/2026-09-12.1",
+                   "shop_id": "S1"}]), PAYLOAD_REJECTION)         # 未登记键
+        self.assertEqual(payload_rejection(
+            diagnostics=[{"code": "cost_coverage", "rows": 1}]), PAYLOAD_REJECTION)
+        self.assertEqual(payload_rejection(
+            diagnostics=[{"code": "erp_document_coverage", "rows": 1}]),
+            PAYLOAD_REJECTION)                                    # 未登记字段
+        self.assertEqual(payload_rejection(
+            diagnostics=[{"code": "erp_document_coverage", "documents": 1.5}]),
+            PAYLOAD_REJECTION)                                    # 浮点冒充计数
+        self.assertEqual(payload_rejection(diagnostics=["erp_document_coverage"]),
+                         PAYLOAD_REJECTION)
+        self.assertEqual(payload_rejection(limitations=["成本口径没核验"]),
+                         PAYLOAD_REJECTION)                       # 未登记披露文本
+        self.assertEqual(payload_rejection(basis=[]), PAYLOAD_REJECTION)
+        # 反例：一次干净的结果本来就没有披露与诊断，清空这两项必须照旧可发。
+        clean = validate_exploration(exploration_payload(limitations=[], diagnostics=[]))
+        self.assertEqual(clean["limitations"], [])
+        self.assertEqual(clean["diagnostics"], [])
+
+    def test_model_payload_and_artifact_payload_are_the_same_shape(self):
+        """探索结果里没有展示名，所以给模型与公开发的是同一份形状。"""
+        payload = exploration_payload()
+        self.assertEqual(validate_exploration(payload, as_model=True),
+                         validate_exploration(payload))
+        # 同一护栏对两支都生效：少任何必填键，两边都不收。
+        for as_model in (False, True):
+            with self.subTest(as_model=as_model):
+                try:
+                    validate_exploration(without(payload, "statement_fingerprint"),
+                                         as_model=as_model)
+                except ValueError as exc:
+                    self.assertEqual(str(exc), PAYLOAD_REJECTION)
+                else:
+                    self.fail("运行层接下了缺字段的探索载荷")
+
+    def test_the_runtime_validator_and_the_task_one_contract_agree(self):
+        """计划 Task 1 的 `ExplorationResult` 与运行层载荷校验必须判同一件事。"""
+        from bi_agent.exploration.models import ExplorationResult
+
+        payload = exploration_payload()
+        result = ExplorationResult(**payload)
+        self.assertEqual(validate_exploration(result.model_dump(mode="json")),
+                         validate_exploration(payload))
+        # 运行层是单向收紧：Task 1 收下的形状仍要过已登记词表。
+        ExplorationResult(**dict(payload, diagnostics=[{"code": "cost_coverage"}]))
+        self.assertEqual(payload_rejection(diagnostics=[{"code": "cost_coverage"}]),
+                         PAYLOAD_REJECTION)
+        with self.assertRaises(ValueError):
+            ExplorationResult(**dict(payload, sql_text=result.statement_fingerprint))
+
+
+class ExplorationStoreContractTests(unittest.TestCase):
+    """两个 Store 复用同一份载荷校验，并且只有一处私有诊断通道（不碰库的那一半）。"""
+
+    def _record(self, **overrides):
+        from bi_agent.catalog import ref_for_key
+        from bi_agent.runtime.models import NewQueryRun
+
+        values = dict(
+            chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
+            tool_call_id="call_1", domain=EXPLORATION_DOMAIN, attempt_no=1,
+            normalized_request={"shop_refs": [ref_for_key("shop", "S1")]},
+            state={"node": "select_schema"})
+        values.update(overrides)
+        return NewQueryRun(**values)
+
+    def _memory_store(self):
+        from bi_agent.runtime.memory import MemoryQueryRunStore
+
+        return MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+
+    def _memory_store_run(self, store) -> UUID:
+        """内存 Store 要先有运行行：`save_artifact` / `record_diagnostic` 都以它为前提。"""
+        return store.create_run(self._record())
+
+    def _postgres_store(self):
+        from bi_agent.runtime.repository import PostgresQueryRunStore
+
+        # 载荷被拒必须发生在碰库之前：连接替身是 None，越界就是 AttributeError。
+        return PostgresQueryRunStore(None, forbidden_values={"S1", "ERP-P-9"})
+
+    def _construct_artifact(self, payload):
+        """跳过构造期校验：这里要证明的是 Store 自己会拒，不是 Pydantic 先拦。"""
+        from bi_agent.runtime.models import NewArtifact
+
+        return NewArtifact.model_construct(artifact_type=EXPLORATION_ARTIFACT_TYPE,
+                                           payload=payload, data_as_of=None,
+                                           coverage=None, dataset_ref=None,
+                                           chart_version=None)
+
+    def test_both_stores_refuse_a_node_the_domain_does_not_own(self):
+        """节点名全局合法不等于本领域可写：两个 Store 都在碰库之前拒。"""
+        for store in (self._memory_store(), self._postgres_store()):
+            with self.subTest(store=type(store).__name__):
+                with self.assertRaises(ValueError) as caught:
+                    store.create_run(self._record(state={"node": "execute_fixed_query"}))
+                self.assertEqual(str(caught.exception), PAYLOAD_REJECTION)
+
+    def test_both_stores_reject_the_same_exploration_payloads(self):
+        bad = (exploration_payload() | {"sql_text": "SELECT 1"},
+               without(exploration_payload(), "statement_fingerprint"),
+               exploration_payload(rows=[{"day": "2026-09-01"}]),
+               exploration_payload(limitations=["成本口径没核验"]),
+               exploration_payload(diagnostics=[{"code": "cost_coverage"}]))
+        for index, payload in enumerate(bad):
+            memory = self._memory_store()
+            for label, store, run_id in (("memory", memory, self._memory_store_run(memory)),
+                                         ("postgres", self._postgres_store(), uuid4())):
+                with self.subTest(case=index, store=label):
+                    with self.assertRaises(ValueError) as caught:
+                        store.save_artifact(run_id, self._construct_artifact(payload))
+                    self.assertEqual(str(caught.exception), PAYLOAD_REJECTION)
+
+    def test_both_stores_reject_a_real_shop_id_in_the_exploration_payload(self):
+        """真店号进不了公开载荷：形状再合法也没用，两个 Store 同一条规则。"""
+        payload = text_column_payload(rows=[{TEXT_COLUMN: "S1"}])
+        validate_exploration(payload)          # 形状这一道是过的
+        memory = self._memory_store()
+        for label, store, run_id in (("memory", memory, self._memory_store_run(memory)),
+                                     ("postgres", self._postgres_store(), uuid4())):
+            with self.subTest(store=label):
+                with self.assertRaises(ValueError) as caught:
+                    store.save_artifact(run_id, self._construct_artifact(payload))
+                self.assertEqual(str(caught.exception), PAYLOAD_REJECTION)
+
+    def test_memory_store_keeps_diagnostics_out_of_every_public_record(self):
+        from bi_agent.runtime.models import NewArtifact
+
+        store = self._memory_store()
+        run_id = self._memory_store_run(store)
+        diagnostic_id = store.record_diagnostic(
+            run_id, template_id="exploration_sql",
+            sql_text='SELECT fact."day" FROM "reporting"."v_product_cost_daily" AS fact'
+                     ' WHERE fact."shop_id" = ANY(%(allowed_shop_ids)s)',
+            parameters={"allowed_shop_ids": ["S1"], "limit": 100})
+        self.assertIsInstance(diagnostic_id, UUID)
+        self.assertEqual(store.diagnostic_count, 1)
+        # 私有通道按设计带着 SQL 与真店号：这里不许被公开载荷那套护栏误伤。
+        self.assertEqual(store.diagnostics[run_id][0]["parameters"]["allowed_shop_ids"],
+                         ["S1"])
+        for published in (store.runs, store.events, store.artifacts):
+            self.assertNotIn("SELECT", repr(published))
+            self.assertNotIn("allowed_shop_ids", repr(published))
+            self.assertNotIn("'S1'", repr(published))
+        ref = store.save_artifact(run_id, NewArtifact(
+            artifact_type=EXPLORATION_ARTIFACT_TYPE, payload=exploration_payload()))
+        self.assertEqual(ref.type, EXPLORATION_ARTIFACT_TYPE)
+        self.assertEqual([item["artifact_type"] for item in store.artifacts.values()],
+                         [EXPLORATION_ARTIFACT_TYPE])
+        self.assertNotIn("SELECT", repr(store.artifacts))
+        # 一次成功的探索：一份公开结果 + 一份私有证据，不多不少。
+        self.assertEqual((len(store.artifacts), store.diagnostic_count), (1, 1))
+
+    def test_memory_record_diagnostic_requires_an_existing_run(self):
+        from bi_agent.runtime.models import RunNotFound
+
+        store = self._memory_store()
+        with self.assertRaises(RunNotFound):
+            store.record_diagnostic(uuid4(), template_id="exploration_sql",
+                                   sql_text="SELECT 1", parameters={})
+
+
+# --- Task 5（阶段二）固定图与 Tool 适配器 ---------------------------------------
+#
+# 反恒真约定（开发流程 §4.1）：每个拒答用例都同时钉「原因码 + 走到哪一格 + 有没有碰库
+# + 发了几份公开结果」。只断「招了」不算护栏：`EvidenceConn` 对第三条语句直接报错，
+# 所以「提前终止」是可证的而不是推测的。
+
+GRAPH_NOW = POLICY_NOW
+GRAPH_START, GRAPH_END = date(2026, 9, 1), date(2026, 9, 8)
+# 探索夹具只能用**已登记能力标签同名**的指标（014 的口径）：`metric-cost-total` 的列
+# `cost_total` 没有任何已登记的来源依赖表，探索层必须当场拒它（见
+# `ExplorationReadinessRegressionTests`）。
+GRAPH_QUESTION = "按店铺和日期看支付金额与订单数"
+READY_METRICS = ("metric-paid-amount",)
+READY_GROUPS = (DAY_SHOP_DAILY, SHOP_SHOP_DAILY)
+PAID_METRIC = "metric-paid-amount"
+# 未投影的原始行：带真店号，用来证明投影与公开载荷那一跑是必需的而不是装饰。
+STUB_ROWS = [(GRAPH_START, "S1", Decimal("1000.00")), (GRAPH_START, "S2", Decimal("0.00"))]
+STUB_COLUMNS = [DAY_SHOP_DAILY, SHOP_ID_COLUMN, PAID_METRIC]
+# `normalized_request.shop_refs` 走全仓那条实体引用规则（`ent-` + 8 位），不是投影夹具里
+# 那种可读假名：这里必须用同源生成的真引用，否则运行契约先判红。
+from bi_agent.catalog import ref_for_key as _ref_for_key
+
+GRAPH_SHOP_REFS = {shop: _ref_for_key("shop", shop) for shop in sorted(POLICY_SHOP_IDS)}
+# readiness 只该读这一条事实（店 × 平台 × 能力标签）；覆盖/质量/截止由
+# `data_quality.assess_query_coverage` 判，用例把它的结论贴进来当输入。
+
+
+class RecordingStore:
+    """只记录写序列的 Store 代身：节点推进、诊断与 Artifact 的先后就是契约。"""
+
+    def __init__(self, *, fail_diagnostic=False, fail_artifact=False,
+                 fail_transition_after=None, fail_finish=False):
+        self.log: list[tuple] = []
+        self.artifacts: dict = {}
+        self.diagnostics: dict = {}
+        self.fail_diagnostic = fail_diagnostic
+        self.fail_artifact = fail_artifact
+        # 第 N 次 transition 写完就报错：模拟"图跑到一半死了"。
+        self.fail_transition_after = fail_transition_after
+        self.fail_finish = fail_finish
+        self.transitions = 0
+        self.finishes = 0
+        self._run_id = uuid4()
+
+    def create_run(self, record):
+        self.log.append(("create_run", record.domain, record.state.get("node")))
+        return self._run_id
+
+    def transition(self, run_id, transition):
+        self.transitions += 1
+        self.log.append(("transition", transition.node, transition.status.value))
+        if self.fail_transition_after == self.transitions:
+            raise RuntimeError("connection lost mid-chain")
+
+    def record_diagnostic(self, run_id, *, template_id, sql_text, parameters):
+        self.log.append(("diagnostic", template_id, sql_text, parameters))
+        if self.fail_diagnostic:
+            raise RuntimeError("diagnostic write failed")
+        self.diagnostics.setdefault(run_id, []).append(sql_text)
+        return uuid4()
+
+    def save_artifact(self, run_id, artifact):
+        self.log.append(("artifact", artifact.artifact_type, artifact.payload,
+                         artifact.coverage, artifact.data_as_of))
+        if self.fail_artifact:
+            raise RuntimeError("artifact write failed")
+        from bi_agent.runtime.models import ArtifactRef
+
+        ref = ArtifactRef(id=uuid4(), type=artifact.artifact_type)
+        self.artifacts[ref.id] = artifact.payload
+        return ref
+
+    def finish(self, run_id, completion):
+        self.finishes += 1
+        self.log.append(("finish", completion.node, completion.status.value,
+                         completion.termination_reason, completion.error_code,
+                         completion.state, completion.payload))
+        if self.fail_finish:
+            raise RuntimeError("finish write failed")
+
+    @property
+    def kinds(self) -> list[str]:
+        return [entry[0] for entry in self.log]
+
+    @property
+    def nodes(self) -> list[str]:
+        return [entry[1] for entry in self.log if entry[0] == "transition"]
+
+    @property
+    def diagnostic_count(self) -> int:
+        return sum(len(items) for items in self.diagnostics.values())
+
+    @property
+    def finish_record(self) -> tuple:
+        return next(entry for entry in reversed(self.log) if entry[0] == "finish")
+
+
+class Rows:
+    """psycopg 结果对象的最小代身。"""
+
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class EvidenceConn:
+    """只回答 readiness 那一条店铺事实的假连接。
+
+    覆盖、质量、时间口径与共同截止由 `assess_query_coverage` 判（用例贴它的结论），所以
+    这里出现**任何**别的语句（覆盖引擎的 SQL、EXPLAIN、真执行）都是越界：这让"提前终止"
+    是可证的而不是推测的。
+    """
+
+    def __init__(self, *, shops=None, broken=False):
+        default = [("S1", "fxg", ["paid_amount", "paid_orders"]),
+                   ("S2", "fxg", ["paid_amount", "paid_orders"])]
+        self.shops = default if shops is None else shops
+        self.broken = broken
+        self.statements: list[str] = []
+
+    def execute(self, sql, parameters=None):
+        self.statements.append(sql)
+        if self.broken:
+            raise RuntimeError("database unavailable")
+        if "reporting.v_shops" in sql:
+            return Rows(self.shops)
+        raise AssertionError(f"exploration issued a statement it must not: {sql[:40]}")
+
+
+def assessment(*, status="complete", quality="passed", data_as_of=GRAPH_NOW,
+               missing=(), blocking=(), disclosure=(), unconfigured=(),
+               batches=("batch-orders-1",), raise_error=None):
+    """脚本化的就绪结论：readiness 只能按它的字段判，不在图里重拄一套规则。"""
+    from bi_agent.data_quality import CoverageAssessment
+
+    if raise_error is not None:
+        return raise_error          # 直接交异常实例：`graph_patches` 用 side_effect 贴
+    return CoverageAssessment(
+        status=status,
+        requested_window=(GRAPH_START.isoformat(), GRAPH_END.isoformat()),
+        covered_windows=((GRAPH_START.isoformat(), GRAPH_END.isoformat()),) * int(
+            status == "complete"),
+        missing_windows=tuple(missing),
+        data_as_of=data_as_of,
+        quality_status=quality,
+        source_batches=tuple(batches),
+        gaps=(),
+        suggested_window=None,
+        source_unconfigured=tuple(unconfigured),
+        time_basis_blocking=tuple(blocking),
+        time_basis_disclosure=tuple(disclosure))
+
+
+def graph_context(store, conn, **overrides):
+    values = {"subject_id": "subject-one", "allowed_shop_ids": POLICY_SHOP_IDS,
+              "shop_refs": dict(GRAPH_SHOP_REFS), "conn": conn, "store": store,
+              "chat_id": UUID(int=11), "user_message_id": UUID(int=12),
+              "root_request_id": UUID(int=13), "now": GRAPH_NOW,
+              "deadline": time.monotonic() + 30.0, "attempt_no": 1}
+    values.update(overrides)
+    return policy_context(**values)
+
+
+def graph_versions():
+    from bi_agent.runtime.artifacts import GRAPH_VERSION
+    from bi_agent.runtime.versions import VersionSet
+    from bi_agent.semantic_catalog.registry import CATALOG
+    from bi_agent.sources import METRIC_VERSION, POLICY_VERSION, SOURCE_REGISTRY_VERSION
+
+    return VersionSet(schema_version="020", semantic_catalog_version=CATALOG.version,
+                      data_catalog_version=0, metric_version=METRIC_VERSION,
+                      policy_version=POLICY_VERSION,
+                      source_registry_version=SOURCE_REGISTRY_VERSION,
+                      graph_version=GRAPH_VERSION)
+
+
+def ready_request(**overrides):
+    values = {"start": GRAPH_START, "end": GRAPH_END}
+    values.update(overrides)
+    return request_for(READY_METRICS, list(READY_GROUPS), **values)
+
+
+def stub_estimate(conn, plan, *, deadline):
+    """贴估算值的新计划：与 Task 4 真库拿到的形状一致，但不进库。"""
+    return plan.model_copy(update={"estimated_rows": 18,
+                                   "estimated_total_cost": Decimal("647.04")})
+
+
+def stub_execute(conn, plan, *, deadline):
+    """返回**未投影**的原始行（带真店号）：投影仍由真 `project_result` 做。"""
+    return list(STUB_COLUMNS), [tuple(row) for row in STUB_ROWS]
+
+
+def graph_patches(selection=None, *, estimate=stub_estimate, execute=stub_execute,
+                  ready=None):
+    """图外面那几道会进库/查目录的口：检索贴 selection，覆盖结论贴脚本。
+
+    `ready` 给 `CoverageAssessment` 就是"引擎这么判"，给异常实例就是"引擎自己跳了"。
+    """
+    selection = selection_for(READY_METRICS, groups=READY_GROUPS)         if selection is None else selection
+    verdict = assessment() if ready is None else ready
+    coverage_kwargs = ({"side_effect": verdict} if isinstance(verdict, Exception)
+                       else {"return_value": verdict})
+    return [
+        mock.patch("bi_agent.exploration.graph.retrieve_schema_candidates",
+                   return_value=selection),
+        mock.patch("bi_agent.exploration.graph.assess_query_coverage",
+                   **coverage_kwargs),
+        mock.patch("bi_agent.exploration.graph.estimate_plan", side_effect=estimate),
+        mock.patch("bi_agent.exploration.graph.execute_plan", side_effect=execute),
+    ]
+
+
+def run_graph(request=None, *, selection=None, store=None, conn=None, versions=None,
+              question=None, patches=None, ready=None, **context_overrides):
+    """跑图：默认贴好那几道口，所以本文件的图用例不需要数据库也能跑完九格。"""
+    from contextlib import ExitStack
+
+    from bi_agent.exploration.graph import run_exploration_graph
+
+    request = ready_request() if request is None else request
+    store = RecordingStore() if store is None else store
+    conn = EvidenceConn() if conn is None else conn
+    context = graph_context(store, conn, **context_overrides)
+    with ExitStack() as stack:
+        for patcher in (graph_patches(selection, ready=ready) if patches is None
+                        else patches):
+            stack.enter_context(patcher)
+        execution = run_exploration_graph(
+            question=GRAPH_QUESTION if question is None else question,
+            request=request, context=context, versions=versions or graph_versions())
+    return execution, store, context
+
+
+def refusal_reason_of(store) -> str:
+    return store.finish_record[3]
+
+
+def refusal_state(store) -> dict:
+    return store.finish_record[5]
+
+
+class ExplorationGraphChainTests(unittest.TestCase):
+    """九节点链、写顺序与「在碰库之前就能停」。"""
+
+    def test_chain_visits_the_nine_nodes_and_publishes_one_of_each(self):
+        execution, store, _context = run_graph()
+        self.assertEqual(store.nodes, list(EXPLORATION_NODES[:-1]))
+        self.assertEqual(store.finish_record[1], EXPLORATION_NODES[-1])
+        self.assertEqual(execution.domain_result.status.value, "success",
+                         execution.domain_result.error)
+        self.assertEqual(store.kinds.count("diagnostic"), 1)
+        self.assertEqual(store.kinds.count("artifact"), 1)
+        # 先留证据再发结果：顺序反了就是「结果没有可追溯的语句」。
+        self.assertLess(store.kinds.index("diagnostic"), store.kinds.index("artifact"))
+        self.assertEqual(refusal_reason_of(store), "succeeded")
+        self.assertIsNotNone(execution.plan.estimated_rows)
+        self.assertIsNotNone(execution.plan.estimated_total_cost)
+
+    def test_success_publishes_one_artifact_and_keeps_sql_private(self):
+        execution, store, _context = run_graph()
+        artifacts = execution.domain_result.artifacts
+        self.assertEqual([item.ref.type for item in artifacts], [EXPLORATION_ARTIFACT_TYPE])
+        payload = artifacts[0].public_payload
+        self.assertEqual(set(payload), EXPLORATION_PAYLOAD_KEYS)
+        self.assertEqual([row[SHOP_REF_COLUMN] for row in payload["rows"]],
+                         [GRAPH_SHOP_REFS["S1"], GRAPH_SHOP_REFS["S2"]])
+        self.assertEqual([row[PAID_METRIC] for row in payload["rows"]],
+                         ["1000.00", "0.00"])
+        self.assertEqual(payload["coverage"]["status"], "complete")
+        self.assertEqual(payload["diagnostics"], [])
+        self.assertEqual(execution.domain_result.model_payload, payload)
+        sql = store.log[store.kinds.index("diagnostic")][2]
+        self.assertIn("SELECT", sql)
+        # SQL 与真店号只活在那一条私有记录里。
+        for surface, text in (("artifact", repr(artifacts)),
+                              ("model", repr(execution.domain_result.model_payload)),
+                              ("run", repr(store.finish_record))):
+            with self.subTest(surface=surface):
+                for leak in ("SELECT", "ANY(", "'S1'", "statement_timeout"):
+                    self.assertNotIn(leak, text, leak)
+
+    def test_fixed_tool_question_is_refused_before_any_statement(self):
+        """计划 Task 5 种子用例：固定 Tool 能表达的就不许花一钱数据库。"""
+        # 不带分组：`analyze_product_performance` 能表达成本合计。
+        execution, store, _context = run_graph(request_for("metric-cost-total"))
+        self.assertEqual(execution.domain_result.status.value, "needs_input")
+        self.assertEqual(execution.domain_result.error.code, "invalid_parameters")
+        self.assertIsNone(execution.plan)
+        self.assertEqual(refusal_reason_of(store), "fixed_tool_available")
+        self.assertEqual(store.nodes, ["select_schema", "authorize_scope"])
+        self.assertEqual(store.kinds.count("artifact"), 0)
+        self.assertEqual(store.kinds.count("diagnostic"), 0)
+        self.assertEqual(execution.domain_result.artifacts, [])
+
+    def test_clarification_missing_concept_and_empty_candidates_stop_at_selection(self):
+        # 三格都停在 select_schema，但归因不同：该澄清的要问用户，没注册概念的要说
+        # "换问法"（库里没有第五个新码，所以终止原因同为 schema_ambiguous，靠终态区分）。
+        cases = (("clarify", selection_for(READY_METRICS, groups=READY_GROUPS,
+                                          requires_clarification=True),
+                  "schema_ambiguous", "needs_input"),
+                 ("missing", selection_for(READY_METRICS, groups=READY_GROUPS,
+                                           missing_concepts=("profit_grain",)),
+                  "schema_ambiguous", "missing_data"),
+                 ("无候选", selection_for(READY_METRICS, groups=READY_GROUPS,
+                                         view_refs=(), field_refs=()),
+                  "schema_ambiguous", "needs_input"))
+        for label, selection, reason, status in cases:
+            with self.subTest(case=label):
+                conn = EvidenceConn()
+                execution, store, _context = run_graph(selection=selection, conn=conn)
+                self.assertEqual(store.nodes, ["select_schema"])
+                self.assertEqual(refusal_reason_of(store), reason)
+                self.assertEqual(execution.domain_result.status.value, status)
+                self.assertEqual(store.kinds.count("artifact"), 0)
+                self.assertEqual(conn.statements, [], "选择没定下来就不该读证据")
+
+    def test_readiness_failures_stop_before_the_database_gates(self):
+        """能力 / 质量 / 覆盖 / 时间口径 / 截止各说各的，并且都走不到 EXPLAIN。
+
+        P1-1 回归（red→green）：旧实现只看"这家店有没有任何能力标签"，所以一个
+        拿不到 `paid_orders` 授权的店也能被 `paid_amount` 的探索顺手带出去；现在逐
+        店逐指标走 `sources.unsupported_reason`，标签不对就该当场拒。同理，覆盖不再
+        拿订单脊柱推定、`data_as_of` 不再取 max。
+        """
+        # 请求要两个指标，其中 `paid_orders` 没被授权：旧实现只看"有没有任何标签"，
+        # 这一格会直接放行；新实现逐店逐指标问 `sources.unsupported_reason`。
+        both = request_for([PAID_METRIC, "metric-paid-orders"],
+                           [DAY_SHOP_DAILY, SHOP_SHOP_DAILY],
+                           start=GRAPH_START, end=GRAPH_END)
+        cases = (
+            ("标签存在但不是这个指标", {"shops": [("S1", "fxg", ["paid_amount"]),
+                                            ("S2", "fxg", ["paid_amount"])]},
+             "capability_unavailable"),
+            ("完全没标签", {"shops": [("S1", "fxg", []), ("S2", "fxg", ["paid_amount"])]},
+             "capability_unavailable"),
+            ("档案不在库里", {"shops": [("S1", "fxg", ["paid_amount"])]},
+             "source_not_onboarded"),
+            ("平台未登记来源", {"shops": [("S1", "nosuch", ["paid_amount", "paid_orders"]),
+                                     ("S2", "nosuch", ["paid_amount", "paid_orders"])]},
+             "source_not_onboarded"),
+            ("库读不到", {"broken": True}, "source_not_onboarded"))
+        for label, kwargs, reason in cases:
+            with self.subTest(case=label):
+                conn = EvidenceConn(**kwargs)
+                selection = selection_for([PAID_METRIC, "metric-paid-orders"],
+                                          groups=[DAY_SHOP_DAILY, SHOP_SHOP_DAILY])
+                _execution, store, _context = run_graph(both, selection=selection,
+                                                        conn=conn)
+                self.assertEqual(refusal_reason_of(store), reason)
+                self.assertEqual(store.nodes, ["select_schema", "authorize_scope",
+                                               "assess_readiness"])
+                self.assertEqual(store.kinds.count("artifact"), 0)
+                self.assertEqual(store.kinds.count("diagnostic"), 0)
+                # 只读那一条店铺事实：没有 EXPLAIN、没有真执行、也没有手写 multirange。
+                self.assertLessEqual(len(conn.statements), 1)
+                for sql in conn.statements:
+                    self.assertIn("reporting.v_shops", sql)
+
+    def test_one_metric_with_two_dependencies_publishes_both_basis_rows(self):
+        """P1-1a 回归（red→green）：`cash_difference` 合法地同时要订单与退款发生两个来源。
+
+        旧写法逐条 binding 各算一份签名再比"只许一份"，于是这个**每家店都一致**的指标被
+        永久判成"口径不兼容"（termination `contract_violation`）。兼容性只能按整条
+        (店 × 指标) 依赖表跨店比，与 `metrics._incompatible_metrics` 同一条规则。
+        """
+        cash = "metric-cash-difference"
+        selection = selection_for([cash], groups=[DAY_SHOP_DAILY, SHOP_SHOP_DAILY])
+        columns = [DAY_SHOP_DAILY, SHOP_ID_COLUMN, cash]
+        rows = [(GRAPH_START, "S1", Decimal("700.00")),
+                (GRAPH_START, "S2", Decimal("-30.00"))]
+
+        def execute(conn, plan, *, deadline):
+            return list(columns), [tuple(row) for row in rows]
+
+        conn = EvidenceConn(shops=[("S1", "fxg", ["cash_difference"]),
+                                   ("S2", "fxg", ["cash_difference"])])
+        execution, store, _context = run_graph(
+            request_for([cash], [DAY_SHOP_DAILY, SHOP_SHOP_DAILY],
+                        start=GRAPH_START, end=GRAPH_END),
+            selection=selection, conn=conn,
+            patches=graph_patches(selection, execute=execute))
+        self.assertEqual(execution.domain_result.status.value, "success",
+                         execution.domain_result.error)
+        payload = execution.domain_result.artifacts[0].public_payload
+        self.assertEqual({(item["basis"], item["time_basis"]) for item in payload["basis"]},
+                         {("platform_payment/v1", "pay_time"),
+                          ("platform_refund_occurrence/v1",
+                           "aftersale_completion_time")})
+        self.assertEqual({item["metric"] for item in payload["basis"]}, {cash})
+        self.assertEqual([row[cash] for row in payload["rows"]], ["700.00", "-30.00"])
+        self.assertEqual(refusal_reason_of(store), "succeeded")
+        self.assertEqual(store.kinds.count("artifact"), 1)
+        self.assertEqual(store.kinds.count("diagnostic"), 1)
+
+    def test_unknown_quality_must_publish_the_registered_disclosure(self):
+        """P1-1b 回归：质量三态不能被掰成两态。`unknown` 可出数但必须披露。
+
+        文本与限制码都是仓库里已登记的那一份（`_PUBLIC_LIMITATIONS` /
+        `_LIMITATION_CODES`，与固定指标查询、运营图同句），不是为探索新造的口径。
+        """
+        text = "来源质量未核验（尚无对账记录）"
+        for label, ready, expect_text, expect_code in (
+                ("未核验", assessment(quality="unknown"), [text],
+                 ["source_quality_unverified"]),
+                ("已核验", assessment(quality="passed"), [], [])):
+            with self.subTest(case=label):
+                execution, store, _context = run_graph(ready=ready)
+                self.assertEqual(execution.domain_result.status.value, "success",
+                                 execution.domain_result.error)
+                payload = execution.domain_result.artifacts[0].public_payload
+                self.assertEqual(payload["limitations"], expect_text)
+                self.assertEqual(execution.domain_result.model_payload["limitations"],
+                                 expect_text)
+                self.assertEqual(refusal_reason_of(store), "succeeded")
+                self.assertEqual(refusal_state(store).get("limitations", []), expect_code)
+                self.assertEqual(store.finish_record[6].get("limitation_codes", []),
+                                 expect_code)
+
+    def test_quality_failed_still_refuses_although_disclosure_exists(self):
+        """反向护栏：`failed` 不得被新的披露通道救成"可出数"。"""
+        _execution, store, _context = run_graph(ready=assessment(quality="failed"))
+        self.assertEqual(refusal_reason_of(store), "source_quality_failed")
+        self.assertEqual(store.kinds.count("artifact"), 0)
+
+    def test_coverage_engine_verdicts_are_mapped_one_by_one(self):
+        """覆盖引擎的四种结论必须是四个不同的原因码，不能合 fire。"""
+        cases = (("对账未通过", assessment(quality="failed"), "source_quality_failed"),
+                 ("部分覆盖", assessment(status="partial",
+                                       missing=[("2026-09-01", "2026-09-04")]),
+                  "coverage_incomplete"),
+                 ("完全没覆盖", assessment(status="missing",
+                                        missing=[("2026-09-01", "2026-09-08")]),
+                  "coverage_incomplete"),
+                 ("时间口径实测不成立", assessment(blocking=("S1",)),
+                  "coverage_time_basis_unverified"),
+                 ("时间口径未取证", assessment(disclosure=("S1",)),
+                  "coverage_time_basis_unverified"),
+                 ("共同截止未知", assessment(data_as_of=None), "data_as_of_unknown"),
+                 ("来源未开通的店", assessment(unconfigured=("S9",)), "source_not_onboarded"),
+                 ("引擎自己跳了", assessment(raise_error=RuntimeError("no sync_state")),
+                  "contract_violation"))
+        for label, ready, reason in cases:
+            with self.subTest(case=label):
+                conn = EvidenceConn()
+                _execution, store, _context = run_graph(ready=ready, conn=conn)
+                self.assertEqual(refusal_reason_of(store), reason)
+                self.assertEqual(store.nodes, ["select_schema", "authorize_scope",
+                                               "assess_readiness"])
+                self.assertEqual(store.kinds.count("artifact"), 0)
+                self.assertEqual(store.kinds.count("diagnostic"), 0)
+                self.assertEqual(len(conn.statements), 1)
+
+    def test_unattested_metric_is_refused_before_any_database_read(self):
+        """目录里拿不到已登记能力标签的指标（如 `cost_total`）：一句库也不发。"""
+        request = request_for("metric-cost-total", [DAY_COST, SHOP_COST],
+                              start=GRAPH_START, end=GRAPH_END)
+        conn = EvidenceConn()
+        _execution, store, _context = run_graph(
+            request, selection=selection_for(["metric-cost-total"],
+                                             groups=[DAY_COST, SHOP_COST]), conn=conn)
+        self.assertEqual(refusal_reason_of(store), "capability_unavailable")
+        self.assertEqual(store.nodes, ["select_schema", "authorize_scope",
+                                       "assess_readiness"])
+        self.assertEqual(conn.statements, [])
+
+    def test_mixed_basis_across_shops_is_not_summed(self):
+        """同一指标在两家店来自不同口径：汇成一个数就是回答了一个没人问过的问题。"""
+        conn = EvidenceConn(shops=[("S1", "fxg", ["paid_amount"]),
+                                   ("S2", "jd", ["paid_amount"])])
+        _execution, store, _context = run_graph(conn=conn)
+        # 库里没有第五个码能叫 basis_incompatible：终止原因记在 contract_violation 上，
+        # 但限制码与公开消息仍然是口径不兼容那一套，归因不丢。
+        self.assertEqual(refusal_reason_of(store), "contract_violation")
+        self.assertEqual(refusal_state(store)["limitations"], ["basis_incompatible"])
+        self.assertEqual(store.kinds.count("artifact"), 0)
+
+    def test_basis_entries_are_resolved_evidence_not_the_catalog_version(self):
+        """公开载荷的 `basis` 必须来自来源注册表：目录版本不是口径凭证。"""
+        from bi_agent.sources import METRIC_VERSION, PAYMENT_BASIS
+
+        execution, _store, _context = run_graph()
+        basis = execution.domain_result.artifacts[0].public_payload["basis"]
+        self.assertEqual({item["metric"] for item in basis}, {PAID_METRIC})
+        self.assertEqual({item["basis"] for item in basis}, {PAYMENT_BASIS})
+        self.assertEqual({item["time_basis"] for item in basis}, {"pay_time"})
+        self.assertEqual({item["metric_version"] for item in basis}, {METRIC_VERSION})
+        self.assertEqual({item["shop_ref"] for item in basis},
+                         {GRAPH_SHOP_REFS["S1"], GRAPH_SHOP_REFS["S2"]})
+        for item in basis:
+            self.assertNotIn("semantic/", item.values().__str__())
+        self.assertEqual(execution.domain_result.model_payload["basis"], basis)
+
+    def test_coverage_refusal_records_the_gap_and_the_limitation(self):
+        _execution, store, _context = run_graph(
+            ready=assessment(status="partial",
+                             missing=[("2026-09-01", "2026-09-04")]))
+        state = refusal_state(store)
+        self.assertEqual(state["coverage"]["gaps"], ["2026-09-01~2026-09-04"])
+        self.assertEqual(state["coverage"]["status"], "partial")
+        self.assertEqual(state["limitations"], ["coverage_incomplete"])
+        self.assertEqual(store.finish_record[2], "missing_data")
+
+    def test_pool_only_authorization_is_refused_without_substituting_ids(self):
+        """只能按池授权的视图：当场 `forbidden`，不拿池 id 去填店铺集合。"""
+        selection = selection_for("metric-physical-available-quantity",
+                                 groups=[POOL_PHYSICAL])
+        execution, store, _context = run_graph(
+            selection=selection, allowed_inventory_pool_ids=frozenset({"S1"}))
+        self.assertEqual(store.nodes, ["select_schema", "authorize_scope"])
+        self.assertEqual(refusal_reason_of(store), "forbidden")
+        self.assertEqual(execution.domain_result.error.code, "forbidden")
+        self.assertEqual(store.kinds.count("diagnostic"), 0)
+        self.assertEqual(execution.domain_result.model_payload["status"], "unavailable")
+
+    def test_empty_or_unmapped_scope_is_forbidden(self):
+        for label, overrides in (("空集合", {"allowed_shop_ids": frozenset()}),
+                                ("没有引用", {"shop_refs": {}})):
+            with self.subTest(case=label):
+                _execution, store, _context = run_graph(**overrides)
+                self.assertEqual(refusal_reason_of(store), "forbidden")
+                self.assertEqual(store.nodes, ["select_schema", "authorize_scope"])
+
+    def test_exhausted_budget_never_reaches_the_gates(self):
+        """剩不够两道 5 秒门加余量时直接停：宁可当场 deadline，也不留半截查询。"""
+        conn = EvidenceConn()
+        _execution, store, _context = run_graph(conn=conn,
+                                                deadline=time.monotonic() + 3.0)
+        self.assertEqual(refusal_reason_of(store), "deadline_exceeded")
+        self.assertEqual(store.nodes, ["select_schema", "authorize_scope",
+                                       "assess_readiness", "compile_query",
+                                       "validate_ast", "estimate_cost"])
+        self.assertEqual(len(conn.statements), 1, "只读了店铺事实，没有 EXPLAIN")
+        for sql in conn.statements:
+            self.assertTrue("reporting.v_shops" in sql or "reporting.v_coverage" in sql, sql)
+        self.assertEqual(store.kinds.count("diagnostic"), 0)
+
+    def test_second_gate_also_refuses_when_the_budget_is_short(self):
+        """估算用掉大半预算后，只读执行这一道门也不跑：预算不能被烧成半截执行。"""
+        from bi_agent.exploration.graph import FINAL_GATE_RESERVE_SECONDS, run_exploration_graph
+
+        store = RecordingStore()
+        context = graph_context(store, EvidenceConn(),
+                                deadline=time.monotonic() + 16.0)
+        executed = []
+
+        def spending_estimate(conn, plan, *, deadline):
+            # 模拟"EXPLAIN 花了 8 秒"：把剩余预算压到第二道门的最低线以下。
+            context.deadline = time.monotonic() + FINAL_GATE_RESERVE_SECONDS - 1.0
+            return stub_estimate(conn, plan, deadline=deadline)
+
+        patches = graph_patches(estimate=spending_estimate,
+                                execute=mock.Mock(side_effect=executed.append))
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            execution = run_exploration_graph(
+                question=GRAPH_QUESTION, request=ready_request(), context=context,
+                versions=graph_versions())
+        self.assertEqual(refusal_reason_of(store), "deadline_exceeded")
+        # 第二道门已经进格（归因要指到它），但一句库语句都没发。
+        self.assertEqual(store.nodes, list(EXPLORATION_NODES[:7]))
+        self.assertEqual(executed, [], "第二道门不该发起任何语句")
+        # 估算过的那份计划仍然交回（指纹与预算数字都是事实），但它一次也没被执行。
+        self.assertIsNotNone(execution.plan.estimated_rows)
+        self.assertEqual(store.kinds.count("diagnostic"), 0)
+        self.assertEqual(store.kinds.count("artifact"), 0)
+
+    def test_plan_is_never_mutated_after_fingerprinting(self):
+        """指纹之后不许改：改了就是「发出去的结果与留证的语句不是同一条」。"""
+        from bi_agent.exploration.graph import run_exploration_graph
+
+        seen: list[tuple] = []
+        store = RecordingStore()
+
+        def capture_execute(conn, plan, *, deadline):
+            seen.append((plan.statement_fingerprint, plan.sql_text,
+                         dict(plan.parameters), tuple(plan.selected_refs)))
+            return stub_execute(conn, plan, deadline=deadline)
+
+        patches = graph_patches(execute=capture_execute)
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            execution = run_exploration_graph(
+                question=GRAPH_QUESTION, request=ready_request(),
+                context=graph_context(store, EvidenceConn()),
+                versions=graph_versions())
+        fingerprint, sql_text, parameters, refs = seen[0]
+        self.assertEqual(execution.plan.statement_fingerprint, fingerprint)
+        self.assertEqual(execution.plan.sql_text, sql_text)
+        self.assertEqual(dict(execution.plan.parameters), parameters)
+        self.assertEqual(tuple(execution.plan.selected_refs), refs)
+        artifact_log = store.log[store.kinds.index("artifact")]
+        self.assertEqual(artifact_log[2]["statement_fingerprint"], fingerprint)
+        self.assertEqual(store.log[store.kinds.index("diagnostic")][2], sql_text)
+
+    def test_compile_rejection_is_attributed_to_the_selection(self):
+        """编译器接不下这份选择：归因到契约违规，不是策略拒绝。"""
+        selection = selection_for(READY_METRICS, groups=READY_GROUPS, selected_metrics=())
+        _execution, store, _context = run_graph(selection=selection)
+        self.assertEqual(store.nodes, ["select_schema", "authorize_scope",
+                                       "assess_readiness", "compile_query"])
+        self.assertEqual(refusal_reason_of(store), "contract_violation")
+        self.assertEqual(store.kinds.count("diagnostic"), 0)
+
+
+class ExplorationGraphFailureMappingTests(unittest.TestCase):
+    """策略 / 成本 / 持久化三类失败：原因码分开，载荷与事件不沾 SQL。"""
+
+    def test_policy_rejection_is_attributable_before_estimation(self):
+        from bi_agent.exploration.graph import run_exploration_graph
+
+        tampered = shell_draft(sql_text="SELECT * FROM reporting.v_shop_daily")
+        store = RecordingStore()
+        patches = graph_patches() + [mock.patch("bi_agent.exploration.graph.compile_query",
+                                                return_value=tampered)]
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            execution = run_exploration_graph(
+                question=GRAPH_QUESTION, request=ready_request(),
+                context=graph_context(store, EvidenceConn()),
+                versions=graph_versions())
+        self.assertEqual(refusal_reason_of(store), "sql_policy_rejected")
+        self.assertEqual(store.nodes, list(EXPLORATION_NODES[:5]))
+        self.assertEqual(store.kinds.count("diagnostic"), 0,
+                         "被策略拒掉的语句不该进诊断表")
+        self.assertIsNone(execution.plan)
+        self.assertNotIn("SELECT", repr(store.log))
+
+    def test_cost_over_budget_is_reported_as_cost_not_as_timeout(self):
+        from bi_agent.exploration.graph import run_exploration_graph
+        from bi_agent.exploration.models import ExplorationBudgetExceeded
+
+        store = RecordingStore()
+        patches = graph_patches(estimate=mock.Mock(
+            side_effect=ExplorationBudgetExceeded("estimated_rows")))
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            execution = run_exploration_graph(
+                question=GRAPH_QUESTION, request=ready_request(),
+                context=graph_context(store, EvidenceConn()),
+                versions=graph_versions())
+        self.assertEqual(refusal_reason_of(store), "query_cost_exceeded")
+        self.assertEqual(store.kinds.count("artifact"), 0)
+        self.assertEqual(execution.domain_result.status.value, "failed")
+        self.assertNotEqual(refusal_reason_of(store), "query_timeout")
+
+    def test_projection_and_statement_refusals_publish_nothing(self):
+        from bi_agent.exploration.graph import run_exploration_graph
+
+        for label, error in (("投影拒收", ValueError("exploration_shop_not_registered")),
+                             ("语句被库拒", ValueError("exploration_query_rejected")),
+                             ("结果过大", ValueError("exploration_result_too_large"))):
+            with self.subTest(case=label):
+                store = RecordingStore()
+                patches = graph_patches(execute=mock.Mock(side_effect=error))
+                from contextlib import ExitStack
+
+                with ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    execution = run_exploration_graph(
+                        question=GRAPH_QUESTION, request=ready_request(),
+                        context=graph_context(store, EvidenceConn()),
+                        versions=graph_versions())
+                self.assertEqual(execution.domain_result.status.value, "failed")
+                self.assertEqual(store.kinds.count("artifact"), 0)
+                self.assertEqual(store.kinds.count("diagnostic"), 0)
+                self.assertNotIn("SELECT", repr(execution.domain_result.model_payload))
+                self.assertNotIn("S1", repr(execution.domain_result.model_payload))
+                self.assertEqual(store.finish_record[1], "finalize")
+
+    def test_write_failures_clear_the_public_result(self):
+        """证据留不下 → 不发结果；结果存不下 → 也不算成功。"""
+        from bi_agent.exploration.graph import run_exploration_graph
+
+        for label, store in (("diagnostic", RecordingStore(fail_diagnostic=True)),
+                             ("artifact", RecordingStore(fail_artifact=True))):
+            with self.subTest(case=label):
+                from contextlib import ExitStack
+
+                with ExitStack() as stack:
+                    for patcher in graph_patches():
+                        stack.enter_context(patcher)
+                    execution = run_exploration_graph(
+                        question=GRAPH_QUESTION, request=ready_request(),
+                        context=graph_context(store, EvidenceConn()),
+                        versions=graph_versions())
+                self.assertEqual(execution.domain_result.status.value, "failed")
+                self.assertEqual(execution.domain_result.error.code,
+                                 "artifact_persistence_failed")
+                self.assertEqual(refusal_reason_of(store), "persistence_failed")
+                self.assertEqual(execution.domain_result.artifacts, [])
+                self.assertEqual(store.artifacts, {})
+                # 计划仍然交了：指纹在，只是结果没发出去。
+                self.assertIsNotNone(execution.plan)
+
+
+class ExplorationToolAdapterTests(unittest.TestCase):
+    """Tool 面：模型只能给 ref 与业务值，提问由服务端注入。"""
+
+    def _selection(self, **overrides):
+        return selection_for(READY_METRICS, groups=READY_GROUPS, **overrides)
+
+    def _call(self, arguments, error=None):
+        from bi_agent.llm import ToolCall
+
+        return ToolCall(id="call_1", name="explore_business_data", arguments=arguments,
+                        arguments_error=error)
+
+    def test_schema_offers_only_this_rounds_refs_and_no_server_keys(self):
+        from bi_agent.exploration.tool import exploration_request_schema
+
+        selection = self._selection()
+        schema = exploration_request_schema(selection)
+        self.assertEqual(set(schema["properties"]),
+                         {"entity_refs", "requested_metric_refs", "group_by_field_refs",
+                          "start", "end", "limit"})
+        self.assertIs(schema["additionalProperties"], False)
+        self.assertEqual(schema["required"], ["requested_metric_refs"])
+        for name, allowed in (("entity_refs", selection.entity_refs),
+                              ("requested_metric_refs", selection.metric_refs),
+                              ("group_by_field_refs", selection.field_refs)):
+            with self.subTest(field=name):
+                self.assertEqual(schema["properties"][name]["items"]["enum"],
+                                 sorted(allowed))
+        for banned in ("question", "sql", "sql_text", "shop_id", "shop_ids",
+                      "allowed_shop_ids", "statement_fingerprint", "catalog_version",
+                      "selected_refs", "domain", "parameters"):
+            self.assertNotIn(banned, schema["properties"], banned)
+        # 换一个 selection 就换一个 enum：词表不是写死的。
+        # 换一个 selection 就换一个 enum：词表不是写死的，而是跟着本轮检索走。
+        narrow = selection_for(["metric-paid-amount"])
+        other = exploration_request_schema(narrow)
+        self.assertEqual(other["properties"]["requested_metric_refs"]["items"]["enum"],
+                         ["metric-paid-amount"])
+        self.assertEqual(other["properties"]["group_by_field_refs"]["items"]["enum"],
+                         sorted(narrow.field_refs))
+        with self.assertRaises(TypeError):
+            exploration_request_schema({})
+
+    def test_server_question_replaces_anything_the_model_might_offer(self):
+        from bi_agent.exploration.tool import execute_exploration_tool
+
+        captured: dict = {}
+        placeholder = _ToolPassThrough()
+
+        def fake_graph(**kwargs):
+            captured.update(kwargs)
+            return placeholder
+
+        store = RecordingStore()
+        conn = EvidenceConn()
+        with mock.patch("bi_agent.exploration.tool.run_exploration_graph",
+                        side_effect=fake_graph), \
+                mock.patch("bi_agent.exploration.tool.retrieve_schema_candidates",
+                           return_value=self._selection()):
+            returned = execute_exploration_tool(
+                self._call({"requested_metric_refs": [PAID_METRIC],
+                            "group_by_field_refs": [DAY_SHOP_DAILY], "limit": 20}),
+                graph_context(store, conn), question=GRAPH_QUESTION,
+                versions=graph_versions())
+        self.assertIs(returned, placeholder)
+        self.assertEqual(captured["question"], GRAPH_QUESTION)
+        self.assertEqual(captured["request"].question, GRAPH_QUESTION)
+        self.assertEqual(captured["versions"], graph_versions())
+        self.assertEqual(captured["request"].limit, 20)
+        self.assertEqual(store.log, [], "图接管了运行记录，Tool 不再补写")
+
+    def test_server_owned_and_unparsable_arguments_are_refused_before_sql(self):
+        from bi_agent.exploration.tool import execute_exploration_tool
+
+        cases = (("带 SQL", {"requested_metric_refs": [PAID_METRIC],
+                           "sql": "SELECT * FROM bi.orders"}, None),
+                 ("带提问", {"requested_metric_refs": [PAID_METRIC],
+                           "question": "自己写提问"}, None),
+                 ("带店号", {"requested_metric_refs": [PAID_METRIC],
+                           "shop_ids": ["S1"]}, None),
+                 ("带授权", {"requested_metric_refs": [PAID_METRIC],
+                           "allowed_shop_ids": ["S1"]}, None),
+                 ("缺指标", {"group_by_field_refs": [DAY_SHOP_DAILY]}, None),
+                 ("limit 越界", {"requested_metric_refs": [PAID_METRIC],
+                             "limit": 5000}, None),
+                 ("窗口不完整", {"requested_metric_refs": [PAID_METRIC],
+                             "start": "2026-09-01"}, None),
+                 ("ref 不是 ref", {"requested_metric_refs": ["SUM(cost_total)"]}, None),
+                 ("不可解析", None, "json truncated"),
+                 ("参数缺席", None, None))
+        for label, arguments, error in cases:
+            with self.subTest(case=label):
+                store = RecordingStore()
+                conn = EvidenceConn()
+                with mock.patch("bi_agent.exploration.tool.run_exploration_graph") as graph:
+                    execution = execute_exploration_tool(
+                        self._call(arguments, error), graph_context(store, conn),
+                        question=GRAPH_QUESTION, versions=graph_versions())
+                graph.assert_not_called()
+                self.assertIsNone(execution.plan)
+                self.assertEqual(execution.domain_result.status.value, "needs_input")
+                self.assertEqual(execution.domain_result.error.code, "invalid_parameters")
+                self.assertEqual(execution.domain_result.artifacts, [])
+                self.assertEqual(store.kinds.count("artifact"), 0)
+                self.assertEqual(store.kinds.count("diagnostic"), 0)
+                self.assertEqual(conn.statements, [])
+                # 原因码可归因，而且留下一条可审计的运行记录。
+                self.assertEqual(store.kinds[0], "create_run")
+                self.assertEqual(store.kinds[-1], "finish")
+                self.assertEqual(store.finish_record[3], "invalid_parameters")
+                self.assertEqual(store.finish_record[1], "finalize")
+                self.assertNotIn("SELECT", repr(store.log))
+                self.assertNotIn("S1", repr(store.log))
+
+    def test_refs_outside_the_servers_selection_are_refused(self):
+        """枚举是提示，不是凭据：服务端重检一遍才算授权。
+
+        三个用例都给的是**目录里真实存在**的 ref（不是乱写的字符串），只是本轮检索没
+        选中它们：形状合法而集合外，才是最需要子集检查的那一类。
+        """
+        from bi_agent.exploration.tool import execute_exploration_tool
+
+        cases = (("指标越界", {"requested_metric_refs": ["metric-paid-orders"],
+                            "group_by_field_refs": [DAY_SHOP_DAILY]}),
+                 ("分组越界", {"requested_metric_refs": [PAID_METRIC],
+                            "group_by_field_refs": [SHOPS_PLATFORM]}),
+                 ("实体越界", {"requested_metric_refs": [PAID_METRIC],
+                            "entity_refs": ["entity-product"],
+                            "group_by_field_refs": [DAY_SHOP_DAILY]}))
+        for label, arguments in cases:
+            with self.subTest(case=label):
+                store = RecordingStore()
+                conn = EvidenceConn()
+                with mock.patch("bi_agent.exploration.tool.retrieve_schema_candidates",
+                                return_value=self._selection()),                         mock.patch("bi_agent.exploration.tool.run_exploration_graph") as graph:
+                    execution = execute_exploration_tool(self._call(arguments),
+                                                        graph_context(store, conn),
+                                                        question=GRAPH_QUESTION,
+                                                        versions=graph_versions())
+                graph.assert_not_called()
+                self.assertIsNone(execution.plan)
+                self.assertEqual(store.finish_record[3], "schema_ambiguous")
+                self.assertEqual(store.kinds.count("artifact"), 0)
+                self.assertEqual(conn.statements, [])
+
+    def test_stale_catalog_version_is_refused_without_running_the_graph(self):
+        from bi_agent.exploration.tool import execute_exploration_tool
+
+        store = RecordingStore()
+        conn = EvidenceConn()
+        stale = graph_versions().model_copy(
+            update={"semantic_catalog_version": "semantic/1970-01-01.1"})
+        with mock.patch("bi_agent.exploration.tool.run_exploration_graph") as graph:
+            execution = execute_exploration_tool(
+                self._call({"requested_metric_refs": [PAID_METRIC],
+                            "group_by_field_refs": [DAY_SHOP_DAILY]}),
+                graph_context(store, conn), question=GRAPH_QUESTION, versions=stale)
+        graph.assert_not_called()
+        self.assertIsNone(execution.plan)
+        self.assertEqual(store.finish_record[3], "schema_ambiguous")
+
+    def test_tool_refusal_payload_still_passes_the_runtime_validator(self):
+        """拒答载荷也是公开载荷：形状不合法就是第二份 bug。"""
+        from bi_agent.exploration.tool import execute_exploration_tool
+        from bi_agent.runtime.models import validate_model_payload
+
+        store = RecordingStore()
+        conn = EvidenceConn()
+        with mock.patch("bi_agent.exploration.tool.run_exploration_graph"):
+            execution = execute_exploration_tool(self._call({"sql": "SELECT 1"}),
+                                                graph_context(store, conn),
+                                                question=GRAPH_QUESTION,
+                                                versions=graph_versions())
+        payload = execution.domain_result.model_payload
+        self.assertEqual(validate_model_payload(payload), payload)
+        self.assertEqual(payload["termination_reason"], "invalid_parameters")
+
+
+class _ToolPassThrough:
+    """Tool 用例里替图接住的返回值：只证明 Tool 原样转交。"""
+
+    plan = None
+    domain_result = None
+
+
+class ExplorationGraphCrashFinalizationTests(unittest.TestCase):
+    """P1-2 回归（red→green）：意外异常不能让运行记录停在 `running`。
+
+    唯一键 `(user_message_id, domain, attempt_no)` 会占住同一次尝试的重放（`sql/004`），
+    而会话侧没有回收器：一条半死的运行如果不落终态，就既查不出为什么失败，也重不了。
+    与经营/运营/价审/库存四张图同一契约：best-effort 收尾，然后**原样上抛**。
+    """
+
+    def test_mid_chain_store_failure_still_finalizes_and_reraises(self):
+        from bi_agent.exploration.graph import run_exploration_graph
+
+        for label, kwargs in (("第二条推进失败", {"fail_transition_after": 2}),
+                              ("最后一条推进失败", {"fail_transition_after": 6})):
+            with self.subTest(case=label):
+                store = RecordingStore(**kwargs)
+                patches = graph_patches()
+                from contextlib import ExitStack
+
+                with ExitStack() as stack:
+                    for patcher in patches:
+                        stack.enter_context(patcher)
+                    with self.assertRaises(RuntimeError):
+                        run_exploration_graph(
+                            question=GRAPH_QUESTION, request=ready_request(),
+                            context=graph_context(store, EvidenceConn()),
+                            versions=graph_versions())
+                # 收尾补上了一个终态，而不是留在 running。
+                self.assertEqual(store.finishes, 1)
+                self.assertEqual(store.finish_record[1], "finalize")
+                self.assertEqual(store.finish_record[2], "failed")
+                self.assertEqual(store.finish_record[3], "upstream_unavailable")
+                self.assertEqual(store.finish_record[4], "unavailable")
+                self.assertEqual(store.kinds.count("artifact"), 0)
+                self.assertEqual(store.kinds.count("diagnostic"), 0)
+
+    def test_unexpected_step_failure_finalizes_once(self):
+        """节点自已在收尾之外爆炸（不是可归因的招拒）：也不能留 running。"""
+        from bi_agent.exploration.graph import run_exploration_graph
+
+        store = RecordingStore()
+        patches = graph_patches() + [
+            mock.patch("bi_agent.exploration.graph.compile_query",
+                       side_effect=KeyError("programmer error"))]
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            with self.assertRaises(KeyError):
+                run_exploration_graph(question=GRAPH_QUESTION, request=ready_request(),
+                                      context=graph_context(store, EvidenceConn()),
+                                      versions=graph_versions())
+        self.assertEqual(store.finishes, 1)
+        self.assertEqual(store.finish_record[2], "failed")
+        self.assertEqual(store.finish_record[3], "upstream_unavailable")
+        # 不能把本来已归因的拒答劫成另一个原因：这一步压根没跑到收尾。
+        self.assertNotEqual(store.finish_record[3], "contract_violation")
+
+    def test_finalize_failure_is_not_replaced_by_the_cleanup_write(self):
+        """收尾本身也写了：不掩盖原异常，也不无限重试（二次写失败必须吞掉）。"""
+        from bi_agent.exploration.graph import run_exploration_graph
+
+        store = RecordingStore(fail_finish=True)
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            for patcher in graph_patches():
+                stack.enter_context(patcher)
+            with self.assertRaises(RuntimeError) as caught:
+                run_exploration_graph(question=GRAPH_QUESTION, request=ready_request(),
+                                      context=graph_context(store, EvidenceConn()),
+                                      versions=graph_versions())
+        self.assertIn("finish write failed", str(caught.exception))
+        self.assertEqual(store.finishes, 2, "一次收尾 + 一次 best-effort 补写")
+
+    def test_happy_path_does_not_write_a_second_completion(self):
+        _execution, store, _context = run_graph()
+        self.assertEqual(store.finishes, 1)
+        self.assertEqual(store.finish_record[2], "succeeded")
+        self.assertNotEqual(store.finish_record[3], "upstream_unavailable")
 
 
 if __name__ == "__main__":

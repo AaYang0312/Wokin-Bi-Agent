@@ -18,6 +18,8 @@ ARTIFACT_TYPES = frozenset({
     "chart_spec",
     "price_audit",
     "inventory_alerts",
+    # 受控 SQL 探索（计划 Task 5）：安全结果 + 口径/覆盖/诊断/限制，永远没有 SQL 原文。
+    "exploration_result",
 })
 
 # 数据集与图表必须成对同版本：chart_spec 只能引用这两类数据集 Artifact。
@@ -75,6 +77,13 @@ INVENTORY_NODES = frozenset({
     "compute_total_and_shop_levels", "evaluate_thresholds", "classify_actions",
     "persist_alerts", "finalize",
 })
+# 受控 SQL 探索（计划 Task 5 Step 1 的固定九节点链）。推进顺序由
+# `exploration/graph.py` 的状态机决定（阶段二），这里只回答"这个领域能不能写这个节点"。
+# 与价审/库存同一做派：必须与图上的节点枚举逐项相等（由用例比对）。
+EXPLORATION_NODES = frozenset({
+    "select_schema", "authorize_scope", "assess_readiness", "compile_query",
+    "validate_ast", "estimate_cost", "execute_readonly", "persist_artifact", "finalize",
+})
 
 _REGISTRY: dict[str, DomainSpec] = {
     "business_query": DomainSpec(
@@ -99,6 +108,11 @@ _REGISTRY: dict[str, DomainSpec] = {
     "inventory_watch": DomainSpec(
         name="inventory_watch", nodes=INVENTORY_NODES,
         artifact_types=frozenset({"inventory_alerts"}),
+    ),
+    # 受控 SQL 探索只发这一种 Artifact：它不是固定指标查询的数据集，也不借道价审/库存。
+    "controlled_sql_exploration": DomainSpec(
+        name="controlled_sql_exploration", nodes=EXPLORATION_NODES,
+        artifact_types=frozenset({"exploration_result"}),
     ),
 }
 
@@ -137,5 +151,5 @@ def allows_node(domain: str, node: object) -> bool:
 
 
 __all__ = ["ARTIFACT_TYPES", "COMMERCE_NODES", "DATASET_ARTIFACT_TYPES", "DomainSpec",
-           "DomainUnknown", "INVENTORY_NODES", "LISTING_NODES", "allows_artifact_type",
-           "allows_node", "domains", "known_domain", "spec_for"]
+           "DomainUnknown", "EXPLORATION_NODES", "INVENTORY_NODES", "LISTING_NODES",
+           "allows_artifact_type", "allows_node", "domains", "known_domain", "spec_for"]

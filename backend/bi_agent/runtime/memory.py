@@ -40,6 +40,9 @@ class MemoryQueryRunStore:
         self.runs: dict[UUID, dict[str, object]] = {}
         self.events: dict[UUID, list[dict[str, object]]] = {}
         self.artifacts: dict[UUID, dict[str, object]] = {}
+        # 私有诊断：与 Postgres 的 `bi.query_diagnostics` 同一个位置——按设计带着 SQL 原文
+        # 与真店铺主键，所以不进 runs/events/artifacts 中任何一份公开记录。
+        self.diagnostics: dict[UUID, list[dict[str, object]]] = {}
 
     def create_run(self, record: NewQueryRun) -> UUID:
         record = self._revalidate_new_run(record)
@@ -139,6 +142,32 @@ class MemoryQueryRunStore:
             "created_at": _now(),
         }
         return ArtifactRef(id=artifact_id, type=artifact.artifact_type)
+
+    @property
+    def diagnostic_count(self) -> int:
+        """已记录的私有诊断总数：阶段二的图用它证明“一次执行只留一份证据”。"""
+        return sum(len(items) for items in self.diagnostics.values())
+
+    def record_diagnostic(self, run_id: UUID, *, template_id: str, sql_text: str,
+                          parameters: dict[str, object]) -> UUID:
+        """内存版本的私有诊断记录：与 Postgres 同一契约，只记在公开三条记录之外。
+
+        这条通道按设计带着 SQL 原文与真店铺主键（Postgres 那边写的是
+        `bi.query_diagnostics`），所以**不**跑 `_reject_forbidden_values`：那道护栏是给
+        公开载荷的，套到这里只会让门禁无法留证。运行行不存在同样报 `RunNotFound`：
+        两个实现不能在“写失败长成什么样”上分叉。
+        """
+        self._require_run(run_id)
+        diagnostic_id = uuid4()
+        self.diagnostics.setdefault(run_id, []).append({
+            "id": diagnostic_id,
+            "run_id": run_id,
+            "template_id": template_id,
+            "sql_text": sql_text,
+            "parameters": deepcopy(parameters),
+            "recorded_at": _now(),
+        })
+        return diagnostic_id
 
     def record_provenance(self, run_id: UUID, *, provenance, identity) -> None:
         run = self._require_run(run_id)

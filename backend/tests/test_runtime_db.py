@@ -7,10 +7,13 @@ as ``test_db.py`` prevent this module from connecting to a production host.
 
 import json
 import os
+import re
 import traceback
+from decimal import Decimal
 import unittest
+from unittest import mock
 from contextlib import nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -22,8 +25,13 @@ import psycopg
 from .dbfixtures import connect_test_db
 from .fakeconn import P1_REF, S1_REF, S2_REF, price_audit_payload
 from .test_exploration import (
-    DAY_COST, SHOP_COST, SHOP_ID_COLUMN, SHOP_REF_COLUMN, ExplorationLivePlanFixture,
-    project, repository_entries, server_plan)
+    BASELINE_ARTIFACT_TYPES, BASELINE_DOMAINS, BASELINE_TERMINATION_REASONS, COST_METRIC,
+    DAY_COST, EXPLORATION_PAYLOAD_KEYS,
+    EXPLORATION_ARTIFACT_TYPE, EXPLORATION_DOMAIN, EXPLORATION_NODES, GRAPH_QUESTION,
+    EXPLORATION_TERMINATION_REASONS, SHOP_COST, SHOP_ID_COLUMN, SHOP_REF_COLUMN,
+    ExplorationLivePlanFixture, exploration_payload, graph_context, graph_versions,
+    project, ready_request, repository_entries, selection_for, server_plan,
+    validate_exploration, DAY_SHOP_DAILY, SHOP_SHOP_DAILY)
 from bi_agent.runtime import PostgresQueryRunStore
 from bi_agent.runtime.models import (
     ArtifactPersistenceError,
@@ -41,6 +49,8 @@ from bi_agent.runtime.models import (
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 MIGRATION = Path(__file__).parents[1] / "sql" / "004_query_runtime.sql"
+# 受控 SQL 探索的运行契约迁移（计划 Task 5 Step 3）：只在本机 `*_test` 库里重放。
+MIGRATION_020 = "020_controlled_sql_exploration.sql"
 
 
 class RuntimeStoreValidationTests(unittest.TestCase):
@@ -882,3 +892,541 @@ class ExplorationRoleDatabaseTests(ExplorationLivePlanFixture, unittest.TestCase
         with psycopg.connect(os.environ["BI_TEST_READER_DSN"]) as conn:
             with self.assertRaises(psycopg.errors.InsufficientPrivilege):
                 conn.execute("DELETE FROM bi.orders")
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ExplorationMigrationTests(RuntimeDatabaseFixture, unittest.TestCase):
+    """计划 Task 5 Step 3：020 重建三份 CHECK、幂等，并且不给诊断开第二条读取通道。
+
+    全部 DDL 都在本类的管理员外层事务里跑，结束按 Rollback 协议退出：共享测试库只保留
+    已提交的那一份 020，不保留仿真用的 022。
+    """
+
+    CONSTRAINTS = ("query_runs_domain_check", "query_artifacts_artifact_type_check",
+                   "query_runs_termination_reason")
+
+    def setUp(self):
+        super().setUp()
+        self.migration_path = Path(__file__).parents[1] / "sql" / MIGRATION_020
+        self.migration = self.migration_path.read_text(encoding="utf-8")
+
+    def _definitions(self) -> dict[str, str]:
+        rows = self.conn.execute(
+            """SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+               WHERE conname = ANY(%s)""", (list(self.CONSTRAINTS),)).fetchall()
+        self.assertEqual(len(rows), len(self.CONSTRAINTS),
+                         f"三份 CHECK 必须都在：{[row[0] for row in rows]}")
+        return {str(row[0]): str(row[1]) for row in rows}
+
+    def _reporting_views(self):
+        return self.conn.execute(
+            "SELECT table_name FROM information_schema.views "
+            "WHERE table_schema='reporting' ORDER BY table_name").fetchall()
+
+    def test_020_is_the_next_numbered_migration_after_019(self):
+        """迁移编号已冻结：020 只属于本计划，而且排在 019 之后。"""
+        files = sorted(path.name for path in self.migration_path.parent.glob("*.sql"))
+        self.assertIn(MIGRATION_020, files)
+        self.assertGreater(files.index(MIGRATION_020),
+                           files.index("019_inventory_snapshots.sql"))
+        self.assertEqual([name for name in files if name.startswith("020")], [MIGRATION_020],
+                         "同一编号不能有两份迁移：那意味着 020 已被占用")
+
+    def test_replaying_020_twice_never_narrows_the_whitelists(self):
+        from bi_agent.runtime.artifacts import TERMINATION_REASONS
+        from bi_agent.runtime.domain_registry import ARTIFACT_TYPES, domains
+
+        self.conn.execute(self.migration)
+        once = self._definitions()
+        self.conn.execute(self.migration)
+        self.assertEqual(self._definitions(), once, "重放不得改变约束定义")
+        domain_def = once["query_runs_domain_check"]
+        artifact_def = once["query_artifacts_artifact_type_check"]
+        reason_def = once["query_runs_termination_reason"]
+        for value in sorted(BASELINE_DOMAINS | {EXPLORATION_DOMAIN} | set(domains())):
+            self.assertIn(f"'{value}'", domain_def, f"库里的领域名单缺 {value}")
+        for value in sorted(BASELINE_ARTIFACT_TYPES | {EXPLORATION_ARTIFACT_TYPE}
+                            | set(ARTIFACT_TYPES)):
+            self.assertIn(f"'{value}'", artifact_def, f"库里的类型名单缺 {value}")
+        for value in sorted(TERMINATION_REASONS | BASELINE_TERMINATION_REASONS):
+            self.assertIn(f"'{value}'", reason_def, f"库里的码表缺 {value}")
+        # 多一个就算宽：库里的领域取值必须逐项等于注册表，不能变成自由文本列。
+        self.assertEqual(sorted(re.findall(r"'([a-z_]+)'", domain_def)), sorted(domains()))
+
+    def test_020_keeps_values_another_lane_already_added(self):
+        """020 必须能在 022 之后执行而不收缩：库里已存在的额外取值全部保留。"""
+        for statement in (
+            """ALTER TABLE bi.query_runs DROP CONSTRAINT IF EXISTS query_runs_domain_check;
+               ALTER TABLE bi.query_runs ADD CONSTRAINT query_runs_domain_check CHECK (
+                 domain IN ('business_query', 'commerce_performance',
+                            'controlled_sql_exploration', 'inventory_watch',
+                            'isolated_analysis', 'listing_price_audit'))""",
+            """ALTER TABLE bi.query_artifacts DROP CONSTRAINT IF EXISTS
+                     query_artifacts_artifact_type_check;
+               ALTER TABLE bi.query_artifacts ADD CONSTRAINT
+                     query_artifacts_artifact_type_check CHECK (
+                 artifact_type IN ('analysis_result', 'chart_spec', 'comparison_table',
+                                   'exploration_result', 'inventory_alerts',
+                                   'metric_result', 'price_audit', 'trend_series'))""",
+        ):
+            self.conn.execute(statement)
+        self.conn.execute(self.migration)
+        self.conn.execute(self.migration)
+        definitions = self._definitions()
+        for value in ("isolated_analysis", "controlled_sql_exploration",
+                      "business_query", "inventory_watch"):
+            self.assertIn(f"'{value}'", definitions["query_runs_domain_check"], value)
+        for value in ("analysis_result", "exploration_result", "chart_spec",
+                      "inventory_alerts"):
+            self.assertIn(f"'{value}'", definitions["query_artifacts_artifact_type_check"],
+                          value)
+
+    def test_020_accepts_the_new_values_and_still_rejects_unknown_ones(self):
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        run_id = uuid4()
+        self.conn.execute(
+            """INSERT INTO bi.query_runs (id, chat_id, user_message_id, subject_id,
+                   tool_call_id, domain, attempt_no, normalized_request, state)
+               VALUES (%s, %s, %s, 'u1', 'call_1', %s, 1, '{}', '{}')""",
+            (run_id, chat_id, message_id, EXPLORATION_DOMAIN))
+        self.conn.execute(
+            """INSERT INTO bi.query_artifacts (id, run_id, artifact_type, payload)
+               VALUES (%s, %s, %s, %s::jsonb)""",
+            (uuid4(), run_id, EXPLORATION_ARTIFACT_TYPE,
+             json.dumps(exploration_payload(), ensure_ascii=False, default=str)))
+        self.conn.execute("UPDATE bi.query_runs SET termination_reason=%s WHERE id=%s",
+                          ("query_cost_exceeded", run_id))
+        for reason in sorted(EXPLORATION_TERMINATION_REASONS):
+            self.conn.execute("UPDATE bi.query_runs SET termination_reason=%s WHERE id=%s",
+                              (reason, run_id))
+        for statement, parameters in (
+                ("""INSERT INTO bi.query_runs (id, chat_id, user_message_id, subject_id,
+                        tool_call_id, domain, attempt_no, normalized_request, state)
+                    VALUES (%s, %s, %s, 'u1', 'c', %s, 2, '{}', '{}')""",
+                 (uuid4(), chat_id, message_id, "arbitary_sql")),
+                ("UPDATE bi.query_runs SET termination_reason=%s WHERE id=%s",
+                 ("query_was_too_slow", run_id))):
+            with self.subTest(parameters=str(parameters)[-24:]), \
+                    self.assertRaises(psycopg.errors.CheckViolation):
+                with self.conn.transaction():
+                    self.conn.execute(statement, parameters)
+
+    def test_020_leaves_the_diagnostics_channel_private(self):
+        """不新增 reporting 视图，也不给 bi_reader 任何新授权。"""
+        views_before = self._reporting_views()
+        self.conn.execute(self.migration)
+        self.assertEqual(self._reporting_views(), views_before, "020 不得建视图")
+        exposed = self.conn.execute(
+            "SELECT count(*) FROM information_schema.views "
+            "WHERE view_definition ILIKE '%query_diagnostics%'").fetchone()[0]
+        self.assertEqual(exposed, 0, "诊断记录不得经任何视图暴露")
+        privileges = self.conn.execute(
+            """SELECT has_table_privilege('bi_reader', 'bi.query_diagnostics', 'SELECT'),
+                       has_table_privilege('bi_reader', 'bi.query_diagnostics', 'INSERT'),
+                       has_table_privilege('bi_app', 'bi.query_diagnostics', 'INSERT'),
+                       has_table_privilege('public', 'bi.query_diagnostics', 'SELECT')
+                   """).fetchone()
+        self.assertEqual(privileges, (False, False, True, False), privileges)
+
+    def test_exploration_run_and_artifact_round_trip_through_the_postgres_store(self):
+        """Store 与库同一口径：能写进去的载荷读回来仍然没有 SQL 与真店号。"""
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        store = PostgresQueryRunStore(self.conn, forbidden_values={"S1", "ERP-P-9"})
+        run_id = store.create_run(NewQueryRun(
+            chat_id=chat_id, user_message_id=message_id, subject_id="u1",
+            tool_call_id="call_1", domain=EXPLORATION_DOMAIN, attempt_no=1,
+            state={"node": EXPLORATION_NODES[0]}))
+        ref = store.save_artifact(run_id, NewArtifact(
+            artifact_type=EXPLORATION_ARTIFACT_TYPE, payload=exploration_payload()))
+        row = self.conn.execute(
+            "SELECT artifact_type, payload FROM bi.query_artifacts WHERE id=%s",
+            (ref.id,)).fetchone()
+        self.assertEqual(row[0], EXPLORATION_ARTIFACT_TYPE)
+        stored = row[1] if isinstance(row[1], dict) else json.loads(row[1])
+        self.assertEqual(validate_exploration(stored), stored)
+        self.assertNotIn("SELECT", json.dumps(stored, ensure_ascii=False))
+        diagnostic_id = store.record_diagnostic(
+            run_id, template_id="exploration_sql",
+            sql_text='SELECT fact."day" FROM reporting.v_product_cost_daily AS fact',
+            parameters={"allowed_shop_ids": ["S1"], "limit": 100})
+        self.assertEqual(self.conn.execute(
+            "SELECT parameters->>'limit' FROM bi.query_diagnostics WHERE id=%s",
+            (diagnostic_id,)).fetchone()[0], "100")
+        store.finish(run_id, RunCompletion(
+            expected_revision=0, node="finalize", status=RunStatus.SUCCEEDED, state={},
+            termination_reason="succeeded"))
+        self.assertEqual(self.conn.execute(
+            "SELECT current_node, termination_reason FROM bi.query_runs WHERE id=%s",
+            (run_id,)).fetchone(), ("finalize", "succeeded"))
+
+    def test_record_diagnostic_reports_the_same_failures_as_the_memory_store(self):
+        """运行行不存在与约束违反：两个 Store 必须长成同一个异常。"""
+        store = PostgresQueryRunStore(self.conn, forbidden_values={"S1"})
+        with self.assertRaises(RunNotFound):
+            with self.conn.transaction():      # 外键违反会中止事务：用保存点收回去
+                store.record_diagnostic(uuid4(), template_id="exploration_sql",
+                                        sql_text="SELECT 1", parameters={})
+        chat_id, message_id = self._seed_user_message(subject="u1")
+        run_id = store.create_run(NewQueryRun(
+            chat_id=chat_id, user_message_id=message_id, subject_id="u1",
+            tool_call_id="call_1", domain=EXPLORATION_DOMAIN, attempt_no=1,
+            state={"node": "select_schema"}))
+        with self.assertRaises(ArtifactPersistenceError):
+            with self.conn.transaction():
+                store.record_diagnostic(run_id, template_id=" padded ",
+                                       sql_text="SELECT 1", parameters={})
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ExplorationGraphDatabaseTests(ExplorationLivePlanFixture, unittest.TestCase):
+    """真库上的成功路径与四类拒答：九格全走，一条真 SELECT，一份诊断，一份公开结果。
+
+    店铺按 `platform='fxg'` 与 `reporting.v_shop_daily` 现有数据挑（`fxg` 是注册表里唯一
+    “付款时间口径实测成立”的交易通道），能力标签与来源覆盖由本用例在回滚事务里造：
+    readiness 走的是 `sources` + `data_quality` 那两份**已登记**契约，不是替身字面量。
+    """
+
+    PAID = "metric-paid-amount"
+
+    def setUp(self):
+        super().setUp()
+        from bi_agent.data_quality import QUALITY_RULE
+        from bi_agent.sources import TRADE_LIST_SOURCE
+
+        self.quality_rule = QUALITY_RULE
+        self.source = TRADE_LIST_SOURCE
+        row = self.conn.execute(
+            "SELECT s.shop_id, min(v.day), max(v.day) FROM reporting.v_shop_daily v "
+            "JOIN bi.shops s ON s.shop_id = v.shop_id WHERE s.platform = 'fxg' "
+            "  AND s.enabled GROUP BY s.shop_id "
+            "ORDER BY count(DISTINCT v.day) DESC, s.shop_id LIMIT 1").fetchone()
+        assert row is not None, "测试库里没有 fxg 店的 v_shop_daily 数据：无法取证"
+        self.shop_id, first, last = str(row[0]), row[1], row[2]
+        assert (last - first).days + 1 <= 300, f"窗口超出预算：{first}..{last}"
+        self.start, self.end = first, last + timedelta(days=1)
+        from bi_agent.catalog import ref_for_key
+
+        self.shop_ref = ref_for_key("shop", self.shop_id)
+        self.chat_id, self.user_message_id = uuid4(), uuid4()
+        self.conn.execute("INSERT INTO bi.app_chats(id, subject_id, title) "
+                          "VALUES (%s, 'exploration-subject', '探索')", (self.chat_id,))
+        self.conn.execute(
+            "INSERT INTO bi.app_messages(id, chat_id, role, content, status) "
+            "VALUES (%s, %s, 'user', %s, 'complete')",
+            (self.user_message_id, self.chat_id, GRAPH_QUESTION))
+        self.conn.execute("UPDATE bi.shops SET capabilities=%s WHERE shop_id=%s",
+                          (["paid_amount", "paid_orders"], self.shop_id))
+        self.conn.execute(
+            """INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered,
+                       data_as_of, quality_status, quality_rule)
+               VALUES (%s, 'orders', %s, %s,
+                       tstzmultirange(tstzrange(%s, %s, '[)')), %s, 'passed', %s)
+               ON CONFLICT (source, entity, shop_id) DO UPDATE SET
+                       covered = bi.sync_state.covered + EXCLUDED.covered,
+                       quality_status = 'passed', quality_rule = EXCLUDED.quality_rule,
+                       data_as_of = EXCLUDED.data_as_of""",
+            (self.source, self.shop_id, self.end, self.start - timedelta(days=1),
+             self.end + timedelta(days=1), self.end, self.quality_rule))
+
+    def _new_turn(self):
+        """再开一条用户消息：`query_runs` 的唯一键按 (消息, 领域, 尝试) 占位。"""
+        self.chat_id, self.user_message_id = uuid4(), uuid4()
+        self.conn.execute("INSERT INTO bi.app_chats(id, subject_id, title) "
+                          "VALUES (%s, 'exploration-subject', '探索')", (self.chat_id,))
+        self.conn.execute(
+            "INSERT INTO bi.app_messages(id, chat_id, role, content, status) "
+            "VALUES (%s, %s, 'user', %s, 'complete')",
+            (self.user_message_id, self.chat_id, GRAPH_QUESTION))
+
+    def _store(self):
+        return PostgresQueryRunStore(self.conn, forbidden_values={self.shop_id})
+
+    def _context(self, store):
+        return graph_context(store, self.conn,
+                             allowed_shop_ids=frozenset({self.shop_id}),
+                             shop_refs={self.shop_id: self.shop_ref},
+                             subject_id="exploration-subject", chat_id=self.chat_id,
+                             user_message_id=self.user_message_id)
+
+    def _run(self, store, metrics=None, groups=None, **request_overrides):
+        from bi_agent.exploration.graph import run_exploration_graph
+
+        values = {"start": self.start, "end": self.end}
+        values.update(request_overrides)
+        metrics = [self.PAID] if metrics is None else list(metrics)
+        groups = ([DAY_SHOP_DAILY, SHOP_SHOP_DAILY] if groups is None
+                  else list(groups))
+        # 指标与分组同时送进"本轮选择"和"探索请求"：只改一处测的就不是 readiness，
+        # 而是后面那格编译失败。
+        values.setdefault("requested_metric_refs", list(metrics))
+        values.setdefault("group_by_field_refs", list(groups))
+        with mock.patch("bi_agent.exploration.graph.retrieve_schema_candidates",
+                        return_value=selection_for(metrics, groups=groups)):
+            return run_exploration_graph(question=GRAPH_QUESTION,
+                                         request=ready_request(**values),
+                                         context=self._context(store),
+                                         versions=graph_versions())
+
+    def _termination_reason(self, execution) -> str:
+        return self.conn.execute(
+            "SELECT termination_reason FROM bi.query_runs WHERE id=%s",
+            (execution.domain_result.run_id,)).fetchone()[0]
+
+    def _diagnostic_count(self, execution) -> int:
+        return self.conn.execute(
+            "SELECT count(*) FROM bi.query_diagnostics WHERE run_id=%s",
+            (execution.domain_result.run_id,)).fetchone()[0]
+
+    def test_ready_exploration_persists_one_artifact_and_one_diagnostic(self):
+        execution = self._run(self._store())
+        self.assertEqual(execution.domain_result.status.value, "success",
+                         execution.domain_result.error)
+        self.assertIsNotNone(execution.plan.estimated_rows)
+        payload = execution.domain_result.artifacts[0].public_payload
+        self.assertEqual(set(payload), EXPLORATION_PAYLOAD_KEYS)
+        self.assertTrue(payload["rows"])
+        self.assertEqual({row[SHOP_REF_COLUMN] for row in payload["rows"]},
+                         {self.shop_ref})
+        for row in payload["rows"]:
+            self.assertRegex(row[self.PAID], r"^-?\d+(\.\d+)?$")
+        # 覆盖/口径/截止都必须来自真证据：complete + 已解析的 basis + 共同截止。
+        self.assertEqual(payload["coverage"]["status"], "complete")
+        self.assertEqual({item["metric"] for item in payload["basis"]}, {self.PAID})
+        self.assertEqual({item["basis"] for item in payload["basis"]},
+                         {"platform_payment/v1"})
+        self.assertEqual({item["time_basis"] for item in payload["basis"]}, {"pay_time"})
+        for item in payload["basis"]:
+            self.assertNotIn("semantic/", str(list(item.values())))
+        self.assertEqual(execution.domain_result.data_as_of, self.conn.execute(
+            "SELECT data_as_of FROM bi.sync_state WHERE shop_id=%s AND entity='orders'",
+            (self.shop_id,)).fetchone()[0])
+        for leak in ("SELECT", "ANY(", self.shop_id, "statement_timeout"):
+            self.assertNotIn(leak, json.dumps(payload, ensure_ascii=False), leak)
+        run_id = execution.domain_result.run_id
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.query_artifacts WHERE run_id=%s "
+            "AND artifact_type='exploration_result'", (run_id,)).fetchone()[0], 1)
+        sql_text = self.conn.execute(
+            "SELECT sql_text FROM bi.query_diagnostics WHERE run_id=%s",
+            (run_id,)).fetchone()[0]
+        self.assertIn("SELECT", sql_text)
+        self.assertEqual(sql_text, execution.plan.sql_text)
+        self.assertEqual(self.conn.execute(
+            "SELECT status, termination_reason FROM bi.query_runs WHERE id=%s",
+            (run_id,)).fetchone(), ("succeeded", "succeeded"))
+        self.assertEqual(self.conn.execute(
+            "SELECT domain, current_node FROM bi.query_runs WHERE id=%s",
+            (run_id,)).fetchone(), (EXPLORATION_DOMAIN, "finalize"))
+
+    def test_wrong_capability_tag_refuses_before_any_statement(self):
+        """P1-1 回归：标签集合里没这个指标的标签，旧实现只看"非空"就当已开通。"""
+        self.conn.execute("UPDATE bi.shops SET capabilities=%s WHERE shop_id=%s",
+                          (["paid_orders"], self.shop_id))
+        execution = self._run(self._store())
+        self.assertEqual(execution.domain_result.status.value, "missing_data")
+        self.assertIsNone(execution.plan)
+        self.assertEqual(self._diagnostic_count(execution), 0)
+        self.assertEqual(self._termination_reason(execution), "capability_unavailable")
+
+    def test_metric_without_registered_capability_refuses_without_reading_facts(self):
+        """`cost_total` 没有已登记的能力标签：一句库都不该问。
+
+        这条同时钉住"没有把订单脊柱当万能覆盖"：旧实现会拿 orders 覆盖替它宣布
+        `complete`，所以只断"拒答"不够，还要断诊断/事实读取都没发生。
+        """
+        execution = self._run(self._store(), metrics=["metric-cost-total"],
+                              groups=[DAY_COST, SHOP_COST])
+        self.assertIsNone(execution.plan)
+        self.assertEqual(execution.domain_result.status.value, "missing_data")
+        self.assertEqual(self._diagnostic_count(execution), 0)
+        self.assertEqual(self._termination_reason(execution), "capability_unavailable")
+
+    def test_unverified_time_basis_refuses_although_coverage_is_complete(self):
+        """覆盖与质量都对，但付款时间口径没逐店对照取证：不拿它出聚合数。"""
+        self.conn.execute("UPDATE bi.shops SET platform='jd' WHERE shop_id=%s",
+                          (self.shop_id,))
+        execution = self._run(self._store())
+        self.assertIsNone(execution.plan)
+        self.assertEqual(self._diagnostic_count(execution), 0)
+        self.assertEqual(self._termination_reason(execution),
+                         "coverage_time_basis_unverified")
+
+    def test_missing_common_cutoff_refuses_although_coverage_is_complete(self):
+        """覆盖完整但 `data_as_of` 没推进：不能声称数据新到什么时候。"""
+        self.conn.execute("UPDATE bi.sync_state SET data_as_of = NULL WHERE shop_id=%s "
+                          "AND entity='orders'", (self.shop_id,))
+        execution = self._run(self._store())
+        self.assertIsNone(execution.plan)
+        self.assertEqual(self._termination_reason(execution), "data_as_of_unknown")
+
+    def test_stale_quality_rule_publishes_only_with_the_mandatory_disclosure(self):
+        """P1-1b 回归（真库、真引擎）：对账口径版本一变，旧的 passed 降为 unknown。
+
+        `data_quality` 的口径是三态：unknown **可出数但必须披露**。把中间那态当"干净"
+        就是丢一句必要的披露；当"失败"拒答又是另一回事（那是固定路径也不做的加严）。
+        """
+        self.conn.execute("UPDATE bi.sync_state SET quality_rule='older-rule' "
+                          "WHERE shop_id=%s AND entity='orders'", (self.shop_id,))
+        execution = self._run(self._store())
+        self.assertEqual(execution.domain_result.status.value, "success",
+                         execution.domain_result.error)
+        payload = execution.domain_result.artifacts[0].public_payload
+        self.assertEqual(payload["limitations"], ["来源质量未核验（尚无对账记录）"])
+        self.assertEqual(payload["coverage"]["status"], "complete")
+        self.assertEqual(execution.domain_result.model_payload["limitations"],
+                         payload["limitations"])
+        state = self.conn.execute(
+            "SELECT state, termination_reason FROM bi.query_runs WHERE id=%s",
+            (execution.domain_result.run_id,)).fetchone()
+        run_state = state[0] if isinstance(state[0], dict) else json.loads(state[0])
+        self.assertEqual(run_state["limitations"], ["source_quality_unverified"])
+        self.assertEqual(state[1], "succeeded")
+
+    def test_verified_quality_keeps_the_payload_free_of_borrowed_disclosure(self):
+        """反例（反恒真）：质控已取证时不得附那句披露。"""
+        execution = self._run(self._store())
+        payload = execution.domain_result.artifacts[0].public_payload
+        self.assertEqual(payload["limitations"], [])
+        self.assertEqual(self._run_state(execution).get("limitations", []), [])
+
+    def test_metric_with_two_dependencies_publishes_both_over_the_real_engine(self):
+        """P1-1a 回归（真库）：`cash_difference` 要两个来源，不是"口径不兼容"。
+
+        这里同时证两件相反的事：两个来源都取证才能出数（只补订单行就拒），而且
+        两家店都同意时不得拒（逐条签名比会把它永久拒掉）。
+        """
+        from bi_agent.sources import AFTERSALE_ENTITY, AFTERSALE_SOURCE
+
+        cash = "metric-cash-difference"
+        self.conn.execute("UPDATE bi.shops SET capabilities=%s WHERE shop_id=%s",
+                          (["cash_difference"], self.shop_id))
+        self.conn.execute(
+            """INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered,
+                       data_as_of, quality_status, quality_rule)
+               VALUES (%s, %s, %s, %s, tstzmultirange(tstzrange(%s, %s, '[)')),
+                       %s, 'passed', %s)
+               ON CONFLICT (source, entity, shop_id) DO UPDATE SET
+                       covered = bi.sync_state.covered + EXCLUDED.covered,
+                       quality_status = 'passed', quality_rule = EXCLUDED.quality_rule,
+                       data_as_of = EXCLUDED.data_as_of""",
+            (AFTERSALE_SOURCE, AFTERSALE_ENTITY, self.shop_id, self.end,
+             self.start - timedelta(days=1), self.end + timedelta(days=1), self.end,
+             self.quality_rule))
+        execution = self._run(self._store(), metrics=[cash],
+                              groups=[DAY_SHOP_DAILY, SHOP_SHOP_DAILY])
+        self.assertEqual(execution.domain_result.status.value, "success",
+                         execution.domain_result.error)
+        basis = execution.domain_result.artifacts[0].public_payload["basis"]
+        self.assertEqual({(item["basis"], item["time_basis"]) for item in basis},
+                         {("platform_payment/v1", "pay_time"),
+                          ("platform_refund_occurrence/v1",
+                           "aftersale_completion_time")})
+        self.assertEqual(self._termination_reason(execution), "succeeded")
+
+        # 只补一个来源就不得出数：另一个来源从没取过数，不是"零"。
+        self.conn.execute("DELETE FROM bi.sync_state WHERE shop_id=%s AND entity=%s",
+                          (self.shop_id, AFTERSALE_ENTITY))
+        self._new_turn()      # 一条用户消息就是一个运行上下文：第二次问要换新的那一条
+        second = self._run(self._store(), metrics=[cash],
+                           groups=[DAY_SHOP_DAILY, SHOP_SHOP_DAILY])
+        self.assertIsNone(second.plan)
+        self.assertEqual(self._termination_reason(second), "coverage_incomplete")
+
+    def _run_state(self, execution) -> dict:
+        state = self.conn.execute(
+            "SELECT state FROM bi.query_runs WHERE id=%s",
+            (execution.domain_result.run_id,)).fetchone()[0]
+        return state if isinstance(state, dict) else json.loads(state)
+
+    def test_uncovered_window_refuses_and_records_the_gap(self):
+        self.conn.execute(
+            "UPDATE bi.sync_state SET covered = tstzmultirange() WHERE shop_id=%s "
+            "AND entity='orders'", (self.shop_id,))
+        execution = self._run(self._store())
+        self.assertIsNone(execution.plan)
+        self.assertEqual(self._termination_reason(execution), "coverage_incomplete")
+        state = self.conn.execute(
+            "SELECT state FROM bi.query_runs WHERE id=%s",
+            (execution.domain_result.run_id,)).fetchone()[0]
+        state = state if isinstance(state, dict) else json.loads(state)
+        self.assertEqual(state["limitations"], ["coverage_incomplete"])
+        self.assertTrue(state["coverage"]["gaps"])
+
+    def test_agent_turn_end_to_end_offers_only_the_tool_and_leaks_no_sql(self):
+        """主层→适配器→图→真库的一条完整路径：模型拿到的那一句里没有 SQL 也没有真店号。
+
+        只贴检索那一句（让本轮选择确定）：能力、覆盖、编译、AST、EXPLAIN、只读执行、
+        投影与两条写入都是真的。这才能证明"门禁在列 Tool 阶段不查库"与"回到模型的
+        载荷形状合法"不是推论。
+        """
+        import json
+
+        from bi_agent.agent import SessionState, answer
+        from bi_agent.llm import Message, ModelReply, ToolCall
+        from bi_agent.runtime import TurnContext
+        from bi_agent.runtime.models import RunNotFound
+
+        selection = selection_for([self.PAID], groups=[DAY_SHOP_DAILY, SHOP_SHOP_DAILY])
+        call = ToolCall(id="call_e1", name="explore_business_data",
+                        arguments={"requested_metric_refs": [self.PAID],
+                                   "group_by_field_refs": [DAY_SHOP_DAILY,
+                                                           SHOP_SHOP_DAILY],
+                                   "start": self.start.isoformat(),
+                                   "end": self.end.isoformat()})
+
+        def scripted(text, calls):
+            reply = ModelReply(text=text, tool_calls=calls)
+            reply._message = Message(role="assistant", content=text, tool_calls=calls)
+            return reply
+
+        reply_calls = [scripted(None, [call]), scripted("按引用给出了结果", [])]
+        sent: list = []
+
+        class ScriptedModel:
+            def complete(self, messages, tools, timeout_s=None):
+                sent.append((list(messages), list(tools)))
+                return reply_calls[len(sent) - 1]
+
+        with mock.patch("bi_agent.exploration.tool.retrieve_schema_candidates",
+                        return_value=selection), \
+                mock.patch("bi_agent.exploration.graph.retrieve_schema_candidates",
+                           return_value=selection):
+            turn = answer("按店铺和日期看支付金额与订单数", SessionState(subject="u1"),
+                          model=ScriptedModel(), conn=self.conn,
+                          allowed_shop_ids=frozenset({self.shop_id}),
+                          now=datetime(2026, 9, 8, 9, tzinfo=BEIJING),
+                          run_store=self._store(),
+                          turn_context=TurnContext(chat_id=self.chat_id,
+                                                   user_message_id=self.user_message_id,
+                                                   subject_id="exploration-subject"),
+                          controlled_sql_enabled=True)
+        self.assertEqual(sent[0][1][-1]["function"]["name"], "explore_business_data",
+                         "本轮选择不可由固定 Tool 表达 → 必须公告探索入口")
+        tool_messages = [message for message in sent[1][0]
+                         if isinstance(message, Message) and message.role == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+        payload = json.loads(tool_messages[0].content)
+        self.assertEqual(set(payload), EXPLORATION_PAYLOAD_KEYS)
+        self.assertTrue(payload["rows"])
+        self.assertEqual({item["basis"] for item in payload["basis"]},
+                         {"platform_payment/v1"})
+        for leak in ("SELECT", "ANY(", "%(limit)s", "statement_timeout", self.shop_id):
+            self.assertNotIn(leak, tool_messages[0].content, leak)
+        self.assertEqual([item["artifact_type"] for item in turn.artifacts],
+                         [EXPLORATION_ARTIFACT_TYPE])
+        run_id = self.conn.execute(
+            "SELECT id FROM bi.query_runs WHERE domain=%s",
+            (EXPLORATION_DOMAIN,)).fetchone()[0]
+        self.assertEqual(self.conn.execute(
+            "SELECT status, termination_reason FROM bi.query_runs WHERE id=%s",
+            (run_id,)).fetchone(), ("succeeded", "succeeded"))
+        # 图与 Tool 只开了一个运行行、一条诊断：不存在逐店循环的额外写入。
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.query_runs WHERE domain=%s",
+            (EXPLORATION_DOMAIN,)).fetchone()[0], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.query_diagnostics WHERE run_id=%s",
+            (run_id,)).fetchone()[0], 1)
+        with self.assertRaises(RunNotFound):
+            self._store().record_diagnostic(uuid4(), template_id="exploration_sql",
+                                           sql_text="SELECT 1", parameters={})

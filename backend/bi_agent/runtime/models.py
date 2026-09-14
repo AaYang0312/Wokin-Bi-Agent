@@ -74,6 +74,7 @@ from .domain_registry import (
     known_domain,
     spec_for,
 )
+from .versions import check_version_identifier
 PersistenceNode = Literal[
     "received", "resolve_parameters", "validate_parameters", "authorize_scope",
     "execute_fixed_query", "classify_result", "persist_artifact", "finalize",
@@ -95,6 +96,10 @@ PersistenceNode = Literal[
     "check_completeness_and_freshness", "normalize_units_and_deduplicate_pools",
     "compute_total_and_shop_levels", "evaluate_thresholds", "classify_actions",
     "persist_alerts",
+    # 受控 SQL 探索图（计划 Task 5）：九格固定链里只有这三格与既有领域共用。
+    # 逐格分开是为了归因：检索/编译/AST/成本/只读执行各自会失败在不同的地方。
+    "select_schema", "assess_readiness", "compile_query", "validate_ast",
+    "estimate_cost", "execute_readonly",
 ]
 ErrorCode = Literal[
     "missing_parameters", "invalid_parameters", "forbidden", "deadline_exceeded",
@@ -287,6 +292,9 @@ _ARTIFACT_KEYS = frozenset({
 
 # UUID 串形式与 Artifact 引用同一规则（`str(UUID)` 的小写 8-4-4-4-12）。
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# SHA-256 十六进制小写：与 `artifacts.RequestIdentity.request_fingerprint`、
+# `exploration.models` 的 statement fingerprint 同一形状，不在三处各写一份正则。
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 # `metric_basis` 的形状与血缘口径签名同一规则（`指标|口径|时间归属`）：
 # 同一概念不拄第二份正则，也不给载荷留自由文本通道。
 _METRIC_BASIS_RE = BASIS_SIGNATURE_RE
@@ -1331,6 +1339,11 @@ def _basis_items(value: object) -> None:
             raise ValueError("basis_invalid")
 
 
+def _diagnosis_value_ok(item: object) -> bool:
+    """诊断字段只许是计数或标签：浮点与布尔不得冒充计数。"""
+    return isinstance(item, (int, str)) and not isinstance(item, bool)
+
+
 def _diagnostics(value: object) -> None:
     """可量化限制的结构化形状：与披露文本同一来源，只允许已登记的诊断与字段。"""
     if not isinstance(value, dict):
@@ -1341,7 +1354,7 @@ def _diagnostics(value: object) -> None:
         if set(fields) - _DIAGNOSIS_FIELDS[key]:
             raise ValueError("diagnostics_invalid")
         for item in fields.values():
-            if not isinstance(item, (int, str)) or isinstance(item, bool):
+            if not _diagnosis_value_ok(item):
                 raise ValueError("diagnostics_invalid")
 
 
@@ -1713,6 +1726,201 @@ def _prices_agree(actual: object, expected: object, status: str) -> bool:
     return equal if status == "match" else not equal
 
 
+# ---------------------------------------------------------------------------
+# 受控 SQL 探索（`exploration_result`）的载荷白名单（计划 Task 5 Step 4）
+#
+# 只钉三个事实：字段全集就是那九个、每一行的 key 与声明的列逐字相等、值按声明
+# 类型收。不重新发明覆盖/诊断/披露词表：这三样继续走本模块已登记的那一份，否则同一个
+# 缺口会在两个领域各起一个名字。
+# ---------------------------------------------------------------------------
+
+_EXPLORATION_PAYLOAD_KEYS = frozenset({
+    "template_version", "catalog_version", "statement_fingerprint", "columns", "rows",
+    "basis", "coverage", "diagnostics", "limitations"})
+_EXPLORATION_COLUMN_KEYS = frozenset({"ref", "data_type"})
+_EXPLORATION_COLUMN_REQUIRED = frozenset({"ref", "data_type"})
+# 口径凭证的键集与数据集那一支同源（`_BASIS_ITEM_KEYS`），但判别位不同：探索层按稳定
+# ref 命名指标，不按固定指标码，所以必须单独一份 required。
+_EXPLORATION_BASIS_KEYS = frozenset({"metric", "basis", "time_basis", "metric_version",
+                                    "shop_ref"})
+_EXPLORATION_BASIS_REQUIRED = frozenset({"metric", "basis"})
+# 公开载荷里不许出现 SQL 形状：语句关键字、`%(name)s` 占位符、分号与注释符都整份拒。
+# 计划 Final Verification 要求 Artifact 里没有 `SELECT`；这一道不依赖上游只发安全结果。
+_EXPLORATION_SQLISH_RE = re.compile(
+    r"(?i)\b(?:select|insert|update|delete|merge|upsert|create|drop|alter|truncate|"
+    r"grant|revoke|copy|call|explain|analyze|vacuum|union|intersect|except)\b"
+    r"|%\([a-z_][a-z0-9_]*\)s|[;]|--|/\*")
+
+
+def _exploration_vocabulary() -> tuple[frozenset[str], int, int, str]:
+    """探索契约自己的四个常量：类型词表、行数预算、文本上界与店铺列名。
+
+    为什么在函数里 import：`bi_agent.exploration.*` 与 `bi_agent.semantic_catalog.*` 都会
+    回头加载 `bi_agent.runtime` 包，本模块改成模块级引用后，从任一侧先被导入就会撞上
+    尚未执行完的半初始化模块（ImportError）。数字与列名的真源仍只有一处。
+    """
+    from typing import get_args
+
+    from bi_agent.exploration.models import MAX_ROWS, MAX_TEXT_CHARS, SHOP_REF_COLUMN
+    from bi_agent.semantic_catalog.models import DataType
+
+    return frozenset(get_args(DataType)), MAX_ROWS, MAX_TEXT_CHARS, SHOP_REF_COLUMN
+
+
+def _exploration_ref(value: object) -> None:
+    """列身份与 ref 只语义目录那一条 kebab-case 规则（不在这里抄第二份）。"""
+    from bi_agent.semantic_catalog.models import _require_ref
+
+    if not isinstance(value, str):
+        _unsafe_payload()
+    try:
+        _require_ref(value)
+    except ValueError:
+        _unsafe_payload()
+
+
+def _exploration_columns(value: object) -> dict[str, str]:
+    """列声明：稳定 ref + 目录词表里的类型，逐项唯一；返回 `ref -> data_type`。"""
+    types, _rows, _chars, shop_ref = _exploration_vocabulary()
+    if not isinstance(value, list) or not value:
+        _unsafe_payload()
+    declared: dict[str, str] = {}
+    for item in value:
+        column = _mapping(item, allowed=_EXPLORATION_COLUMN_KEYS,
+                         required=_EXPLORATION_COLUMN_REQUIRED)
+        data_type = column["data_type"]
+        if not isinstance(data_type, str) or data_type not in types:
+            _unsafe_payload()
+        _exploration_ref(column["ref"])
+        if column["ref"] in declared:
+            _unsafe_payload()          # 两列同名：后一列会静默盖掉前一列
+        # `ref` 类型只属于投影后的店铺列，反过来那一名列也只能是 `ref` 类型。
+        if (column["ref"] == shop_ref) != (data_type == "ref"):
+            _unsafe_payload()
+        declared[column["ref"]] = data_type
+    return declared
+
+
+def _exploration_cell(ref: str, data_type: str, value: object) -> None:
+    """按声明类型收值：投影层已经把它换成 JSON 安全值，这里只验“说的和发的一致”。"""
+    _types, _max_rows, max_chars, shop_ref = _exploration_vocabulary()
+    if data_type == "ref":
+        # 不知道属于哪家店的行不能发：那一格不是“缺值”，是归属未定。
+        if ref != shop_ref:
+            _unsafe_payload()
+        _exploration_ref(value)
+        return
+    if value is None:
+        return
+    if data_type == "boolean":
+        if not isinstance(value, bool):
+            _unsafe_payload()
+        return
+    if data_type == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            _unsafe_payload()
+        return
+    if data_type == "decimal":
+        if not isinstance(value, str) or not _DECIMAL_RE.fullmatch(value):
+            _unsafe_payload()
+        return
+    if data_type == "date":
+        _date_string(value)
+        return
+    if data_type == "datetime":
+        _datetime_string(value)        # 没时区的时刻无法与窗口对齐
+        return
+    if not isinstance(value, str) or len(value) > max_chars:
+        _unsafe_payload()
+
+
+def _exploration_rows(value: object, declared: dict[str, str]) -> None:
+    """行数用请求侧同一个预算；每行的 key 必须与声明的列逐字相等。"""
+    _types, max_rows, _chars, _shop_ref = _exploration_vocabulary()
+    if not isinstance(value, list) or len(value) > max_rows:
+        _unsafe_payload()
+    names = set(declared)
+    for row in value:
+        if not isinstance(row, dict) or set(row) != names:
+            _unsafe_payload()          # 多一列就是第二条数据通道
+        for ref, cell in row.items():
+            _exploration_cell(ref, declared[ref], cell)
+
+
+def _exploration_basis(value: object) -> None:
+    """口径凭证：指标名是稳定 ref，口径名沿用已登记的那一条形状。"""
+    if not isinstance(value, list) or not value:
+        _unsafe_payload()              # 没有口径就没有能解释的结果
+    for item in value:
+        entry = _mapping(item, allowed=_EXPLORATION_BASIS_KEYS,
+                        required=_EXPLORATION_BASIS_REQUIRED)
+        _exploration_ref(entry["metric"])
+        for key in ("basis", "time_basis", "metric_version"):
+            if key in entry and not (isinstance(entry[key], str)
+                                     and _BASIS_NAME_RE.fullmatch(entry[key])):
+                _unsafe_payload()
+        if "shop_ref" in entry:
+            _exploration_ref(entry["shop_ref"])
+
+
+def _exploration_diagnostics(value: object) -> None:
+    """诊断取列表形态，但诊断码与字段仍取自已登记词表：不给“未登记的键先放行”的口子。"""
+    if not isinstance(value, list):
+        _unsafe_payload()
+    for item in value:
+        if not isinstance(item, dict) or "code" not in item:
+            _unsafe_payload()
+        code = item["code"]
+        if not isinstance(code, str) or code not in _DIAGNOSIS_KEYS:
+            _unsafe_payload()
+        if set(item) - ({"code"} | _DIAGNOSIS_FIELDS[code]):
+            _unsafe_payload()
+        for key, nested in item.items():
+            if key != "code" and not _diagnosis_value_ok(nested):
+                _unsafe_payload()
+
+
+def _reject_sql_shaped_text(value: object) -> None:
+    """全量递归扫描：只检查键名的护栏拦不住藏在值里的语句原文。"""
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if isinstance(key, str) and _EXPLORATION_SQLISH_RE.search(key):
+                _unsafe_payload()
+            _reject_sql_shaped_text(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _reject_sql_shaped_text(nested)
+    elif isinstance(value, str) and _EXPLORATION_SQLISH_RE.search(value):
+        _unsafe_payload()
+
+
+def _exploration_payload(value: object) -> dict[str, object]:
+    """受控 SQL 探索的公开载荷：给模型与公开发的是同一份形状。9 个键全部必填。
+
+    为什么两份完全相同：`entities` / 展示名根本不在这份载荷的键集里，没东西可以在
+    给模型时剔掉（与数据集那一支不同）。真店铺主键由两个 Store 的
+    `_reject_forbidden_values` 另判一道：形状合法不等于取值合法。
+    """
+    payload = _mapping(value, allowed=_EXPLORATION_PAYLOAD_KEYS,
+                      required=_EXPLORATION_PAYLOAD_KEYS)
+    for key in ("template_version", "catalog_version"):
+        try:
+            check_version_identifier(payload[key])
+        except ValueError:
+            _unsafe_payload()
+    fingerprint = payload["statement_fingerprint"]
+    if not isinstance(fingerprint, str) or not _SHA256_HEX_RE.fullmatch(fingerprint):
+        _unsafe_payload()
+    declared = _exploration_columns(payload["columns"])
+    _exploration_rows(payload["rows"], declared)
+    _exploration_basis(payload["basis"])
+    _coverage(payload["coverage"])          # 覆盖走全仓已有的 `Coverage` 契约
+    _exploration_diagnostics(payload["diagnostics"])
+    _string_list(payload["limitations"], _public_limitation)
+    _reject_sql_shaped_text(payload)
+    return payload
+
+
 def validate_model_payload(value: object,
                            artifact_type: str = "metric_result") -> dict[str, object]:
     """给模型的载荷：与公开载荷共用同一判别位，只是不含展示名。"""
@@ -1720,6 +1928,13 @@ def validate_model_payload(value: object,
         return _price_audit_payload(value, public=False)
     if artifact_type == "inventory_alerts":
         return _inventory_alerts_payload(value, public=False)
+    if artifact_type == "exploration_result":
+        return _exploration_payload(value)
+    if isinstance(value, dict) and set(value) == _EXPLORATION_PAYLOAD_KEYS:
+        # `DomainResult.model_payload` 的校验器只有值、没有类型：探索载荷那九个键就是它
+        # 自己的判别位（与数据集键集完全不相交）。反过来显式传类型仍走上面那一支，
+        # 所以类型与形状不会在两处判出两种结果。
+        return _exploration_payload(value)
     return _public_metric_payload(value, public=False)
 
 
@@ -1738,6 +1953,9 @@ def validate_artifact_payload(value: object,
         return _price_audit_payload(value, public=True)
     if artifact_type == "inventory_alerts":
         return _inventory_alerts_payload(value, public=True)
+    if artifact_type == "exploration_result":
+        # 受控探索只发安全结果：键集与数据集完全不交，判别位就是唯一的分发依据。
+        return _exploration_payload(value)
     return _public_metric_payload(value, public=True)
 
 
