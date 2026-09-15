@@ -158,8 +158,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             set(AppSettings.model_fields),
             {"app_dsn", "shop_ids", "environment", "allowed_subjects", "public_origin",
-             "auth_subject_header", "semantic_catalog_enabled",
-             "controlled_sql_enabled"})
+             "auth_subject_header", "semantic_catalog_enabled", "controlled_sql_enabled",
+             "approved_query_memory_enabled", "approver_subjects", "approver_dsn"})
         self.assertIs(AppSettings.model_fields["controlled_sql_enabled"].default, False)
 
     def test_env_example_ships_the_controlled_sql_gate_closed(self):
@@ -174,6 +174,102 @@ class ConfigTests(unittest.TestCase):
                 assignments = [line for line in text.splitlines()
                                if line.startswith(f"{key}=")]
                 self.assertEqual(assignments, [f"{key}=false"])
+
+    def test_approved_query_memory_gate_defaults_off_and_accepts_only_true_false(self):
+        """计划 Task 1：记忆门禁默认关，开关沿用 `_flag` 的严格 true/false 解析。
+
+        审核者与审核 DSN 只在门禁开启时从环境装入：关着的记忆功能连审核身份都不
+        进配置，关与缺席必须给出逐字同一份设置。
+        """
+        from bi_agent.config import AppSettings, load_app_settings
+
+        env = valid_app_env()
+        self.assertFalse(load_app_settings(env).approved_query_memory_enabled)
+        for off in ("false", " false ", "", "   "):
+            with self.subTest(off=off):
+                settings = load_app_settings(
+                    {**env, "APPROVED_QUERY_MEMORY_ENABLED": off})
+                self.assertFalse(settings.approved_query_memory_enabled)
+        enabled_env = {
+            **env,
+            "APP_APPROVER_SUBJECTS": "reviewer-a",
+            "BI_APPROVER_DSN": "postgresql://bi_approver:pw@localhost/bi_agent",
+        }
+        for on in ("true", " true "):
+            with self.subTest(on=on):
+                settings = load_app_settings(
+                    {**enabled_env, "APPROVED_QUERY_MEMORY_ENABLED": on})
+                self.assertTrue(settings.approved_query_memory_enabled)
+        for bad in ("TRUE", "True", "1", "0", "yes", "no", "on", "off", "enabled",
+                    "truthy", "tru", "false 1", ";", "true; DROP TABLE bi.orders"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError,
+                                            "APPROVED_QUERY_MEMORY_ENABLED"):
+                    load_app_settings(
+                        {**env, "APPROVED_QUERY_MEMORY_ENABLED": bad})
+        self.assertIs(
+            AppSettings.model_fields["approved_query_memory_enabled"].default, False)
+        self.assertEqual(AppSettings.model_fields["approver_subjects"].default,
+                         frozenset())
+        self.assertIsNone(AppSettings.model_fields["approver_dsn"].default)
+
+    def test_enabling_memory_requires_reviewers_and_a_separate_dsn(self):
+        """开启记忆必须有审核者、审核 DSN，且审核身份不能搭在聊天连接上。"""
+        from bi_agent.config import load_app_settings
+
+        env = valid_app_env()
+        approver_dsn = "postgresql://bi_approver:pw@localhost/bi_agent"
+        enabled = {**env, "APPROVED_QUERY_MEMORY_ENABLED": "true"}
+        with self.assertRaises(ValueError) as caught:
+            load_app_settings(enabled)
+        self.assertEqual(str(caught.exception),
+                         "APPROVED_QUERY_MEMORY_REQUIRES_APPROVER_SUBJECTS")
+        with self.assertRaises(ValueError) as caught:
+            load_app_settings({**enabled, "APP_APPROVER_SUBJECTS": "reviewer-a"})
+        self.assertEqual(str(caught.exception),
+                         "APPROVED_QUERY_MEMORY_REQUIRES_APPROVER_DSN")
+        with self.assertRaises(ValueError) as caught:
+            load_app_settings({**enabled, "APP_APPROVER_SUBJECTS": "reviewer-a",
+                               "BI_APPROVER_DSN": env["BI_APP_DSN"]})
+        self.assertEqual(str(caught.exception),
+                         "APPROVED_QUERY_MEMORY_APPROVER_DSN_MUST_DIFFER")
+        settings = load_app_settings({
+            **enabled,
+            "APP_APPROVER_SUBJECTS": "reviewer-a, reviewer-b",
+            "BI_APPROVER_DSN": approver_dsn,
+        })
+        self.assertEqual(settings.approver_subjects,
+                         frozenset({"reviewer-a", "reviewer-b"}))
+        self.assertEqual(settings.approver_dsn.get_secret_value(), approver_dsn)
+        # SecretStr 的 repr/str 不落 DSN：与 app_dsn 同一口径。
+        self.assertNotIn(approver_dsn, repr(settings))
+        self.assertNotIn(approver_dsn, str(settings))
+
+    def test_disabled_memory_gate_leaves_approver_settings_unloaded(self):
+        """门禁关着时审核者与审核 DSN 不进配置：功能关就是全关。"""
+        from bi_agent.config import load_app_settings
+
+        settings = load_app_settings({
+            **valid_app_env(),
+            "APP_APPROVER_SUBJECTS": "reviewer-a",
+            "BI_APPROVER_DSN": "postgresql://bi_approver:pw@localhost/bi_agent",
+        })
+        self.assertFalse(settings.approved_query_memory_enabled)
+        self.assertEqual(settings.approver_subjects, frozenset())
+        self.assertIsNone(settings.approver_dsn)
+
+    def test_env_example_ships_the_approved_query_memory_gate_closed(self):
+        """`.env.example` 是部署方抄的那份：新门禁写=false，审核者留空示例。"""
+        import pathlib
+
+        text = (pathlib.Path(__file__).resolve().parents[2] / ".env.example"
+                ).read_text(encoding="utf-8")
+        self.assertIn("APPROVED_QUERY_MEMORY_ENABLED=false\n", text)
+        assignments = [line for line in text.splitlines()
+                       if line.startswith("APPROVED_QUERY_MEMORY_ENABLED=")]
+        self.assertEqual(assignments, ["APPROVED_QUERY_MEMORY_ENABLED=false"])
+        self.assertIn("APP_APPROVER_SUBJECTS=\n", text)
+        self.assertIn("BI_APPROVER_DSN=\n", text)
 
     def test_selected_provider_uses_its_own_key(self):
         from bi_agent.config import load_model_settings

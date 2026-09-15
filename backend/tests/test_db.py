@@ -4,6 +4,7 @@
 无测试DSN时显式skip——skip不是通过证明。
 """
 
+import json
 import os
 import unittest
 from datetime import datetime, timedelta
@@ -2248,6 +2249,216 @@ class RefetchConvergenceTests(unittest.TestCase):
             "SELECT count(*) FROM bi.sync_batches WHERE mode='incremental'"
         ).fetchone()[0], 0, "失败的上游页不能留下批次凭证")
         self.assertEqual(self._pending(), {"C9"})
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ApprovedQueryMemoryMigrationTests(unittest.TestCase):
+    """计划 Task 1 Step 4/6：021 幂等、bi_app 无底表权限、只有 approved 投影可读。
+
+    全部 DDL 在管理员外层事务里跑（结束按 Rollback 协议退出），共享测试库只保留
+    由命令行显式提交的那份 021。privilege 探针沿用 020 诊断用例的
+    `has_*_privilege` 写法：bi_approver 是 NOLOGIN，不切会话角色。
+    """
+
+    MIGRATION = "021_approved_query_memory.sql"
+    SLOTS_JSON = ('[{"name": "shop_scope", "kind": "entity_scope"}, '
+                  '{"name": "date_window", "kind": "date_window"}]')
+    REQUEST_JSON = '{"requested_metric_refs": ["metric-cost-total"]}'
+    VERSIONS_JSON = ('{"schema_version": "reporting/2026-09-14.1", '
+                     '"semantic_catalog_version": "semantic/2026-09-14.1", '
+                     '"data_catalog_version": 7, '
+                     '"metric_version": "metrics/2026-09-12.1", '
+                     '"policy_version": "multi-source-policy/2026-09-12.1", '
+                     '"source_registry_version": "sources/2026-09-12.1", '
+                     '"graph_version": "business_query-graph/2026-09-11.1"}')
+
+    def setUp(self):
+        self.conn = connect_test_db(self)
+
+    def _migration_sql(self) -> str:
+        from pathlib import Path
+
+        path = Path(__file__).parents[1] / "sql" / self.MIGRATION
+        return path.read_text(encoding="utf-8")
+
+    def _seed_run(self) -> str:
+        """预置一条可被样例引用的 query_run（样例行 FK 指向它）。"""
+        chat_id, message_id = uuid4(), uuid4()
+        run_id = uuid4()
+        self.conn.execute(
+            "INSERT INTO bi.app_chats(id, subject_id, title) VALUES (%s, 'subject-a', '查询')",
+            (chat_id,))
+        self.conn.execute(
+            "INSERT INTO bi.app_messages(id, chat_id, role, content, status) "
+            "VALUES (%s, %s, 'user', '查询销售额', 'complete')",
+            (message_id, chat_id))
+        self.conn.execute(
+            "INSERT INTO bi.query_runs(id, chat_id, user_message_id, subject_id, "
+            "tool_call_id, domain, attempt_no, normalized_request, state) "
+            "VALUES (%s, %s, %s, 'subject-a', 'call_1', 'business_query', 1, '{}', '{}')",
+            (run_id, chat_id, message_id))
+        return str(run_id)
+
+    def _insert_example(self, run_id: str, ref: str, *, status: str,
+                        request_json: str = REQUEST_JSON,
+                        revision: int = 1) -> None:
+        self.conn.execute(
+            """INSERT INTO bi.approved_query_examples(
+                   example_ref, source_run_id, owner_subject_id, domain,
+                   intent_signature, question_template, slots, normalized_request,
+                   expected_tool, version_requirements, authorization_refs,
+                   status, approval_revision, created_by)
+               VALUES (%s, %s, 'subject-a', 'controlled_exploration',
+                       'cost-by-shop-and-window',
+                       '比较 {shop_scope} 在 {date_window} 的成本',
+                       %s::jsonb, %s::jsonb, 'explore_business_data',
+                       %s::jsonb, ARRAY['ent-1a2b3c4d'], %s, %s, 'reviewer-a')""",
+            (ref, run_id, self.SLOTS_JSON, request_json, self.VERSIONS_JSON,
+             status, revision))
+
+    def test_021_is_the_next_numbered_migration_after_020(self):
+        """迁移编号已冻结：021 只属于本计划，而且排在 020 之后。"""
+        from pathlib import Path
+
+        sql_dir = Path(__file__).parents[1] / "sql"
+        files = sorted(path.name for path in sql_dir.glob("*.sql"))
+        self.assertIn(self.MIGRATION, files)
+        self.assertGreater(files.index(self.MIGRATION),
+                           files.index("020_controlled_sql_exploration.sql"))
+        self.assertEqual([name for name in files if name.startswith("021")],
+                         [self.MIGRATION], "同一编号不能有两份迁移")
+
+    def test_replaying_021_is_idempotent(self):
+        self.conn.execute(self._migration_sql())
+        self.conn.execute(self._migration_sql())
+        objects = self.conn.execute(
+            """SELECT table_name FROM information_schema.tables
+               WHERE table_schema='bi' AND table_name IN
+                     ('approved_query_examples', 'approved_query_events')
+               UNION ALL
+               SELECT table_name FROM information_schema.views
+               WHERE table_schema='reporting'
+                     AND table_name='v_approved_query_examples'
+               ORDER BY 1""").fetchall()
+        self.assertEqual([row[0] for row in objects],
+                         ["approved_query_events", "approved_query_examples",
+                          "v_approved_query_examples"])
+        self.assertFalse(self.conn.execute(
+            "SELECT rolcanlogin FROM pg_roles WHERE rolname='bi_approver'"
+        ).fetchone()[0], "审核身份必须是 NOLOGIN：它只能经独立 DSN 的会话成员使用")
+
+    def test_bi_app_cannot_read_or_write_memory_base_tables(self):
+        self.conn.execute(self._migration_sql())
+        self.conn.execute("SET LOCAL ROLE bi_app")
+        denials = (
+            "SELECT count(*) FROM bi.approved_query_examples",
+            "SELECT count(*) FROM bi.approved_query_events",
+            "INSERT INTO bi.approved_query_events(example_ref, revision, "
+            "actor_subject_id, event_kind, reason) "
+            "VALUES ('mem-x', 0, 's', 'drafted', 'r')",
+        )
+        for statement in denials:
+            with self.subTest(sql=statement[:36]), \
+                    self.assertRaises(psycopg.errors.InsufficientPrivilege), \
+                    self.conn.transaction():
+                self.conn.execute(statement)
+        # 投影视图可读，但只读：INSERT 的授权从未给出。
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM reporting.v_approved_query_examples").fetchone()[0], 0)
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege), \
+                self.conn.transaction():
+            self.conn.execute(
+                "INSERT INTO reporting.v_approved_query_examples(example_ref) "
+                "VALUES ('mem-nope')")
+
+    def test_view_exposes_only_approved_rows_and_never_the_source_columns(self):
+        self.conn.execute(self._migration_sql())
+        run_id = self._seed_run()
+        self._insert_example(run_id, "mem-draft-001", status="draft")
+        self._insert_example(run_id, "mem-ok-0001", status="approved")
+        rows = self.conn.execute(
+            "SELECT example_ref FROM reporting.v_approved_query_examples "
+            "ORDER BY example_ref").fetchall()
+        self.assertEqual([row[0] for row in rows], ["mem-ok-0001"],
+                         "draft 行不得进检索投影")
+        columns = [row[0] for row in self.conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='reporting' "
+            "AND table_name='v_approved_query_examples' "
+            "ORDER BY ordinal_position").fetchall()]
+        self.assertEqual(columns, ["example_ref", "owner_subject_id", "domain",
+                                   "intent_signature", "question_template", "slots",
+                                   "normalized_request", "expected_tool",
+                                   "version_requirements", "authorization_refs",
+                                   "approval_revision"])
+        for leaked in ("source_run_id", "status", "created_by"):
+            self.assertNotIn(leaked, columns, f"投影不得暴露 {leaked}")
+
+    def test_base_tables_reject_every_bound_value_key(self):
+        """021 的 no_bound_values CHECK 与 models.FORBIDDEN_VALUE_KEYS 同一词表。"""
+        from bi_agent.query_memory.models import FORBIDDEN_VALUE_KEYS
+
+        self.conn.execute(self._migration_sql())
+        run_id = self._seed_run()
+        for key in sorted(FORBIDDEN_VALUE_KEYS):
+            poisoned = json.dumps({"requested_metric_refs": ["metric-cost-total"],
+                                   key: "x"})
+            with self.subTest(key=key), \
+                    self.assertRaises(psycopg.errors.CheckViolation), \
+                    self.conn.transaction():
+                self._insert_example(run_id, f"mem-bound-{key[:8].replace('_','')}",
+                                     status="approved", request_json=poisoned)
+
+    def test_base_tables_reject_unknown_status_and_negative_revision(self):
+        self.conn.execute(self._migration_sql())
+        run_id = self._seed_run()
+        for field, value in (("status", "learning"), ("approval_revision", -1)):
+            with self.subTest(field=field), \
+                    self.assertRaises(psycopg.errors.CheckViolation), \
+                    self.conn.transaction():
+                self.conn.execute(
+                    f"INSERT INTO bi.approved_query_examples(example_ref, source_run_id, "
+                    f"owner_subject_id, domain, intent_signature, question_template, "
+                    f"slots, normalized_request, expected_tool, version_requirements, "
+                    f"authorization_refs, {field}, created_by) "
+                    f"VALUES ('mem-bad-x', %s, 's', 'd', 'i', 't', '{{}}', '{{}}', "
+                    f"'t', '{{}}', ARRAY['ent-1a2b3c4d'], %s, 'r')",
+                    (run_id, value))
+
+    def test_bi_approver_has_least_privilege(self):
+        """bi_approver 能写样例与追加事件，但没有事件改写权，也没有任何事实表权限。"""
+        self.conn.execute(self._migration_sql())
+        privileges = self.conn.execute(
+            """SELECT
+                   has_table_privilege('bi_approver', 'bi.approved_query_examples',
+                                       'SELECT'),
+                   has_table_privilege('bi_approver', 'bi.approved_query_examples',
+                                       'INSERT'),
+                   has_table_privilege('bi_approver', 'bi.approved_query_examples',
+                                       'UPDATE'),
+                   has_table_privilege('bi_approver', 'bi.approved_query_examples',
+                                       'DELETE'),
+                   has_table_privilege('bi_approver', 'bi.approved_query_events',
+                                       'SELECT'),
+                   has_table_privilege('bi_approver', 'bi.approved_query_events',
+                                       'INSERT'),
+                   has_table_privilege('bi_approver', 'bi.approved_query_events',
+                                       'UPDATE'),
+                   has_table_privilege('bi_approver', 'bi.approved_query_events',
+                                       'DELETE'),
+                   has_table_privilege('bi_approver', 'bi.query_runs', 'SELECT'),
+                   has_table_privilege('bi_approver', 'bi.query_provenance', 'SELECT'),
+                   has_table_privilege('bi_approver', 'bi.orders', 'SELECT'),
+                   has_table_privilege('bi_approver', 'bi.shops', 'SELECT'),
+                   has_sequence_privilege('bi_approver',
+                                          'bi.approved_query_events_id_seq',
+                                          'USAGE, SELECT'),
+                   has_schema_privilege('bi_approver', 'bi', 'USAGE')
+               """).fetchone()
+        self.assertEqual(privileges, (True, True, True, False,
+                                      True, True, False, False,
+                                      True, True, False, False,
+                                      True, True), privileges)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,12 @@ class AppSettings(BaseModel):
     # 受控 SQL 探索默认关：关闭时 Tool 列表、数据库读与聊天结果必须与当前版本一致。
     # 它只能建在已发布的语义目录之上，依赖关系在 `load_app_settings()` 里判。
     controlled_sql_enabled: bool = False
+    # approved 查询记忆默认关：关闭时检索、写路径与审核入口都不存在，聊天行为与
+    # 没有这个功能的版本一致。审核者与审核 DSN 只在开启时从环境装入，功能关就是
+    # 全关（含配置面）。
+    approved_query_memory_enabled: bool = False
+    approver_subjects: frozenset[str] = frozenset()
+    approver_dsn: SecretStr | None = None
 
 
 class SyncSettings(BaseModel):
@@ -119,6 +125,26 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
         # 探索层的 SQL 标识符只能从语义目录的稳定 ref 解析：目录关着就没有解析路径，
         # 只能当场失败，不能“退化成不带目录的 SQL”（总设计 §6.1、计划 Task 1）。
         raise ValueError("CONTROLLED_SQL_REQUIRES_SEMANTIC_CATALOG")
+    approved_query_memory_enabled = _flag(env, "APPROVED_QUERY_MEMORY_ENABLED")
+    approver_subjects: frozenset[str] = frozenset()
+    approver_dsn: SecretStr | None = None
+    if approved_query_memory_enabled:
+        # 记忆开启必须有明确的审核者与独立审核身份：bi_approver 的写权限不能搭在
+        # bi_app 的聊天连接上，否则“模型/聊天路径不能写长期记忆”就只剩口头承诺
+        # （计划 Task 1 Step 5；总设计 §7.3）。
+        approver_subjects = frozenset(
+            part.strip()
+            for part in (env.get("APP_APPROVER_SUBJECTS") or "").split(",")
+            if part.strip()
+        )
+        if not approver_subjects:
+            raise ValueError("APPROVED_QUERY_MEMORY_REQUIRES_APPROVER_SUBJECTS")
+        approver_dsn_raw = (env.get("BI_APPROVER_DSN") or "").strip()
+        if not approver_dsn_raw:
+            raise ValueError("APPROVED_QUERY_MEMORY_REQUIRES_APPROVER_DSN")
+        if approver_dsn_raw == app_dsn.get_secret_value():
+            raise ValueError("APPROVED_QUERY_MEMORY_APPROVER_DSN_MUST_DIFFER")
+        approver_dsn = SecretStr(approver_dsn_raw)
     return AppSettings(
         app_dsn=app_dsn,
         shop_ids=shop_ids,
@@ -128,6 +154,9 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
         auth_subject_header=(env.get("AUTH_SUBJECT_HEADER") or "X-Auth-Request-Sub").strip(),
         semantic_catalog_enabled=semantic_catalog_enabled,
         controlled_sql_enabled=controlled_sql_enabled,
+        approved_query_memory_enabled=approved_query_memory_enabled,
+        approver_subjects=approver_subjects,
+        approver_dsn=approver_dsn,
     )
 
 
