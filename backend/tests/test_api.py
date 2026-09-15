@@ -1,12 +1,14 @@
 """Chat API contract checks that do not require an ERP connection."""
 
+import json
 import unittest
 import warnings
 import os
-from datetime import date, datetime
+from contextlib import contextmanager
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch, sentinel
-from uuid import uuid4
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -17,7 +19,7 @@ warnings.filterwarnings("ignore", category=StarletteDeprecationWarning, module="
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from tests.fakeconn import S1_REF, ShopCatalogConn
+from tests.fakeconn import S1_REF, Rows, QueryMemoryConn, ShopCatalogConn, example_row, memory_run_row
 
 
 class ApiTests(unittest.TestCase):
@@ -647,3 +649,490 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("/api/query", paths)
         self.assertNotIn("/api/metrics", paths)
         self.assertNotIn("/api/sql", paths)
+
+
+# ======================================================================
+# approved 查询记忆审核 API（计划 2026-09-14-approved-query-memory.md Task 4）
+#
+# 全部跑在替身上：bi_agent.query_memory.api 的 psycopg.connect 被换成假的
+# approver 连接，于是「审核读写只建独立短连接、绝不碰 bi_app DSN」「被拒的
+# 请求不建任何连接」都能直接断言。响应断言落在稳定 envelope（code/message）
+# 与稳定 memory_* 错误码上；owner、授权域、created_by、事件理由、SQL、聊天、
+# 结果、DSN、数据库异常文本一律不得出现在任何响应里。
+
+_RUN_ID = UUID("550e8400-e29b-41d4-a716-446655440000")
+_RUN_REF = f"run-{_RUN_ID}"
+_TEMPLATE = "比较 {shop_scope} 在 {date_window} 的成本"
+_SLOTS = [{"name": "shop_scope", "kind": "entity_scope"},
+          {"name": "date_window", "kind": "date_window"}]
+_APP_DSN = "postgresql://bi_app:app-secret@localhost/bi_agent_test"
+_APPROVER_DSN = "postgresql://bi_approver:approver-secret@localhost/bi_agent_test"
+
+_DRAFT_PROJECTION_FIELDS = {
+    "example_ref", "domain", "intent_signature", "question_template", "slots",
+    "normalized_request", "expected_tool", "version_requirements", "status",
+    "approval_revision", "source_run_ref"}
+_CANDIDATE_PROJECTION_FIELDS = {
+    "source_run_ref", "domain", "normalized_request", "expected_tool",
+    "version_requirements", "created_at"}
+
+_DRAFT_LIST_COLUMNS = (
+    "example_ref", "source_run_id", "domain", "intent_signature",
+    "question_template", "slots", "normalized_request", "expected_tool",
+    "version_requirements", "status", "approval_revision")
+
+
+class ReviewerApiConn(QueryMemoryConn):
+    """生命周期替身 + 审核 API 的三条读取：候选列表、草稿列表、来源 owner 解析。
+
+    白名单之外的 SQL（聊天、Artifact、诊断……）由 QueryMemoryConn 显式报错，
+    所以「审核 API 不读聊天与结果」同样是替身保证的性质。
+    """
+
+    def __init__(self, *, candidate_rows=None, runs=None, **overrides):
+        super().__init__(**overrides)
+        self.candidate_rows = list(candidate_rows or [])
+        self.runs = dict(runs or {})
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_details):
+        self.closed = True
+        return False
+
+    def close(self):
+        self.closed = True
+
+    def execute(self, sql, params=None):
+        text = " ".join(sql.split())
+        values = list(params or [])
+        self.sql_log.append(text)
+        if text.startswith("SELECT r.id, r.domain, r.normalized_request"):
+            return Rows(self.candidate_rows)
+        if text.startswith("SELECT example_ref, source_run_id, domain"):
+            ordered = sorted(self.examples.values(), key=lambda row: row["example_ref"])
+            return Rows([[row[column] for column in _DRAFT_LIST_COLUMNS] for row in ordered])
+        if text.startswith("SELECT subject_id FROM bi.query_runs WHERE id"):
+            return Rows([(self.runs[values[0]],)]) if values[0] in self.runs else Rows([])
+        return super().execute(sql, params)
+
+
+def _candidate_row(*, run_id=_RUN_ID, domain="controlled_sql_exploration",
+                   request_extra=None, provenance=True):
+    """候选列表 SELECT 的一行：(id, domain, request, started_at, 血缘九列)。"""
+    row = memory_run_row(domain=domain, request_extra=request_extra, provenance=provenance)
+    started_at = datetime(2026, 9, 14, 12, tzinfo=timezone.utc)
+    return (run_id, row[2], row[3], started_at, *row[4:])
+
+
+class QueryMemoryApiTests(unittest.TestCase):
+    """计划 Task 4 Step 1：非审核者拒绝、载荷脱敏与来源保护的 API 契约。"""
+
+    maxDiff = None
+
+    @contextmanager
+    def reviewer_client(self, conn, *, enabled=True, loud=True):
+        from bi_agent.api import create_app
+        from bi_agent.config import AppSettings
+
+        app = create_app(AppSettings(
+            app_dsn=SecretStr(_APP_DSN),
+            shop_ids=frozenset({"S1"}),
+            environment="production",
+            allowed_subjects=frozenset({"subject-a", "reviewer-a"}),
+            public_origin="https://bi.test",
+            auth_subject_header="X-Auth-Request-Sub",
+            approved_query_memory_enabled=enabled,
+            approver_subjects=frozenset({"reviewer-a"}) if enabled else frozenset(),
+            approver_dsn=SecretStr(_APPROVER_DSN) if enabled else None,
+        ))
+        calls = []
+
+        def connect(dsn, **kwargs):
+            calls.append((dsn, kwargs))
+            return conn
+
+        with patch("bi_agent.query_memory.api.psycopg.connect", side_effect=connect):
+            yield TestClient(app, raise_server_exceptions=loud), calls
+
+    @staticmethod
+    def _read(sub="reviewer-a"):
+        return {"X-Auth-Request-Sub": sub}
+
+    @staticmethod
+    def _write(sub="reviewer-a"):
+        return {"Content-Type": "application/json", "X-BI-Agent": "web",
+                "Origin": "https://bi.test", "X-Auth-Request-Sub": sub}
+
+    @staticmethod
+    def _draft_payload():
+        return {"source_run_ref": _RUN_REF, "question_template": _TEMPLATE,
+                "slots": _SLOTS}
+
+    def _forbidden_words_absent(self, rendered, extra=()):
+        for word in ("sql_text", "rows", "subject_id", "shop_id", "raw_prompt",
+                     "owner_subject_id", "authorization_refs", "created_by",
+                     "actor", "error_code", "chat_messages", "query_artifacts",
+                     "dsn=", "app-secret", "approver-secret", *extra):
+            self.assertNotIn(word, rendered, word)
+
+    # ---- feature gate：关闭时整条审核面都是 404，且不建任何连接 ------------
+
+    def test_feature_gate_off_returns_stable_404_on_every_memory_route(self):
+        conn = ReviewerApiConn(runs={_RUN_ID: "subject-a"})
+        with self.reviewer_client(conn, enabled=False) as (client, calls):
+            requests = (
+                lambda: client.get("/api/query-memory/candidates", headers=self._read()),
+                lambda: client.get("/api/query-memory/drafts", headers=self._read()),
+                lambda: client.post("/api/query-memory/drafts",
+                                    headers=self._write(), json=self._draft_payload()),
+                lambda: client.post("/api/query-memory/drafts/mem-target/approve",
+                                    headers=self._write(), json={"reason": "血缘与模板复核通过"}),
+                lambda: client.post("/api/query-memory/drafts/mem-target/revoke",
+                                    headers=self._write(), json={"reason": "血缘与模板复核通过"}),
+                lambda: client.post("/api/query-memory/drafts/mem-target/supersede",
+                                    headers=self._write(),
+                                    json={"reason": "口径已升级", "replacement_ref": "mem-other"}),
+            )
+            for request in requests:
+                with self.subTest(route=request):
+                    response = request()
+                    self.assertEqual(response.status_code, 404, response.text)
+                    body = response.json()
+                    self.assertEqual(body["code"], "not_found")
+                    self.assertEqual(body["message"], "功能未启用")
+        # 关闭时连审核 DSN 都不能碰：一条连接都不建。
+        self.assertEqual(calls, [])
+        self.assertEqual(conn.writes, [])
+
+    def test_missing_subject_is_unauthenticated_before_anything_else(self):
+        conn = ReviewerApiConn()
+        with self.reviewer_client(conn) as (client, calls):
+            response = client.get("/api/query-memory/drafts")
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(response.json()["code"], "unauthenticated")
+        self.assertEqual(calls, [])
+
+    # ---- 非审核者 403；被拒请求不建审核连接 --------------------------------
+
+    def test_non_reviewer_cannot_list_create_or_decide(self):
+        conn = ReviewerApiConn(runs={_RUN_ID: "subject-a"})
+        with self.reviewer_client(conn) as (client, calls):
+            requests = (
+                lambda: client.get("/api/query-memory/candidates", headers=self._read("subject-a")),
+                lambda: client.get("/api/query-memory/drafts", headers=self._read("subject-a")),
+                lambda: client.post("/api/query-memory/drafts",
+                                    headers=self._write("subject-a"), json=self._draft_payload()),
+                lambda: client.post("/api/query-memory/drafts/mem-target/approve",
+                                    headers=self._write("subject-a"), json={"reason": "血缘与模板复核通过"}),
+            )
+            for request in requests:
+                with self.subTest(route=request):
+                    response = request()
+                    self.assertEqual(response.status_code, 403, response.text)
+                    body = response.json()
+                    self.assertEqual(body["code"], "forbidden")
+                    self.assertEqual(body["message"], "无审核权限")
+        self.assertEqual(calls, [])
+        self.assertEqual(conn.writes, [])
+
+    # ---- 写请求必须过既有 WebWrite 边界 ------------------------------------
+
+    def test_writes_require_the_existing_web_write_boundary(self):
+        conn = ReviewerApiConn(runs={_RUN_ID: "subject-a"})
+        bad = {"Content-Type": "application/json", "X-Auth-Request-Sub": "reviewer-a"}
+        with self.reviewer_client(conn) as (client, calls):
+            for path, payload in (
+                ("/api/query-memory/drafts", self._draft_payload()),
+                ("/api/query-memory/drafts/mem-target/approve", {"reason": "血缘与模板复核通过"}),
+                ("/api/query-memory/drafts/mem-target/revoke", {"reason": "血缘与模板复核通过"}),
+                ("/api/query-memory/drafts/mem-target/supersede",
+                 {"reason": "口径已升级", "replacement_ref": "mem-other"}),
+            ):
+                with self.subTest(path=path):
+                    response = client.post(path, headers=bad, json=payload)
+                    self.assertEqual(response.status_code, 403, response.text)
+                    self.assertEqual(response.json()["code"], "forbidden")
+        # 来源不可信的写请求在建立审核连接之前就被拒。
+        self.assertEqual(calls, [])
+        self.assertEqual(conn.writes, [])
+
+    # ---- 审核读写只走独立 approver DSN 的短连接 ----------------------------
+
+    def test_reads_use_one_short_lived_separate_approver_connection(self):
+        conn = ReviewerApiConn(examples={
+            "mem-a": example_row("mem-a", run_id=_RUN_ID)})
+        with self.reviewer_client(conn) as (client, calls):
+            response = client.get("/api/query-memory/drafts", headers=self._read())
+            self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(calls, [(_APPROVER_DSN, {"autocommit": True})])
+        self.assertNotEqual(calls[0][0], _APP_DSN)
+        # 请求结束连接即归还：审核路径不留挂着的连接。
+        self.assertTrue(conn.closed)
+
+    # ---- 投影脱敏：候选与草稿只暴露计划字段，绝无来源/授权/聊天/SQL --------
+
+    def test_draft_listing_exposes_only_the_safe_projection(self):
+        conn = ReviewerApiConn(examples={
+            "mem-b": example_row("mem-b", run_id=UUID(int=2),
+                                 status="approved", revision=1),
+            "mem-a": example_row("mem-a", run_id=_RUN_ID),
+        })
+        with self.reviewer_client(conn) as (client, calls):
+            response = client.get("/api/query-memory/drafts", headers=self._read())
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+        self.assertEqual([item["example_ref"] for item in body], ["mem-a", "mem-b"])
+        for item in body:
+            self.assertEqual(set(item), _DRAFT_PROJECTION_FIELDS)
+        self.assertEqual(body[0]["source_run_ref"], _RUN_REF)
+        self.assertEqual(body[1]["source_run_ref"],
+                         "run-00000000-0000-0000-0000-000000000002")
+        rendered = json.dumps(body, ensure_ascii=False)
+        self._forbidden_words_absent(rendered, extra=("reason", "state"))
+
+    def test_candidates_expose_the_value_free_projection_only(self):
+        good = _candidate_row()
+        poisoned = _candidate_row(run_id=UUID(int=2), request_extra={"top_n": 5})
+        unknown_domain = _candidate_row(run_id=UUID(int=3), domain="not_registered")
+        no_provenance = _candidate_row(run_id=UUID(int=4), provenance=False)
+        conn = ReviewerApiConn(
+            candidate_rows=[poisoned, good, unknown_domain, no_provenance])
+        with self.reviewer_client(conn) as (client, calls):
+            response = client.get("/api/query-memory/candidates", headers=self._read())
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+        # 不合格的候选整条 fail-closed：不出现在列表里，也不带原因文本。
+        self.assertEqual(len(body), 1)
+        candidate = body[0]
+        self.assertEqual(set(candidate), _CANDIDATE_PROJECTION_FIELDS)
+        self.assertEqual(candidate["source_run_ref"], _RUN_REF)
+        self.assertEqual(candidate["domain"], "controlled_sql_exploration")
+        # 净化投影：日期区间与店铺选择被剥掉，只剩稳定引用与业务码——绝不是
+        # 原始存储请求。
+        self.assertEqual(candidate["normalized_request"], {"metrics": ["paid_amount"]})
+        self.assertNotIn("start", candidate["normalized_request"])
+        self.assertNotIn("shop_refs", candidate["normalized_request"])
+        self.assertEqual(candidate["expected_tool"], "explore_business_data")
+        rendered = json.dumps(body, ensure_ascii=False)
+        self._forbidden_words_absent(rendered)
+        # 列表 SQL 只读安全列：成功状态 + 完整血缘 + 排除已有草稿的运行，
+        # 硬上限 100；聊天/Artifact/诊断/state/error_code 一个都不碰。
+        self.assertEqual(len(conn.sql_log), 1)
+        sql = " ".join(conn.sql_log[0].split())
+        self.assertIn("bi.query_runs", sql)
+        self.assertIn("bi.query_provenance", sql)
+        self.assertIn("NOT EXISTS", sql)
+        self.assertIn("bi.approved_query_examples", sql)
+        self.assertIn("'succeeded'", sql)
+        self.assertIn("LIMIT 100", sql)
+        for forbidden in ("chat_messages", "query_artifacts", "query_diagnostics",
+                          "r.state", "error_code", "payload"):
+            self.assertNotIn(forbidden, sql)
+
+    # ---- 草稿创建：opaque ref 服务端解析，owner 与审核者分离 ---------------
+
+    def test_draft_creation_resolves_the_opaque_ref_and_keeps_owner_distinct(self):
+        conn = ReviewerApiConn(runs={_RUN_ID: "subject-a"},
+                               run_row=memory_run_row(subject="subject-a"))
+        with self.reviewer_client(conn) as (client, calls):
+            response = client.post("/api/query-memory/drafts", headers=self._write(),
+                                   json=self._draft_payload())
+            self.assertEqual(response.status_code, 201, response.text)
+            body = response.json()
+        self.assertEqual(body["example_ref"], "mem-" + _RUN_ID.hex)
+        self.assertEqual(body["source_run_ref"], _RUN_REF)
+        self.assertEqual(body["status"], "draft")
+        self.assertEqual(body["approval_revision"], 0)
+        self.assertEqual(set(body), _DRAFT_PROJECTION_FIELDS)
+        rendered = json.dumps(body, ensure_ascii=False)
+        self._forbidden_words_absent(rendered, extra=("reason", "state"))
+        # owner 是来源运行本人，created_by/actor 是审核者：两者必须不同。
+        stored = conn.examples["mem-" + _RUN_ID.hex]
+        self.assertEqual(stored["owner_subject_id"], "subject-a")
+        event = conn.events[0]
+        self.assertEqual(event[3], "reviewer-a")
+        self.assertEqual(event[4], "drafted")
+        # 草稿请求是净化投影：一次性业务值不进记忆。
+        self.assertNotIn("start", stored["normalized_request"])
+        for sql in conn.sql_log:
+            self.assertNotIn("chat_messages", sql)
+            self.assertNotIn("query_artifacts", sql)
+        self.assertTrue(conn.closed)
+
+    def test_draft_owner_comes_from_the_run_not_from_the_reviewer(self):
+        conn = ReviewerApiConn(runs={_RUN_ID: "subject-b"},
+                               run_row=memory_run_row(subject="subject-b"))
+        with self.reviewer_client(conn) as (client, calls):
+            response = client.post("/api/query-memory/drafts", headers=self._write(),
+                                   json=self._draft_payload())
+            self.assertEqual(response.status_code, 201, response.text)
+        stored = conn.examples["mem-" + _RUN_ID.hex]
+        self.assertEqual(stored["owner_subject_id"], "subject-b")
+        self.assertEqual(conn.events[0][3], "reviewer-a")
+
+    def test_draft_creation_rejects_fields_beyond_the_three_allowed(self):
+        for smuggled in (
+            {"subject": "someone-else"},
+            {"owner_subject_id": "someone-else"},
+            {"status": "approved"},
+            {"domain": "business_query"},
+            {"normalized_request": {"metrics": ["paid_amount"]}},
+            {"version_requirements": {}},
+            {"authorization_refs": [S1_REF]},
+            {"example_ref": "mem-forged"},
+        ):
+            with self.subTest(field=sorted(smuggled)):
+                conn = ReviewerApiConn(runs={_RUN_ID: "subject-a"},
+                                       run_row=memory_run_row(subject="subject-a"))
+                with self.reviewer_client(conn) as (client, calls):
+                    response = client.post("/api/query-memory/drafts",
+                                           headers=self._write(),
+                                           json=self._draft_payload() | smuggled)
+                    self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(calls[0][0], _APPROVER_DSN)
+
+    def test_draft_creation_revalidates_the_source_run(self):
+        cases = (
+            ("absent", ReviewerApiConn()),
+            ("failed", ReviewerApiConn(runs={_RUN_ID: "subject-a"},
+                                       run_row=memory_run_row(status="failed"))),
+            ("no_provenance", ReviewerApiConn(
+                runs={_RUN_ID: "subject-a"},
+                run_row=memory_run_row(provenance=False))),
+        )
+        for name, conn in cases:
+            with self.subTest(source=name):
+                with self.reviewer_client(conn) as (client, calls):
+                    response = client.post("/api/query-memory/drafts",
+                                           headers=self._write(),
+                                           json=self._draft_payload())
+                    self.assertEqual(response.status_code, 422, response.text)
+                    body = response.json()
+                    self.assertEqual(body["code"], "memory_source_run_not_eligible")
+                self.assertEqual(conn.writes, [])
+
+    def test_draft_creation_rejects_malformed_source_refs(self):
+        conn = ReviewerApiConn()
+        for bad_ref in ("run-not-a-uuid", _RUN_ID.hex,
+                        "mem-" + _RUN_ID.hex, "run-"):
+            with self.subTest(ref=bad_ref):
+                with self.reviewer_client(conn) as (client, calls):
+                    response = client.post("/api/query-memory/drafts",
+                                           headers=self._write(),
+                                           json=self._draft_payload()
+                                           | {"source_run_ref": bad_ref})
+                    self.assertEqual(response.status_code, 422, response.text)
+        # 形状不合格的 ref 从未到达解析 SQL：bi.query_runs 一次都没被读。
+        for sql in conn.sql_log:
+            self.assertNotIn("bi.query_runs", sql)
+        self.assertEqual(conn.writes, [])
+
+    # ---- 状态迁移：稳定错误码 → 固定 404/409/422 ---------------------------
+
+    def _examples_with(self, *, status="draft", revision=0, extra=None):
+        examples = {"mem-target": example_row("mem-target", run_id=_RUN_ID,
+                                              status=status, revision=revision)}
+        examples.update(extra or {})
+        return examples
+
+    def test_transition_errors_map_to_fixed_statuses(self):
+        with self.subTest(case="unknown-ref"):
+            conn = ReviewerApiConn()
+            with self.reviewer_client(conn) as (client, calls):
+                response = client.post("/api/query-memory/drafts/mem-target/approve",
+                                       headers=self._write(),
+                                       json={"reason": "血缘与模板复核通过"})
+                self.assertEqual(response.status_code, 404, response.text)
+                self.assertEqual(response.json()["code"], "memory_example_not_found")
+            self.assertEqual(conn.events, [])
+        with self.subTest(case="approve-twice"):
+            conn = ReviewerApiConn(examples=self._examples_with(
+                status="approved", revision=1))
+            with self.reviewer_client(conn) as (client, calls):
+                response = client.post("/api/query-memory/drafts/mem-target/approve",
+                                       headers=self._write(),
+                                       json={"reason": "血缘与模板复核通过"})
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(response.json()["code"], "memory_transition_invalid")
+            self.assertEqual(conn.events, [])
+        with self.subTest(case="revision-conflict"):
+            conn = ReviewerApiConn(examples=self._examples_with())
+            conn.cas_fail = True
+            with self.reviewer_client(conn) as (client, calls):
+                response = client.post("/api/query-memory/drafts/mem-target/approve",
+                                       headers=self._write(),
+                                       json={"reason": "血缘与模板复核通过"})
+                self.assertEqual(response.status_code, 409, response.text)
+                self.assertEqual(response.json()["code"], "memory_revision_conflict")
+            # CAS 冲突绝不追加事件，也不重放审批。
+            self.assertEqual(conn.events, [])
+        with self.subTest(case="replacement-not-approved"):
+            # supersede 只能从 approved 发起：目标本身必须是已批准记录。
+            conn = ReviewerApiConn(examples=self._examples_with(
+                status="approved", revision=1,
+                extra={"mem-other": example_row("mem-other", run_id=UUID(int=9))}))
+            with self.reviewer_client(conn) as (client, calls):
+                response = client.post("/api/query-memory/drafts/mem-target/supersede",
+                                       headers=self._write(),
+                                       json={"reason": "口径已升级",
+                                             "replacement_ref": "mem-other"})
+                self.assertEqual(response.status_code, 422, response.text)
+                self.assertEqual(response.json()["code"], "memory_replacement_invalid")
+            self.assertEqual(conn.events, [])
+        with self.subTest(case="supersede-without-replacement-field"):
+            conn = ReviewerApiConn(examples=self._examples_with())
+            with self.reviewer_client(conn) as (client, calls):
+                response = client.post("/api/query-memory/drafts/mem-target/supersede",
+                                       headers=self._write(), json={"reason": "口径已升级"})
+                self.assertEqual(response.status_code, 422, response.text)
+            self.assertEqual(conn.events, [])
+        with self.subTest(case="blank-reason"):
+            conn = ReviewerApiConn(examples=self._examples_with())
+            with self.reviewer_client(conn) as (client, calls):
+                response = client.post("/api/query-memory/drafts/mem-target/approve",
+                                       headers=self._write(), json={"reason": "   "})
+                self.assertEqual(response.status_code, 422, response.text)
+            self.assertEqual(conn.events, [])
+        with self.subTest(case="approve-must-not-carry-replacement"):
+            conn = ReviewerApiConn(examples=self._examples_with())
+            with self.reviewer_client(conn) as (client, calls):
+                response = client.post("/api/query-memory/drafts/mem-target/approve",
+                                       headers=self._write(),
+                                       json={"reason": "血缘与模板复核通过",
+                                             "replacement_ref": "mem-other"})
+                self.assertEqual(response.status_code, 422, response.text)
+            self.assertEqual(conn.events, [])
+
+    def test_approval_updates_the_projection_and_appends_one_event(self):
+        conn = ReviewerApiConn(examples=self._examples_with())
+        with self.reviewer_client(conn) as (client, calls):
+            response = client.post("/api/query-memory/drafts/mem-target/approve",
+                                   headers=self._write(),
+                                   json={"reason": "血缘与模板复核通过"})
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+        self.assertEqual(body["status"], "approved")
+        self.assertEqual(body["approval_revision"], 1)
+        self.assertEqual(set(body), _DRAFT_PROJECTION_FIELDS)
+        self.assertEqual(len(conn.events), 1)
+        _depth, ref, revision, actor, kind, reason, replacement = conn.events[0]
+        self.assertEqual((ref, revision, actor, kind, reason, replacement),
+                         ("mem-target", 1, "reviewer-a", "approved",
+                          "血缘与模板复核通过", None))
+
+    # ---- 数据库失败：500 泛化响应，不外泄 DSN 或异常文本 -------------------
+
+    def test_database_failure_leaks_no_dsn_or_exception_text(self):
+        class BrokenConn(ReviewerApiConn):
+            def execute(self, sql, params=None):
+                raise psycopg.OperationalError(
+                    "connection to server failed dsn="
+                    f"\"{_APPROVER_DSN}\" SELECT * FROM bi.approved_query_examples")
+
+        with self.reviewer_client(BrokenConn(), loud=False) as (client, calls):
+            response = client.get("/api/query-memory/drafts", headers=self._read())
+        self.assertEqual(response.status_code, 500)
+        self._forbidden_words_absent(response.text, extra=("OperationalError", "SELECT"))

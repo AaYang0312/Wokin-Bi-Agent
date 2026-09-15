@@ -836,3 +836,136 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
 .chart-point.chart-series-4 { fill: var(--pink); }
 .chart-point.chart-series-5 { fill: var(--danger); }
 .chart-values li[data-series] span { color: var(--text-2); }
+
+/* ---------------------------------------------------------------------------
+ * 记忆审核面板（approved 查询记忆计划 Task 4）：审核者专属的独立表面，
+ * 不属于聊天消息流。颜色只取已通过对比度门禁的既有 token，不新引入色值。
+ * ------------------------------------------------------------------------- */
+.review-toggle {
+  position: fixed; right: 18px; bottom: 18px; z-index: 25;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 14px;
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface-raised);
+  color: var(--text-2);
+  font-size: 12px; font-weight: 600;
+  box-shadow: var(--shadow-float), var(--inset-hi);
+  backdrop-filter: blur(18px) saturate(150%);
+  transition: color .16s var(--ease-out), border-color .16s var(--ease-out), transform .16s var(--ease-out);
+}
+.review-toggle:hover { color: var(--text); border-color: var(--accent-line); }
+.review-toggle:active { transform: translateY(1px); }
+.review-toggle.open { color: var(--accent-soft); border-color: var(--accent-line); background: var(--accent-veil); }
+
+.review-dock {
+  position: fixed; top: 12px; bottom: 12px; right: 12px; z-index: 40;
+  width: min(620px, calc(100vw - 24px));
+  display: flex; flex-direction: column;
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface-solid);
+  box-shadow: var(--shadow-float);
+  overflow: hidden;
+}
+.review-panel { display: flex; flex-direction: column; min-height: 0; height: 100%; }
+.review-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  flex: 0 0 auto;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--hair);
+}
+.review-title { margin: 0; font-size: 15px; font-weight: 660; letter-spacing: -.01em; }
+.review-body {
+  flex: 1; min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 18px;
+  display: grid; gap: 14px; align-content: start;
+}
+.review-kicker {
+  margin: 4px 0 0;
+  color: var(--text-3);
+  font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+}
+.review-denied, .review-notice {
+  margin: 0; padding: 10px 12px;
+  border: 1px solid rgba(255, 107, 111, .32);
+  border-radius: var(--r-md);
+  background: rgba(255, 107, 111, .10);
+  color: #ffb4b7;
+  font-size: 13px;
+}
+.review-empty { margin: 0; color: var(--text-3); font-size: 12.5px; }
+.review-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.review-card {
+  display: grid; gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  background: var(--surface-raised);
+}
+.review-card.selected { border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-veil); }
+.review-ref {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-3);
+  word-break: break-all;
+}
+.review-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.review-tag {
+  padding: 2px 8px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-pill);
+  color: var(--text-2);
+  font-size: 11px;
+}
+.review-tag.status-draft { color: var(--accent-soft); border-color: var(--accent-line); }
+.review-tag.status-approved { color: var(--ok); border-color: rgba(79, 209, 165, .4); }
+.review-tag.status-revoked, .review-tag.status-superseded { color: var(--text-3); }
+.review-template { margin: 0; font-size: 13.5px; line-height: 1.6; }
+.review-slot {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-pill);
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.review-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.review-btn {
+  padding: 6px 12px;
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface-raised);
+  color: var(--text-2);
+  font-size: 12px; font-weight: 600;
+  transition: color .16s var(--ease-out), border-color .16s var(--ease-out), filter .16s var(--ease-out);
+}
+.review-btn:hover { color: var(--text); border-color: var(--accent-line); }
+.review-btn.primary {
+  background: var(--accent-grad);
+  border-color: transparent;
+  color: var(--text-on-accent);
+  box-shadow: 0 10px 22px -12px var(--accent), inset 0 1px 0 rgba(255, 255, 255, .3);
+}
+.review-btn.primary:hover { color: var(--text-on-accent); filter: brightness(1.08); }
+.review-btn.danger:hover { color: var(--danger); border-color: rgba(255, 107, 111, .4); }
+.review-form { display: grid; gap: 10px; }
+.review-field { display: grid; gap: 4px; color: var(--text-2); font-size: 12px; }
+.review-field textarea, .review-field select {
+  width: 100%;
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+}
+.review-field textarea { resize: vertical; min-height: 56px; }
+.review-field textarea:focus-visible, .review-field select:focus-visible {
+  outline: none; border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-veil);
+}
+
+@media (max-width: 767px) {
+  .review-dock { top: 0; bottom: 0; right: 0; width: 100vw; border-radius: 0; border: 0; }
+}

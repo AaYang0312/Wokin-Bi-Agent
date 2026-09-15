@@ -1,9 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 
-import { ApiError, createChat, deleteChat, listChats, loadMessages, renameChat, sendMessage } from './api'
+import {
+  ApiError, createChat, deleteChat, listChats, loadMessages, probeReviewAccess,
+  renameChat, sendMessage,
+} from './api'
 import { ChatView } from './components/ChatView'
+import { QueryMemoryReviewSection } from './components/QueryMemoryReview'
 import { Sidebar } from './components/Sidebar'
-import type { Artifact, ChatMessage, ChatSummary } from './types'
+import type { Artifact, ChatMessage, ChatSummary, ReviewAccess } from './types'
 
 const stageText: Record<string, string> = {
   thinking: '正在理解问题…',
@@ -15,8 +19,10 @@ const stageText: Record<string, string> = {
 const DRAWER_QUERY = '(max-width: 767px)'
 
 function useNarrow() {
-  const [narrow, setNarrow] = useState(() => window.matchMedia(DRAWER_QUERY).matches)
+  const [narrow, setNarrow] = useState(() => (
+    typeof window === 'undefined' ? false : window.matchMedia(DRAWER_QUERY).matches))
   useEffect(() => {
+    if (typeof window === 'undefined') return
     const query = window.matchMedia(DRAWER_QUERY)
     const sync = () => setNarrow(query.matches)
     sync()
@@ -24,6 +30,25 @@ function useNarrow() {
     return () => query.removeEventListener('change', sync)
   }, [])
   return narrow
+}
+
+/**
+ * 审核入口：只在后端确认审核能力（候选探针 200）时出现。404（功能关）与
+ * 403（无权限）都不渲染——聊天界面本身永远不是审核入口，普通用户看不到任何
+ * 审核痕迹；权限拒绝由面板内部表达。
+ */
+export function ReviewEntry({ access, open, onToggle }: {
+  access: ReviewAccess | null
+  open: boolean
+  onToggle: () => void
+}) {
+  if (access !== 'available') return null
+  return (
+    <button type="button" className={`review-toggle${open ? ' open' : ''}`}
+      onClick={onToggle} aria-expanded={open} aria-controls="review-dock">
+      审核记忆
+    </button>
+  )
 }
 
 export default function App() {
@@ -34,6 +59,8 @@ export default function App() {
   const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [error, setError] = useState<string | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [reviewAccess, setReviewAccess] = useState<ReviewAccess | null>(null)
+  const [reviewOpen, setReviewOpen] = useState(false)
   const narrow = useNarrow()
   const controller = useRef<AbortController | null>(null)
   const selectedRef = useRef<string | null>(null)
@@ -49,6 +76,16 @@ export default function App() {
     }
     window.addEventListener('keydown', closeOnEscape)
     return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [])
+
+  // 审核能力探测：只在挂载时问一次后端（GET candidates）。
+  // available 才出现入口；forbidden/off/unavailable 都保持聊天界面原样。
+  useEffect(() => {
+    let cancelled = false
+    void probeReviewAccess().then((access) => {
+      if (!cancelled) setReviewAccess(access)
+    })
+    return () => { cancelled = true }
   }, [])
 
   // 窄屏抽屉的焦点交接：开时进入抽屉，收时回给触发按钮（inert 会把焦点丢给 body）。
@@ -170,6 +207,8 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <ReviewEntry access={reviewAccess} open={reviewOpen}
+        onToggle={() => setReviewOpen((value) => !value)} />
       <div className="workspace">
         <Sidebar chats={chats} selectedId={selectedId} busy={controller.current !== null}
           open={sidebarOpen} narrow={narrow} drawerRef={drawerRef}
@@ -183,6 +222,11 @@ export default function App() {
           onOpenSidebar={() => setSidebarOpen(true)} onSend={send}
           onDrilldown={(intent) => void send(intent.question)} />
       </div>
+      {reviewOpen && reviewAccess === 'available' && (
+        <div className="review-dock" id="review-dock" role="dialog" aria-label="记忆审核">
+          <QueryMemoryReviewSection onClose={() => setReviewOpen(false)} />
+        </div>
+      )}
     </div>
   )
 }

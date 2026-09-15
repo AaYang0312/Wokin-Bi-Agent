@@ -29,6 +29,7 @@ from .chats import (
 from .config import AppSettings
 from .agent import encode_sse, run_chat_turn
 from .llm import ChatModel
+from .query_memory.api import mount_reviewer_api
 from .semantic_catalog import CATALOG
 from .semantic_catalog.schema_check import validate_catalog_schema
 
@@ -167,5 +168,11 @@ def create_app(settings: AppSettings, model: ChatModel | None = None) -> FastAPI
             events(), media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    # 计划 Task 4：审核者 API。路由常驻、门槛在依赖里判——feature gate 关闭时
+    # 所有 query-memory 路由返回 404（既有稳定 envelope），且不建任何审核连接；
+    # 写请求复用同一道 WebWrite 边界，读写只走独立 approver DSN。
+    mount_reviewer_api(app, settings, get_subject=get_subject,
+                       require_web_write=require_web_write)
 
     return app

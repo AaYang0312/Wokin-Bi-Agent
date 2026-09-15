@@ -83,3 +83,54 @@ export type ChatEvent =
   | { event: 'message'; data: ChatMessage }
   | { event: 'error'; data: { code: string; message: string } }
   | { event: 'done'; data: { status: 'complete' | 'error' } }
+
+/** 审核面板的槽位定义：一次性业务值只能是槽位，不允许是常量。 */
+export type QueryMemorySlotKind =
+  | 'entity_scope'
+  | 'date_window'
+  | 'target_price'
+  | 'threshold'
+  | 'budget'
+
+export type QueryMemorySlot = {
+  name: string
+  kind: QueryMemorySlotKind
+}
+
+export type ApprovalAction = 'approve' | 'revoke' | 'supersede'
+
+export type QueryMemoryStatus = 'draft' | 'approved' | 'superseded' | 'revoked'
+
+/**
+ * 候选来源：后端从成功运行的**安全列**投影而来，normalized_request 已经是
+ * value-free 的净化结果。前端只原样展示，不缓存、不进聊天消息流。
+ */
+export type QueryMemoryCandidate = {
+  source_run_ref: string
+  domain: string
+  normalized_request: Record<string, unknown>
+  expected_tool: string
+  version_requirements: Record<string, unknown>
+  created_at: string
+}
+
+/**
+ * 审核 DRAFT/记录投影：与后端 DraftProjection 字段一一对应。owner、授权域、
+ * created_by、事件理由、SQL、结果在后端就被收口，类型里根本没有这些字段。
+ */
+export type QueryMemoryDraft = {
+  example_ref: string
+  domain: string
+  intent_signature: string
+  question_template: string
+  slots: QueryMemorySlot[]
+  normalized_request: Record<string, unknown>
+  expected_tool: string
+  version_requirements: Record<string, unknown>
+  status: QueryMemoryStatus
+  approval_revision: number
+  source_run_ref: string
+}
+
+/** 审核能力探测结果：404=功能关（隐藏面板），403=无权限（显示拒绝）。 */
+export type ReviewAccess = 'available' | 'forbidden' | 'off' | 'unavailable'

@@ -1,4 +1,7 @@
-import type { ChatEvent, ChatMessage, ChatSummary } from './types'
+import type {
+  ApprovalAction, ChatEvent, ChatMessage, ChatSummary, QueryMemoryCandidate,
+  QueryMemoryDraft, QueryMemorySlot, ReviewAccess,
+} from './types'
 
 export class ApiError extends Error {
   constructor(readonly status: number, message: string) {
@@ -159,4 +162,56 @@ export async function sendMessage(
     parser.push(value)
   }
   parser.finish()
+}
+
+// ---------------------------------------------------------------- 记忆审核 API
+// 审核者是独立的人机界面：读走既有 GET 通道，写与聊天一样必须过 writeHeaders
+// （X-BI-Agent: web + JSON）。载荷只含后端定义的安全字段。
+
+export function listQueryMemoryCandidates() {
+  return json<QueryMemoryCandidate[]>('/api/query-memory/candidates')
+}
+
+export function listQueryMemoryDrafts() {
+  return json<QueryMemoryDraft[]>('/api/query-memory/drafts')
+}
+
+export type DraftCreateInput = {
+  source_run_ref: string
+  question_template: string
+  slots: QueryMemorySlot[]
+}
+
+export function createQueryMemoryDraft(input: DraftCreateInput) {
+  return json<QueryMemoryDraft>('/api/query-memory/drafts', {
+    method: 'POST', headers: writeHeaders, body: JSON.stringify(input),
+  })
+}
+
+export function decideQueryMemoryDraft(
+  exampleRef: string,
+  action: ApprovalAction,
+  reason: string,
+  replacementRef?: string,
+) {
+  const body: Record<string, string> = { reason }
+  if (action === 'supersede') body.replacement_ref = replacementRef ?? ''
+  return json<QueryMemoryDraft>(
+    `/api/query-memory/drafts/${encodeURIComponent(exampleRef)}/${action}`,
+    { method: 'POST', headers: writeHeaders, body: JSON.stringify(body) },
+  )
+}
+
+/** 用候选列表探针审核能力：200=可用，403=无权限，404=功能关，其余=不可用。 */
+export async function probeReviewAccess(): Promise<ReviewAccess> {
+  try {
+    await listQueryMemoryCandidates()
+    return 'available'
+  } catch (caught) {
+    if (caught instanceof ApiError) {
+      if (caught.status === 403) return 'forbidden'
+      if (caught.status === 404) return 'off'
+    }
+    return 'unavailable'
+  }
 }
