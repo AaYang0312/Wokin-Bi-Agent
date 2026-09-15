@@ -1430,3 +1430,230 @@ class ExplorationGraphDatabaseTests(ExplorationLivePlanFixture, unittest.TestCas
         with self.assertRaises(RunNotFound):
             self._store().record_diagnostic(uuid4(), template_id="exploration_sql",
                                            sql_text="SELECT 1", parameters={})
+
+
+# ---------------------------------------------------------------------------
+# approved 查询学习记忆的生命周期（计划 Task 2 Step 5）：真库上的草稿来源边界、
+# 人工状态机、CAS 与「恰好一条不可变事件」。全部写入发生在管理员外层事务里，
+# 结束按 Rollback 协议丢弃，共享 *_test 库不留任何草稿或事件。
+# ---------------------------------------------------------------------------
+
+MEMORY_REQUEST = {"shop_refs": [S1_REF], "metrics": ["paid_amount"]}
+MEMORY_PROVENANCE = ("fixed_metric_query", "1", "metrics/2026-09-12.1", "008", 7,
+                     "identity/2026-09-11.1", "multi-source-policy/2026-09-12.1",
+                     "business_query-graph/2026-09-11.1", "sources/2026-09-12.1")
+MEMORY_TEMPLATE = "比较 {shop_scope} 在 {date_window} 的成本"
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class QueryMemoryLifecycleDatabaseTests(unittest.TestCase):
+    """计划 Task 2 Step 5：非成功/跨 owner 运行为 0 草稿；状态变化恰好一条事件。"""
+
+    def setUp(self):
+        self.conn = connect_test_db(self)
+
+    def _command(self, action: str, reason: str, replacement: str | None = None):
+        from bi_agent.query_memory.models import ApprovalCommand
+
+        return ApprovalCommand(action=action, reason=reason,
+                               replacement_ref=replacement)
+
+    def _seed_run(self, *, subject: str = "subject-a", status: str = "succeeded",
+                  domain: str = "business_query", with_provenance: bool = True,
+                  request: dict | None = None):
+        from psycopg.types.json import Jsonb
+
+        chat_id, message_id, run_id = uuid4(), uuid4(), uuid4()
+        self.conn.execute(
+            "INSERT INTO bi.app_chats(id, subject_id, title) VALUES (%s, %s, '查询')",
+            (chat_id, subject))
+        self.conn.execute(
+            "INSERT INTO bi.app_messages(id, chat_id, role, content, status) "
+            "VALUES (%s, %s, 'user', '查询销售额', 'complete')",
+            (message_id, chat_id))
+        self.conn.execute(
+            "INSERT INTO bi.query_runs(id, chat_id, user_message_id, subject_id, "
+            "tool_call_id, domain, attempt_no, status, normalized_request, state) "
+            "VALUES (%s, %s, %s, %s, 'call_1', %s, 1, %s, %s, '{}')",
+            (run_id, chat_id, message_id, subject, domain, status,
+             Jsonb(request if request is not None else MEMORY_REQUEST)))
+        if with_provenance:
+            self.conn.execute(
+                """INSERT INTO bi.query_provenance (
+                       run_id, template_id, template_version, metric_version,
+                       schema_version, catalog_version, mapping_version,
+                       policy_version, graph_version, source_registry_version)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (run_id, *MEMORY_PROVENANCE))
+        return run_id
+
+    def _slots(self):
+        from bi_agent.query_memory.models import QuerySlot
+
+        return (QuerySlot(name="shop_scope", kind="entity_scope"),
+                QuerySlot(name="date_window", kind="date_window"))
+
+    def _build(self, run_id, *, owner: str = "subject-a"):
+        from bi_agent.query_memory.repository import build_draft_from_run
+
+        return build_draft_from_run(
+            self.conn, run_id=run_id, owner_subject_id=owner,
+            question_template=MEMORY_TEMPLATE, slots=self._slots(),
+            created_by="reviewer-a")
+
+    def _repository(self):
+        from bi_agent.query_memory.repository import QueryMemoryRepository
+
+        return QueryMemoryRepository(self.conn)
+
+    def _event_count(self, example_ref: str) -> int:
+        return self.conn.execute(
+            "SELECT count(*) FROM bi.approved_query_events WHERE example_ref=%s",
+            (example_ref,)).fetchone()[0]
+
+    def _history(self, example_ref: str) -> list[tuple]:
+        """按 revision 排好的 (revision, event_kind) 历史：不可变、只增。"""
+        return self.conn.execute(
+            "SELECT revision, event_kind FROM bi.approved_query_events "
+            "WHERE example_ref=%s ORDER BY revision",
+            (example_ref,)).fetchall()
+
+    def test_succeeded_owned_run_builds_a_sanitized_draft_with_one_event(self):
+        from bi_agent.semantic_catalog.registry import CATALOG
+
+        run_id = self._seed_run()
+        record = self._build(run_id)
+        self.assertEqual(record.example_ref, "mem-" + run_id.hex)
+        self.assertEqual((record.status, record.approval_revision), ("draft", 0))
+        row = self.conn.execute(
+            """SELECT status, approval_revision, expected_tool, normalized_request,
+                      authorization_refs, slots
+               FROM bi.approved_query_examples WHERE example_ref=%s""",
+            (record.example_ref,)).fetchone()
+        status, revision, tool, request, auth_refs, slots = row
+        self.assertEqual((status, revision, tool), ("draft", 0, "query_business"))
+        # 一次性业务值已剥离；授权域来自运行自身的 shop_refs；版本集合已冻结。
+        self.assertEqual(request, {"metrics": ["paid_amount"]})
+        self.assertEqual(list(auth_refs), [S1_REF])
+        self.assertEqual([item["name"] for item in slots],
+                         ["shop_scope", "date_window"])
+        versions = self.conn.execute(
+            "SELECT version_requirements FROM bi.approved_query_examples "
+            "WHERE example_ref=%s", (record.example_ref,)).fetchone()[0]
+        self.assertEqual(versions["semantic_catalog_version"], CATALOG.version)
+        self.assertEqual(versions["data_catalog_version"], 7)
+        # 恰好一条 drafted 事件：revision 0、操作者与固定理由留痕。
+        self.assertEqual(self._event_count(record.example_ref), 1)
+        event = self.conn.execute(
+            """SELECT revision, actor_subject_id, event_kind, reason, replacement_ref
+               FROM bi.approved_query_events WHERE example_ref=%s""",
+            (record.example_ref,)).fetchone()
+        self.assertEqual(event, (0, "reviewer-a", "drafted", "drafted", None))
+
+    def test_ineligible_runs_leave_zero_drafts_and_zero_events(self):
+        run_id = self._seed_run(status="failed")
+        with self.assertRaisesRegex(ValueError, "memory_source_run_not_eligible"):
+            self._build(run_id, owner="subject-a")
+        cross = self._seed_run(subject="subject-b")
+        with self.assertRaisesRegex(ValueError, "memory_source_run_not_eligible"):
+            self._build(cross, owner="subject-a")
+        orphan = self._seed_run(with_provenance=False)
+        with self.assertRaisesRegex(ValueError, "memory_source_run_not_eligible"):
+            self._build(orphan)
+        scoped = self._seed_run(request={"shop_refs": ["invalid_shop"],
+                                         "metrics": ["paid_amount"]})
+        with self.assertRaisesRegex(ValueError, "memory_source_run_not_eligible"):
+            self._build(scoped)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.approved_query_examples").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.approved_query_events").fetchone()[0], 0)
+
+    def test_double_draft_of_same_run_conflicts_on_the_primary_key(self):
+        run_id = self._seed_run()
+        first = self._build(run_id)
+        with self.assertRaisesRegex(ValueError, "memory_draft_exists"):
+            self._build(run_id)
+        self.assertEqual(self._event_count(first.example_ref), 1)
+
+    def test_lifecycle_transitions_append_exactly_one_event_each(self):
+        run_id = self._seed_run()
+        draft = self._build(run_id)
+        repository = self._repository()
+        approved = repository.transition(
+            draft.example_ref, command=self._command("approve", "人工复核通过"),
+            actor_subject_id="reviewer-a")
+        self.assertEqual((approved.status, approved.approval_revision),
+                         ("approved", 1))
+        self.assertEqual(self._history(draft.example_ref),
+                         [(0, "drafted"), (1, "approved")])
+        # 已批准的样例不能再批准：非法迁移失败收场，事件不再增加。
+        with self.assertRaisesRegex(ValueError, "memory_transition_invalid"):
+            repository.transition(
+                draft.example_ref,
+                command=self._command("approve", "cannot approve twice"),
+                actor_subject_id="reviewer-a")
+        self.assertEqual(self._history(draft.example_ref),
+                         [(0, "drafted"), (1, "approved")])
+        # 撤销：approved → revoked，第二次状态变化恰一条新事件，状态进入终态。
+        revoked = repository.transition(
+            draft.example_ref, command=self._command("revoke", "证据失效，立即撤销"),
+            actor_subject_id="reviewer-a")
+        self.assertEqual((revoked.status, revoked.approval_revision),
+                         ("revoked", 2))
+        self.assertEqual(self._history(draft.example_ref),
+                         [(0, "drafted"), (1, "approved"), (2, "revoked")])
+
+    def test_supersede_needs_an_approved_same_domain_replacement(self):
+        old_run = self._seed_run()
+        old = self._build(old_run)
+        new_run = self._seed_run()
+        new = self._build(new_run)
+        repository = self._repository()
+        repository.transition(
+            old.example_ref, command=self._command("approve", "人工复核通过"),
+            actor_subject_id="reviewer-a")
+        repository.transition(
+            new.example_ref, command=self._command("approve", "人工复核通过"),
+            actor_subject_id="reviewer-a")
+        # 替换目标未批准（还是 draft）→ 无效，且不追加事件。
+        draft_two = self._build(self._seed_run())
+        with self.assertRaisesRegex(ValueError, "memory_replacement_invalid"):
+            repository.transition(
+                old.example_ref,
+                command=self._command("supersede", "版本升级，换用新样例",
+                                      draft_two.example_ref),
+                actor_subject_id="reviewer-a")
+        self.assertEqual(self._history(old.example_ref),
+                         [(0, "drafted"), (1, "approved")])
+        # 自替换同样无效。
+        with self.assertRaisesRegex(ValueError, "memory_replacement_invalid"):
+            repository.transition(
+                old.example_ref,
+                command=self._command("supersede", "版本升级，换用新样例",
+                                      old.example_ref),
+                actor_subject_id="reviewer-a")
+        superseded = repository.transition(
+            old.example_ref,
+            command=self._command("supersede", "版本升级，换用新样例",
+                                  new.example_ref),
+            actor_subject_id="reviewer-a")
+        self.assertEqual((superseded.status, superseded.approval_revision),
+                         ("superseded", 2))
+        event = self.conn.execute(
+            """SELECT revision, event_kind, replacement_ref
+               FROM bi.approved_query_events
+               WHERE example_ref=%s ORDER BY revision DESC LIMIT 1""",
+            (old.example_ref,)).fetchone()
+        self.assertEqual(event, (2, "superseded", new.example_ref))
+
+    def test_draft_row_satisfies_the_database_bound_value_check(self):
+        """净化器剥掉 start/shop_refs 后，底表 CHECK 也不该再见到任何绑定值键。"""
+        from bi_agent.query_memory.models import FORBIDDEN_VALUE_KEYS
+
+        run_id = self._seed_run()
+        record = self._build(run_id)
+        stored = self.conn.execute(
+            "SELECT normalized_request FROM bi.approved_query_examples "
+            "WHERE example_ref=%s", (record.example_ref,)).fetchone()[0]
+        self.assertFalse(set(stored) & FORBIDDEN_VALUE_KEYS)

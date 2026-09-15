@@ -1,11 +1,14 @@
-"""approved 查询学习记忆的契约（计划 2026-09-14-approved-query-memory.md Task 1）。
+"""approved 查询学习记忆的契约与生命周期（计划 2026-09-14-approved-query-memory.md
+Task 1、Task 2）。
 
-本文件只钉形状与净化规则：生命周期运行时属 Task 2，检索属 Task 3。所有断言都落在
-稳定原因码（`memory_*` / `replacement_ref_action_mismatch`）上；被拒的输入本身
-不允许出现在错误文本里（`hide_input_in_errors`），否则报错就成了第二条泄露通道。
+Task 1 钉形状与净化规则；QueryMemoryLifecycleTests 钉 Task 2 的草稿来源边界与
+人工状态机（离线用替身，真库用例在 tests.test_runtime_db）。所有断言都落在稳定
+原因码（`memory_*` / `replacement_ref_action_mismatch`）上；被拒的输入本身不允许
+出现在错误文本里（`hide_input_in_errors`），否则报错就成了第二条泄露通道。
 """
 
 import unittest
+from uuid import UUID
 
 from pydantic import ValidationError
 
@@ -218,6 +221,329 @@ class QueryMemoryContractTests(unittest.TestCase):
                     self.assertRaisesRegex(ValidationError,
                                            "replacement_ref_action_mismatch"):
                 ApprovalCommand(**command)
+
+
+class QueryMemoryLifecycleTests(unittest.TestCase):
+    """计划 Task 2：草稿来源边界与 draft→approved→superseded/revoked 人工状态机。
+
+    全部跑在 fakeconn.QueryMemoryConn 上：替身对白名单之外的 SQL（含聊天表与
+    Artifact 载荷）显式报错，所以“builder 不读聊天与结果”是替身保证的性质。
+    真库事务、锁与约束的用例在 tests.test_runtime_db。
+    """
+
+    RUN_ID = UUID("550e8400-e29b-41d4-a716-446655440000")
+
+    # ---- 造替身的小工具 ---------------------------------------------------
+
+    def _conn(self, **overrides):
+        from tests.fakeconn import QueryMemoryConn, memory_run_row
+
+        return QueryMemoryConn(run_row=memory_run_row(**overrides))
+
+    def failed_run_conn(self, *, owner: str = "subject-a"):
+        return self._conn(subject=owner, status="failed")
+
+    def build(self, conn, *, owner: str = "subject-a", run_id=None,
+              template: str = "比较 {shop_scope} 在 {date_window} 的成本",
+              slots=None, created_by: str = "reviewer-a"):
+        from bi_agent.query_memory.repository import build_draft_from_run
+
+        return build_draft_from_run(
+            conn, run_id=run_id or self.RUN_ID, owner_subject_id=owner,
+            question_template=template,
+            slots=valid_slots() if slots is None else slots,
+            created_by=created_by)
+
+    def memory_repository(self, *, status: str = "draft", revision: int = 0,
+                          domain: str = "controlled_exploration",
+                          extra=None):
+        from bi_agent.query_memory.repository import QueryMemoryRepository
+        from tests.fakeconn import QueryMemoryConn, example_row
+
+        rows = {"mem-approved-001": example_row(
+            "mem-approved-001", status=status, revision=revision, domain=domain)}
+        rows.update(extra or {})
+        return QueryMemoryRepository(QueryMemoryConn(examples=rows))
+
+    def command(self, action: str, reason: str, replacement=None):
+        from bi_agent.query_memory.models import ApprovalCommand
+
+        return ApprovalCommand(action=action, reason=reason,
+                               replacement_ref=replacement)
+
+    def draft_command(self):
+        """对默认 run 可用的最小构建参数（模板含全部槽位）。"""
+        return dict(template="比较 {shop_scope} 在 {date_window} 的成本",
+                    slots=valid_slots())
+
+    # ---- 草稿来源：只有本人、已成功、血缘完整、领域登记的运行可入草稿 ----------
+
+    def test_only_succeeded_owned_run_can_become_draft(self):
+        with self.assertRaisesRegex(ValueError, "memory_source_run_not_eligible"):
+            self.build(self.failed_run_conn(owner="subject-a"), **self.draft_command())
+
+    def test_other_users_succeeded_run_is_not_eligible(self):
+        conn = self._conn(subject="subject-b", status="succeeded")
+        with self.assertRaisesRegex(ValueError, "memory_source_run_not_eligible"):
+            self.build(conn, **self.draft_command())
+
+    def test_incomplete_provenance_or_unknown_domain_is_not_eligible(self):
+        # 血缘列占资格读取行的第 4–12 位：逐项探测「完整」判定的每个缺口。
+        for name, index, value in (("missing", 4, None),
+                                   ("metric_version", 6, None),
+                                   ("catalog_version", 8, -1),
+                                   ("source_registry", 12, "")):
+            with self.subTest(provenance=name):
+                conn = self._conn()
+                row = list(conn.run_row)
+                row[index] = value
+                conn.run_row = tuple(row)
+                with self.assertRaisesRegex(ValueError,
+                                            "memory_source_run_not_eligible"):
+                    self.build(conn, **self.draft_command())
+        with self.subTest(provenance="absent"):
+            with self.assertRaisesRegex(ValueError,
+                                        "memory_source_run_not_eligible"):
+                self.build(self._conn(provenance=False), **self.draft_command())
+        with self.subTest(domain="unknown"):
+            with self.assertRaisesRegex(ValueError,
+                                        "memory_source_run_not_eligible"):
+                self.build(self._conn(domain="not_a_registered_domain"),
+                           **self.draft_command())
+
+    def test_run_without_clean_shop_scope_is_not_eligible(self):
+        from tests.fakeconn import S1_REF
+
+        for shop_refs in ([], ["invalid_shop"], ["S1"], [S1_REF, "invalid_shop"]):
+            with self.subTest(shop_refs=str(shop_refs)):
+                conn = self._conn(shop_refs=shop_refs)
+                with self.assertRaisesRegex(ValueError,
+                                            "memory_source_run_not_eligible"):
+                    self.build(conn, **self.draft_command())
+
+    def test_unapproved_request_field_is_rejected(self):
+        conn = self._conn(request_extra={"top_n": 5})
+        with self.assertRaisesRegex(ValueError, "memory_request_field_unapproved"):
+            self.build(conn, **self.draft_command())
+
+    def test_invented_kebab_ref_is_rejected_but_registered_ref_passes(self):
+        invented = self._conn(request_extra={
+            "requested_metric_refs": ["metric-cost-total", "metric-never-registered"]})
+        with self.assertRaisesRegex(ValueError,
+                                    "memory_value_not_a_stable_ref_or_code"):
+            self.build(invented, **self.draft_command())
+        registered = self._conn(request_extra={
+            "requested_metric_refs": ["metric-cost-total", "view-shop-daily"]})
+        self.build(registered, **self.draft_command())
+
+    # ---- 草稿内容：脱敏、授权域、工具与确定性签名 ---------------------------
+
+    def test_draft_is_sanitized_and_scoped_from_the_run_itself(self):
+        from bi_agent.query_memory.models import StoredMemoryRecord
+        from bi_agent.semantic_catalog.registry import CATALOG
+        from tests.fakeconn import S1_REF
+
+        record = self.build(self._conn(), **self.draft_command())
+        self.assertIsInstance(record, StoredMemoryRecord)
+        self.assertEqual(record.example_ref, "mem-" + self.RUN_ID.hex)
+        self.assertEqual(record.status, "draft")
+        self.assertEqual(record.approval_revision, 0)
+        self.assertEqual(record.source_run_id, self.RUN_ID)
+        self.assertEqual(record.domain, "business_query")
+        self.assertEqual(record.expected_tool, "query_business")
+        # 一次性业务值剥离；授权域只来自该运行自己的 shop_refs。
+        self.assertEqual(record.normalized_request, {"metrics": ["paid_amount"]})
+        for stripped in ("start", "end", "shop_refs"):
+            self.assertNotIn(stripped, record.normalized_request)
+        self.assertEqual(record.authorization_refs, (S1_REF,))
+        self.assertEqual(
+            record.version_requirements.semantic_catalog_version, CATALOG.version)
+        self.assertEqual(record.version_requirements.data_catalog_version, 7)
+
+    def test_intent_signature_is_deterministic_and_readable(self):
+        first = self.build(self._conn(), **self.draft_command())
+        second = self.build(self._conn(
+            request_extra={"metrics": ["paid_amount"], "sales_basis": "verified_payment"}),
+            **self.draft_command())
+        self.assertEqual(first.intent_signature, "paid-amount")
+        self.assertEqual(second.intent_signature, "paid-amount-verified-payment")
+
+    def test_intent_signature_falls_back_to_registered_domain(self):
+        conn = self._conn()
+        subject, status, domain, request = conn.run_row[:4]
+        # 唯一的业务码以数字开头，进不了签名：语义 token 耗尽后回退到领域 kebab。
+        conn.run_row = (subject, status, domain,
+                        {"shop_refs": list(request["shop_refs"]),
+                         "platforms": ["1688"]},
+                        *conn.run_row[4:])
+        record = self.build(conn, **self.draft_command())
+        self.assertEqual(record.intent_signature, "business-query")
+
+    def test_commerce_report_kind_selects_the_tool(self):
+        cases = (("product", "analyze_product_performance"),
+                 ("comparison", "compare_performance"))
+        for kind, tool in cases:
+            with self.subTest(report_kind=kind):
+                record = self.build(self._conn(domain="commerce_performance",
+                                               request_extra={"report_kind": kind}),
+                                    **self.draft_command())
+                self.assertEqual(record.expected_tool, tool)
+        conn = self._conn(domain="commerce_performance")
+        with self.assertRaisesRegex(ValueError, "memory_source_run_not_eligible"):
+            self.build(conn, **self.draft_command())
+
+    def test_tool_map_covers_exactly_the_registered_domains(self):
+        from bi_agent.runtime import domain_registry
+        from bi_agent.query_memory.repository import _TOOL_FOR_DOMAIN
+
+        self.assertEqual(set(_TOOL_FOR_DOMAIN) | {"commerce_performance"},
+                         set(domain_registry.domains()))
+
+    def test_draft_insert_and_drafted_event_share_one_transaction(self):
+        conn = self._conn()
+        self.build(conn, **self.draft_command())
+        self.assertEqual(len(conn.writes), 2)
+        depth = conn.writes[0][0]
+        self.assertEqual([write[0] for write in conn.writes], [depth, depth])
+        self.assertEqual([write[1] for write in conn.writes], ["example", "event"])
+        self.assertEqual(len(conn.events), 1)
+        event_depth, ref, revision, actor, kind, reason, replacement = conn.events[0]
+        self.assertEqual((event_depth, ref, revision, actor, kind, reason, replacement),
+                         (depth, "mem-" + self.RUN_ID.hex, 0, "reviewer-a",
+                          "drafted", "drafted", None))
+
+    def test_builder_never_reads_chat_or_artifact_tables(self):
+        conn = self._conn()
+        self.build(conn, **self.draft_command())
+        for sql in conn.sql_log:
+            self.assertNotIn("chat_messages", sql)
+            self.assertNotIn("query_artifacts", sql)
+
+    def test_duplicate_draft_of_same_run_fails_closed(self):
+        from tests.fakeconn import example_row
+
+        conn = self._conn()
+        conn.examples["mem-" + self.RUN_ID.hex] = example_row(
+            "mem-" + self.RUN_ID.hex, run_id=self.RUN_ID)
+        with self.assertRaisesRegex(ValueError, "memory_draft_exists"):
+            self.build(conn, **self.draft_command())
+
+    def test_slotless_template_is_rejected_before_any_write(self):
+        conn = self._conn()
+        with self.assertRaisesRegex(ValueError, "memory_slot_missing_from_template"):
+            self.build(conn, template="比较店铺的成本")
+        self.assertEqual(conn.writes, [])
+
+    # ---- 人工状态机：锁行 + CAS + 恰好一条不可变事件 -------------------------
+
+    def test_approved_cannot_return_to_draft(self):
+        repository = self.memory_repository(status="approved", revision=1)
+        with self.assertRaisesRegex(ValueError, "memory_transition_invalid"):
+            repository.transition(
+                "mem-approved-001",
+                command=self.command("approve", "cannot approve twice"),
+                actor_subject_id="reviewer-a")
+
+    def test_terminal_states_reject_every_command(self):
+        for status, action in (("superseded", "approve"), ("revoked", "revoke"),
+                               ("revoked", "approve"), ("superseded", "supersede"),
+                               ("draft", "supersede")):
+            with self.subTest(status=status, action=action):
+                repository = self.memory_repository(status=status)
+                with self.assertRaisesRegex(ValueError, "memory_transition_invalid"):
+                    repository.transition(
+                        "mem-approved-001",
+                        command=self.command(action, "不可能的迁移", "mem-approved-002")
+                        if action == "supersede"
+                        else self.command(action, "不可能的迁移"),
+                        actor_subject_id="reviewer-a")
+
+    def test_draft_approval_locks_the_row_and_appends_one_event(self):
+        repository = self.memory_repository(status="draft", revision=0)
+        record = repository.transition(
+            "mem-approved-001", command=self.command("approve", "人工复核通过"),
+            actor_subject_id="reviewer-a")
+        self.assertEqual((record.status, record.approval_revision), ("approved", 1))
+        conn = repository.conn
+        self.assertTrue(any("FOR UPDATE" in sql for sql in conn.sql_log))
+        self.assertEqual(len(conn.events), 1)
+        depth, ref, revision, actor, kind, reason, replacement = conn.events[0]
+        self.assertEqual((ref, revision, actor, kind, reason, replacement),
+                         ("mem-approved-001", 1, "reviewer-a", "approved",
+                          "人工复核通过", None))
+
+    def test_approved_record_can_be_revoked_then_stays_terminal(self):
+        repository = self.memory_repository(status="approved", revision=1)
+        record = repository.transition(
+            "mem-approved-001", command=self.command("revoke", "证据失效，立即撤销"),
+            actor_subject_id="reviewer-a")
+        self.assertEqual((record.status, record.approval_revision), ("revoked", 2))
+        with self.assertRaisesRegex(ValueError, "memory_transition_invalid"):
+            repository.transition(
+                "mem-approved-001", command=self.command("approve", "撤销后不可再批准"),
+                actor_subject_id="reviewer-a")
+
+    def test_supersede_requires_approved_same_domain_replacement(self):
+        from tests.fakeconn import example_row
+
+        def repository_with(replacement):
+            return self.memory_repository(
+                status="approved", revision=1,
+                extra={"mem-approved-002": replacement})
+
+        good = example_row("mem-approved-002", status="approved", revision=1)
+        for name, replacement in (
+            ("missing", None),
+            ("draft", example_row("mem-approved-002", status="draft")),
+            ("cross-domain", example_row("mem-approved-002", status="approved",
+                                         revision=1, domain="business_query")),
+        ):
+            with self.subTest(replacement=name):
+                repository = repository_with(replacement)
+                with self.assertRaisesRegex(ValueError, "memory_replacement_invalid"):
+                    repository.transition(
+                        "mem-approved-001",
+                        command=self.command("supersede", "版本升级，换用新样例",
+                                             "mem-approved-002"),
+                        actor_subject_id="reviewer-a")
+                self.assertEqual(repository.conn.events, [])
+        # 自替换：替换目标指向自身，同样无效。
+        repository = self.memory_repository(status="approved", revision=1)
+        with self.assertRaisesRegex(ValueError, "memory_replacement_invalid"):
+            repository.transition(
+                "mem-approved-001",
+                command=self.command("supersede", "版本升级，换用新样例",
+                                     "mem-approved-001"),
+                actor_subject_id="reviewer-a")
+        # 合法替换：目标已批准、同领域、非自身。
+        repository = repository_with(good)
+        record = repository.transition(
+            "mem-approved-001",
+            command=self.command("supersede", "版本升级，换用新样例", "mem-approved-002"),
+            actor_subject_id="reviewer-a")
+        self.assertEqual((record.status, record.approval_revision), ("superseded", 2))
+        self.assertEqual(len(repository.conn.events), 1)
+        self.assertEqual(repository.conn.events[0][6], "mem-approved-002")
+        self.assertEqual(repository.conn.events[0][4], "superseded")
+
+    def test_stale_revision_conflicts_without_appending_an_event(self):
+        """CAS 命中 0 行：状态与 revision 原样，事件一条不加，审批不重放。"""
+        repository = self.memory_repository(status="draft", revision=0)
+        repository.conn.cas_fail = True
+        with self.assertRaisesRegex(ValueError, "memory_revision_conflict"):
+            repository.transition(
+                "mem-approved-001", command=self.command("approve", "人工复核通过"),
+                actor_subject_id="reviewer-a")
+        row = repository.conn.examples["mem-approved-001"]
+        self.assertEqual((row["status"], row["approval_revision"]), ("draft", 0))
+        self.assertEqual(repository.conn.events, [])
+
+    def test_unknown_example_ref_is_not_found(self):
+        repository = self.memory_repository(status="draft")
+        with self.assertRaisesRegex(ValueError, "memory_example_not_found"):
+            repository.transition(
+                "mem-missing", command=self.command("approve", "人工复核通过"),
+                actor_subject_id="reviewer-a")
 
 
 if __name__ == "__main__":
