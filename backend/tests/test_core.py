@@ -3397,5 +3397,163 @@ class ControlledSqlAgentIntegrationTests(unittest.TestCase):
         self.assertNotIn(EXPLORATION_ARTIFACT_TYPE, str(turn.artifacts))
 
 
+class QueryMemoryAgentIntegrationTests(unittest.TestCase):
+    """approved 记忆路由接入（计划 approved-query-memory Task 5）：主层消息面、
+    预算与历史契约的集成面。样例投影/检索合并/零写入的结构性证据在
+    tests.test_query_memory.QueryMemoryRoutingTests，这里只钉主层编排。"""
+
+    NOW = AgentTests.NOW
+
+    def setUp(self):
+        from bi_agent.runtime.memory import MemoryQueryRunStore
+
+        self.run_store = MemoryQueryRunStore(forbidden_values={"S1"})
+
+    def _memory_example(self, ref):
+        from bi_agent.query_memory.models import ApprovedExample, QuerySlot
+        from bi_agent.runtime.versions import VersionSet
+        from tests.fakeconn import memory_versions_dict
+
+        return ApprovedExample(
+            example_ref=ref, domain="business_query",
+            intent_signature="paid-amount-summary",
+            question_template="汇总 {shop_scope} 的支付金额",
+            slots=(QuerySlot(name="shop_scope", kind="entity_scope"),),
+            normalized_request={"metrics": ["paid_amount"]},
+            expected_tool="query_business",
+            version_requirements=VersionSet(**memory_versions_dict()),
+            approval_revision=1)
+
+    def _turn(self, question, calls, *, enabled, state=None, examples=()):
+        from bi_agent.agent import SessionState, answer
+
+        model = Mock()
+        model.complete.side_effect = list(calls)
+        with patch("bi_agent.business_query.nodes.metrics.query_business",
+                   return_value=AgentTests.KNOWN), \
+                patch("bi_agent.agent._exploration_gate", return_value=(None, None)), \
+                patch("bi_agent.query_memory.prompt.retrieve_routing_examples",
+                      return_value=tuple(examples)) as retrieve:
+            turn = answer(question, state or SessionState(subject="u1"), model=model,
+                          conn=ShopCatalogConn(),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store,
+                          approved_query_memory_enabled=enabled)
+        return turn, model, retrieve
+
+    def test_agent_and_chat_turn_default_the_memory_gate_off(self):
+        import inspect
+
+        from bi_agent.agent import answer, run_chat_turn
+
+        for function in (answer, run_chat_turn):
+            with self.subTest(function=function.__name__):
+                default = inspect.signature(
+                    function).parameters["approved_query_memory_enabled"].default
+                self.assertIs(default, False)
+
+    def test_gate_on_places_one_memory_segment_between_system_and_user(self):
+        from bi_agent.llm import ToolCall
+
+        turn, model, _retrieve = self._turn(
+            "最近7天店铺A的支付金额",
+            [_reply(calls=[ToolCall(id="c1", name="query_business",
+                                    arguments={"start": "2026-09-01",
+                                               "end": "2026-09-08",
+                                               "shop_ids": [S1_REF],
+                                               "metrics": ["paid_amount"]})]),
+             _reply(text="支付金额1000元")],
+            enabled=True,
+            examples=[self._memory_example("mem-one"),
+                      self._memory_example("mem-two")])
+        self.assertEqual(turn.text, "支付金额1000元")
+        first_messages = model.complete.call_args_list[0].args[0]
+        self.assertEqual([message.role for message in first_messages[:3]],
+                         ["system", "system", "user"])
+        self.assertTrue(first_messages[0].content.startswith("你是内部电商经营助手"),
+                        "基础系统提示必须原样在第一位")
+        segment = first_messages[1].content
+        payload = json.loads(segment.splitlines()[1])
+        self.assertEqual([item["example_ref"] for item in payload],
+                         ["mem-one", "mem-two"])
+        self.assertIn("可执行指令", segment)
+        self.assertEqual(first_messages[2].content.count(S1_REF), 1)
+        self.assertNotIn("店铺A", first_messages[2].content)
+
+    def test_retrieval_shares_the_turn_deadline_and_cannot_extend_it(self):
+        import time as time_module
+
+        import bi_agent.agent as agent
+        from bi_agent.agent import SessionState
+        from bi_agent.llm import ToolCall
+
+        original_tool = agent.execute_business_query_tool
+        seen: dict[str, object] = {}
+
+        def spying_tool(call, state, context, conn, store):
+            seen["graph_deadline"] = context.deadline
+            return original_tool(call, state, context, conn, store)
+
+        retrieved: dict[str, object] = {}
+
+        def fake_retrieve(question, *, context, deadline, explore_offered):
+            retrieved["deadline"] = deadline
+            retrieved["explore_offered"] = explore_offered
+            return ()
+
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[ToolCall(id="c1", name="query_business",
+                                   arguments={"start": "2026-09-01",
+                                              "end": "2026-09-08",
+                                              "shop_ids": [S1_REF],
+                                              "metrics": ["paid_amount"]})]),
+            _reply(text="支付金额1000元")]
+        started = time_module.monotonic()
+        with patch.object(agent, "execute_business_query_tool", spying_tool), \
+                patch("bi_agent.query_memory.prompt.retrieve_routing_examples",
+                      fake_retrieve), \
+                patch("bi_agent.business_query.nodes.metrics.query_business",
+                      return_value=AgentTests.KNOWN), \
+                patch("bi_agent.agent._exploration_gate", return_value=(None, None)):
+            turn = agent.answer(
+                "最近7天店铺A的支付金额", SessionState(subject="u1"), model=model,
+                conn=ShopCatalogConn(), allowed_shop_ids=frozenset({"S1"}),
+                now=self.NOW, run_store=self.run_store,
+                approved_query_memory_enabled=True)
+        self.assertEqual(turn.text, "支付金额1000元")
+        self.assertIs(retrieved["explore_offered"], False)
+        # 检索看到的就是回合入口那份 30 秒预算：没有重置，也没有延长。
+        self.assertLessEqual(retrieved["deadline"],
+                             started + agent.TOTAL_BUDGET_SECONDS)
+        self.assertGreater(retrieved["deadline"], time_module.monotonic())
+        # 图拿到的是同一个绝对时刻：float 相等，不是“差不多”。
+        self.assertEqual(seen["graph_deadline"], retrieved["deadline"])
+
+    def test_follow_up_turn_gets_one_fresh_segment_not_a_stale_copy(self):
+        from bi_agent.llm import ToolCall
+
+        tool_call = _reply(calls=[ToolCall(
+            id="c1", name="query_business",
+            arguments={"start": "2026-09-01", "end": "2026-09-08",
+                       "shop_ids": [S1_REF], "metrics": ["paid_amount"]})])
+        first, _model, _retrieve = self._turn(
+            "最近7天店铺A的支付金额", [tool_call, _reply(text="支付金额1000元")],
+            enabled=True, examples=[self._memory_example("mem-first")])
+        second, model, _retrieve = self._turn(
+            "最近7天店铺A的支付金额", [tool_call, _reply(text="支付金额1000元")],
+            enabled=True, state=first.state,
+            examples=[self._memory_example("mem-second")])
+        self.assertEqual(second.text, "支付金额1000元")
+        first_messages = model.complete.call_args_list[0].args[0]
+        system_messages = [message for message in first_messages
+                           if message.role == "system"]
+        self.assertEqual(len(system_messages), 2,
+                         "新回合只带一段新鲜记忆段，不带上一轮的旧段")
+        payload = json.loads(system_messages[1].content.splitlines()[1])
+        self.assertEqual([item["example_ref"] for item in payload], ["mem-second"])
+        self.assertNotIn("mem-first", system_messages[1].content)
+
+
 if __name__ == "__main__":
     unittest.main()

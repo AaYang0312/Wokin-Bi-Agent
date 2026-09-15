@@ -548,10 +548,11 @@ class OperatorFixture(unittest.TestCase):
               state: SessionState | None = None,
               store: MemoryQueryRunStore | None = None,
               conn: Any = None,
-              deadline_patch: float | None = None):
+              deadline_patch: float | None = None,
+              approved_query_memory_enabled: bool = False):
         """一句话过一遍主层：真实图、真实库、脚本模型。
 
-        这是"离线集成"而不是"真实模型验收"：模型侧只提供预制回合，因此这些用例
+        这是“离线集成”而不是“真实模型验收”：模型侧只提供预制回合，因此这些用例
         能钉住分发、参数契约、降级与持久化路径，钉不住模型的理解准确率。
         """
         model = mock.Mock()
@@ -568,7 +569,8 @@ class OperatorFixture(unittest.TestCase):
             patch.start()
         self.addCleanup(lambda: [patch.stop() for patch in patches])
         return answer(question, state, model=model, conn=self.conn if conn is None
-                      else conn, allowed_shop_ids=allowed, now=NOW, run_store=store)
+                      else conn, allowed_shop_ids=allowed, now=NOW, run_store=store,
+                      approved_query_memory_enabled=approved_query_memory_enabled)
 
 
 def _is_database_class(node: ast.AST) -> bool:
@@ -2066,6 +2068,73 @@ class OperatorMultiSourceGuardrailTests(OperatorFixture):
                              "应用配置里没有拼多多凭证入口（不接入、不 onboarding）")
 
 
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class QueryMemoryOperatorGateTests(OperatorFixture):
+    """记忆门禁开着的一回合走真库（计划 approved-query-memory Task 5）。
+
+    测试库的记忆投影视图是空的：这里要钉的不是“样例改变了什么”，而是三件
+    不变式——(1) 开着时真的只对 reporting.v_approved_query_examples 发只读
+    SELECT，每域一条，不碰底表也不写任何东西；(2) 同一工作流在门禁开/关下
+    得到同型的结果（空记忆 = 无记忆基线）；(3) 会话历史里不留记忆段。
+    """
+
+    def _product_workflow_replies(self):
+        return [_reply(calls=[_call("analyze_product_performance", {
+            "product": {"text": "直钉枪"},
+            "scope": {"mode": "all_authorized"},
+            "start": START.isoformat(), "end": END.isoformat(),
+            "metrics": ["sold_quantity", "sales_amount"],
+            "sales_basis": "erp_effective_parent", "profit_basis": "none"})]),
+            _reply(text="销量与销售额见下方表格")]
+
+    def _seed_one_shop(self) -> None:
+        self._archive(PRODUCT, "直钉枪")
+        self._shop("1")
+        self._cover("1")
+        self._sale("1", "E1", quantity="1", amount="100", cost="40")
+
+    def test_gate_on_turn_reads_only_the_projection_and_keeps_the_workflow(self):
+        import re as re_module
+
+        self._seed_one_shop()
+        question = "直钉枪在获准店铺近七天卖得怎么样？"
+        off = self._turn(question, self._product_workflow_replies())
+        counted = _CountingConn(self.conn)
+        on = self._turn(question, self._product_workflow_replies(), state=off.state,
+                        conn=counted, approved_query_memory_enabled=True)
+        # 工作流不因记忆改变：同型 Artifact、同一份数值（视图为空 = 无记忆基线）。
+        self.assertEqual([item["artifact_type"] for item in on.artifacts],
+                         [item["artifact_type"] for item in off.artifacts])
+        self.assertEqual(on.results[-1].data, off.results[-1].data)
+        # 只读投影：business_query / commerce / listing / inventory 各一条
+        # SELECT（探索 Tool 没开放，探索域一条都不发）。
+        view_reads = [text for text in counted.statements
+                      if "v_approved_query_examples" in text]
+        self.assertEqual(len(view_reads), 4)
+        for statement in counted.statements:
+            if "approved_query" in statement:
+                self.assertIn("FROM reporting.v_approved_query_examples", statement)
+                self.assertTrue(statement.upper().startswith("SELECT"), statement)
+                self.assertNotIn("BI.APPROVED_QUERY_EXAMPLES", statement.upper())
+            self.assertNotIn("APPROVED_QUERY_EVENTS", statement.upper())
+            self.assertIsNone(re_module.search(
+                r"\b(INSERT|UPDATE|DELETE)\b", statement.upper()),
+                f"聊天路径不得发出写入：{statement[:80]}")
+        # 记忆段不进会话历史：第二回合的历史里没有 system 消息。
+        for message in on.state.turns:
+            self.assertNotEqual(message.role, "system")
+
+    def test_gate_off_and_absent_flag_run_identical_workflow_turns(self):
+        self._seed_one_shop()
+        question = "直钉枪在获准店铺近七天卖得怎么样？"
+        baseline = self._turn(question, self._product_workflow_replies())
+        off = self._turn(question, self._product_workflow_replies(),
+                         approved_query_memory_enabled=False)
+        self.assertEqual([item["artifact_type"] for item in off.artifacts],
+                         [item["artifact_type"] for item in baseline.artifacts])
+        self.assertEqual(off.text, baseline.text)
+
+
 class OperatorAcceptanceSetTests(unittest.TestCase):
     """修订后的 26 题合同：题库形状与逐题守护字段。
 
@@ -2237,4 +2306,5 @@ __all__ = ["OperatorFixture", "OperatorTestDatabaseGatingTests",
            "OperatorProductWorkflowTests",
            "OperatorComparisonWorkflowTests", "OperatorListingWorkflowTests",
            "OperatorInventoryWorkflowTests", "OperatorAgentRoutingTests",
-           "OperatorMultiSourceGuardrailTests", "OperatorAcceptanceSetTests"]
+           "OperatorMultiSourceGuardrailTests", "OperatorAcceptanceSetTests",
+           "QueryMemoryOperatorGateTests"]

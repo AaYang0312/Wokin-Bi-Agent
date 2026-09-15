@@ -348,7 +348,8 @@ def encode_sse(event: ChatEvent) -> bytes:
 
 def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: ChatModel,
                   allowed_shop_ids: frozenset[str], now: datetime,
-                  controlled_sql_enabled: bool = False) -> Iterator[ChatEvent]:
+                  controlled_sql_enabled: bool = False,
+                  approved_query_memory_enabled: bool = False) -> Iterator[ChatEvent]:
     """保存可见消息并输出有限阶段事件；调用方负责会话锁和连接生命周期。"""
     from .chats import (
         load_chat_context,
@@ -383,6 +384,8 @@ def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: Cha
             ),
             # 默认关：未拿到明确的服务端开关前不开放探索入口。
             controlled_sql_enabled=controlled_sql_enabled,
+            # approved 查询记忆同样默认关：关着时连检索 SQL 都不存在（计划 Task 5）。
+            approved_query_memory_enabled=approved_query_memory_enabled,
         )
         artifacts = list(turn.artifacts)
         if artifacts:
@@ -571,7 +574,8 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
            allowed_shop_ids: frozenset[str], now: datetime,
            run_store: QueryRunStore | None = None,
            turn_context: TurnContext | None = None,
-           controlled_sql_enabled: bool = False) -> TurnResult:
+           controlled_sql_enabled: bool = False,
+           approved_query_memory_enabled: bool = False) -> TurnResult:
     deadline = time_module.monotonic() + TOTAL_BUDGET_SECONDS
     if run_store is None:
         run_store = MemoryQueryRunStore(forbidden_values=allowed_shop_ids)
@@ -618,10 +622,39 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
         if exploration_entry is not None:
             tools = tools + [exploration_entry]
     offered_tools = [str(item["function"]["name"]) for item in tools]
+    # approved 查询记忆默认关：关着时不 import、不读库、不多一段消息，回合与没有
+    # 这个功能的版本逐字节相同。开着也在固定 Tool 可表达性判断（探索门禁）之后、
+    # 第一次模型调用之前检索：此时模型尚未说话，域与版本全部来自服务端确定性事实
+    # （计划 approved-query-memory Task 5 Step 4；检索沿用同一份 30 秒绝对预算，
+    # 剩余不足 2 秒时整段跳过，失败时整段降级为无记忆，绝不重置 deadline）。
+    memory_segment: Message | None = None
+    if approved_query_memory_enabled:
+        from .commerce.models import DomainContext as _MemoryContext
+        from .query_memory.prompt import (memory_system_segment,
+                                          retrieve_routing_examples)
+
+        examples = retrieve_routing_examples(
+            question,
+            context=_MemoryContext(
+                subject_id=turn_context.subject_id,
+                allowed_shop_ids=allowed_shop_ids,
+                shop_refs=dict(state.shop_refs),
+                conn=conn, store=None, chat_id=turn_context.chat_id,
+                user_message_id=turn_context.user_message_id,
+                root_request_id=turn_context.user_message_id,
+                now=now, deadline=deadline),
+            deadline=deadline,
+            explore_offered=exploration_entry is not None)
+        if examples:
+            memory_segment = Message(role="system",
+                                     content=memory_system_segment(examples))
     system = Message(role="system",
                      content=_SYSTEM_PROMPT.format(now=now.astimezone(BEIJING),
                                                    ref_doc=ref_doc or "（无店铺）"))
-    messages = [system] + list(state.turns)
+    messages = [system]
+    if memory_segment is not None:
+        messages.append(memory_segment)
+    messages.extend(state.turns)
     messages.append(Message(role="user",
                             content=_anonymize_question(question, shops, state.shop_refs)))
     results: list[ToolResult] = []
@@ -950,7 +983,10 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
 
     new_state = state.model_copy(update={
         "filters": filters,
-        "turns": _trim_turns(messages[1:]),
+        # 记忆段只服务本回合的路由，不进会话历史：否则下一轮会带着上一轮的旧段，
+        # 再叠一段新段（按 identity 剔除；段为 None 时列表原样）。
+        "turns": _trim_turns([message for message in messages[1:]
+                              if message is not memory_segment]),
     })
     # 确定性改写：模型只可能写出引用，用户读到的是已核验的展示名。
     # 名字未取得时保留引用，不丢答案、不编名。
