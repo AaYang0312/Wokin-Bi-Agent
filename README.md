@@ -24,6 +24,17 @@ React/Vite 前端 → /api 代理 → FastAPI → 受限 Agent
 - 模型侧只见 kebab-case 语义 ref；SQL 标识符只由服务端 `resolve_sql_identifier()` 解析。底表 `bi.*` 永不进目录，也不因该功能获得任何新授权。
 - 目前只完成本地开发与本地验收（[验收记录](docs/superpowers/research/2026-09-14-semantic-catalog-acceptance.md)）；启用步骤、前置检查与回退方式见[运行手册](docs/runbook.md)。生产启用仍以 Task 11 统一发布门禁为前置，该门禁尚未通过。
 
+## 受控聚合探索（默认关闭）
+
+`backend/bi_agent/exploration/` 交付的是**受控聚合探索**：只为固定业务 Tool 无法表达、但来源能力与覆盖已满足的问题，生成**一条参数化的单基表只读 `SELECT`**。它不是通用 Text2SQL，也不存在“用户或模型写 SQL”的入口：模型只给稳定语义 ref 与业务值，SQL 标识符、授权集合、时间窗口与行数上限全部由服务端从已发布语义目录（`semantic/2026-09-14.1`）解析并注入。
+
+- 固定 Tool 优先：只要有一个固定 Tool 能同时覆盖本轮全部指标与全部分组粒度，就不开探索入口，返回 `fixed_tool_available`。缺能力、缺覆盖、来源未认证、需要澄清或写请求同样不许降级成 SQL——换一条语句绕过固定口径的拒答就是绕过门禁。
+- 纵深防御：只允许单条非递归 `SELECT`；只能命中目录里 11 张 `reporting.*` 视图；聚合只放 `sum/count/min/max`（比值型的 `avg` 不授权）；跳视图分组只允许目录登记的 4 条 `many_to_one` 店铺档案边上的平台码。`SELECT *`、CTE、子查询、UNION、未登记对象、多语句与 DDL/DML/COPY/CALL/DO/锁在碰库之前被 AST 策略拒（`sql_policy_rejected`）。
+- 预算与身份：运行在 `bi_app`、`READ ONLY` 事务与 `statement_timeout = 5s` 下；先跑受控 `EXPLAIN`，预计行数 ≤ 50000 且总成本 ≤ 100000 才进执行；结果至多 500 行、安全投影后 ≤ 262144 字节；整轮仍是 30 秒 deadline。超预算或行数溢出整条拒，不返回被截断的偏低汇总。
+- 隐私：SQL 原文与参数只进 `bi.query_diagnostics`（`bi_reader` 拿不到任何新授权，也不为它建 reporting 视图）；模型消息、普通事件、公开 Artifact 与应用日志都不含 SQL、DSN 或真实店铺 ID，店铺只以 opaque `shop-ref` 出现。
+- 默认关闭：`CONTROLLED_SQL_ENABLED=false`（`.env.example` 就是该值），且只有 `SEMANTIC_CATALOG_ENABLED=true` 时才能开——否则启动即 `CONTROLLED_SQL_REQUIRES_SEMANTIC_CATALOG`。关闭时 Tool 列表逐字不变、根本不进门禁，路由与聊天行为无差异。
+- 目前只完成本地开发与本地验收（[验收记录](docs/superpowers/research/2026-09-14-controlled-sql-acceptance.md)）：它只证明“放行/拒答的形状与边界”，不证明任何平台真实来源已就绪，也不改变 Task 11 统一发布门禁的状态。部署顺序（含 `020`）、两个门禁、诊断与回退见[运行手册](docs/runbook.md)，允许面边界见[指标口径](docs/metrics.md)。生产启用仍以 Task 11 统一发布门禁为前置，该门禁第 4–7 项尚未通过。
+
 ## 本地启动
 
 需要 Python 3.11、Node.js 22、PostgreSQL 17。复制 `.env.example` 为 `.env.app`，只填写 API 所需的 `BI_APP_DSN`、店铺范围和一个模型 provider 配置；不要在其中放同步 DSN 或快麦凭证。
@@ -64,7 +75,7 @@ psql -d bi_agent -f backend/sql/004_query_runtime.sql
 
 它创建 `bi_sync`、报表只读身份 `bi_reader` 与 API 身份 `bi_app`，并建立可审计的查询运行记录。API 使用 `bi_app`，只能读取 `reporting` 视图和读写聊天与查询运行表。
 
-本机两个库（`bi_agent`、`bi_agent_test`）已经建好并随命名卷保留，重建容器不需要重跑 DDL；新克隆时按[运行手册](docs/runbook.md)的完整顺序在两个库各跑一遍（001 → 016）。
+本机两个库（`bi_agent`、`bi_agent_test`）已经建好并随命名卷保留，重建容器不需要重跑 DDL；新克隆时按[运行手册](docs/runbook.md)的完整顺序在两个库各跑一遍（001 → 020）。
 
 ## 数据同步
 

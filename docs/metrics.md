@@ -262,6 +262,115 @@ uv run --locked --env-file ../.env.test python -m unittest tests.test_semantic_c
 
 30 题 gold set 的逐题结果、Top 5 召回率与“门禁关闭时行为不变”的对比证据见 [语义目录与 Schema 检索本地验收记录](superpowers/research/2026-09-14-semantic-catalog-acceptance.md)。
 
+## 4.6 受控聚合探索的允许面（`backend/bi_agent/exploration/`，计划 Task 11 后置子项目 B）
+
+入口是 `explore_business_data`：它只在门禁打开且本轮过得了探索门禁时，作为**第七个** Tool 追加在
+现有六份固定 Tool 之后（固定 Tool 的顺序与描述逐字不变；关闭时根本不追加）。门禁
+`CONTROLLED_SQL_ENABLED` **默认关闭**（且必须先开 `SEMANTIC_CATALOG_ENABLED`，否则启动即
+`CONTROLLED_SQL_REQUIRES_SEMANTIC_CATALOG`）。本节只登记“受控聚合探索能表达什么”，**不改变上面
+任何一条口径、能力或覆盖门禁**：它不是通用 Text2SQL，也不是“多一个算指标的地方”。同一个指标
+走探索与走固定 Tool 必须是同一个数，否则就是口径事故。
+
+### 固定 Tool 优先（先问“谁能表达”，再谈能不能发 SQL）
+
+只要有一个固定 Tool 能同时覆盖本轮全部指标与全部分组粒度，就不开探索入口（运行层记
+`fixed_tool_available`，发生在任何 SQL 之前）。重叠时按 Tool 声明顺序取第一个覆盖者：
+`query_business` → `analyze_product_performance` → `compare_performance` →
+`audit_listing_prices` → `inspect_inventory`。分组粒度取各固定 Tool **真实契约**能表达的那几种，
+并且整组匹配（`QueryRequest.group_by` / `ComparisonGroupBy` 都是单值枚举，所以 `{day, shop}`
+这种两维组合谁都不覆盖）：
+
+| Tool | 覆盖的指标 ref | 可表达的分组 |
+| --- | --- | --- |
+| `query_business` | `metric-paid-amount`、`metric-paid-orders`、`metric-erp-documents`、`metric-refund-amount`、`metric-cash-difference`、`metric-quantity`、`metric-product-paid-amount` | 合计、`day`、`shop`、`product`（商品面指标只能配 `product`） |
+| `analyze_product_performance` | `metric-sales-amount`、`metric-quantity`、`metric-cost-total`、`metric-product-gross-profit-reference` | 合计、`product`、`shop`、`line_kind`（固定报告行形；七日窗口固定，所以 `day` 不算它能表达） |
+| `compare_performance` | `metric-sales-amount`、`metric-quantity`、`metric-cost-total`、`metric-paid-amount`、`metric-paid-orders`、`metric-erp-gross-profit-reference` | `platform`、`shop`（`group_by` 必填，无“合计”这一档） |
+| `audit_listing_prices` | `metric-listing-price` | 合计、`shop`、`listing`、`sku` |
+| `inspect_inventory` | `metric-physical-available-quantity`、`metric-channel-sellable-quantity` | 合计、`shop`、`pool`、`warehouse`、`listing`、`sku`、`{pool, warehouse}`、`{shop, listing}` |
+
+两点不得误读：`metric-quantity` 是计划矩阵里的写法，在已发布目录里没有条目（“销量”的 ref 是
+`metric-sold-quantity`），所以该条目对今天的目录天然空转——把它改写成 `metric-sold-quantity`
+属于“新增 Tool 覆盖”，要改得先改计划；而**固定 Tool 的拒答不会被降级绕过**：它因缺能力、
+缺覆盖或口径未定而正确拒答时，探索入口仍然不开（这一层刻意不看 `missing_concepts` 与
+`requires_clarification`，也不拿“它大概也会拒”当放行 SQL 的理由）。
+
+### 允许的视图、聚合与分组列
+
+编译只仍从当前发布的语义目录（`semantic/2026-09-14.1`）解标识符；目录关着就没有解析路径。
+
+| 视图 | 可探索的指标 ref（默认聚合） | 可当分组维度的列 | 备注 |
+| --- | --- | --- | --- |
+| `view-shop-daily` | `metric-paid-amount`、`metric-paid-orders`、`metric-erp-documents`、`metric-refund-amount`、`metric-cash-difference`（均 `sum`） | `day`、`currency`、`shop_id`（授权列） | 与固定指标查询共用同一口径定义 |
+| `view-product-daily` | `metric-sold-quantity`、`metric-gift-quantity`、`metric-product-paid-amount`（均 `sum`） | `day`、`line_kind`、`allocation_verified`、`shop_id` | 父项口径，不是子 SKU 排行 |
+| `view-product-cost-daily` | `metric-sales-amount`、`metric-cost-total`（均 `sum`） | `day`、`line_kind`、`shop_id` | 商品毛利参考与成交均价不可探索（下表） |
+| `view-erp-document-daily` | `metric-erp-document-cost`、`metric-erp-gross-profit-reference`（均 `sum`） | `day`、`normalization_status`、`shop_id` | 单据面永不连 `order_items`（§4.2 第 2 条） |
+| `view-payments` | `metric-payment-flow-amount`（`sum`） | `currency`、`verified`、`paid_at`、`shop_id` | 明细面；与 `v_shop_daily` 的已支付金额不同数 |
+| `view-refunds` | `metric-refund-record-amount`（`sum`） | `platform_success`、`refund_canonical`、`matched`、`platform_completed_at`、`shop_id` | 平台原始金额，不等于已归一的 `refund_amount` |
+| `view-listing-items` | **无**（两个价指标都不可探索） | `captured_at`、`currency`、`on_sale`、`shop_id`（只供固定 Tool） | 上架价仍是 `audit_listing_prices` 的固定路径 |
+| `view-physical-stock-items` | `metric-physical-available-quantity`、`metric-inbound-quantity`、`metric-locked-quantity`（均 `sum`） | `unit`、`captured_at`、`pool_id` | 实物按 (池, 仓库, SKU, 批次, 单位) 去重，不跟渠道数相加 |
+| `view-channel-stock-items` | `metric-channel-sellable-quantity`（`sum`） | `unit`、`captured_at`、`shop_id` | 渠道逐店各一行；单位不换算也不相加 |
+| `view-shops` | 无（只档案列） | 只能作 JOIN 右侧的 `platform` | 它是档案侧，不是事实粒度 |
+| `view-coverage` | 无（只覆盖与质量列） | — | 覆盖与质量仍由 `data_quality` / `sources` 判，不拿 SQL 重算 |
+
+不可探索的四个指标（编译器当场拒，不回落成“换个聚合试试”）：
+
+| 指标 ref | 拒因 |
+| --- | --- |
+| `metric-product-gross-profit-reference` | 多字段比值：要分子分母在同一行集合上各自求和再相除，单列一个聚合发不出那个数（`exploration_metric_field_ambiguous`） |
+| `metric-transaction-average-price` | 同上，且默认聚合是未授权的 `avg` |
+| `metric-listing-price` | 目录登记默认聚合 `avg`，而编译器只放 `sum/count/min/max`（`exploration_aggregate_not_permitted`） |
+| `metric-campaign-price` | 同上 |
+
+允许的聚合只有 `sum`、`count`、`min`、`max`。允许当分组维度的列角色只有 `dimension`、
+`time`、`authorization`；`measure`（未聚合的度量）与 `internal`（ERP 主键）一律不可分组也不可
+公开出列——授权列参与分组时只能以 opaque `shop-ref` 出现，`_pool_id` 等其他 `_` 前缀列在投影
+层直接拒。
+
+### 允许的 JOIN
+
+只有目录里那 4 条 `many_to_one` 店铺档案边（`join-shop-daily-shops`、
+`join-product-daily-shops`、`join-product-cost-daily-shops`、`join-erp-document-daily-shops`），
+而且跳视图分组**只准取档案侧的 `field-shops-platform` 这一列**（本轮检索还必须已经把这条边
+选进 `join_path_refs`）。两侧都是各自的授权列，所以不放大行数；金额只在事实侧聚一次。
+
+§4.5 里“故意没有登记”的三对边在探索层同样不放开：支付 ↔ 退款、商品毛利 ↔ 单据毛利、
+实物库存 ↔ 渠道库存。未登记边返回 `exploration_join_not_registered`，跳事实粒度返回
+`exploration_multiple_fact_grains`；这跟 §4.2 / §4.4 的“两面分列、不相加不相除”是同一条红线。
+
+### 预算与结果契约
+
+| 契约 | 取值 | 超限行为 |
+| --- | --- | --- |
+| 窗口 | `[start, end)` 半开，至多 366 天；无窗口不编译 | `exploration_window_required` |
+| 行数 | `limit ≤ 500`，实取 `limit + 1` | 多出的那一行是截断证据 ⇒ 整条拒，不交偏低的汇总 |
+| 结果体积 | 安全投影后的紧凑 JSON ≤ **262144** 字节 | `exploration_result_too_large` |
+| 预计行数 / 总成本 | 真 `EXPLAIN` 的 `Plan Rows ≤ 50000` 且 `Total Cost ≤ 100000` | `exploration_budget_exceeded(estimated_rows\|total_cost)` → 运行层 `query_cost_exceeded` |
+| 语句超时 | `SET LOCAL statement_timeout = '5000ms'`（两道门各自一次） | `exploration_statement_timeout` → `query_timeout` |
+| 整轮预算 | 沿用 `context.deadline`（30 秒），图不重置也不另开一份 | `deadline_exceeded` |
+| 身份 | 只跑 `bi_app` 的 `READ ONLY` 事务；底表依旧读不到，`pg_read_file` 一类同样被拒 | 数据库报的错一律换成稳定码，不带语句原文 |
+| 隐私 | SQL 与参数只进 `bi.query_diagnostics`（`bi_reader` 无授权、不建 reporting 视图）；公开 Artifact 只存安全结果与 `statement_fingerprint` | 诊断或 Artifact 写不进 ⇒ `persistence_failed`，不发结果 |
+
+### 不得从本功能读出的结论
+
+- **时效与完整性**：“按抓取时刻看上架价”是已批准的 fail-closed 映射——它作为 `R01` 负例行存在，
+  拒在聚合授权（`avg`），不改编译器、不改目录、也不升目录版本；上架价的固定路径仍是
+  `audit_listing_prices`。库存快照的时效/完整性只通过真正放行的 `sum` 型渠道/实物指标（可售、
+  可用、在途、锁定）覆盖，这**不**证明来源就绪，也不证明快照完整。
+- 能力与覆盖门禁仍属 `sources.py` + `bi.shops.capabilities`；“能编出一条干净的语句”永远不会
+  把 `capability_unavailable` / `coverage_incomplete` / `coverage_time_basis_unverified` 洗成可出数。
+- basis 仍照 §3 / §4.4 / §4.5：目录里只有支付口径的金额列，探索不发明“出库口径的销售额”。
+- 拼多多保持不支持：本功能未新增任何连接器、来源登记、支付能力、凭证或 onboarding 路径，
+  也不因 `erp_documents` 单据列的存在而打开支付族。
+- 本节全部放行证据来自本机 `*_test` 与事务内 seed 的合成行，逐条见
+  [受控 SQL 探索本地验收记录](../research/2026-09-14-controlled-sql-acceptance.md)；真实模型与
+  真实来源的验证一律 `未执行`。
+
+回归命令（`backend/`）：
+
+```sh
+uv run --locked --env-file ../.env.test python -m unittest tests.test_exploration -v
+```
+
 ## 5. 真实对账结果摘要
 
 ### 合成基准（已通过，冻结时刻 2026-09-08 09:00+08）

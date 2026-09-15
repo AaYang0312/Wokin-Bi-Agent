@@ -16,7 +16,7 @@
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
@@ -33,6 +33,7 @@ psql -d bi_agent -f backend/sql/016_channel_catalog.sql
 psql -d bi_agent -f backend/sql/017_commerce_views.sql
 psql -d bi_agent -f backend/sql/018_listing_audit.sql
 psql -d bi_agent -f backend/sql/019_inventory_snapshots.sql
+psql -d bi_agent -f backend/sql/020_controlled_sql_exploration.sql
 ```
 
 单实例：全程持有数据库 advisory 锁，重复启动立即失败。
@@ -261,7 +262,7 @@ uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --all-shops 
 
 ### 启用前置（本机与目标环境同一顺序）
 
-1. **迁移必须齐**：本机 `*_test` 与目标库都按完整顺序 `001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019`（编号 006 已作废）。目录声明对应的最新定义迁移：
+1. **迁移必须齐**：本机 `*_test` 与目标库都按完整顺序 `001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019`（编号 006 已作废；受控聚合探索另需 020，见下一节）。目录声明对应的最新定义迁移：
 
 | 登记视图 | 列定义来源（最新） |
 | --- | --- |
@@ -320,6 +321,68 @@ uv run --locked --env-file ../.env.test python -m unittest tests.test_semantic_c
 
 不得做的“恢复”动作：不要为了让启动成功而 `CREATE VIEW` / 改列名去凑声明；不要把门禁关掉后就宣布问题已解决（先分清是“库落后”还是“目录写错”）；不要拿离线 26/26 或本地预检通过当作可发布给运营用户的依据——Task 11 统一发布门禁 4–7 项仍是 open。
 
+## 受控聚合探索（默认关闭）
+
+`backend/bi_agent/exploration/` 是 Task 11 后置子项目 B：把固定业务 Tool 无法表达、但来源能力与覆盖已满足的只读聚合问题，编译成**一条**受控语句执行。它叫受控聚合探索，不是通用 Text2SQL：模型与前端都没有提交 SQL、标识符、排序、limit 或授权条件的入口，SQL 标识符只由服务端从语义目录的稳定 ref 解出，真值全部走参数。拼多多继续按 2026-09-12 决定不接入，本功能不为它开任何口。
+
+### 两个门禁与依赖
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `SEMANTIC_CATALOG_ENABLED` | `false` | 语义目录与启动预检（上一节）。受控探索的标识符解析依赖它 |
+| `CONTROLLED_SQL_ENABLED` | `false` | 受控聚合探索：`explore_business_data` 是否出现在 Tool 列表、探索图是否可被调用 |
+
+- `CONTROLLED_SQL_ENABLED=true` 而 `SEMANTIC_CATALOG_ENABLED=false` → 启动即失败 `CONTROLLED_SQL_REQUIRES_SEMANTIC_CATALOG`：目录关着就没有 SQL 标识符的解析路径，不许“退化成不带目录的 SQL”。
+- 两个变量都只接受 `true` / `false`（`1` / `0` / `yes` / `TRUE` / `on` 一律当场拒绝）；`.env.example` 给的是两个 `false`，并由用例钉住“示例文件带的是关闭值”。
+- 关闭时（默认）：根本不进探索门禁，发给模型的 Tool 列表 JSON 逐字等于关闭基线（6 个 Tool，无 `explore_business_data`），`/api` 路由集合与用户可见面不变。打开时也只在“固定 Tool 表达不了、不需要澄清、无未注册概念、服务端作用域就绪”四项都过的那一轮才多一项；固定 Tool 本轮即便会返回 `unavailable` / `missing_data` 也不因此开放探索。
+- 一次探索 Tool 调用 = 一个 `DomainContext` = 一次图执行：不逐店循环，提问由服务端注入，回到模型的那一句里没有 SQL 也没有真店号。
+
+### 020 的部署、幂等与回退
+
+`020_controlled_sql_exploration.sql` 必须在 `004 → 009 → 014 → 015 → 016 → 017 → 018 → 019` 之后执行（它重建 009/014 声明的三份 CHECK，读不到既有定义就 `constraint_missing:<名>` 早失败），只做三件事：
+
+1. 三份白名单**只重建不收缩**：逐字重声明 009/014 已登记的每一个取值，并保留库里当前已存在的额外取值，再参加本计划的 `controlled_sql_exploration` 领域、`exploration_result` 类型与 `fixed_tool_available` / `schema_ambiguous` / `sql_policy_rejected` / `query_cost_exceeded` 四个终止原因。因此它在独立泳道的 `022_isolated_analysis_artifacts.sql` 之前或之后执行都成立，谁后跑谁负责合并，不靠顺序运气。
+2. `bi.query_diagnostics` 保持私有：不建任何 reporting 视图，`REVOKE ALL … FROM PUBLIC / bi_reader`，只给 `bi_app` `SELECT, INSERT, UPDATE`。
+3. 幂等：全部是 `DROP … IF EXISTS` + 重建，可重复执行。本机 `bi_agent_test` 已应用该迁移（探索图能以该领域写真库为证），测试里还在管理员外层事务内重放两次并逐字比对约束定义（`ExplorationMigrationTests`，跑完按 Rollback 协议退出）。
+
+```powershell
+Set-Location backend
+psql -d bi_agent -v ON_ERROR_STOP=1 -f sql/020_controlled_sql_exploration.sql
+```
+
+回退 = 把 `CONTROLLED_SQL_ENABLED` 改回 `false`（或删掉该变量）后重启：不新增 Tool、不进门禁、不发任何语句。回退**不需要**回滚 020：白名单只增不减，已有的探索运行记录与诊断仍按当版可读；也不要为了让启动成功去改约束、删运行记录或把门禁“先关掉当已解决”。
+
+### 诊断：一次受控聚合探索为什么没出数
+
+| 观察到的稳定码 | 发生在哪一步 | 含义与处置 |
+| --- | --- | --- |
+| `fixed_tool_available` | `authorize_scope`（编译之前） | 固定 Tool 已能表达这个问题：改用它。“换个工具再试一次”不是绕过固定口径的路 |
+| `schema_ambiguous` | `select_schema` | 检索无法唯一定位语义 ref：该澄清，不是猜一个就发 SQL |
+| 编译层的 `exploration_*`（运行层记 `contract_violation`） | `compile_query` | 本轮选择与目录不自洽、缺窗口、跳事实粒度、聚合未授权（如上架价默认的 `avg`）、未登记 JOIN 边、授权集合为空等：属契约/选择问题，不是数据库问题 |
+| `sql_policy_rejected` | `validate_ast` | AST 白名单在碰库之前拒掉这条语句（多语句、CTE、子查询、UNION、未登记对象、函数逃逸、缺授权或时间谓词等）。语句原文只进诊断表，错误文本只剩一个码 |
+| `query_cost_exceeded` | `estimate_cost` | 真 `EXPLAIN` 的预计行数 > 50000 或总成本 > 100000：缩小窗口或店铺范围，不为了过门抬阈值 |
+| `query_timeout` | 执行 / 投影 | 5 秒 `statement_timeout` 掐断了这条语句 |
+| `deadline_exceeded` | 任一进库步骤之前 | 整轮 30 秒预算不足（进库前要求容得下两道 5 秒门 + 两道 0.1 秒 IO 余量 + 1 秒收尾）：宁可当场判未完成，也不留半截查询 |
+| `result_too_large` | 执行 / 投影 | 命中 500 行上限（取 `limit + 1`，多一行就是截断证据）或安全投影后 > 262144 字节：整条拒，不返回被截断的偏低汇总 |
+| `persistence_failed` | `persist_artifact` | 诊断或 Artifact 写不进：清空待发布结果。先恢复运行记录的写入能力，再由用户重发原问题 |
+| `forbidden` | `authorize_scope` | 授权集合为空、拿不到 opaque 引用，或本轮选中的视图只能按库存池授权：探索链只开店铺一条授权通道，池 id 绝不 substitute 进来 |
+
+排查时只读 `bi.query_diagnostics`（`bi_app` 与管理员身份读得到，`bi_reader` 无授权）：SQL 原文与参数只在这里，通过 `run_id` 引用；事件、模型消息与本页示例都不含 SQL、DSN 或真实店铺标识。历史 SQL 只可查看，目录版本或模板版本一变就必须重新生成并重新验证（`exploration_catalog_version_mismatch`），旧计划不得复用。
+
+### 启用前置（本机与目标环境同一顺序）
+
+1. 迁移齐：按上面的完整顺序含 `020`；预检失败即发布失败，不得绕过。
+2. 权限核对（只读，管理员执行）：用上一节那两条 `information_schema.table_privileges` 查询确认 11 张登记视图对 `bi_app` / `bi_reader` 仍只有 `SELECT`，且 `bi_app` 对 `bi.*` 事实表仍无 `SELECT`——受控探索不扩权：它读的还是目录里那 11 张视图，底表权限不因本功能变化。
+3. 回归（本机 `*_test`）：
+
+```powershell
+Set-Location backend
+uv run --locked --env-file ../.env.test python -m unittest tests.test_exploration tests.test_runtime tests.test_runtime_db -v
+uv run --locked --env-file ../.env.test python -m tests.acceptance --offline
+```
+
+4. 本轮**未在任何环境启用过该门禁**：真实 provider smoke 与 26 题 live、目标环境迁移与授权实测、生产启用、部署与一周试用全部记 `未执行`，逐条见 [受控 SQL 探索本地验收记录](superpowers/research/2026-09-14-controlled-sql-acceptance.md) §9。放行矩阵里的库存行只在回滚事务内 seed，不意味着库存或上架价来源已就绪；真实部署里 `listing_audit` / `inventory` 注册表仍为空，两个固定 Tool 依旧只报 `unsupported`。
+
 ## 同源部署
 
 发布 `frontend/dist` 静态文件。反向代理将 `/api/*` 转发到 `127.0.0.1:8000`，其余路径提供 SPA 回退；关闭 SSE 路径的响应缓冲。FastAPI 仅运行于回环地址且使用单 worker：
@@ -337,6 +400,9 @@ uv run --env-file ../.env.app uvicorn bi_agent.api:create_runtime_app --factory 
 Set-Location backend
 # 四工作流与运营场景回归（计划 Task 7–11）
 uv run --env-file ../.env.test python -m unittest tests.test_channel_mapping tests.test_commerce tests.test_comparison tests.test_listing_audit tests.test_inventory tests.test_operator_workflows -v
+# 受控聚合探索（计划 Task 1–6：契约、固定 Tool 优先与编译器、AST 策略与攻击语料、
+# 成本门与投影、运行图，以及 Task 6 的 14 行放行矩阵 / 4 行负例 / 46 行攻击汇总）
+uv run --locked --env-file ../.env.test python -m unittest tests.test_exploration -v
 # 底座回归
 uv run python -m unittest tests.test_core -v
 uv run --env-file ../.env.test python -m unittest tests.test_db tests.test_api tests.test_runtime_db -v

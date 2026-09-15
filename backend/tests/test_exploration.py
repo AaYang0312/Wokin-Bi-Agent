@@ -13,7 +13,13 @@ Task 3 AST 策略与攻击语料 + Task 4 只读成本门禁与安全投影）�
 `ExplorationBudgetExceeded` 的两个原因码，以及"先 EXPLAIN、后只读执行、最后投影"这条序列。
 `ExplorationProjectionTests` 是纯函数投影用例；`ExplorationRepositoryTests` 走**真库**：
 EXPLAIN 成本、只读事务、`statement_timeout`、`limit+1` 溢出、列名逐项比对与数据库角色拒绝。
-运行域与 Agent Tool（Task 5）仍不在本文件里。
+运行域与 Agent Tool（Task 5）在 `ExplorationDomainContractTests` 往后的几组里。
+`ExplorationAcceptanceMatrixTests`（Task 6 阶段 1A）只钉**冻结验收矩阵**这一份契约：十四行
+预期放行的受控聚合探索用例、一行上架快照时效负例、三行固定 Tool 优先负例，加上人工基准与
+夹具锚点的形状。`ExplorationAcceptanceDatabaseTests`（阶段 1B）拿它在真库上跑完链：回滚事务
+内 seed 确定性的七类基表行，编译→策略→EXPLAIN 成本门→只读执行→安全投影，列声明与每一格值
+都逐字对一份独立写出的手工基准；`ExplorationAcceptanceSummaryTests` 把 46 行攻击语料与三行
+固定 Tool 拒答汇总起来，证明它们都在碰库之前就被拦下。
 
 为什么 256 KiB 在投影层判而不在执行层判：`execute_plan` 看到的是**未投影**的行，里面还有真
 店号；把预算绑到那份表示上，要么逼执行层留下原始行，要么逼它偷偷调用投影。两者都不做，
@@ -4768,6 +4774,1367 @@ class ExplorationGraphCrashFinalizationTests(unittest.TestCase):
         self.assertEqual(store.finishes, 1)
         self.assertEqual(store.finish_record[2], "succeeded")
         self.assertNotEqual(store.finish_record[3], "upstream_unavailable")
+
+
+# --- Task 6 阶段 1A：冻结验收矩阵、人工基准与确定性锚点 ---------------------------
+#
+# 计划 Task 6 Step 1 要的是一份**冻结**的矩阵，而不是一串现编的问法：阶段 1B 的 live 环只
+# 能从这份契约里取用例，不能自己加。三件事在这里定死：
+#
+# 1. 行数与 id：十四行 `permitted`（计划下限十行），加一行上架快照时效负例与三行固定 Tool
+#    优先负例。负例**不计入**那十行，也不带人工基准 —— 它们期望的是“根本不执行 SQL”。
+# 2. 期望的列：公开列只由 `acceptance_output_refs` 一条规则推出（分组 ref 排序 → 店铺授权
+#    列换成 `shop-ref` → 指标 ref 排序）。这条规则是测试自己写的：阶段 1B 拿它去要结果形状，
+#    而不是反过来问编译器“你出了哪几列”。
+# 3. 人工基准：每行一段手写 SQL，关系别名（`agg`）、档案别名（`s`）、参数名（`%(scope)s`）
+#    与引号写法都与编译器不同，只在测试 fixture 的只读事务里跑，永不进产品代码。它不调用
+#    编译器、策略、成本门或投影，也不复用它们的算术 —— 两份独立实现撞上一个数才算对照。
+#
+# 阶段 1B 的顺序是硬的：先取时钟窗口，再在同一个回滚事务里往**同一个**作用域与窗口内 seed
+# 缺的形状（NULL 金额、快照行），最后两边各跑一次。作用域是从用例 id 导出的合成店/池：把它扫
+# 到现有数据上，共享库里那几千行会同时涌进两边，对照仍会“相等”，但真零/空值/小数标度这些要
+# 证的形状就变成“看运气”。窗口由 `window_days` 逐行钉住（默认七天，按时刻分组的那行收到一天）；
+# `limit` 不是一条用例旋钮，阶段 1B 一律给到契约上限，不然“行多”会伪装成“语义错”。
+#
+# 为什么上架快照时效单独一行负例（已批准的 fail-closed 映射）：目录给上架价登记的默认聚合是
+# `avg`，而编译器只放 sum/count/min/max（比值型的数要分子分母各自求和再相除）。所以“按抓取
+# 时间看上架价”必须在编译前就被拦下：不进那十行，也不为此改编译器、语义目录或目录版本。上架
+# 价本身的正路仍是固定 Tool `audit_listing_prices`（见 `F02`）。
+#
+# 库存四行（P11–P14）只证明“渠道/实物快照可以按 sum 聚合出分组数”：共享测试库当前没有快照行，
+# 阶段 1B 必须在回滚事务内 seeding；池作用域也只在编译→策略→执行→投影这条链上取证（Task 5 的
+# 图上池作用域按 `forbidden` 收口）。两者都不构成来源就绪声明。
+
+MIN_PERMITTED_CASES = 10
+# 冻结在本阶段的预期放行行数：计划下限是十行，十四行是本阶段钉死的覆盖面（改行数先改计划）。
+EXPECTED_PERMITTED_CASES = 14
+EXPECTED_REFUSAL_CASES = 4
+MIN_ATTACK_ROWS = 20
+# 默认七天窗口（与现有固定口径的周报同宽）：矩阵里只有一行收得更窄，因为按时刻分组
+# 一天就能过五百行上限——那是预算撞墙，不是语义问题，所以窗口写在用例里而不是全局改小。
+ACCEPTANCE_WINDOW_DAYS = 7
+MAX_ACCEPTANCE_WINDOW_DAYS = 7
+KIND_PERMITTED = "permitted"
+KIND_REFUSAL = "refusal"
+ACCEPTANCE_KINDS = frozenset({KIND_PERMITTED, KIND_REFUSAL})
+SCOPE_KINDS = frozenset({"shop", "pool"})
+PERMITTED_ID_RE = re.compile(r"^P[0-9]{2}$")
+AGGREGATE_REFUSAL_ID_RE = re.compile(r"^R[0-9]{2}$")
+FIXED_TOOL_REFUSAL_ID_RE = re.compile(r"^F[0-9]{2}$")
+BARE_IDENTIFIER_RE = re.compile(r"^[a-z_][a-z0-9_]*$")
+
+# 主题词表：一个主题一种拼法，覆盖断言只看这一份。
+TOPIC_PRODUCT_COST_COVERAGE = "product_cost_coverage"
+TOPIC_ERP_DOCUMENT_NORMALIZATION = "erp_document_normalization"
+TOPIC_PAYMENT_FLOW_BREAKDOWN = "payment_flow_breakdown"
+TOPIC_REFUND_MATCH_BREAKDOWN = "refund_match_breakdown"
+TOPIC_INVENTORY_SNAPSHOT_COMPLETENESS = "inventory_snapshot_completeness"
+TOPIC_LISTING_SNAPSHOT_FRESHNESS = "listing_snapshot_freshness"
+TOPIC_FIXED_TOOL_PRIORITY = "fixed_tool_priority"
+ACCEPTANCE_TOPICS = frozenset({
+    TOPIC_PRODUCT_COST_COVERAGE, TOPIC_ERP_DOCUMENT_NORMALIZATION,
+    TOPIC_PAYMENT_FLOW_BREAKDOWN, TOPIC_REFUND_MATCH_BREAKDOWN,
+    TOPIC_INVENTORY_SNAPSHOT_COMPLETENESS, TOPIC_LISTING_SNAPSHOT_FRESHNESS,
+    TOPIC_FIXED_TOOL_PRIORITY})
+# 计划 Step 1 逐字点名的覆盖面（listing 那一项只能以负例出现）。
+PERMITTED_REQUIRED_TOPICS = frozenset({
+    TOPIC_PRODUCT_COST_COVERAGE, TOPIC_ERP_DOCUMENT_NORMALIZATION,
+    TOPIC_PAYMENT_FLOW_BREAKDOWN, TOPIC_REFUND_MATCH_BREAKDOWN,
+    TOPIC_INVENTORY_SNAPSHOT_COMPLETENESS})
+REFUSAL_ONLY_TOPICS = frozenset({TOPIC_LISTING_SNAPSHOT_FRESHNESS,
+                                 TOPIC_FIXED_TOOL_PRIORITY})
+# 上架价/活动价只能走固定 Tool：不许出现在任何预期放行的行里。
+LISTING_METRIC_REFS = frozenset({"metric-listing-price", "metric-campaign-price"})
+LISTING_VIEW_REF = "view-listing-items"
+# 本矩阵能用的拒答码就两个：前缀不算约束（`exploration_*` 里现场编一个也算过），所以按集合逐字判。
+AGGREGATE_REFUSAL_REASON = "exploration_aggregate_not_permitted"
+FIXED_TOOL_REFUSAL_REASON = "fixed_tool_available"
+ACCEPTANCE_REFUSAL_REASONS = frozenset({AGGREGATE_REFUSAL_REASON,
+                                        FIXED_TOOL_REFUSAL_REASON})
+
+# 矩阵里新用到的目录真 ref（与上面 Task 2 那组同一命名法：视图作用域前缀 + 列名）。
+VIEW_SHOP_DAILY = "view-shop-daily"
+VIEW_PRODUCT_DAILY = "view-product-daily"
+VIEW_ERP_DOCUMENT_DAILY = "view-erp-document-daily"
+VIEW_PAYMENTS = "view-payments"
+VIEW_REFUNDS = "view-refunds"
+VIEW_PHYSICAL = "view-physical-stock-items"
+VIEW_CHANNEL = "view-channel-stock-items"
+DAY_PRODUCT_DAILY = "field-product-daily-day"
+SHOP_PRODUCT_DAILY = "field-product-daily-shop-id"
+SHOP_SHOP_DAILY = "field-shop-daily-shop-id"
+SHOP_ERP = "field-erp-document-daily-shop-id"
+CURRENCY_PAYMENTS = "field-payments-currency"
+VERIFIED_PAYMENTS = "field-payments-verified"
+MATCHED_REFUNDS = "field-refunds-matched"
+PLATFORM_SUCCESS_REFUNDS = "field-refunds-platform-success"
+SHOP_LISTING = "field-listing-items-shop-id"
+CAPTURED_CHANNEL = "field-channel-stock-items-captured-at"
+UNIT_CHANNEL = "field-channel-stock-items-unit"
+CAPTURED_PHYSICAL = "field-physical-stock-items-captured-at"
+UNIT_PHYSICAL = "field-physical-stock-items-unit"
+JOIN_PRODUCT_DAILY_SHOPS = "join-product-daily-shops"
+# 按店铺授权列分组时，结果里那一格的名字是 `shop-ref`：真店号没有对外通道。
+SHOP_AUTHORIZATION_GROUP_REFS = frozenset({
+    "field-shops-shop-id", SHOP_SHOP_DAILY, SHOP_COST, SHOP_PRODUCT_DAILY, SHOP_ERP,
+    "field-payments-shop-id", "field-refunds-shop-id", SHOP_LISTING, SHOP_CHANNEL})
+
+# `reporting.<视图名>` 的唯一一份书写：人工基准与锚点都从这里取，不留第二份。
+COST_VIEW_RELATION = "v_product_cost_daily"
+PRODUCT_DAILY_RELATION = "v_product_daily"
+SHOP_DAILY_RELATION = "v_shop_daily"
+ERP_DAILY_RELATION = "v_erp_document_daily"
+PAYMENTS_RELATION = "v_payments"
+REFUNDS_RELATION = "v_refunds"
+CHANNEL_RELATION = "v_channel_stock_items"
+PHYSICAL_RELATION = "v_physical_stock_items"
+SHOPS_RELATION = "v_shops"
+LISTING_RELATION = "v_listing_snapshot_items"
+
+
+class AcceptanceCase(typing.NamedTuple):
+    """矩阵的一行：问题、受控选择、人工基准与各自独立写出的期望。
+
+    用 `NamedTuple` 而不是 dataclass：这份契约要被切片、进集合、当断言左值，冻结是硬的。
+    负例行的 `manual_sql` 恒为空 —— 期望是“不执行 SQL”，没有可对照的基准行。
+    """
+
+    case_id: str
+    kind: str
+    topic: str
+    view_ref: str
+    scope_kind: str
+    question: str
+    window_days: int = ACCEPTANCE_WINDOW_DAYS
+    metrics: tuple[str, ...] = ()
+    groups: tuple[str, ...] = ()
+    joins: tuple[str, ...] = ()
+    manual_sql: str = ""
+    expected_reason: str = ""
+    expected_tool: str = ""
+    evidence: str = ""
+
+
+def manual_baseline_sql(*lines: str) -> str:
+    """把逐行手写的人工基准拼成一条语句：LF 连接，末尾不带分号。"""
+    sql = "\n".join(lines)
+    assert sql and ";" not in sql, sql
+    return sql
+
+
+ACCEPTANCE_CASES: tuple[AcceptanceCase, ...] = (
+    AcceptanceCase(
+        case_id="P01", kind=KIND_PERMITTED, topic=TOPIC_PRODUCT_COST_COVERAGE,
+        view_ref=COST_VIEW, scope_kind="shop",
+        question="按日期和店铺看商品成本合计与商品销售额",
+        metrics=("metric-cost-total", "metric-sales-amount"),
+        groups=(DAY_COST, SHOP_COST),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.day, agg.shop_id, sum(agg.cost_total), sum(agg.sales_amount)",
+            f"FROM reporting.{COST_VIEW_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.day >= %(start)s AND agg.day < %(end)s",
+            "GROUP BY agg.day, agg.shop_id",
+            "ORDER BY agg.day, agg.shop_id"),
+        evidence="两个指标同一基表：一条只读语句里各聚一次，不逐指标一圈（N+1）。视图里的 "
+                 "cost_total 已经 coalesce 过，所以本行只对照数值与分组，不宣称成本覆盖完整。"),
+    AcceptanceCase(
+        case_id="P02", kind=KIND_PERMITTED, topic=TOPIC_PRODUCT_COST_COVERAGE,
+        view_ref=COST_VIEW, scope_kind="shop",
+        question="按日期和商品行类型看商品成本合计",
+        metrics=("metric-cost-total",), groups=(DAY_COST, LINE_KIND_COST),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.day, agg.line_kind, sum(agg.cost_total)",
+            f"FROM reporting.{COST_VIEW_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.day >= %(start)s AND agg.day < %(end)s",
+            "GROUP BY agg.day, agg.line_kind",
+            "ORDER BY agg.day, agg.line_kind"),
+        evidence="line_kind 是维度列：父项与子件各成一组，不靠名字合并。"),
+    AcceptanceCase(
+        case_id="P03", kind=KIND_PERMITTED, topic=TOPIC_PRODUCT_COST_COVERAGE,
+        view_ref=VIEW_PRODUCT_DAILY, scope_kind="shop",
+        question="按日期和店铺看成交件数与赠品件数",
+        metrics=("metric-sold-quantity", "metric-gift-quantity"),
+        groups=(DAY_PRODUCT_DAILY, SHOP_PRODUCT_DAILY),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.day, agg.shop_id, sum(agg.gift_quantity), sum(agg.quantity)",
+            f"FROM reporting.{PRODUCT_DAILY_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.day >= %(start)s AND agg.day < %(end)s",
+            "GROUP BY agg.day, agg.shop_id",
+            "ORDER BY agg.day, agg.shop_id"),
+        evidence="成交件数与赠品件数是两列两份口径：赠品不并入销量，也不从销量里扣。"),
+    AcceptanceCase(
+        case_id="P04", kind=KIND_PERMITTED, topic=TOPIC_PRODUCT_COST_COVERAGE,
+        view_ref=VIEW_PRODUCT_DAILY, scope_kind="shop",
+        question="按平台看赠品件数",
+        metrics=("metric-gift-quantity",), groups=(SHOPS_PLATFORM,),
+        joins=(JOIN_PRODUCT_DAILY_SHOPS,),
+        manual_sql=manual_baseline_sql(
+            "SELECT s.platform, sum(agg.gift_quantity)",
+            f"FROM reporting.{PRODUCT_DAILY_RELATION} AS agg",
+            f"INNER JOIN reporting.{SHOPS_RELATION} AS s ON s.shop_id = agg.shop_id",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.day >= %(start)s AND agg.day < %(end)s",
+            "GROUP BY s.platform",
+            "ORDER BY s.platform"),
+        evidence="唯一放开的跳视图粒度：目录登记的 N:1 店铺档案边，且本轮检索已选上它。"),
+    AcceptanceCase(
+        case_id="P05", kind=KIND_PERMITTED, topic=TOPIC_ERP_DOCUMENT_NORMALIZATION,
+        view_ref=VIEW_ERP_DOCUMENT_DAILY, scope_kind="shop",
+        question="按单据归一化状态看单据成本与单据毛利",
+        metrics=("metric-erp-document-cost", "metric-erp-gross-profit-reference"),
+        groups=(STATUS_ERP,),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.normalization_status, sum(agg.raw_cost), sum(agg.raw_gross_profit)",
+            f"FROM reporting.{ERP_DAILY_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.day >= %(start)s AND agg.day < %(end)s",
+            "GROUP BY agg.normalization_status",
+            "ORDER BY agg.normalization_status"),
+        evidence="raw_cost 可空：整组无成本时那一格发 null，不折算成 0；确有 0 成本的组仍发 "
+                 "0.00。normalization_status 列本身 NOT NULL，缺状态在库里构造不出来，也就不拿 "
+                 "占位字符串冒充空值组。"),
+    AcceptanceCase(
+        case_id="P06", kind=KIND_PERMITTED, topic=TOPIC_ERP_DOCUMENT_NORMALIZATION,
+        view_ref=VIEW_ERP_DOCUMENT_DAILY, scope_kind="shop",
+        question="按单据归一化状态和店铺看单据成本",
+        metrics=("metric-erp-document-cost",), groups=(STATUS_ERP, SHOP_ERP),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.normalization_status, agg.shop_id, sum(agg.raw_cost)",
+            f"FROM reporting.{ERP_DAILY_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.day >= %(start)s AND agg.day < %(end)s",
+            "GROUP BY agg.normalization_status, agg.shop_id",
+            "ORDER BY agg.normalization_status, agg.shop_id"),
+        evidence="店铺授权列参与分组时只能以 shop-ref 出列：真店号不进结果、不进日志。"),
+    AcceptanceCase(
+        case_id="P07", kind=KIND_PERMITTED, topic=TOPIC_PAYMENT_FLOW_BREAKDOWN,
+        view_ref=VIEW_PAYMENTS, scope_kind="shop",
+        question="按币种看支付流水金额",
+        metrics=("metric-payment-flow-amount",), groups=(CURRENCY_PAYMENTS,),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.currency, sum(agg.amount)",
+            f"FROM reporting.{PAYMENTS_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.paid_at >= %(start)s AND agg.paid_at < %(end)s",
+            "GROUP BY agg.currency",
+            "ORDER BY agg.currency"),
+        evidence="明细面口径：支付流水金额与 v_shop_daily 的已支付金额不是同一个数。"),
+    AcceptanceCase(
+        case_id="P08", kind=KIND_PERMITTED, topic=TOPIC_PAYMENT_FLOW_BREAKDOWN,
+        view_ref=VIEW_PAYMENTS, scope_kind="shop",
+        question="按支付是否已核验看支付流水金额",
+        metrics=("metric-payment-flow-amount",), groups=(VERIFIED_PAYMENTS,),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.verified, sum(agg.amount)",
+            f"FROM reporting.{PAYMENTS_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.paid_at >= %(start)s AND agg.paid_at < %(end)s",
+            "GROUP BY agg.verified",
+            "ORDER BY agg.verified"),
+        evidence="verified 列 NOT NULL，可空的是 amount：未核验且金额未知的流水不并入任何有"
+                 "金额的组，整组无金额时那一格发 null——未核验不等于 0，也不等于已核验。"),
+    AcceptanceCase(
+        case_id="P09", kind=KIND_PERMITTED, topic=TOPIC_PAYMENT_FLOW_BREAKDOWN,
+        view_ref=VIEW_PAYMENTS, scope_kind="shop",
+        question="按支付时间看支付流水金额",
+        window_days=1,
+        metrics=("metric-payment-flow-amount",), groups=(DAY_PAYMENTS,),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.paid_at, sum(agg.amount)",
+            f"FROM reporting.{PAYMENTS_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.paid_at >= %(start)s AND agg.paid_at < %(end)s",
+            "GROUP BY agg.paid_at",
+            "ORDER BY agg.paid_at"),
+        evidence="时刻列也是半开区间的轴：窗口两端只走参数，paid_at 为 NULL 的行不进组。"
+                 "按时刻分组粒度极高，所以本行窗口收到一天：不然先撞的是五百行预算。"),
+    AcceptanceCase(
+        case_id="P10", kind=KIND_PERMITTED, topic=TOPIC_REFUND_MATCH_BREAKDOWN,
+        view_ref=VIEW_REFUNDS, scope_kind="shop",
+        question="按退款是否已匹配和平台是否退款成功看平台原始退款金额",
+        metrics=("metric-refund-record-amount",),
+        groups=(MATCHED_REFUNDS, PLATFORM_SUCCESS_REFUNDS),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.matched, agg.platform_success, sum(agg.raw_platform_amount)",
+            f"FROM reporting.{REFUNDS_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.platform_completed_at >= %(start)s"
+            " AND agg.platform_completed_at < %(end)s",
+            "GROUP BY agg.matched, agg.platform_success",
+            "ORDER BY agg.matched, agg.platform_success"),
+        evidence="两个布尔维度各成一组，未匹配/未成功的金额不并进成功组；平台原始金额与已归一"
+                 "金额是两回事，这里只聚原始面。"),
+    AcceptanceCase(
+        case_id="P11", kind=KIND_PERMITTED, topic=TOPIC_INVENTORY_SNAPSHOT_COMPLETENESS,
+        view_ref=VIEW_CHANNEL, scope_kind="shop",
+        question="按快照抓取时间看店铺可售库存",
+        metrics=("metric-channel-sellable-quantity",), groups=(CAPTURED_CHANNEL,),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.captured_at, sum(agg.sellable_quantity)",
+            f"FROM reporting.{CHANNEL_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.captured_at >= %(start)s AND agg.captured_at < %(end)s",
+            "GROUP BY agg.captured_at",
+            "ORDER BY agg.captured_at"),
+        evidence="渠道快照行只在回滚事务内 seed：本行只证明 sum 聚合链路，不证明来源就绪，也"
+                 "不证明快照完整。"),
+    AcceptanceCase(
+        case_id="P12", kind=KIND_PERMITTED, topic=TOPIC_INVENTORY_SNAPSHOT_COMPLETENESS,
+        view_ref=VIEW_CHANNEL, scope_kind="shop",
+        question="按店铺和计量单位看店铺可售库存",
+        metrics=("metric-channel-sellable-quantity",),
+        groups=(SHOP_CHANNEL, UNIT_CHANNEL),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.shop_id, agg.unit, sum(agg.sellable_quantity)",
+            f"FROM reporting.{CHANNEL_RELATION} AS agg",
+            "WHERE agg.shop_id = ANY(%(scope)s)",
+            "  AND agg.captured_at >= %(start)s AND agg.captured_at < %(end)s",
+            "GROUP BY agg.shop_id, agg.unit",
+            "ORDER BY agg.shop_id, agg.unit"),
+        evidence="piece/box/set/kit 不换算：不同单位的数不汇总成一行。"),
+    AcceptanceCase(
+        case_id="P13", kind=KIND_PERMITTED, topic=TOPIC_INVENTORY_SNAPSHOT_COMPLETENESS,
+        view_ref=VIEW_PHYSICAL, scope_kind="pool",
+        question="按快照抓取时间看实物可用量、入库在途量与锁定量",
+        metrics=("metric-physical-available-quantity", "metric-inbound-quantity",
+                 "metric-locked-quantity"),
+        groups=(CAPTURED_PHYSICAL,),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.captured_at, sum(agg.inbound_quantity), sum(agg.locked_quantity),"
+            " sum(agg.available_quantity)",
+            f"FROM reporting.{PHYSICAL_RELATION} AS agg",
+            "WHERE agg.pool_id = ANY(%(scope)s)",
+            "  AND agg.captured_at >= %(start)s AND agg.captured_at < %(end)s",
+            "GROUP BY agg.captured_at",
+            "ORDER BY agg.captured_at"),
+        evidence="三个量各聚一次，不互相加减；inbound/locked 可空，整组无值发 null。按池授权"
+                 "只走编译→策略→执行→投影这条链取证，不构成来源就绪。"),
+    AcceptanceCase(
+        case_id="P14", kind=KIND_PERMITTED, topic=TOPIC_INVENTORY_SNAPSHOT_COMPLETENESS,
+        view_ref=VIEW_PHYSICAL, scope_kind="pool",
+        question="按计量单位看实物可用量",
+        metrics=("metric-physical-available-quantity",), groups=(UNIT_PHYSICAL,),
+        manual_sql=manual_baseline_sql(
+            "SELECT agg.unit, sum(agg.available_quantity)",
+            f"FROM reporting.{PHYSICAL_RELATION} AS agg",
+            "WHERE agg.pool_id = ANY(%(scope)s)",
+            "  AND agg.captured_at >= %(start)s AND agg.captured_at < %(end)s",
+            "GROUP BY agg.unit",
+            "ORDER BY agg.unit"),
+        evidence="单位是维度而不是换算系数：跳单位不求总量。"),
+    # --- 负例：上架快照时效（不计入那十行，也不去改编译器/目录/目录版本） ----------
+    AcceptanceCase(
+        case_id="R01", kind=KIND_REFUSAL, topic=TOPIC_LISTING_SNAPSHOT_FRESHNESS,
+        view_ref=LISTING_VIEW_REF, scope_kind="shop",
+        question="按快照抓取时间看上架价",
+        metrics=("metric-listing-price",), groups=(LISTING_CAPTURED_AT,),
+        expected_reason=AGGREGATE_REFUSAL_REASON,
+        evidence="上架价默认 avg，编译器只放 sum/count/min/max：时效分组不降级为 SQL，也不为"
+                 "它改编译器、目录或目录版本。"),
+    # --- 负例：固定 Tool 可表达的问题不许走受控聚合探索（同样不计入那十行） ------
+    AcceptanceCase(
+        case_id="F01", kind=KIND_REFUSAL, topic=TOPIC_FIXED_TOOL_PRIORITY,
+        view_ref=VIEW_SHOP_DAILY, scope_kind="shop",
+        question="按日期看买家已支付金额",
+        metrics=("metric-paid-amount",), groups=(DAY_SHOP_DAILY,),
+        expected_reason=FIXED_TOOL_REFUSAL_REASON, expected_tool="query_business",
+        evidence="固定 Tool 的 group_by=day 已能表达：不拿 SQL 再算一遍同一个数。"),
+    AcceptanceCase(
+        case_id="F02", kind=KIND_REFUSAL, topic=TOPIC_FIXED_TOOL_PRIORITY,
+        view_ref=LISTING_VIEW_REF, scope_kind="shop",
+        question="按店铺看上架价",
+        metrics=("metric-listing-price",), groups=(SHOP_LISTING,),
+        expected_reason=FIXED_TOOL_REFUSAL_REASON, expected_tool="audit_listing_prices",
+        evidence="上架价的固定路径仍是价审 Tool：R01 被拦不等于上架价换了条路。本行只能按 "
+                 "固定 Tool 优先归因（那道门在编译之前）：同一个选择丢给编译器也会拒，"
+                 "拿编译器替本行归因会让固定 Tool 优先那条规则静默失去覆盖。"),
+    AcceptanceCase(
+        case_id="F03", kind=KIND_REFUSAL, topic=TOPIC_FIXED_TOOL_PRIORITY,
+        view_ref=VIEW_PHYSICAL, scope_kind="pool",
+        question="按库存池看实物可用量",
+        metrics=("metric-physical-available-quantity",), groups=(POOL_PHYSICAL,),
+        expected_reason=FIXED_TOOL_REFUSAL_REASON, expected_tool="inspect_inventory",
+        evidence="库存监看 Tool 的 pool 行形已能表达：不需要再发一条聚合语句。"),
+)
+
+
+class MatrixAnchor(typing.NamedTuple):
+    """一个事实视图的夹具元数据：真实关系名、作用域列、时间轴列。
+
+    这三样是阶段 1B 写 seed 与绑窗口时唯一允许的取值来源：谓词落在哪一列、作用域是店还是
+    池、手写基准该读哪个视图，都由这里给出，不在用例里再拄一遍。关系名同时用来校每行的手写
+    基准确实读的就是那个视图。
+
+    窗口不再从“现有数据里行最多的那个作用域”推：本库两个库存快照视图目前是空的，而
+    `exploration_aggregate_not_permitted` 以外的形状（整组无金额、真零、跨单位）在现有数据里
+    并不能保证存在——拿它们做期望就会把一个没被证明的约定当成基线。所以窗口改为纯时钟（见
+    `MATRIX_WINDOW_SQL`），形状由回滚事务内的 seed 给出；作用域列与时间轴列仍是这里唯一的一份。
+    """
+
+    view_ref: str
+    relation: str
+    scope_column: str
+    time_column: str
+
+
+MATRIX_ANCHORS = {
+    anchor.view_ref: anchor
+    for anchor in (
+        MatrixAnchor(COST_VIEW, COST_VIEW_RELATION, "shop_id", "day"),
+        MatrixAnchor(VIEW_SHOP_DAILY, SHOP_DAILY_RELATION, "shop_id", "day"),
+        MatrixAnchor(VIEW_PRODUCT_DAILY, PRODUCT_DAILY_RELATION, "shop_id", "day"),
+        MatrixAnchor(VIEW_ERP_DOCUMENT_DAILY, ERP_DAILY_RELATION, "shop_id", "day"),
+        MatrixAnchor(VIEW_PAYMENTS, PAYMENTS_RELATION, "shop_id", "paid_at"),
+        MatrixAnchor(VIEW_REFUNDS, REFUNDS_RELATION, "shop_id", "platform_completed_at"),
+        MatrixAnchor(VIEW_CHANNEL, CHANNEL_RELATION, "shop_id", "captured_at"),
+        MatrixAnchor(VIEW_PHYSICAL, PHYSICAL_RELATION, "pool_id", "captured_at"),
+        MatrixAnchor(LISTING_VIEW_REF, LISTING_RELATION, "shop_id", "captured_at"),
+    )
+}
+# 夹具窗口只有一句纯时钟语句：整体往前留一天，再取 `window_days` 天半开区间。所有 seed
+# 时刻因此严格早于 `now()`：018/019 的“不许声称一个还没发生的抓取”不能被一个跑在正午之前的
+# 用例误伤，而空视图也能取证（不依赖共享库里恰好有什么）。两边都把同一个 date 参数交给同一个
+# 隐式 date→timestamptz 转换（会话时区零点），所以“时刻列上的窗口”在人工基准与编译产物里落在
+# 同一个瞬间，而不是两份写法巧合相等。
+MATRIX_WINDOW_SQL = "SELECT (current_date - {back})::date, (current_date - 1)::date"
+
+
+def matrix_window_sql(*, window_days: int = ACCEPTANCE_WINDOW_DAYS) -> str:
+    """解出夹具窗口语句：窗口 = `[current_date - window_days - 1, current_date - 1)`。"""
+    assert 1 <= window_days <= MAX_ACCEPTANCE_WINDOW_DAYS, window_days
+    return MATRIX_WINDOW_SQL.format(back=window_days + 1)
+
+
+def acceptance_cases_of_kind(kind: str) -> tuple[AcceptanceCase, ...]:
+    """按 kind 取矩阵切片：kind 只许写那两个词，写错了当场判红。"""
+    if kind not in ACCEPTANCE_KINDS:
+        raise AssertionError(f"未知的验收类型：{kind}")
+    return tuple(case for case in ACCEPTANCE_CASES if case.kind == kind)
+
+
+def acceptance_case(case_id: str) -> AcceptanceCase:
+    """按 id 取一行：id 不存在就是拼错了，不让用例静默消失。"""
+    return next(case for case in ACCEPTANCE_CASES if case.case_id == case_id)
+
+
+def acceptance_output_refs(case: AcceptanceCase) -> tuple[str, ...]:
+    """人工基准的列序规则：分组 ref 排序（店铺授权列 → shop-ref）+ 指标 ref 排序。"""
+    if case.kind != KIND_PERMITTED:
+        return ()
+    return tuple(SHOP_REF_COLUMN if ref in SHOP_AUTHORIZATION_GROUP_REFS else ref
+                 for ref in sorted(case.groups)) + tuple(sorted(case.metrics))
+
+
+def manual_select_width(manual_sql: str) -> int:
+    """人工基准 SELECT 清单的项数（只数括号外的逗号）：与期望列数逐项对齐。"""
+    head = manual_sql.splitlines()[0]
+    assert head.startswith("SELECT "), head
+    depth, items = 0, 1
+    for char in head[len("SELECT "):]:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            items += 1
+    assert depth == 0, head
+    return items
+
+
+def matrix_window(conn, case: AcceptanceCase):
+    """取该用例的确定性窗口：回 `(start, end)`，半开区间。
+
+    这一条不碰编译器也不碰投影：它只定“拿哪一段区间对照”。两个值都来自数据库自己的当日：
+    不在测试里拿 `date.today()` 再猜一次，也不把某一天写进契约。
+    """
+    row = conn.execute(matrix_window_sql(window_days=case.window_days)).fetchone()
+    assert row is not None and row[0] is not None, "时钟语句没回数：夹具定不了窗口"
+    start, end = row[0], row[1]
+    assert (end - start).days == case.window_days, (case.case_id, start, end)
+    return start, end
+
+
+def manual_query(conn, sql, *, scope, start, end):
+    """跑一段手写基准：只读事务里执行，回原始行。
+
+    这条路径上不许出现编译器、策略、成本门或投影：它与受控链路就是用来互相对照的两份独立
+    实现。共用的只有会话设置（READ ONLY 与 statement_timeout）：两边跑在同一个环境下。
+    上架时效那一行（`R01`）的反事实基准也从这里走：它按契约不能有 `manual_sql`。
+    """
+    assert sql and ";" not in sql, sql
+    with conn.transaction():
+        conn.execute(READ_ONLY_STATEMENT)
+        conn.execute(STATEMENT_TIMEOUT_STATEMENT)
+        return conn.execute(sql, {"scope": list(scope), "start": start, "end": end}).fetchall()
+
+
+def manual_baseline(conn, case: AcceptanceCase, *, scope, start, end):
+    """跑一行的手算基准：矩阵里那段手写 SQL，参数只有作用域与窗口。"""
+    assert case.manual_sql, case.case_id
+    return manual_query(conn, case.manual_sql, scope=scope, start=start, end=end)
+
+
+def baseline_cell(value: object) -> object:
+    """把人工基准的一格换成与公开结果同词表的值（测试自写的对照器，不调投影层）。
+
+    Decimal → 保留标度的十进制文本；date/datetime → ISO 文本（时刻不换算时区）；None/bool/
+    int/str 原样。真店号 → opaque 引用的映射属服务端的表，不在这层。
+    """
+    if isinstance(value, Decimal):
+        return format(value, "f")
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
+
+
+class ExplorationAcceptanceMatrixTests(unittest.TestCase):
+    """钉住 Task 6 Step 1 的矩阵形状与覆盖：阶段 1A 一行库都不碰。"""
+
+    def test_case_ids_are_unique_and_kind_is_one_of_the_two_frozen_words(self):
+        ids = [case.case_id for case in ACCEPTANCE_CASES]
+        self.assertEqual(len(ids), len(set(ids)), "验收用例 id 重复")
+        self.assertEqual({case.kind for case in ACCEPTANCE_CASES}, ACCEPTANCE_KINDS)
+        for case in ACCEPTANCE_CASES:
+            with self.subTest(case=case.case_id):
+                pattern = {"P": PERMITTED_ID_RE, "R": AGGREGATE_REFUSAL_ID_RE,
+                           "F": FIXED_TOOL_REFUSAL_ID_RE}[case.case_id[0]]
+                self.assertIsNotNone(pattern.match(case.case_id), case.case_id)
+                self.assertEqual(case.kind == KIND_PERMITTED, case.case_id.startswith("P"))
+                self.assertIn(case.scope_kind, SCOPE_KINDS)
+                self.assertGreaterEqual(case.window_days, 1)
+                self.assertLessEqual(case.window_days, MAX_ACCEPTANCE_WINDOW_DAYS)
+                self.assertIn(case.topic, ACCEPTANCE_TOPICS)
+                self.assertIn(case.view_ref, MATRIX_ANCHORS)
+
+    def test_at_least_ten_cases_are_marked_permitted(self):
+        permitted = acceptance_cases_of_kind(KIND_PERMITTED)
+        refusals = acceptance_cases_of_kind(KIND_REFUSAL)
+        self.assertGreaterEqual(len(permitted), MIN_PERMITTED_CASES)
+        # 冻结：十四行是计划下限之上的实际覆盖面，负例不计入那十行。
+        self.assertEqual(len(permitted), EXPECTED_PERMITTED_CASES)
+        self.assertEqual(len(refusals), EXPECTED_REFUSAL_CASES)
+        self.assertEqual(len(ACCEPTANCE_CASES),
+                         EXPECTED_PERMITTED_CASES + EXPECTED_REFUSAL_CASES)
+        self.assertEqual(len({case.question for case in ACCEPTANCE_CASES}),
+                         len(ACCEPTANCE_CASES), "两行问同一句话就没法归因到用例")
+
+    def test_required_topics_are_covered_by_permitted_rows(self):
+        covered = {case.topic for case in acceptance_cases_of_kind(KIND_PERMITTED)}
+        missing = PERMITTED_REQUIRED_TOPICS - covered
+        self.assertFalse(missing, sorted(missing))
+        for topic in sorted(REFUSAL_ONLY_TOPICS):
+            with self.subTest(topic=topic):
+                self.assertNotIn(topic, covered)
+                self.assertTrue([case for case in ACCEPTANCE_CASES
+                                 if case.topic == topic], topic)
+
+    def test_listing_snapshot_freshness_is_a_refusal_only_row(self):
+        rows = [case for case in ACCEPTANCE_CASES
+                if case.topic == TOPIC_LISTING_SNAPSHOT_FRESHNESS]
+        self.assertEqual([case.case_id for case in rows], ["R01"])
+        self.assertEqual(rows[0].kind, KIND_REFUSAL)
+        self.assertEqual(rows[0].expected_reason, AGGREGATE_REFUSAL_REASON)
+        self.assertEqual(rows[0].manual_sql, "", "负例不得带人工基准：它期望不执行 SQL")
+        # 时效分组不授权任何上架指标：那十行里不得出现上架视图或上架价。
+        for case in acceptance_cases_of_kind(KIND_PERMITTED):
+            self.assertFalse(LISTING_METRIC_REFS & set(case.metrics), case.case_id)
+            self.assertNotEqual(case.view_ref, LISTING_VIEW_REF, case.case_id)
+
+    def test_fixed_tool_priority_rows_name_the_fixed_path(self):
+        rows = [case for case in ACCEPTANCE_CASES
+                if case.topic == TOPIC_FIXED_TOOL_PRIORITY]
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({case.expected_tool for case in rows},
+                         {"query_business", "audit_listing_prices", "inspect_inventory"})
+        for case in rows:
+            with self.subTest(case=case.case_id):
+                self.assertEqual(case.kind, KIND_REFUSAL)
+                self.assertEqual(case.expected_reason, FIXED_TOOL_REFUSAL_REASON)
+                self.assertIn(case.expected_tool, PLAN_TOOL_ORDER)
+                self.assertEqual(case.manual_sql, "")
+        # audit_listing_prices 仍是上架价的固定路径（R01 被拦不等于换了路）。
+        self.assertEqual(acceptance_case("F02").expected_tool, "audit_listing_prices")
+
+    def test_refusal_reasons_are_the_two_codes_those_rows_actually_hit(self):
+        # 两个码都得逐字对得上：拿一个“看着像”的新码顶上来，比不写码更坑阶段 1B。
+        used = {case.expected_reason for case in acceptance_cases_of_kind(KIND_REFUSAL)}
+        self.assertEqual(used, set(ACCEPTANCE_REFUSAL_REASONS))
+        self.assertIn(AGGREGATE_REFUSAL_REASON, module_source("compiler"))
+        self.assertIn(FIXED_TOOL_REFUSAL_REASON, module_source("graph"))
+        # 运行层终止码只冻结了那四个新码：固定 Tool 优先那一格不得被换一个说法。
+        self.assertIn(FIXED_TOOL_REFUSAL_REASON, EXPLORATION_TERMINATION_REASONS)
+
+    def test_permitted_rows_carry_an_independent_manual_baseline(self):
+        for case in acceptance_cases_of_kind(KIND_PERMITTED):
+            with self.subTest(case=case.case_id):
+                sql = case.manual_sql
+                anchor = MATRIX_ANCHORS[case.view_ref]
+                self.assertTrue(sql.startswith("SELECT "))
+                self.assertNotIn("\r", sql)
+                self.assertNotIn(";", sql, "一条基准语句就是一句")
+                self.assertEqual(len(re.findall(r"\bselect\b", sql, re.IGNORECASE)), 1,
+                                 "人工基准不得含子查询/CTE")
+                self.assertNotIn("WITH ", sql.upper())
+                self.assertNotIn("SELECT *", sql)
+                # 与编译器不共用的三样东西：关系别名、参数名、引号写法。
+                self.assertNotIn("AS fact", sql)
+                self.assertNotIn("allowed_shop_ids", sql)
+                self.assertNotIn('"', sql, "人工基准不拄编译器的逐段双引号")
+                for name in re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][\w.]*)",
+                                       sql, re.IGNORECASE):
+                    self.assertTrue(name.startswith("reporting."), (case.case_id, name))
+                self.assertIn("%(scope)s", sql)
+                self.assertIn("%(start)s", sql)
+                self.assertIn("%(end)s", sql)
+                self.assertIn(f"{anchor.scope_column} = ANY(%(scope)s)", sql)
+                self.assertIn(f"{anchor.time_column} >= %(start)s", sql)
+                self.assertIn(f"{anchor.time_column} < %(end)s", sql)
+                self.assertEqual(manual_select_width(sql), len(acceptance_output_refs(case)))
+                self.assertIn("GROUP BY", sql)
+                self.assertIn("ORDER BY", sql)
+
+    def test_output_refs_follow_the_one_column_rule(self):
+        # 下面三份期望是手写的：它们与规则不一致就要先改期望，不是改规则。
+        self.assertEqual(acceptance_output_refs(acceptance_case("P01")),
+                         (DAY_COST, SHOP_REF_COLUMN, "metric-cost-total",
+                          "metric-sales-amount"))
+        self.assertEqual(acceptance_output_refs(acceptance_case("P04")),
+                         (SHOPS_PLATFORM, "metric-gift-quantity"))
+        self.assertEqual(acceptance_output_refs(acceptance_case("P13")),
+                         (CAPTURED_PHYSICAL, "metric-inbound-quantity",
+                          "metric-locked-quantity", "metric-physical-available-quantity"))
+        self.assertEqual(acceptance_output_refs(acceptance_case("R01")), ())
+        for case in acceptance_cases_of_kind(KIND_PERMITTED):
+            with self.subTest(case=case.case_id):
+                refs = acceptance_output_refs(case)
+                self.assertEqual(len(refs), len(set(refs)))
+                self.assertNotIn(SHOP_ID_COLUMN, refs, "真店号的列名没有对外通道")
+                # 池授权列不伪装成 shop-ref：那一格在投影层根本没有对外通道。
+                self.assertNotIn(POOL_PHYSICAL, refs)
+
+    def test_matrix_anchors_cover_every_case_view_and_are_single_reads(self):
+        self.assertEqual({anchor.relation for anchor in MATRIX_ANCHORS.values()},
+                         {COST_VIEW_RELATION, SHOP_DAILY_RELATION, PRODUCT_DAILY_RELATION,
+                          ERP_DAILY_RELATION, PAYMENTS_RELATION, REFUNDS_RELATION,
+                          CHANNEL_RELATION, PHYSICAL_RELATION, LISTING_RELATION})
+        for view_ref in sorted(MATRIX_ANCHORS):
+            with self.subTest(view=view_ref):
+                anchor = MATRIX_ANCHORS[view_ref]
+                self.assertEqual(anchor.view_ref, view_ref)
+                for identifier in (anchor.relation, anchor.scope_column, anchor.time_column):
+                    self.assertIsNotNone(BARE_IDENTIFIER_RE.match(identifier), identifier)
+        # 每个用例的锚点元数据必须与它自己那段手写 SQL 说同一件事：读哪个视图、按哪个列授权、
+        # 窗口落在哪个时间轴上。三者不一致就是契约被单侧改了。
+        for case in ACCEPTANCE_CASES:
+            with self.subTest(case=case.case_id):
+                anchor = MATRIX_ANCHORS[case.view_ref]
+                if case.manual_sql:
+                    self.assertIn(f"reporting.{anchor.relation}", case.manual_sql)
+                    self.assertIn(f"{anchor.scope_column} = ANY(%(scope)s)", case.manual_sql)
+                    self.assertIn(f"{anchor.time_column} >= %(start)s", case.manual_sql)
+                self.assertEqual(anchor.scope_column,
+                                 "pool_id" if case.scope_kind == "pool" else "shop_id")
+                self.assertGreaterEqual(case.window_days, 1)
+
+    def test_matrix_window_statement_is_a_single_clock_read(self):
+        sql = matrix_window_sql()
+        self.assertEqual(len(re.findall(r"\bselect\b", sql, re.IGNORECASE)), 1)
+        self.assertNotIn(";", sql)
+        self.assertNotIn("{", sql, "模板没填完")
+        # 不读任何关系：两个库存快照视图本库无行，窗口必须照旧能取证。
+        self.assertIsNone(re.search(r"\bfrom\b", sql, re.IGNORECASE), sql)
+        self.assertNotIn("reporting.", sql)
+        self.assertIn("current_date - 8", sql)                   # 默认七天：前留一天
+        self.assertIn("current_date - 2", matrix_window_sql(window_days=1))
+        with self.assertRaises(AssertionError):
+            matrix_window_sql(window_days=MAX_ACCEPTANCE_WINDOW_DAYS + 1)
+
+    def test_matrix_wording_stays_controlled_and_carries_no_identifiers(self):
+        banned = ("任意 SQL", "通用 Text2SQL", "arbitrary SQL", "Text2SQL",
+                  "拼多多", "PDD", "pdd")
+        for case in ACCEPTANCE_CASES:
+            with self.subTest(case=case.case_id):
+                text = "\n".join((case.question, case.evidence))
+                for word in banned:
+                    self.assertNotIn(word, text)
+                for keyword in ("SELECT", "FROM", "WHERE", "%(", "reporting."):
+                    self.assertNotIn(keyword, case.question, "模型可见文字不携带 SQL")
+
+    def test_attack_corpus_meets_the_frozen_threshold(self):
+        self.assertGreaterEqual(ATTACK_CORPUS_ROWS, MIN_ATTACK_ROWS)
+        rows = attack_rows()
+        self.assertGreaterEqual(len(rows), MIN_ATTACK_ROWS)
+        ids = [row["id"] for row in rows]
+        self.assertEqual(len(ids), len(set(ids)), "攻击语料 id 重复")
+
+
+# --- Task 6 阶段 1B：把矩阵在真库上跑完 -----------------------------------------
+#
+# 这一节只做一件事：把阶段 1A 钉死的十四行放到真链路上跑，并把每一格与两份独立写出的期望
+# 对齐——一份是矩阵里那段手写基准 SQL 的返回值，一份是按 seed 内容手算出来的字面量。两份都
+# 不许从编译器、成本门、执行层或投影结果里反推（开发流程 §4.1）。
+#
+# 链路形状与 Task 5 交付的一致：`compile_query` → `validate_exploration_plan` → `estimate_plan`
+# （真 EXPLAIN 成本门）→ `execute_plan`（只读事务 + statement_timeout + limit+1）→
+# `project_result`。跑的是真库、真门禁，但只有本机 *_test 与回滚事务：seed 不证明任何来源就绪。
+#
+# 作用域是从用例 id 导出的合成店/池，不是真实店铺主键：每个用例只看得见自己的行。把矩阵扫到
+# 现有数据上，共享库里那几千行会同时涌进两边，“相等”仍然成立，但真零/空值/小数标度这些要证的
+# 形状就变成看运气。
+
+FIXTURE_NAMESPACE = "matrix"
+# 行数上限按契约给到最宽：一行用例不该自带预算旋钮，而“行多”不该伪装成“语义错”。
+MATRIX_REQUEST_LIMIT = 500
+MIN_ATTACK_CODES = 20
+MATRIX_TWO_SCOPE_CASES = frozenset({"P04"})       # 只有按平台分组那行要两家店
+FIXTURE_SHOP_STEM = "-matrix-shop"
+FIXTURE_POOL_STEM = "-matrix-pool"
+FIXTURE_MOMENT = "@moment"                        # 时刻分组格：只做形状与升序断言
+FIXTURE_SCOPE_REF = "@scope-ref"                  # 服务端引用表里作用域首格的 opaque 引用
+MOMENT_LABEL_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}$")
+
+
+class FixtureDay(typing.NamedTuple):
+    """分组格是窗口起点后第 n 天：日期无时区，所以可以逐字比对。"""
+
+    offset: int
+
+
+def matrix_scope(case: AcceptanceCase) -> list[str]:
+    """该用例的合成作用域值（店 id 或池 id）：由 case_id 导出，不抄真实主键。"""
+    stem = (f"{case.case_id.lower()}"
+            + (FIXTURE_POOL_STEM if case.scope_kind == "pool" else FIXTURE_SHOP_STEM))
+    return [stem, f"{stem}-b"] if case.case_id in MATRIX_TWO_SCOPE_CASES else [stem]
+
+
+def matrix_scope_refs(case: AcceptanceCase, scope) -> dict[str, str]:
+    """单独建一份“授权主键 → opaque 引用”表：投影那一格只能按它换算。
+
+    拿仓里那条同源规则（`ref_for_key`）从**本轮真正授权的那些值**算出来，不写随机名字也不拿
+    投影回的值倒推。池作用域没有对外通道（`_pool_id` 在投影层被拒），所以那一轮什么都不换算：
+    引用表为空本身就是“结果里不应出现任何池标识”的断言对象。
+    """
+    if case.scope_kind != "shop":
+        return {}
+    return {value: _ref_for_key("shop", value) for value in scope}
+
+
+def _shanghai_day(days: int) -> str:
+    """reporting 视图按 `(paid_at AT TIME ZONE 'Asia/Shanghai')::date` 取日：seed 就得按那个
+    时区的日历日落下，不然“按天分组”对的是一个谁都没声明的日界。"""
+    return f"((%(start)s + {days})::timestamp AT TIME ZONE 'Asia/Shanghai')"
+
+
+def _local_moment(span: str) -> str:
+    """会话本地时刻：窗口两端也是按会话时区的 date→timestamptz，所以它必在半开区间里。"""
+    return f"(%(start)s::timestamptz + interval '{span}')"
+
+
+_MATRIX_SHOPS_SQL = (
+    "INSERT INTO bi.shops(shop_id, platform, display_name, currency, enabled) VALUES ("
+    "%(shop_a)s, 'fxg', '矩阵甲店', 'CNY', true),"
+    "(%(shop_b)s, 'crm', '矩阵乙店', 'CNY', true)")
+
+# 成交行：两个日历日、两种行性质、两种商品。`gift` 行与 `active=false` 行是干扰项：两边
+# 都必须看不见它们，而看不见是基表的定义不是本层的选择，所以只当夹具形状不当成就绪证据。
+_MATRIX_ITEM_SQL = (
+    "INSERT INTO bi.order_items(shop_id, erp_id, line_id, product_id, paid_at, quantity,"
+    " gift_quantity, raw_unit_cost, allocated_paid_amount, allocation_verified, line_kind,"
+    " active) VALUES "
+    + "(%(shop_a)s, 'matrix-erp-1', 'line-1', 'matrix-prod-1', " + _shanghai_day(0)
+    + ", 2, 0, 1.100000, 10.000000, true, 'sale', true),"
+    + "(%(shop_a)s, 'matrix-erp-1', 'line-2', 'matrix-prod-2', " + _shanghai_day(0)
+    + ", 1, 0.500000, 0.000000, 5.500000, false, 'suite', true),"
+    + "(%(shop_a)s, 'matrix-erp-2', 'line-3', 'matrix-prod-1', " + _shanghai_day(1)
+    + ", 3, 1.250000, 2.000000, 7.000000, true, 'sale', true),"
+    + "(%(shop_a)s, 'matrix-erp-2', 'line-4', 'matrix-prod-3', " + _shanghai_day(1)
+    + ", 9, 9, 1.000000, 1.000000, true, 'gift', true),"
+    + "(%(shop_a)s, 'matrix-erp-2', 'line-5', 'matrix-prod-4', " + _shanghai_day(1)
+    + ", 5, 0, 2.000000, 3.000000, true, 'sale', false),"
+    + "(%(shop_b)s, 'matrix-erp-1', 'line-1', 'matrix-prod-1', " + _shanghai_day(0)
+    + ", 4, 0, 1.000000, 20.000000, true, 'sale', true),"
+    + "(%(shop_b)s, 'matrix-erp-1', 'line-2', 'matrix-prod-2', " + _shanghai_day(0)
+    + ", 2, 1.000000, 0.500000, 4.000000, false, 'suite', true),"
+    + "(%(shop_b)s, 'matrix-erp-2', 'line-3', 'matrix-prod-1', " + _shanghai_day(1)
+    + ", 1, 2.000000, 3.000000, 9.000000, true, 'sale', true)")
+
+# 成交行的父单：只当外键占位（成本/件数都落在行上），不当 ERP 口径面用。
+_MATRIX_ITEM_PARENT_SQL = (
+    "INSERT INTO bi.orders(shop_id, erp_id, source, source_updated_at, paid_at, batch_id) VALUES "
+    + "(%(shop_a)s, 'matrix-erp-1', 'erp', " + _shanghai_day(0) + ", " + _shanghai_day(0)
+    + ", 'matrix-batch'),"
+    + "(%(shop_a)s, 'matrix-erp-2', 'erp', " + _shanghai_day(1) + ", " + _shanghai_day(1)
+    + ", 'matrix-batch'),"
+    + "(%(shop_b)s, 'matrix-erp-1', 'erp', " + _shanghai_day(0) + ", " + _shanghai_day(0)
+    + ", 'matrix-batch'),"
+    + "(%(shop_b)s, 'matrix-erp-2', 'erp', " + _shanghai_day(1) + ", " + _shanghai_day(1)
+    + ", 'matrix-batch')")
+
+# ERP 单据：一个状态一个形状——有值、整组无值（NULL）、真零。毛利参考同列同形。
+_MATRIX_ERP_SQL = (
+    "INSERT INTO bi.orders(shop_id, erp_id, source, source_updated_at, paid_at, raw_cost,"
+    " raw_gross_profit, normalization_status, batch_id) VALUES "
+    + "(%(shop_a)s, 'matrix-doc-a', 'erp', " + _shanghai_day(0) + ", " + _shanghai_day(0)
+    + ", 12.500000, 3.500000, 'normal', 'matrix-batch'),"
+    + "(%(shop_a)s, 'matrix-doc-b', 'erp', " + _shanghai_day(1) + ", " + _shanghai_day(1)
+    + ", NULL, NULL, 'needs_review', 'matrix-batch'),"
+    + "(%(shop_a)s, 'matrix-doc-c', 'erp', " + _shanghai_day(2) + ", " + _shanghai_day(2)
+    + ", 0.000000, 0.000000, 'version_conflict', 'matrix-batch'),"
+    + "(%(shop_b)s, 'matrix-doc-d', 'erp', " + _shanghai_day(0) + ", " + _shanghai_day(0)
+    + ", 77.000000, 77.000000, 'normal', 'matrix-batch')")
+
+# 支付流水：四个币种（含一个整组无金额与一个真零）、两个已核验档位，另有一行 `paid_at`
+# 为 NULL 的流水：它不该进任何组，也不该被当成 0 算进总数。
+_MATRIX_PAYMENT_SQL = (
+    "INSERT INTO bi.order_payments(shop_id, commercial_id, paid_at, amount, currency,"
+    " verified) VALUES "
+    + "(%(shop_a)s, 'matrix-pay-1', " + _local_moment("12 hours")
+    + ", 10.250000, 'CNY', true),"
+    + "(%(shop_a)s, 'matrix-pay-6', " + _local_moment("13 hours 30 mins")
+    + ", 1.000000, 'CNY', true),"
+    + "(%(shop_a)s, 'matrix-pay-2', " + _local_moment("1 day 12 hours")
+    + ", 3.500000, 'USD', true),"
+    + "(%(shop_a)s, 'matrix-pay-3', " + _local_moment("2 day 12 hours")
+    + ", NULL, 'JPY', false),"
+    + "(%(shop_a)s, 'matrix-pay-4', " + _local_moment("3 day 12 hours")
+    + ", 0.000000, 'EUR', true),"
+    + "(%(shop_a)s, 'matrix-pay-5', NULL, 99.000000, 'CNY', true),"
+    + "(%(shop_b)s, 'matrix-pay-7', " + _local_moment("12 hours")
+    + ", 50.000000, 'CNY', true)")
+
+_MATRIX_REFUND_SQL = (
+    "INSERT INTO bi.aftersales(shop_id, aftersale_id, raw_platform_amount,"
+    " platform_completed_at, platform_success, refund_canonical, matched, source_updated_at,"
+    " batch_id) VALUES "
+    + "(%(shop_a)s, 'matrix-aft-1', 5.000000, " + _local_moment("12 hours")
+    + ", true, true, true, " + _local_moment("12 hours") + ", 'matrix-batch'),"
+    + "(%(shop_a)s, 'matrix-aft-2', NULL, " + _local_moment("1 day 12 hours")
+    + ", false, true, true, " + _local_moment("1 day 12 hours") + ", 'matrix-batch'),"
+    + "(%(shop_a)s, 'matrix-aft-3', 2.500000, " + _local_moment("2 day 12 hours")
+    + ", true, false, false, " + _local_moment("2 day 12 hours") + ", 'matrix-batch'),"
+    + "(%(shop_a)s, 'matrix-aft-4', 0.000000, " + _local_moment("3 day 12 hours")
+    + ", false, false, false, " + _local_moment("3 day 12 hours") + ", 'matrix-batch'),"
+    + "(%(shop_a)s, 'matrix-aft-5', 7.000000, NULL, true, true, true,"
+      " " + _local_moment("12 hours") + ", 'matrix-batch'),"
+    + "(%(shop_b)s, 'matrix-aft-6', 9.000000, " + _local_moment("12 hours")
+    + ", true, true, true, " + _local_moment("12 hours") + ", 'matrix-batch')")
+
+# 渠道快照：两个抓取时点、三种单位。piece 行只能是整数（019 的 CHECK），所以小数落在 set 上。
+_MATRIX_CHANNEL_SNAPSHOT_SQL = (
+    "INSERT INTO bi.channel_stock_snapshots(snapshot_id, namespace, shop_id, platform,"
+    " source, evidence, captured_at, scan_complete) VALUES "
+    + "('matrix-chs-1', '" + FIXTURE_NAMESPACE + "', %(shop_a)s, 'fxg', 'channel_api',"
+      " 'matrix-evidence', " + _local_moment("12 hours") + ", false),"
+    + "('matrix-chs-2', '" + FIXTURE_NAMESPACE + "', %(shop_a)s, 'fxg', 'channel_api',"
+      " 'matrix-evidence', " + _local_moment("1 day 12 hours") + ", false),"
+    # 作用域外那家店的明细也要有父快照：不写它，干扰行就靠一个外键错静默溜过。
+    + "('matrix-chs-1', '" + FIXTURE_NAMESPACE + "', %(shop_b)s, 'crm', 'channel_api',"
+      " 'matrix-evidence', " + _local_moment("12 hours") + ", false)")
+
+_MATRIX_CHANNEL_ITEM_SQL = (
+    "INSERT INTO bi.channel_stock_items(snapshot_id, namespace, shop_id, listing_id,"
+    " platform_sku_id, erp_sku_id, sellable_quantity, unit, captured_at) VALUES "
+    + "('matrix-chs-1', '" + FIXTURE_NAMESPACE + "', %(shop_a)s, 'matrix-L-1',"
+      " 'matrix-PS-1', 'matrix-ES-1', 4, 'piece', " + _local_moment("12 hours") + "),"
+    + "('matrix-chs-1', '" + FIXTURE_NAMESPACE + "', %(shop_a)s, 'matrix-L-2',"
+      " 'matrix-PS-2', 'matrix-ES-2', 0, 'piece', " + _local_moment("12 hours") + "),"
+    + "('matrix-chs-2', '" + FIXTURE_NAMESPACE + "', %(shop_a)s, 'matrix-L-3',"
+      " 'matrix-PS-3', 'matrix-ES-3', 2.5000, 'set', " + _local_moment("1 day 12 hours")
+      + ")," "('matrix-chs-2', '" + FIXTURE_NAMESPACE + "', %(shop_a)s, 'matrix-L-4',"
+      " 'matrix-PS-4', 'matrix-ES-4', 1.0000, 'box', " + _local_moment("1 day 12 hours")
+      + ")," "('matrix-chs-1', '" + FIXTURE_NAMESPACE + "', %(shop_b)s, 'matrix-L-9',"
+      " 'matrix-PS-9', 'matrix-ES-9', 7, 'piece', " + _local_moment("12 hours") + ")")
+
+_MATRIX_POOL_SQL = (
+    "INSERT INTO bi.inventory_pools(namespace, pool_id, label, connection_kind, evidence)"
+    " VALUES ('" + FIXTURE_NAMESPACE + "', %(pool)s, '矩阵池', 'independent',"
+    " 'matrix-evidence')")
+
+_MATRIX_PHYSICAL_SNAPSHOT_SQL = (
+    "INSERT INTO bi.physical_stock_snapshots(snapshot_id, namespace, pool_id, warehouse_id,"
+    " platform, source, evidence, captured_at, scan_complete, batch_id) VALUES "
+    + "('matrix-ps-1', '" + FIXTURE_NAMESPACE + "', %(pool)s, 'matrix-wh', NULL, 'erp',"
+      " 'matrix-evidence', " + _local_moment("12 hours") + ", false, 'matrix-batch-1'),"
+    + "('matrix-ps-2', '" + FIXTURE_NAMESPACE + "', %(pool)s, 'matrix-wh', NULL, 'erp',"
+      " 'matrix-evidence', " + _local_moment("1 day 12 hours") + ", false, 'matrix-batch-2')")
+
+# 每个抓取时点内部单位齐一：`按抓取时间看三个量` 不得变成跨单位混加，那是一行本身就该
+# 钉住的事。时点一（piece）两行都缺 inbound：整组无值才是 NULL 而不是 0。
+_MATRIX_PHYSICAL_ITEM_SQL = (
+    "INSERT INTO bi.physical_stock_items(snapshot_id, namespace, pool_id, warehouse_id,"
+    " erp_sku_id, available_quantity, inbound_quantity, locked_quantity, unit, batch_id,"
+    " captured_at) VALUES "
+    + "('matrix-ps-1', '" + FIXTURE_NAMESPACE + "', %(pool)s, 'matrix-wh', 'matrix-ES-1',"
+      " 10, NULL, 0, 'piece', 'matrix-batch-1', " + _local_moment("12 hours") + "),"
+    + "('matrix-ps-1', '" + FIXTURE_NAMESPACE + "', %(pool)s, 'matrix-wh', 'matrix-ES-2',"
+      " 0, NULL, 0, 'piece', 'matrix-batch-1', " + _local_moment("12 hours") + "),"
+    + "('matrix-ps-2', '" + FIXTURE_NAMESPACE + "', %(pool)s, 'matrix-wh', 'matrix-ES-3',"
+      " 6, 2, 1, 'box', 'matrix-batch-2', " + _local_moment("1 day 12 hours") + "),"
+    + "('matrix-ps-2', '" + FIXTURE_NAMESPACE + "', %(pool)s, 'matrix-wh', 'matrix-ES-4',"
+      " 0, 0.2500, 0, 'box', 'matrix-batch-2', " + _local_moment("1 day 12 hours") + ")")
+
+_MATRIX_LISTING_SNAPSHOT_SQL = (
+    "INSERT INTO bi.listing_snapshots(snapshot_id, namespace, platform, shop_id, source,"
+    " evidence, captured_at, enumeration_complete) VALUES "
+    + "('matrix-ls-1', '" + FIXTURE_NAMESPACE + "', 'fxg', %(shop_a)s, 'channel_api',"
+      " 'matrix-evidence', " + _local_moment("12 hours") + ", false),"
+    + "('matrix-ls-2', '" + FIXTURE_NAMESPACE + "', 'fxg', %(shop_a)s, 'channel_api',"
+      " 'matrix-evidence', " + _local_moment("1 day 12 hours") + ", false)")
+
+_MATRIX_LISTING_ITEM_SQL = (
+    "INSERT INTO bi.listing_snapshot_items(snapshot_id, shop_id, namespace, listing_id,"
+    " platform_sku_id, erp_sku_id, list_amount, campaign_amount, currency, on_sale,"
+    " captured_at) VALUES "
+    + "('matrix-ls-1', %(shop_a)s, '" + FIXTURE_NAMESPACE + "', 'matrix-LL-1',"
+      " 'matrix-PL-1', '', 9.9000, NULL, 'CNY', true, " + _local_moment("12 hours") + "),"
+    + "('matrix-ls-1', %(shop_a)s, '" + FIXTURE_NAMESPACE + "', 'matrix-LL-2',"
+      " 'matrix-PL-2', '', 10.1000, 9.0000, 'CNY', true, " + _local_moment("12 hours") + "),"
+    + "('matrix-ls-2', %(shop_a)s, '" + FIXTURE_NAMESPACE + "', 'matrix-LL-3',"
+      " 'matrix-PL-3', '', 20.0000, NULL, 'CNY', true,"
+      " " + _local_moment("1 day 12 hours") + ")")
+
+_MATRIX_ITEM_FAMILY = (_MATRIX_SHOPS_SQL, _MATRIX_ITEM_PARENT_SQL, _MATRIX_ITEM_SQL)
+
+# 每个视图一组 seed，顺序就是外键顺序：先档案/池，再快照头，最后明细。
+MATRIX_SEED_STATEMENTS = {
+    COST_VIEW: _MATRIX_ITEM_FAMILY,
+    VIEW_PRODUCT_DAILY: _MATRIX_ITEM_FAMILY,
+    VIEW_ERP_DOCUMENT_DAILY: (_MATRIX_SHOPS_SQL, _MATRIX_ERP_SQL),
+    VIEW_PAYMENTS: (_MATRIX_SHOPS_SQL, _MATRIX_PAYMENT_SQL),
+    VIEW_REFUNDS: (_MATRIX_SHOPS_SQL, _MATRIX_REFUND_SQL),
+    VIEW_CHANNEL: (_MATRIX_SHOPS_SQL, _MATRIX_CHANNEL_SNAPSHOT_SQL, _MATRIX_CHANNEL_ITEM_SQL),
+    VIEW_PHYSICAL: (_MATRIX_POOL_SQL, _MATRIX_PHYSICAL_SNAPSHOT_SQL,
+                    _MATRIX_PHYSICAL_ITEM_SQL),
+    LISTING_VIEW_REF: (_MATRIX_SHOPS_SQL, _MATRIX_LISTING_SNAPSHOT_SQL,
+                       _MATRIX_LISTING_ITEM_SQL),
+}
+
+
+def matrix_seed(conn, case: AcceptanceCase, *, start, scope) -> None:
+    """把该视图需要的确定性行写进**调用方的回滚事务**。
+
+    只写合成作用域：不碰现有行，也不改任何序列/配置。跑完随外层事务回滚（由
+    `test_seeded_rows_never_escape_the_rollback_transaction` 反证）。
+    """
+    shop_b = scope[1] if len(scope) > 1 else f"{scope[0]}-b"
+    parameters = {"shop_a": scope[0], "shop_b": shop_b, "pool": scope[0], "start": start}
+    for sql in MATRIX_SEED_STATEMENTS[case.view_ref]:
+        conn.execute(sql, parameters)
+
+
+# 上架时效那一行按契约不能带 `manual_sql`（它期望的是不执行受控语句），所以反事实基准写在
+# 这里：同一个问题人手能算出来，编译器仍然拒——拒的是形状，不是“没数据”。
+LISTING_FRESHNESS_COUNTERFACTUAL_SQL = manual_baseline_sql(
+    "SELECT agg.captured_at, avg(agg.list_amount), count(agg.list_amount)",
+    f"FROM reporting.{LISTING_RELATION} AS agg",
+    "WHERE agg.shop_id = ANY(%(scope)s)",
+    "  AND agg.captured_at >= %(start)s AND agg.captured_at < %(end)s",
+    "GROUP BY agg.captured_at",
+    "ORDER BY agg.captured_at")
+
+# 每一列对外声明的类型：手写的，不从目录反推（阶段 1B 要的是“编译器与投影不许改口径”）。
+MATRIX_COLUMN_TYPES: dict[str, str] = {
+    SHOP_REF_COLUMN: "ref",
+    DAY_COST: "date", DAY_PRODUCT_DAILY: "date", DAY_SHOP_DAILY: "date",
+    LINE_KIND_COST: "text", SHOPS_PLATFORM: "text", STATUS_ERP: "text",
+    CURRENCY_PAYMENTS: "text", UNIT_CHANNEL: "text", UNIT_PHYSICAL: "text",
+    VERIFIED_PAYMENTS: "boolean", MATCHED_REFUNDS: "boolean",
+    PLATFORM_SUCCESS_REFUNDS: "boolean",
+    DAY_PAYMENTS: "datetime", CAPTURED_CHANNEL: "datetime", CAPTURED_PHYSICAL: "datetime",
+    "metric-cost-total": "decimal", "metric-sales-amount": "decimal",
+    "metric-sold-quantity": "decimal", "metric-gift-quantity": "decimal",
+    "metric-erp-document-cost": "decimal",
+    "metric-erp-gross-profit-reference": "decimal",
+    "metric-payment-flow-amount": "decimal", "metric-refund-record-amount": "decimal",
+    "metric-channel-sellable-quantity": "decimal",
+    "metric-physical-available-quantity": "decimal",
+    "metric-inbound-quantity": "decimal", "metric-locked-quantity": "decimal",
+    "metric-listing-price": "decimal", "metric-paid-amount": "decimal",
+}
+
+
+def acceptance_output_declarations(case: AcceptanceCase) -> tuple[tuple[str, str], ...]:
+    """公开列的 (ref, data_type) 清单：列序走阶段 1A 那一条规则，类型走上面那一张表。"""
+    return tuple((ref, MATRIX_COLUMN_TYPES[ref])
+                 for ref in acceptance_output_refs(case))
+
+
+# 十四行的手算期望：数值就是 seed 里那几个字面量按分组相加的结果，时刻列只判形状。
+MATRIX_FIXTURE_EXPECTATIONS: dict[str, tuple[tuple[object, ...], ...]] = {
+    "P01": ((FixtureDay(0), FIXTURE_SCOPE_REF, "2.200000000000", "15.500000"),
+            (FixtureDay(1), FIXTURE_SCOPE_REF, "6.000000000000", "7.000000")),
+    "P02": ((FixtureDay(0), "sale", "2.200000000000"),
+            (FixtureDay(0), "suite", "0.000000000000"),
+            (FixtureDay(1), "sale", "6.000000000000")),
+    "P03": ((FixtureDay(0), FIXTURE_SCOPE_REF, "0.500000", "3.000000"),
+            (FixtureDay(1), FIXTURE_SCOPE_REF, "1.250000", "3.000000")),
+    # crm = 乙店（赠品 1.0 + 2.0），fxg = 甲店（0 + 0.5 + 1.25）：两家各成一组，不互串。
+    "P04": (("crm", "3.000000"), ("fxg", "1.750000")),
+    "P05": (("needs_review", None, None),
+            ("normal", "12.500000", "3.500000"),
+            ("version_conflict", "0.000000", "0.000000")),
+    "P06": (("needs_review", FIXTURE_SCOPE_REF, None),
+            ("normal", FIXTURE_SCOPE_REF, "12.500000"),
+            ("version_conflict", FIXTURE_SCOPE_REF, "0.000000")),
+    "P07": (("CNY", "11.250000"), ("EUR", "0.000000"), ("JPY", None), ("USD", "3.500000")),
+    "P08": ((False, None), (True, "14.750000")),
+    "P09": ((FIXTURE_MOMENT, "10.250000"), (FIXTURE_MOMENT, "1.000000")),
+    "P10": ((False, False, "0.000000"), (False, True, "2.500000"),
+            (True, False, None), (True, True, "5.000000")),
+    "P11": ((FIXTURE_MOMENT, "4.0000"), (FIXTURE_MOMENT, "3.5000")),
+    "P12": ((FIXTURE_SCOPE_REF, "box", "1.0000"), (FIXTURE_SCOPE_REF, "piece", "4.0000"),
+            (FIXTURE_SCOPE_REF, "set", "2.5000")),
+    "P13": ((FIXTURE_MOMENT, None, "0.0000", "10.0000"),
+            (FIXTURE_MOMENT, "2.2500", "1.0000", "6.0000")),
+    "P14": (("box", "6.0000"), ("piece", "10.0000")),
+}
+
+
+def matrix_expected_rows(case: AcceptanceCase, *, start, scope_ref: str | None):
+    """把手算期望换成与公开结果同一形状：日期按夹具规则重算，引用格按引用表填。"""
+    rows = []
+    for row in MATRIX_FIXTURE_EXPECTATIONS[case.case_id]:
+        cells = []
+        for cell in row:
+            if isinstance(cell, FixtureDay):
+                cells.append((start + timedelta(days=cell.offset)).isoformat())
+            elif cell == FIXTURE_SCOPE_REF:
+                cells.append(scope_ref)
+            else:
+                cells.append(cell)              # 字面文本 / None / bool / FIXTURE_MOMENT
+        rows.append(tuple(cells))
+    return rows
+
+
+def baseline_rows_as_projected(case: AcceptanceCase, rows, *, refs) -> list[tuple]:
+    """把人工基准的原始行换成与公开结果同一形状：店号查引用表，值走 `baseline_cell`。
+
+    这一步只是形状对齐，不重算任何数：基准的数值就是那段手写 SQL 自己回的那些。
+    """
+    column_refs = acceptance_output_refs(case)
+    out = []
+    for row in rows:
+        cells = []
+        for ref, value in zip(column_refs, row):
+            if ref == SHOP_REF_COLUMN:
+                cells.append(refs[str(value)])
+            else:
+                cells.append(baseline_cell(value))
+        out.append(tuple(cells))
+    return out
+
+
+class MatrixStatementLog:
+    """把真库连接包一层只记语句：阶段 1B 用它证明被拒的行没进探索执行层。"""
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.statements: list[str] = []
+
+    def transaction(self):
+        return self.conn.transaction()
+
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        return self.conn.execute(sql, params)
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ExplorationAcceptanceDatabaseTests(unittest.TestCase):
+    """计划 Task 6 Step 1 的真库一半：十四行放行进链，逐格对两份独立期望。"""
+
+    def setUp(self):
+        super().setUp()
+        self.conn = connect_test_db(self)
+
+    def deadline(self) -> float:
+        """与固定指标查询同一形状：`time.monotonic()` 上的绝对时刻。"""
+        return time.monotonic() + 30.0
+
+    def compile_of(self, case: AcceptanceCase, scope, *, start, end):
+        """只编译：不碰库，也不捕异常（负例要拿它当探针）。"""
+        return compile_for(
+            case.metrics, list(case.groups),
+            selection=selection_for(case.metrics, groups=case.groups, joins=case.joins),
+            allowed_shop_ids=frozenset(scope), start=start, end=end,
+            limit=MATRIX_REQUEST_LIMIT)
+
+    def explore(self, case: AcceptanceCase, scope, refs, *, start, end):
+        """受控聚合探索一条链：编译→策略→真 EXPLAIN 成本门→只读执行→安全投影。"""
+        estimate_plan, execute_plan = repository_entries()
+        draft = self.compile_of(case, scope, start=start, end=end)
+        plan = validate(draft, context=policy_context(allowed_shop_ids=frozenset(scope),
+                                                     shop_refs=dict(refs)))
+        estimated = estimate_plan(self.conn, plan, deadline=self.deadline())
+        columns, rows = execute_plan(self.conn, estimated, deadline=self.deadline())
+        declared, projected = project(columns, rows, shop_refs=refs)
+        return plan, estimated, declared, projected
+
+    def prepare(self, case: AcceptanceCase):
+        """先取时钟窗口，再往同一个作用域与窗口里 seed，最后跑那一行的手写基准。"""
+        start, end = matrix_window(self.conn, case)
+        scope = matrix_scope(case)
+        matrix_seed(self.conn, case, start=start, scope=scope)
+        refs = matrix_scope_refs(case, scope)
+        baseline = manual_baseline(self.conn, case, scope=scope, start=start, end=end)
+        return scope, refs, start, end, baseline
+
+    def run_case(self, case: AcceptanceCase):
+        """prepare + explore 的合并入口：只关心结果的用例不必拿五个返回值。"""
+        scope, refs, start, end, _baseline = self.prepare(case)
+        return self.explore(case, scope, refs, start=start, end=end)
+
+    def assert_cell_matrix(self, case, rows, expected, label):
+        """逐格、逐行、按序比：`FIXTURE_MOMENT` 只判形状，其余判字面值。"""
+        column_refs = acceptance_output_refs(case)
+        self.assertEqual(len(rows), len(expected), (case.case_id, label, len(rows)))
+        for index, row in enumerate(rows):
+            self.assertEqual(sorted(row), sorted(column_refs), (case.case_id, label, index))
+            for ref, want in zip(column_refs, expected[index]):
+                got = row[ref]
+                if want == FIXTURE_MOMENT:
+                    self.assertIsInstance(got, str, (case.case_id, label, index, ref))
+                    self.assertRegex(got, MOMENT_LABEL_RE, (case.case_id, label, index, ref))
+                else:
+                    self.assertEqual(got, want, (case.case_id, label, index, ref))
+        for ref, want in zip(column_refs, expected[0] if expected else ()):
+            if want != FIXTURE_MOMENT:
+                continue
+            labels = [row[ref] for row in rows]
+            self.assertEqual(labels, sorted(labels), (case.case_id, ref))
+            self.assertEqual(len(labels), len(set(labels)), (case.case_id, ref))
+
+    # --- 十四行：真链路与两份独立期望逐项一致 ------------------------------------
+
+    def test_every_permitted_case_matches_both_independent_expectations(self):
+        for case in acceptance_cases_of_kind(KIND_PERMITTED):
+            # 一个用例一个保存点：一个用例炸了不把同一方法里的兄弟用例一起拖死。
+            with self.subTest(case=case.case_id), self.conn.transaction():
+                scope, refs, start, end, baseline = self.prepare(case)
+                plan, estimated, declared, projected = self.explore(case, scope, refs,
+                                                                    start=start, end=end)
+                self.assertEqual([(column.ref, column.data_type) for column in declared],
+                                 list(acceptance_output_declarations(case)))
+                self.assertTrue(projected, "空结果不算通过：seed 没落进窗口")
+                self.assert_cell_matrix(
+                    case, projected,
+                    matrix_expected_rows(case, start=start,
+                                         scope_ref=refs.get(scope[0])),
+                    "seed 手算期望")
+                self.assert_cell_matrix(case, projected,
+                                        baseline_rows_as_projected(case, baseline, refs=refs),
+                                        "独立手写基准 SQL")
+                self.assertLessEqual(len(projected), MATRIX_REQUEST_LIMIT)
+                # 成本门是真跑过的：两个估算值来自真 EXPLAIN，且在预算内。
+                self.assertIsNotNone(estimated.estimated_rows)
+                self.assertIsNotNone(estimated.estimated_total_cost)
+                self.assertLessEqual(estimated.estimated_rows, PLAN_MAX_ESTIMATED_ROWS)
+                self.assertLessEqual(estimated.estimated_total_cost, PLAN_MAX_TOTAL_COST)
+                self.assertRegex(plan.statement_fingerprint, r"^[0-9a-f]{64}$")
+
+    # --- 形状：真零、缺值、小数标度、分组与排序 ----------------------------------
+
+    def test_true_zero_and_missing_value_are_never_confused(self):
+        single = {
+            "P05": ("metric-erp-document-cost",
+                    {"needs_review": None, "version_conflict": "0.000000"}),
+            "P07": ("metric-payment-flow-amount",
+                    {"JPY": None, "EUR": "0.000000"}),
+            "P08": ("metric-payment-flow-amount", {False: None, True: "14.750000"}),
+        }
+        for case_id, (metric, by_key) in single.items():
+            case = acceptance_case(case_id)
+            with self.subTest(case=case_id), self.conn.transaction():
+                _plan, _estimated, _declared, projected = self.run_case(case)
+                group_ref = sorted(case.groups)[0]
+                cells = {row[group_ref]: row[metric] for row in projected}
+                for key, want in by_key.items():
+                    self.assertIn(key, cells, (case_id, "缺值那一组不能整行消失"))
+                    self.assertEqual(cells[key], want, (case_id, key))
+                    if want is not None:
+                        # 真零不能被发成 null，也不能被归一成一个没标度的 "0"。
+                        self.assertNotEqual(cells[key], None, (case_id, key))
+                        self.assertIn(".", cells[key], (case_id, key))
+        case = acceptance_case("P10")
+        _plan, _estimated, _declared, projected = self.run_case(case)
+        cells = {(row[MATCHED_REFUNDS], row[PLATFORM_SUCCESS_REFUNDS]):
+                 row["metric-refund-record-amount"] for row in projected}
+        self.assertEqual(cells[(True, False)], None, "已匹配但未成功的缺值被当 0 发了")
+        self.assertEqual(cells[(False, False)], "0.000000", "未匹配未成功的真零丢了标度")
+
+    def test_decimal_scale_survives_the_projection(self):
+        # 期望里的文本就是数据库给的标度：12 位（成本乘件数）、6 位（成交与金额）、
+        # 4 位（快照量）。任何一步拿 float 过一遍都会把它们压成同一个形状。
+        wanted = {"P01": (12, 6), "P02": (12,), "P05": (6, 6), "P07": (6,),
+                  "P11": (4,), "P12": (4,), "P13": (4, 4, 4), "P14": (4,)}
+        for case_id, scales in wanted.items():
+            case = acceptance_case(case_id)
+            with self.subTest(case=case_id), self.conn.transaction():
+                _plan, _estimated, _declared, projected = self.run_case(case)
+                metric_refs = tuple(sorted(case.metrics))
+                row = next(row for row in projected
+                           if all(row[ref] is not None for ref in metric_refs))
+                for ref, scale in zip(metric_refs, scales):
+                    text = row[ref]
+                    self.assertIsInstance(text, str, (case_id, ref))
+                    self.assertNotIn("E", text, (case_id, ref))
+                    self.assertEqual(len(text.split(".")[1]), scale, (case_id, ref, text))
+
+    def test_grouping_keeps_each_dimension_apart(self):
+        # 分组维度不许被合：行性质、计量单位、两个布尔轴各自成组，组数就是 seed 的形状。
+        counts = {"P02": 3, "P10": 4, "P12": 3, "P14": 2, "P04": 2}
+        for case_id, want in counts.items():
+            case = acceptance_case(case_id)
+            with self.subTest(case=case_id), self.conn.transaction():
+                _plan, _estimated, _declared, projected = self.run_case(case)
+                self.assertEqual(len(projected), want)
+                keys = [tuple(row[ref] for ref in sorted(case.groups)
+                              if ref not in SHOP_AUTHORIZATION_GROUP_REFS)
+                        for row in projected]
+                self.assertEqual(len(keys), len(set(keys)), "分组被并成了同一行")
+
+    def test_units_are_never_converted_or_summed_across(self):
+        # 单位是维度而不是换算系数：同一列里不得出现一个跨单位的总量。
+        case = acceptance_case("P14")
+        _plan, _estimated, _declared, projected = self.run_case(case)
+        self.assertEqual([row[UNIT_PHYSICAL] for row in projected], ["box", "piece"])
+        self.assertEqual([row["metric-physical-available-quantity"] for row in projected],
+                         ["6.0000", "10.0000"], "跨单位求了总量")
+
+    def test_group_ordering_is_stable_across_two_executions(self):
+        for case_id in ("P02", "P13"):
+            case = acceptance_case(case_id)
+            with self.subTest(case=case_id), self.conn.transaction():
+                scope, refs, start, end, _baseline = self.prepare(case)
+                first_plan, _first_est, _first_dec, first_rows = self.explore(
+                    case, scope, refs, start=start, end=end)
+                second_plan, _second_est, _second_dec, second_rows = self.explore(
+                    case, scope, refs, start=start, end=end)
+                self.assertEqual(first_plan.sql_text, second_plan.sql_text)
+                self.assertEqual(first_plan.statement_fingerprint,
+                                 second_plan.statement_fingerprint)
+                self.assertEqual(first_rows, second_rows, "同一句话两次跑出不同顺序")
+                self.assertEqual([row[sorted(case.groups)[0]] for row in first_rows],
+                                 sorted(row[sorted(case.groups)[0]] for row in first_rows),
+                                 "顺序不是由分组键定的")
+
+    # --- 不外泄：店号/池号/SQL 都不进公开载荷 -----------------------------------
+
+    def test_private_scope_identifiers_never_reach_the_public_payload(self):
+        for case in acceptance_cases_of_kind(KIND_PERMITTED):
+            with self.subTest(case=case.case_id), self.conn.transaction():
+                scope, refs, start, end, _baseline = self.prepare(case)
+                plan, _estimated, declared, projected = self.explore(case, scope, refs,
+                                                                     start=start, end=end)
+                published = json.dumps({"columns": [column.model_dump() for column in declared],
+                                        "rows": projected}, ensure_ascii=False)
+                for value in scope:
+                    self.assertNotIn(value, published, case.case_id)
+                self.assertNotIn(SHOP_ID_COLUMN, published)
+                self.assertNotIn("SELECT", published)
+                self.assertNotIn("reporting.", published)
+                # SQL 原文只许进诊断表：那一格在公开载荷里出现就是 Task 6 的头一条边界破了。
+                self.assertNotIn(plan.sql_text, published, case.case_id)
+                self.assertNotIn(plan.sql_text, json.dumps([column.model_dump()
+                                                            for column in declared]))
+                if SHOP_REF_COLUMN in acceptance_output_refs(case):
+                    self.assertEqual({row[SHOP_REF_COLUMN] for row in projected},
+                                     {refs[scope[0]]})
+                    self.assertRegex(refs[scope[0]], r"^ent-[0-9a-f]{8}$", case.case_id)
+
+    def test_seeded_rows_never_escape_the_rollback_transaction(self):
+        """共享库里不留种子：外层事务回滚后，另一条连接看不到这些行。"""
+        case = acceptance_case("P12")
+        start, end = matrix_window(self.conn, case)
+        scope = matrix_scope(case)
+        matrix_seed(self.conn, case, start=start, scope=scope)
+        inside = self.conn.execute(
+            "SELECT count(*) FROM bi.channel_stock_items WHERE namespace = 'matrix'"
+            " AND shop_id = ANY(%(scope)s)", {"scope": scope}).fetchone()[0]
+        self.assertGreater(inside, 0, "seed 没写进去：上面的用例全是空对照")
+        observer = connect_test_db(self)
+        outside = observer.execute(
+            "SELECT count(*) FROM bi.channel_stock_items WHERE namespace = 'matrix'").fetchone()[0]
+        self.assertEqual(outside, 0, "夹具行跨出了本用例的事务：它会污染共享库")
+
+    # --- 负例：上架快照时效在碰执行层之前就拒 -----------------------------------
+
+    def test_listing_freshness_row_refuses_before_any_exploration_statement(self):
+        case = acceptance_case("R01")
+        start, end = matrix_window(self.conn, case)
+        scope = matrix_scope(case)
+        matrix_seed(self.conn, case, start=start, scope=scope)
+        log = MatrixStatementLog(self.conn)
+        rows = manual_query(log, LISTING_FRESHNESS_COUNTERFACTUAL_SQL,
+                            scope=scope, start=start, end=end)
+        # 人手能算出来：两个抓取时点、各自有标价行。拒它不是因为查不到东西。
+        self.assertEqual([row[2] for row in rows], [2, 1])
+        self.assertIsNotNone(rows[0][1])
+        with mock.patch("bi_agent.exploration.repository.estimate_plan",
+                        side_effect=AssertionError("成本门被调用了")) as estimate, \
+                mock.patch("bi_agent.exploration.repository.execute_plan",
+                           side_effect=AssertionError("执行层被调用了")) as runner:
+            reason = refusal(lambda: self.compile_of(case, scope, start=start, end=end))
+            # 地雷没被踩：`explore` 里的 `repository_entries()` 拿到的就是这两个代身。
+            self.assertEqual((estimate.call_count, runner.call_count), (0, 0))
+        self.assertEqual(reason, AGGREGATE_REFUSAL_REASON)
+        # 这一行在库里只发过那三句基准自己的语句：没有 EXPLAIN，也没有第二次门禁事务。
+        self.assertEqual(log.statements, [READ_ONLY_STATEMENT, STATEMENT_TIMEOUT_STATEMENT,
+                                         LISTING_FRESHNESS_COUNTERFACTUAL_SQL])
+
+
+class ExplorationAcceptanceSummaryTests(unittest.TestCase):
+    """汇总 runner：46 行攻击与三行固定 Tool 拒答，全都在碰库之前收口。"""
+
+    def test_attack_summary_refuses_every_corpus_row_before_the_database(self):
+        rows = attack_rows()
+        self.assertEqual(len(rows), ATTACK_CORPUS_ROWS)
+        self.assertGreaterEqual(len(rows), MIN_ATTACK_ROWS)
+        codes = {}
+        for row in rows:
+            with self.subTest(id=row["id"], reason=row["reason"]):
+                # `policy_context()` 的 conn/store 是 RefusingConn：碰一下库就当场判红。
+                codes[row["id"]] = policy_reason(attack_draft(row))
+                self.assertEqual(codes[row["id"]], POLICY_CODE_PREFIX + row["reason"])
+        self.assertEqual(len(codes), ATTACK_CORPUS_ROWS)
+        self.assertGreaterEqual(len(set(codes.values())), MIN_ATTACK_CODES,
+                                "一个万能码收完全语料：拒绝就没有分类")
+
+    def test_fixed_tool_rows_refuse_at_the_gate_without_one_statement(self):
+        from bi_agent.exploration.eligibility import fixed_tool_for
+
+        rows = [case for case in ACCEPTANCE_CASES if case.topic == TOPIC_FIXED_TOOL_PRIORITY]
+        self.assertEqual([case.case_id for case in rows], ["F01", "F02", "F03"])
+        for case in rows:
+            with self.subTest(case=case.case_id):
+                selection = selection_for(case.metrics, groups=case.groups, joins=case.joins)
+                request = request_for(case.metrics, list(case.groups), start=GRAPH_START,
+                                      end=GRAPH_END)
+                self.assertEqual(fixed_tool_for(selection, request), case.expected_tool)
+                conn = EvidenceConn()
+                _execution, store, _context = run_graph(
+                    request=request, selection=selection, conn=conn, question=case.question)
+                self.assertEqual(refusal_reason_of(store), FIXED_TOOL_REFUSAL_REASON)
+                self.assertEqual(store.nodes, ["select_schema", "authorize_scope"],
+                                 "固定 Tool 优先那道门必须在编译之前收住这一行")
+                self.assertEqual(conn.statements, [],
+                                 "固定 Tool 能答的问题不许发一条探索语句")
+                self.assertEqual(store.kinds.count("artifact"), 0)
+                self.assertEqual(store.diagnostic_count, 0)
+
+    def test_acceptance_surface_counts_both_sides(self):
+        permitted = acceptance_cases_of_kind(KIND_PERMITTED)
+        self.assertGreaterEqual(len(permitted), MIN_PERMITTED_CASES)
+        self.assertEqual(set(MATRIX_FIXTURE_EXPECTATIONS), {case.case_id for case in permitted})
+        self.assertFalse({case.view_ref for case in permitted} - set(MATRIX_SEED_STATEMENTS),
+                         "某行没有 seed 家族：它会在空库上“通过”")
+        # 链上每一列都得有手写的类型声明：表里缺一项就是那个断言根本不会跑。
+        for case in ACCEPTANCE_CASES:
+            for ref in acceptance_output_refs(case):
+                self.assertIn(ref, MATRIX_COLUMN_TYPES, case.case_id)
 
 
 if __name__ == "__main__":
