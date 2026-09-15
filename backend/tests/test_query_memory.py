@@ -1,15 +1,23 @@
-"""approved 查询学习记忆的契约与生命周期（计划 2026-09-14-approved-query-memory.md
-Task 1、Task 2）。
+"""approved 查询学习记忆的契约、生命周期与检索（计划
+2026-09-14-approved-query-memory.md Task 1–Task 3）。
 
 Task 1 钉形状与净化规则；QueryMemoryLifecycleTests 钉 Task 2 的草稿来源边界与
-人工状态机（离线用替身，真库用例在 tests.test_runtime_db）。所有断言都落在稳定
-原因码（`memory_*` / `replacement_ref_action_mismatch`）上；被拒的输入本身不允许
-出现在错误文本里（`hide_input_in_errors`），否则报错就成了第二条泄露通道。
+人工状态机（离线用替身，真库用例在 tests.test_runtime_db）；
+QueryMemoryRetrievalTests 钉 Task 3 的授权/版本过滤检索与 30 题金标准。所有断言
+都落在稳定原因码（`memory_*` / `replacement_ref_action_mismatch`）上；被拒的
+输入本身不允许出现在错误文本里（`hide_input_in_errors`），否则报错就成了第二条
+泄露通道。
 """
 
+import json
+import random
+import re
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
 from uuid import UUID
 
+from psycopg.types.json import Jsonb
 from pydantic import ValidationError
 
 
@@ -544,6 +552,437 @@ class QueryMemoryLifecycleTests(unittest.TestCase):
             repository.transition(
                 "mem-missing", command=self.command("approve", "人工复核通过"),
                 actor_subject_id="reviewer-a")
+
+
+# --- 计划 Task 3：授权与版本过滤后的确定性检索 ---------------------------------
+#
+# 检索只读 reporting.v_approved_query_examples 投影视图；RetrievalConn 对视图之外
+# 的任何 SQL 显式报错，所以「检索不读底表、聊天与 Artifact」由替身自身保证。排序
+# 契约（复用语义目录归一化、零重叠不召回、example_ref 决胜）与 30 题金标准
+# （tests/fixtures/approved_memory_gold.jsonl）也在这一组里钉住。
+
+VIEW_COLUMNS = ("example_ref", "domain", "intent_signature", "question_template",
+                "slots", "normalized_request", "expected_tool",
+                "version_requirements", "approval_revision")
+GOLD_FIELDS = frozenset({"question", "subject_id", "allowed_refs", "domain",
+                         "versions", "expected_refs"})
+GOLD_PATH = Path(__file__).with_name("fixtures") / "approved_memory_gold.jsonl"
+
+
+def gold_cases() -> list[dict]:
+    with open(GOLD_PATH, encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def _plain(value):
+    """psycopg jsonb 入参解包：真库语义里参数就是 Python 对象。"""
+    return value.obj if isinstance(value, Jsonb) else value
+
+
+def baseline_versions():
+    from bi_agent.runtime.versions import VersionSet
+    from tests.fakeconn import memory_versions_dict
+
+    return VersionSet(**memory_versions_dict())
+
+
+def single_shop_slot() -> list[dict]:
+    return [{"name": "shop_scope", "kind": "entity_scope"}]
+
+
+def retrieval_context(subject, refs=(), *, conn, shop_refs=None):
+    """合成 DomainContext：shop_refs 的键是合成内部 id，值是 opaque 引用。"""
+    from bi_agent.commerce.models import DomainContext
+
+    mapping = (dict(shop_refs) if shop_refs is not None
+               else {f"shop-synthetic-{index}": ref
+                     for index, ref in enumerate(refs)})
+    return DomainContext(
+        subject_id=subject,
+        allowed_shop_ids=frozenset(mapping),
+        shop_refs=mapping,
+        conn=conn,
+        store=None,
+        chat_id=UUID(int=1),
+        user_message_id=UUID(int=2),
+        root_request_id=UUID(int=3),
+        now=datetime(2026, 9, 14, tzinfo=timezone.utc),
+        deadline=float("inf"))
+
+
+class RetrievalConn:
+    """检索读路径的拒绝性替身（与 fakeconn.QueryMemoryConn 同一套约定）。
+
+    只回答 `reporting.v_approved_query_examples` 的投影读取：先按视图语义过出
+    status='approved' 的行，再按 SQL 参数重放 WHERE 过滤（domain / owner 精确
+    相等、authorization_refs 子集、version_requirements 完整相等），按
+    example_ref 排序并套用语句自己的 LIMIT 子句。视图之外的任何 SQL——记忆
+    底表、事件表、聊天、Artifact、血缘——一律显式报错。
+    """
+
+    def __init__(self, records):
+        self.records = list(records)
+        self.sql_log: list[str] = []
+        self.last_params: dict | None = None
+
+    def execute(self, sql, params=None):
+        from tests.fakeconn import Rows
+
+        text = " ".join(sql.split())
+        self.sql_log.append(text)
+        if "FROM reporting.v_approved_query_examples" not in text:
+            raise AssertionError(f"未预期的SQL：{text}")
+        values = dict(params or {})
+        for name in ("domain", "subject_id", "allowed_refs", "versions"):
+            if name not in values:
+                raise AssertionError(f"检索SQL缺少参数：{name}")
+        self.last_params = values
+        allowed = set(values["allowed_refs"])
+        versions = _plain(values["versions"])
+        rows = [row for row in self.records
+                if row["status"] == "approved"
+                and row["domain"] == values["domain"]
+                and row["owner_subject_id"] == values["subject_id"]
+                and set(row["authorization_refs"]) <= allowed
+                and row["version_requirements"] == versions]
+        rows.sort(key=lambda row: row["example_ref"])
+        capped = re.search(r"LIMIT\s+(\d+)\s*$", text)
+        if capped:
+            rows = rows[:int(capped.group(1))]
+        return Rows([[row[column] for column in VIEW_COLUMNS] for row in rows])
+
+
+def memory_store() -> list[dict]:
+    """合成候选仓库：approved 各形态、三种不可批准状态、跨 owner/授权域、陈旧
+    版本、五种坏候选与 120 条用于硬上限的候选。全部为合成 ref、已登记业务码与
+    槽位化模板，不含真实名称、id、SQL、DSN 或密钥。"""
+    from tests.fakeconn import example_row, memory_versions_dict
+
+    baseline = memory_versions_dict()
+
+    def amend(row, **updates):
+        row.update(updates)
+        return row
+
+    def approved(ref, *, intent, template, status="approved", revision=1,
+                 owner="subject-a", auth=("ent-1a2b3c4d",), request=None,
+                 slots=None, versions=None):
+        row = example_row(ref, owner=owner, status=status, revision=revision)
+        row["intent_signature"] = intent
+        row["question_template"] = template
+        row["authorization_refs"] = list(auth)
+        row["slots"] = single_shop_slot() if slots is None else slots
+        if request is not None:
+            row["normalized_request"] = request
+        if versions is not None:
+            row["version_requirements"] = versions
+        return row
+
+    records = [
+        example_row("mem-current-cost", status="approved", revision=1),
+        amend(example_row("mem-wide-cost", status="approved", revision=1),
+              authorization_refs=["ent-1a2b3c4d", "ent-9f8e7d6c"]),
+        amend(example_row("mem-old-schema-cost", status="approved", revision=1),
+              version_requirements=dict(baseline,
+                                        schema_version="reporting/2025-12-31.7")),
+        amend(example_row("mem-old-metric-cost", status="approved", revision=1),
+              version_requirements=dict(baseline,
+                                        metric_version="metrics/2025-12-31.7")),
+        example_row("mem-foreign-cost", owner="subject-b", status="approved",
+                    revision=1),
+        approved("mem-tie-aaa", intent="payment-mix-split",
+                 template="拆分 {shop_scope} 的支付构成"),
+        approved("mem-tie-bbb", intent="payment-mix-split",
+                 template="拆分 {shop_scope} 的支付构成"),
+        approved("mem-rank-base", intent="refund-amount-summary",
+                 template="汇总 {shop_scope} 的退款金额"),
+        approved("mem-rank-broad", intent="refund-amount-summary",
+                 template="汇总 {shop_scope} 的退款金额"),
+        approved("mem-rank-narrow", intent="refund-amount-reason-summary",
+                 template="汇总 {shop_scope} 的退款金额与退货原因"),
+        approved("mem-draft-visit", intent="visitor-conversion",
+                 template="统计 {shop_scope} 的访客转化", status="draft",
+                 revision=0),
+        approved("mem-revoked-ship", intent="ship-speed",
+                 template="统计 {shop_scope} 的发货时效", status="revoked",
+                 revision=2),
+        approved("mem-superseded-return", intent="slow-moving-rate",
+                 template="统计 {shop_scope} 的滞销率", status="superseded",
+                 revision=2),
+        approved("mem-rev-1", intent="commission-ratio-review",
+                 template="复核 {shop_scope} 的佣金比例"),
+        approved("mem-rev-2", intent="commission-ratio-review",
+                 template="复核 {shop_scope} 的佣金比例", revision=2),
+        approved("mem-bad-unknown-ref", intent="price-check-diff",
+                 template="核对 {shop_scope} 的价检差异",
+                 request={"requested_metric_refs": ["metric-never-registered"]}),
+        approved("mem-bad-revision", intent="price-check-diff",
+                 template="核对 {shop_scope} 的价检差异", revision=0),
+        approved("mem-bad-duplicate-slot", intent="price-check-diff",
+                 template="核对 {shop_scope} 的价检差异",
+                 slots=single_shop_slot() * 2),
+        approved("mem-bad-shape", intent="price-check-diff",
+                 template="核对 {shop_scope} 的价检差异", slots="shop_scope"),
+        approved("mem-bad-bound", intent="price-check-diff",
+                 template="核对 {shop_scope} 的价检差异",
+                 request={"semantic_selection": {"filters": {"date": "2026-09-01"}}}),
+    ]
+    # 硬上限家族单独用 subject-cap：120 条同窗候选只服务金标准的 LIMIT 100 用例，
+    # 不挤占 subject-a 视图窗口里其他家族的排序位置。
+    for index in range(100):
+        records.append(approved(f"mem-cap-a-{index:03d}", owner="subject-cap",
+                                intent="gift-stock-check",
+                                template="盘点 {shop_scope} 的赠品库存"))
+    for index in range(20):
+        records.append(approved(f"mem-cap-z-{index:03d}", owner="subject-cap",
+                                intent="gift-stock-expiry-batch",
+                                template="盘点 {shop_scope} 的赠品库存与临期批次"))
+    return records
+
+
+def poison_row() -> dict:
+    """反序列化缺陷无法枚举：这一行在解析时迭代即炸，检索必须整条丢弃。"""
+    from tests.fakeconn import example_row
+
+    row = example_row("mem-bad-poison", status="approved", revision=1)
+    row["intent_signature"] = "price-check-diff"
+    row["question_template"] = "核对 {shop_scope} 的价检差异"
+    row["slots"] = object()
+    return row
+
+
+class QueryMemoryRetrievalTests(unittest.TestCase):
+    """计划 Task 3：先过滤（owner/授权域/版本精确、投影视图、硬上限 100），后
+    确定性排序（语义目录归一化、零重叠不召回、example_ref 决胜），候选
+    fail-closed 只留固定计数。金标准 30 题在
+    tests/fixtures/approved_memory_gold.jsonl，两套洗牌顺序下逐条复现。"""
+
+    maxDiff = None
+
+    def retrieve(self, question, *, context, domain="controlled_exploration",
+                 current_versions=None, limit=3):
+        from bi_agent.query_memory import retrieve_approved_examples
+
+        return retrieve_approved_examples(
+            question, context=context, domain=domain,
+            current_versions=current_versions or baseline_versions(),
+            limit=limit)
+
+    def run_case(self, case, seed):
+        from bi_agent.runtime.versions import VersionSet
+
+        conn = RetrievalConn(memory_store())
+        random.Random(seed).shuffle(conn.records)
+        context = retrieval_context(case["subject_id"], case["allowed_refs"],
+                                    conn=conn)
+        result = self.retrieve(case["question"], context=context,
+                               domain=case["domain"],
+                               current_versions=VersionSet(**case["versions"]))
+        return conn, [item.example_ref for item in result]
+
+    # ---- 过滤边界：状态、owner、授权域、版本 ---------------------------------
+
+    def test_retrieval_excludes_every_incompatible_candidate(self):
+        conn = RetrievalConn(memory_store())
+        result = self.retrieve(
+            "按店比较成本",
+            context=retrieval_context("subject-a", ("ent-1a2b3c4d",), conn=conn))
+        self.assertEqual([item.example_ref for item in result],
+                         ["mem-current-cost"])
+        got = {item.example_ref for item in result}
+        # 撤销 / 授权域超集 / 陈旧版本 / 草稿 / 跨 owner 一律不可见。
+        for excluded in ("mem-revoked-ship", "mem-wide-cost",
+                         "mem-old-schema-cost", "mem-draft-visit",
+                         "mem-foreign-cost"):
+            self.assertNotIn(excluded, got)
+        self.assertEqual(result[0].expected_tool, "explore_business_data")
+        self.assertEqual(result[0].version_requirements, baseline_versions())
+
+    def test_equal_scores_sort_by_ref(self):
+        tie = gold_cases()[3]
+        self.assertEqual(tie["expected_refs"], ["mem-tie-aaa", "mem-tie-bbb"])
+        _, refs = self.run_case(tie, seed=7)
+        self.assertEqual(refs, sorted(refs))
+
+    def test_empty_authorization_refs_return_without_sql(self):
+        class PoisonConn:
+            def execute(self, sql, params=None):
+                raise AssertionError("空授权域不应发出SQL")
+
+        result = self.retrieve(
+            "按店比较成本",
+            context=retrieval_context("subject-a", (), conn=PoisonConn()))
+        self.assertEqual(result, ())
+
+    def test_allowed_refs_come_only_from_opaque_ref_values(self):
+        conn = RetrievalConn(memory_store())
+        self.retrieve("按店比较成本", context=retrieval_context(
+            "subject-a", conn=conn,
+            shop_refs={"S1": "ent-1a2b3c4d", "店铺A": "ent-9f8e7d6c"}))
+        self.assertEqual(conn.last_params["allowed_refs"],
+                         ["ent-1a2b3c4d", "ent-9f8e7d6c"])
+        rendered = json.dumps(conn.last_params, ensure_ascii=False, default=str)
+        self.assertNotIn("S1", rendered)
+        self.assertNotIn("店铺A", rendered)
+
+    # ---- SQL 契约：投影视图、四条前置过滤、排序与硬上限 -----------------------
+
+    def test_sql_prefilters_owner_scope_versions_and_caps_at_100(self):
+        from tests.fakeconn import memory_versions_dict
+
+        conn = RetrievalConn(memory_store())
+        self.retrieve(
+            "按店比较成本",
+            context=retrieval_context("subject-a", ("ent-1a2b3c4d",), conn=conn))
+        self.assertEqual(len(conn.sql_log), 1)
+        sql = conn.sql_log[0]
+        self.assertIn("FROM reporting.v_approved_query_examples", sql)
+        self.assertIn("domain = %(domain)s", sql)
+        self.assertIn("owner_subject_id = %(subject_id)s", sql)
+        self.assertIn("authorization_refs <@ %(allowed_refs)s::text[]", sql)
+        self.assertIn("version_requirements = %(versions)s::jsonb", sql)
+        self.assertIn("ORDER BY example_ref", sql)
+        self.assertIn("LIMIT 100", sql)
+        values = conn.last_params
+        self.assertEqual(values["domain"], "controlled_exploration")
+        self.assertEqual(values["subject_id"], "subject-a")
+        self.assertEqual(values["allowed_refs"], ["ent-1a2b3c4d"])
+        # 完整 VersionSet 的精确 JSON 相等，缺一键或多一键都不算兼容。
+        self.assertEqual(_plain(values["versions"]), memory_versions_dict())
+
+    def test_retrieval_reads_only_the_projection_view(self):
+        conn = RetrievalConn(memory_store())
+        for question in ("按店比较成本", "拆分店铺的支付构成",
+                         "盘点赠品库存与临期批次"):
+            self.retrieve(question, context=retrieval_context(
+                "subject-a", ("ent-1a2b3c4d",), conn=conn))
+        self.assertEqual(len(conn.sql_log), 3)
+        for sql in conn.sql_log:
+            self.assertIn("FROM reporting.v_approved_query_examples", sql)
+            for forbidden in ("bi.approved_query_examples",
+                              "approved_query_events", "chat_messages",
+                              "query_artifacts", "query_runs",
+                              "query_provenance", "INSERT", "UPDATE", "DELETE"):
+                self.assertNotIn(forbidden, sql)
+
+    def test_candidate_hard_cap_keeps_only_ref_sorted_prefix(self):
+        conn = RetrievalConn(memory_store())
+        result = self.retrieve(
+            "盘点赠品库存与临期批次",
+            context=retrieval_context("subject-cap", ("ent-1a2b3c4d",), conn=conn))
+        # mem-cap-z-* 的词项重叠更高，但 ORDER BY example_ref LIMIT 100 只放行
+        # ref 排序在前的一百条：高分尾巴不能靠突破上限挤进来。
+        self.assertEqual([item.example_ref for item in result],
+                         ["mem-cap-a-000", "mem-cap-a-001", "mem-cap-a-002"])
+        self.assertIn("LIMIT 100", conn.sql_log[0])
+
+    # ---- 排序契约：确定性、零重叠不召回、limit 边界 ---------------------------
+
+    def test_limit_only_allows_one_through_three(self):
+        conn = RetrievalConn(memory_store())
+        context = retrieval_context("subject-a",
+                                    ("ent-1a2b3c4d", "ent-9f8e7d6c"), conn=conn)
+        for bad in (0, -1, 4, True, False, "2", 2.0, None):
+            with self.subTest(limit=repr(bad)):
+                with self.assertRaisesRegex(ValueError,
+                                            "memory_limit_out_of_range"):
+                    self.retrieve("按店比较成本", context=context, limit=bad)
+        self.assertEqual(conn.sql_log, [])   # 越界在发 SQL 之前就拒绝
+        for good, expected in ((1, ["mem-current-cost"]),
+                               (2, ["mem-current-cost", "mem-wide-cost"]),
+                               (3, ["mem-current-cost", "mem-wide-cost"])):
+            with self.subTest(limit=good):
+                result = self.retrieve("按店比较成本", context=context, limit=good)
+                self.assertEqual([item.example_ref for item in result], expected)
+
+    def test_zero_overlap_returns_empty_without_newest_padding(self):
+        conn = RetrievalConn(memory_store())
+        result = self.retrieve(
+            "帮我统计一下月球背面陨石坑的数量",
+            context=retrieval_context("subject-a", ("ent-1a2b3c4d",), conn=conn))
+        # SQL 放行的候选足有十几条，但零重叠就是零召回，不回填“最新三条”。
+        self.assertEqual(result, ())
+        self.assertEqual(len(conn.sql_log), 1)
+
+    def test_tokenless_or_nontext_question_never_reaches_sql(self):
+        conn = RetrievalConn(memory_store())
+        context = retrieval_context("subject-a", ("ent-1a2b3c4d",), conn=conn)
+        self.assertEqual(self.retrieve("   ", context=context), ())
+        with self.assertRaisesRegex(ValueError, "semantic_retrieval_text_invalid"):
+            self.retrieve(123, context=context)
+        self.assertEqual(conn.sql_log, [])
+
+    def test_lexical_score_is_deterministic_and_tiebreaks_by_ref(self):
+        from bi_agent.query_memory.models import ApprovedExample
+        from bi_agent.query_memory.retrieval import lexical_score
+
+        example = ApprovedExample(**valid_payload())
+        score = lexical_score("按店比较成本", example)
+        self.assertEqual(score, lexical_score("按店比较成本", example))
+        self.assertEqual(score[2], "mem-approved-001")
+        self.assertGreater(score[0], 0)
+        self.assertEqual(lexical_score("完全无关的问题", example)[0], 0)
+
+    def test_ranking_reuses_semantic_catalog_normalization(self):
+        from bi_agent.query_memory.models import ApprovedExample
+        from bi_agent.query_memory.retrieval import lexical_score
+
+        example = ApprovedExample(**valid_payload())
+        # 全角/大小写形态经语义目录同一套 NFKC + 小写规则折叠后命中。
+        self.assertGreater(lexical_score("比较成本", example)[0], 0)
+        self.assertGreater(lexical_score("比较成本 ｃｏｓｔ", example)[0], 0)
+
+    # ---- 候选 fail-closed：坏候选整条丢弃，只留固定计数 -----------------------
+
+    def test_invalid_candidates_drop_fail_closed_with_fixed_metric(self):
+        from bi_agent.query_memory import retrieval as retrieval_module
+
+        conn = RetrievalConn(memory_store())
+        context = retrieval_context("subject-a", ("ent-1a2b3c4d",), conn=conn)
+        before = retrieval_module._candidate_invalid_total
+        self.assertEqual([item.example_ref for item in
+                          self.retrieve("核对店铺的价检差异", context=context)], [])
+        mid = retrieval_module._candidate_invalid_total
+        self.assertEqual(mid, before + 5)
+        conn.records.append(poison_row())
+        self.assertEqual([item.example_ref for item in
+                          self.retrieve("核对店铺的价检差异", context=context)], [])
+        # 每次读取都重新解析：坏候选每次都丢、每次都只计一次，毒行额外加一。
+        self.assertEqual(retrieval_module._candidate_invalid_total, mid + 6)
+
+    # ---- 金标准：30 题、固定六键、两套洗牌顺序逐条复现 ------------------------
+
+    def test_gold_fixture_has_exactly_thirty_cases(self):
+        from tests.fakeconn import memory_versions_dict
+
+        cases = gold_cases()
+        self.assertEqual(len(cases), 30)
+        for index, case in enumerate(cases):
+            with self.subTest(case=index):
+                self.assertEqual(frozenset(case), GOLD_FIELDS)
+                self.assertEqual(set(case["versions"]),
+                                 set(memory_versions_dict()))
+                for ref in case["allowed_refs"]:
+                    self.assertRegex(ref, r"^ent-[0-9a-z]{8}$")
+                for ref in case["expected_refs"]:
+                    self.assertRegex(ref, r"^mem-[a-z0-9-]{1,60}$")
+        raw = GOLD_PATH.read_text(encoding="utf-8").lower()
+        for marker in ("://", "postgres", "password", "secret", "token",
+                       "bi_app_dsn", "bi_approver_dsn"):
+            self.assertNotIn(marker, raw)
+
+    def test_gold_cases_reproduce_expected_refs_in_two_store_orders(self):
+        cases = gold_cases()
+        for seed in (20260914, 914):
+            for index, case in enumerate(cases):
+                with self.subTest(seed=seed, case=index):
+                    _, refs = self.run_case(case, seed)
+                    self.assertEqual(refs, case["expected_refs"])
+
+    def test_input_order_does_not_change_results(self):
+        case = gold_cases()[0]
+        outputs = {tuple(self.run_case(case, seed)[1]) for seed in (1, 22, 333)}
+        self.assertEqual(outputs, {tuple(case["expected_refs"])})
 
 
 if __name__ == "__main__":
