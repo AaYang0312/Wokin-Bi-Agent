@@ -371,6 +371,44 @@ uv run --locked --env-file ../.env.test python -m unittest tests.test_semantic_c
 uv run --locked --env-file ../.env.test python -m unittest tests.test_exploration -v
 ```
 
+## 4.7 approved 查询学习记忆的观测口径（`backend/bi_agent/query_memory/`，计划 Task 11 后置子项目 C）
+
+本功能默认关闭（`APPROVED_QUERY_MEMORY_ENABLED=false`），且仓库没有指标后端：以下是三个定名指标的**真实现状**与数据库侧的只读观测口径，不虚构未接入的计数器。
+
+### 三个定名指标
+
+| 名称 | 现状 | 含义 |
+| --- | --- | --- |
+| `query_memory_retrieval_total` | 当前**没有独立计数器**：门禁开启的每回合至多发 4 条投影视图 SELECT + 2 条目录版本读取（开放探索 Tool 的回合第 5 域再加一），剩余预算不足 2 秒整段跳过且零 SQL；读取量可由该固定上界与数据库侧对 `reporting.v_approved_query_examples` 的查询计数推出。接入指标后端时应以该名称登记“门禁开启的检索尝试次数” | 衡量记忆面被使用的频度 |
+| `query_memory_candidate_invalid_total` | **进程内计数器**（`bi_agent.query_memory.retrieval` 模块内的定名整数；读取方先快照再取差值） | 检索层因反序列化失败、引用未登记、槽位重复、revision < 1 等缺陷被整条丢弃的候选数；每次读取都重新解析，坏行每次都计 |
+| `query_memory_retrieval_failed_total` | **进程内计数器**（`bi_agent.query_memory.prompt` 模块内；同一读取方式） | 路由期整段记忆检索失败（连接、解析、序列化）的次数；失败即 fail open 为空记忆，回合照常完成 |
+
+两个进程内计数器只在所属进程内有效，进程重启即归零；它们不记异常文本、候选内容或问题文本。
+
+### 按状态计数与审批冲突（数据库侧只读观测）
+
+用 `bi_approver`（或管理员）身份的只读连接；不查聊天、Artifact 与底表载荷，输出只有状态、事件种类与 ref 形状：
+
+```sql
+-- 生命周期存量：draft / approved / superseded / revoked 各多少
+SELECT status, count(*) FROM bi.approved_query_examples GROUP BY status ORDER BY status;
+-- 不可变事件分布：drafted / approved / superseded / revoked 各多少
+SELECT event_kind, count(*) FROM bi.approved_query_events GROUP BY event_kind ORDER BY event_kind;
+-- 当前仍可被检索的样例（投影只含 approved）
+SELECT count(*) FROM reporting.v_approved_query_examples;
+```
+
+- **审批冲突数**：`memory_revision_conflict`（HTTP 409）即并发审批的 CAS 冲突；它是审核 API 的稳定响应码，没有独立计数器，需要趋势时从访问日志按响应码统计。冲突不追加事件、不重放审批，属正常并发防护而不是故障。
+- **label 边界**：一切指标的维度只允许状态、事件种类、domain 与稳定 ref 形状；**任何问题文本、模板内容、真实店铺/商品名称或用户 subject 都不得作为 label、tag 或样本**。
+- 计数器异常的处置：`query_memory_candidate_invalid_total` 持续增长说明有形状不合法的存量样例混进了投影（应核查写入路径与 021 CHECK）；`query_memory_retrieval_failed_total` 增长说明数据库或解析层故障，记忆自动降级为无记忆，路由行为回到固定 Tool 基线，优先排查审核 DSN 连通性。
+
+### 不得从本功能读出的结论
+
+- 门禁关闭时零记忆读取，聊天回合与无记忆基线逐字相同；门禁开启的 26 题离线证据在空投影视图上取得，**不证明**真实模型下的检索质量。
+- 检索只能改善 Tool/参数选择：身份、授权、能力、coverage、basis、来源与固定 Tool 优先级永远由服务端判定，样例不能覆盖它们。
+- 版本零召回是设计行为：七个版本维度任一失配即不可见，进入人工重审，不自动迁移；撤销在下一条检索立即生效。
+- 本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [approved 查询学习记忆本地验收记录](../research/2026-09-14-approved-query-memory-acceptance.md)；HTTP 生产启用被刻意延后（与 `CONTROLLED_SQL_ENABLED` 先例一致），Task 11 统一发布门禁第 4–7 项仍 open。
+
 ## 5. 真实对账结果摘要
 
 ### 合成基准（已通过，冻结时刻 2026-09-08 09:00+08）

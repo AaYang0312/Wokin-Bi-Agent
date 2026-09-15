@@ -35,6 +35,17 @@ React/Vite 前端 → /api 代理 → FastAPI → 受限 Agent
 - 默认关闭：`CONTROLLED_SQL_ENABLED=false`（`.env.example` 就是该值），且只有 `SEMANTIC_CATALOG_ENABLED=true` 时才能开——否则启动即 `CONTROLLED_SQL_REQUIRES_SEMANTIC_CATALOG`。关闭时 Tool 列表逐字不变、根本不进门禁，路由与聊天行为无差异。
 - 目前只完成本地开发与本地验收（[验收记录](docs/superpowers/research/2026-09-14-controlled-sql-acceptance.md)）：它只证明“放行/拒答的形状与边界”，不证明任何平台真实来源已就绪，也不改变 Task 11 统一发布门禁的状态。部署顺序（含 `020`）、两个门禁、诊断与回退见[运行手册](docs/runbook.md)，允许面边界见[指标口径](docs/metrics.md)。生产启用仍以 Task 11 统一发布门禁为前置，该门禁第 4–7 项尚未通过。
 
+## approved 查询学习记忆（默认关闭）
+
+`backend/bi_agent/query_memory/` 提供的是**人工批准的查询样例记忆**：只有授权审核者在独立审核面板上明确批准过的规范化样例，才会在门禁开启且版本、领域、授权域全部精确匹配时，作为至多 3 条 few-shot 提供给路由与参数规范化。它不是聊天历史搜索，也不是自动训练：成功运行、用户点赞和自然语言纠错都不会自动改变长期记忆，模型没有任何创建、批准、撤销或替换样例的入口。
+
+- 记忆**能**做：为“固定 Tool 表达不了”的经营问题提供已审核的 Tool 选择与槽位结构示范，减少同类问题的路由摇摆。
+- 记忆**不能**做：覆盖服务端身份、授权、能力、coverage、basis、来源与固定 Tool 优先级；样例只示范结构，当前值必须从本轮问题提取，任何模型输出仍走既有 JSON schema、授权与 capability 校验。
+- 不保存原始聊天、真实店铺/商品/SKU 名称、真实主键、SQL 原文、结果行、DSN 或密钥；目标价、阈值、预算、日期区间和店铺选择一律是槽位，不得存成长期常量；样例投影只有稳定 ref、槽位化模板、规范化请求与工具名。
+- 生命周期只有 `draft → approved → superseded/revoked`：批准、撤销、替换都必须由审核者给出显式理由并留不可变事件；撤销在下一条检索中立即可见，版本升级后旧例零召回、进入重审，不自动迁移。写路径走独立审核 DSN（`bi_approver` 最小权限），`bi_app` 只能读 approved 投影视图。
+- 默认关闭：`APPROVED_QUERY_MEMORY_ENABLED=false`（`.env.example` 就是该值），启用还要求非空 `APP_APPROVER_SUBJECTS` 与不同于 `BI_APP_DSN` 的 `BI_APPROVER_DSN`。关闭时零记忆读取，聊天回合与无记忆基线逐字相同；回滚 = 把开关保持/改回 `false`。HTTP 生产启用与受控探索一样被刻意延后，需要单独的所有者决定。
+- 目前只完成本地开发与本地验收（[验收记录](docs/superpowers/research/2026-09-14-approved-query-memory-acceptance.md)）：不证明真实模型下的检索质量，也不改变 Task 11 统一发布门禁的状态。启用步骤、审核流程与回退见[运行手册](docs/runbook.md)，定名指标与观测口径见[指标口径](docs/metrics.md)。
+
 ## 本地启动
 
 需要 Python 3.11、Node.js 22、PostgreSQL 17。复制 `.env.example` 为 `.env.app`，只填写 API 所需的 `BI_APP_DSN`、店铺范围和一个模型 provider 配置；不要在其中放同步 DSN 或快麦凭证。
@@ -75,7 +86,7 @@ psql -d bi_agent -f backend/sql/004_query_runtime.sql
 
 它创建 `bi_sync`、报表只读身份 `bi_reader` 与 API 身份 `bi_app`，并建立可审计的查询运行记录。API 使用 `bi_app`，只能读取 `reporting` 视图和读写聊天与查询运行表。
 
-本机两个库（`bi_agent`、`bi_agent_test`）已经建好并随命名卷保留，重建容器不需要重跑 DDL；新克隆时按[运行手册](docs/runbook.md)的完整顺序在两个库各跑一遍（001 → 020）。
+本机两个库（`bi_agent`、`bi_agent_test`）已经建好并随命名卷保留，重建容器不需要重跑 DDL；新克隆时按[运行手册](docs/runbook.md)的完整顺序在两个库各跑一遍（001 → 021）。
 
 ## 数据同步
 

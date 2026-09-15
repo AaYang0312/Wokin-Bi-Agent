@@ -16,7 +16,7 @@
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020 → 021`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020，approved 查询学习记忆的样例表、不可变事件表、`bi_approver` 审核角色与只含 approved 行的投影视图落在 021。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。缺 021 时审核 API 的投影视图不存在，approved 查询学习记忆保持关闭（审核路由按未启用返回 404），不影响其它功能。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
@@ -34,6 +34,7 @@ psql -d bi_agent -f backend/sql/017_commerce_views.sql
 psql -d bi_agent -f backend/sql/018_listing_audit.sql
 psql -d bi_agent -f backend/sql/019_inventory_snapshots.sql
 psql -d bi_agent -f backend/sql/020_controlled_sql_exploration.sql
+psql -d bi_agent -f backend/sql/021_approved_query_memory.sql
 ```
 
 单实例：全程持有数据库 advisory 锁，重复启动立即失败。
@@ -383,6 +384,41 @@ uv run --locked --env-file ../.env.test python -m tests.acceptance --offline
 
 4. 本轮**未在任何环境启用过该门禁**：真实 provider smoke 与 26 题 live、目标环境迁移与授权实测、生产启用、部署与一周试用全部记 `未执行`，逐条见 [受控 SQL 探索本地验收记录](superpowers/research/2026-09-14-controlled-sql-acceptance.md) §9。放行矩阵里的库存行只在回滚事务内 seed，不意味着库存或上架价来源已就绪；真实部署里 `listing_audit` / `inventory` 注册表仍为空，两个固定 Tool 依旧只报 `unsupported`。
 
+## approved 查询学习记忆（默认关闭）
+
+`backend/bi_agent/query_memory/` 是 Task 11 后置子项目 C：把**人工审核批准、已脱敏且版本兼容**的规范化查询样例，在门禁开启时作为至多 3 条 few-shot 提供给路由与参数规范化。模型与成功运行都不能自动写入记忆：唯一的写入口是审核 API → repository，由独立审核 DSN（`bi_approver` 身份）执行。样例不保存原始聊天、真实名称/主键、SQL 原文、结果行、DSN 或密钥；目标价、阈值、预算、日期区间与店铺选择一律是槽位。
+
+### 门禁与启用前置
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `APPROVED_QUERY_MEMORY_ENABLED` | `false` | 记忆检索与审核 API 的总开关；关闭时审核路由按未启用返回 404，聊天零记忆读取 |
+| `APP_APPROVER_SUBJECTS` | 空 | 授权审核者的 subject 集合；开启时必须非空，非审核者一律 403 |
+| `BI_APPROVER_DSN` | 空 | 独立审核连接串（`bi_approver` 会话成员）；开启时必须存在且**不等于** `BI_APP_DSN` |
+
+- 启用 = 三个变量一起配置后重启：`APPROVED_QUERY_MEMORY_ENABLED=true` + 非空 `APP_APPROVER_SUBJECTS` + 合格 `BI_APPROVER_DSN`；缺任一项启动即失败，绝不带病降级。取值只接受 `true` / `false`（其它写法当场拒绝）。
+- 021 必须已按完整顺序应用：`bi.approved_query_examples`、不可变的 `bi.approved_query_events`、`bi_approver`（NOLOGIN 组角色，经独立 DSN 的会话成员使用；只有样例表读写与事件追加权，事件不可改写，事实表零授权）与 `reporting.v_approved_query_examples`（只含 approved 行）。`bi_app` 对两张底表零授权，只读投影视图。
+- 前置回归（本机 `*_test`，串行）：
+
+```powershell
+Set-Location backend
+uv run --locked --env-file ../.env.test python -m unittest tests.test_query_memory tests.test_db tests.test_runtime_db tests.test_api -v
+uv run --locked --env-file ../.env.test python -m tests.acceptance --offline
+```
+
+### 审核流程（全部人工，全部显式理由）
+
+1. **从候选列表建草稿**：审核面板的候选列表只显示最近 100 个 `succeeded`、血缘完整且尚无任何记忆行的运行（含脱敏后的规范化请求、domain、工具与冻结版本）。审核者选中一条来源、把问题改写成槽位化模板（如“比较 {shop_scope} 在 {date_window} 的成本”）并为每个槽位选类型后提交；草稿的 owner 固定取来源运行自己的 subject，与服务端复核，不由请求体指定。
+2. **批准 / 撤销 / 替换都要显式理由**：三个动作的请求体都必须带非空审核理由（至少 3 个字符），与操作者、时间、revision、replacement ref 一起写进不可变事件；理由空或过短一律 422。生命周期只有 `draft → approved → superseded/revoked`、`draft → revoked`；终态不可逆，重新启用必须新建草稿。
+3. **建议双人复核**：系统强制的是“只有人工能批准”，不强制两人；运维上建议批准者与建草稿者不是同一人，替换（supersede）前由第二人核对 replacement 同领域且已批准。
+4. **撤销立即生效**：撤销后的**下一条**检索就看不到该样例（投影视图只含 approved 行），没有缓存宽限期。
+5. **版本升级后旧例进重审，不自动迁移**：schema / 语义目录 / 数据目录 / 指标 / 策略 / 来源注册表 / 图七个版本维度任一变化，旧例即零召回；要让新版本继续可用，必须用新版运行重新走“候选 → 草稿 → 批准”，并把旧例 supersede 到新例上。系统不做任何自动升级或自动迁移。
+- 面板可见性：功能关闭时后端返回 404，审核入口整体隐藏；非审核者 403 显示“无审核权限”；审核面板是独立入口，不是聊天界面的延伸。
+
+### 回退
+
+回退 = 把 `APPROVED_QUERY_MEMORY_ENABLED` 改回 `false`（或删掉该变量）后重启：聊天回到无记忆基线，回合的消息、工具与 SQL 逐字等于关闭基线（测试钉住），审核面板随 404 消失。回退**不需要**回滚 021：样例、事件与视图留在库里仍可审计，已批准样例在下一次开启时按当时的版本精确匹配重新生效。不要为了让启动成功去删表、改授权或把门禁“先关掉当已解决”。
+
 ## 同源部署
 
 发布 `frontend/dist` 静态文件。反向代理将 `/api/*` 转发到 `127.0.0.1:8000`，其余路径提供 SPA 回退；关闭 SSE 路径的响应缓冲。FastAPI 仅运行于回环地址且使用单 worker：
@@ -403,6 +439,9 @@ uv run --env-file ../.env.test python -m unittest tests.test_channel_mapping tes
 # 受控聚合探索（计划 Task 1–6：契约、固定 Tool 优先与编译器、AST 策略与攻击语料、
 # 成本门与投影、运行图，以及 Task 6 的 14 行放行矩阵 / 4 行负例 / 46 行攻击汇总）
 uv run --locked --env-file ../.env.test python -m unittest tests.test_exploration -v
+# approved 查询学习记忆（后置子项目 C：契约与生命周期、授权/版本过滤检索与撤销时效、
+# 路由接入与无自动写入；真库用例在 test_db / test_runtime_db / test_api 内）
+uv run --locked --env-file ../.env.test python -m unittest tests.test_query_memory -v
 # 底座回归
 uv run python -m unittest tests.test_core -v
 uv run --env-file ../.env.test python -m unittest tests.test_db tests.test_api tests.test_runtime_db -v

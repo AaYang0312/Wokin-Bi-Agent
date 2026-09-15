@@ -2394,6 +2394,76 @@ class ApprovedQueryMemoryMigrationTests(unittest.TestCase):
         for leaked in ("source_run_id", "status", "created_by"):
             self.assertNotIn(leaked, columns, f"投影不得暴露 {leaked}")
 
+    def test_repository_revocation_leaves_the_projection_before_the_next_retrieval(self):
+        """计划 Task 6 Step 1 的真库变体：经 repository 撤销后，检索视角的下
+        一次读取立即看不到该行——投影视图只含 approved，撤销即时生效。"""
+        from bi_agent.query_memory.models import ApprovalCommand
+        from bi_agent.query_memory.repository import QueryMemoryRepository
+
+        self.conn.execute(self._migration_sql())
+        run_id = self._seed_run()
+        self._insert_example(run_id, "mem-live-0001", status="approved")
+        self.assertEqual(self.conn.execute(
+            "SELECT example_ref FROM reporting.v_approved_query_examples"
+        ).fetchall(), [("mem-live-0001",)])
+        repository = QueryMemoryRepository(self.conn)
+        repository.transition(
+            "mem-live-0001",
+            command=ApprovalCommand(action="revoke", reason="证据失效，立即撤销"),
+            actor_subject_id="reviewer-a")
+        self.assertEqual(self.conn.execute(
+            "SELECT example_ref FROM reporting.v_approved_query_examples"
+        ).fetchall(), [])
+        self.assertEqual(self.conn.execute(
+            "SELECT status, approval_revision FROM bi.approved_query_examples"
+            " WHERE example_ref = 'mem-live-0001'").fetchone(),
+            ("revoked", 2))
+        self.assertEqual(self.conn.execute(
+            "SELECT revision, actor_subject_id, event_kind, reason"
+            " FROM bi.approved_query_events ORDER BY revision").fetchall(),
+            [(2, "reviewer-a", "revoked", "证据失效，立即撤销")])
+
+    def test_single_version_dimension_change_stops_the_retrieval_match(self):
+        """计划 Task 6 Step 1 的真库变体：VersionSet 七个维度任改其一，检索
+        SQL 的完整 jsonb 精确相等就不再命中；存储行保持 approved，不被自动
+        升级或迁移。"""
+        from psycopg.types.json import Jsonb
+
+        from bi_agent.query_memory.retrieval import _RETRIEVAL_SQL
+        from bi_agent.runtime.versions import VersionSet
+
+        self.conn.execute(self._migration_sql())
+        run_id = self._seed_run()
+        self._insert_example(run_id, "mem-live-0001", status="approved")
+        current = json.loads(self.VERSIONS_JSON)
+        params = {"domain": "controlled_exploration",
+                  "subject_id": "subject-a",
+                  "allowed_refs": ["ent-1a2b3c4d"]}
+        rows = self.conn.execute(_RETRIEVAL_SQL, params | {
+            "versions": Jsonb(current)}).fetchall()
+        self.assertEqual([row[0] for row in rows], ["mem-live-0001"])
+        probes = {
+            "schema_version": "reporting/2099-01-01.probe",
+            "semantic_catalog_version": "semantic/2099-01-01.probe",
+            "data_catalog_version": current["data_catalog_version"] + 1,
+            "metric_version": "metrics/2099-01-01.probe",
+            "policy_version": "multi-source-policy/2099-01-01.probe",
+            "source_registry_version": "sources/2099-01-01.probe",
+            "graph_version": "business_query-graph/2099-01-01.probe",
+        }
+        self.assertEqual(frozenset(probes), frozenset(VersionSet.model_fields))
+        for field, value in probes.items():
+            with self.subTest(field=field):
+                rows = self.conn.execute(_RETRIEVAL_SQL, params | {
+                    "versions": Jsonb(current | {field: value})}).fetchall()
+                self.assertEqual(rows, [], f"{field} 单项失配仍命中了检索")
+        # jsonb 读回就是 Python 对象：版本要求逐键原封不动，没有任何自动升级。
+        self.assertEqual(self.conn.execute(
+            "SELECT status, approval_revision, version_requirements"
+            " FROM bi.approved_query_examples"
+            " WHERE example_ref = 'mem-live-0001'").fetchone(),
+            ("approved", 1, current))
+
     def test_base_tables_reject_every_bound_value_key(self):
         """021 的 no_bound_values CHECK 与 models.FORBIDDEN_VALUE_KEYS 同一词表。"""
         from bi_agent.query_memory.models import FORBIDDEN_VALUE_KEYS

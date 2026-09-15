@@ -303,6 +303,11 @@ describe('审核 API（api.ts）', () => {
     expect(fetchMock.mock.calls[1][0]).toBe('/api/query-memory/drafts/mem-a/approve')
     expect(JSON.parse(String(fetchMock.mock.calls[1][1]?.body)))
       .toEqual({ reason: '血缘与模板复核通过' })
+    // 撤销同样只带显式理由：它是 Task 6 验收的主线，前端不得替审核者编理由。
+    await decideQueryMemoryDraft('mem-a', 'revoke', '证据失效，立即撤销')
+    expect(fetchMock.mock.calls[2][0]).toBe('/api/query-memory/drafts/mem-a/revoke')
+    expect(JSON.parse(String(fetchMock.mock.calls[2][1]?.body)))
+      .toEqual({ reason: '证据失效，立即撤销' })
   })
 
   it('throws ApiError with the server envelope on failures', async () => {

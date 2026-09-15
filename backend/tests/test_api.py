@@ -1123,6 +1123,40 @@ class QueryMemoryApiTests(unittest.TestCase):
                          ("mem-target", 1, "reviewer-a", "approved",
                           "血缘与模板复核通过", None))
 
+    def test_revocation_via_the_api_is_immediate_and_terminal(self):
+        """计划 Task 6：撤销必带显式理由并立即生效；撤销是终态，再批准或再
+        撤销都是 `memory_transition_invalid`，绝不重放审批。"""
+        conn = ReviewerApiConn(examples=self._examples_with(
+            status="approved", revision=1))
+        with self.reviewer_client(conn) as (client, calls):
+            response = client.post("/api/query-memory/drafts/mem-target/revoke",
+                                   headers=self._write(),
+                                   json={"reason": "证据失效，立即撤销"})
+            self.assertEqual(response.status_code, 200, response.text)
+            body = response.json()
+            self.assertEqual((body["status"], body["approval_revision"]),
+                             ("revoked", 2))
+            self.assertEqual(set(body), _DRAFT_PROJECTION_FIELDS)
+            # 列表立即反映撤销后的状态：下一条检索读到的投影里已没有这一行。
+            listed = client.get("/api/query-memory/drafts",
+                                headers=self._read()).json()
+            self.assertEqual([row["status"] for row in listed
+                              if row["example_ref"] == "mem-target"],
+                             ["revoked"])
+            # 终态不可逆：approve/revoke 重放都是 409，且不追加任何事件。
+            for action in ("approve", "revoke"):
+                followup = client.post(
+                    f"/api/query-memory/drafts/mem-target/{action}",
+                    headers=self._write(), json={"reason": "撤销后重放被拒"})
+                self.assertEqual(followup.status_code, 409, followup.text)
+                self.assertEqual(followup.json()["code"],
+                                 "memory_transition_invalid")
+        self.assertEqual([event[4] for event in conn.events], ["revoked"])
+        _depth, ref, revision, actor, kind, reason, replacement = conn.events[0]
+        self.assertEqual((ref, revision, actor, reason, replacement),
+                         ("mem-target", 2, "reviewer-a", "证据失效，立即撤销",
+                          None))
+
     # ---- 数据库失败：500 泛化响应，不外泄 DSN 或异常文本 -------------------
 
     def test_database_failure_leaks_no_dsn_or_exception_text(self):

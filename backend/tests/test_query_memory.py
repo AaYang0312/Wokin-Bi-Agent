@@ -990,6 +990,108 @@ class QueryMemoryRetrievalTests(unittest.TestCase):
         self.assertEqual(outputs, {tuple(case["expected_refs"])})
 
 
+class QueryMemoryRevocationInvalidationTests(unittest.TestCase):
+    """计划 Task 6 Step 1：撤销即时生效、七维版本单项失配零召回且无自动迁移。
+
+    写路径（QueryMemoryRepository 经生命周期替身）与读路径（RetrievalConn 重放
+    `status='approved'` 视图语义）共享同一批行字典对象：repository 改写状态后，
+    紧接着的下一次检索读到的就是改写后的仓库——撤销与替换的“下一条检索不可见”
+    由共享对象结构保证，不靠两个替身碰巧同步。"""
+
+    QUESTION = "按店比较成本"
+    LIVE_REFS = ("mem-current-cost", "mem-rev-2")
+
+    def wired(self):
+        from tests.fakeconn import QueryMemoryConn
+
+        records = [row for row in memory_store()
+                   if row["example_ref"] in self.LIVE_REFS]
+        retrieval_conn = RetrievalConn(records)
+        write_conn = QueryMemoryConn(
+            examples={row["example_ref"]: row for row in records})
+        return retrieval_conn, write_conn
+
+    def retrieve(self, conn, *, current_versions=None):
+        from bi_agent.query_memory import retrieve_approved_examples
+
+        context = retrieval_context("subject-a", ("ent-1a2b3c4d",), conn=conn)
+        return [item.example_ref for item in retrieve_approved_examples(
+            self.QUESTION, context=context, domain="controlled_exploration",
+            current_versions=current_versions or baseline_versions(), limit=3)]
+
+    def test_revocation_is_invisible_on_next_retrieval(self):
+        from bi_agent.query_memory.models import ApprovalCommand
+        from bi_agent.query_memory.repository import QueryMemoryRepository
+
+        retrieval_conn, write_conn = self.wired()
+        self.assertEqual(self.retrieve(retrieval_conn), ["mem-current-cost"])
+        QueryMemoryRepository(write_conn).transition(
+            "mem-current-cost",
+            command=ApprovalCommand(action="revoke", reason="证据失效，立即撤销"),
+            actor_subject_id="reviewer-a")
+        # 撤销后的下一次检索立即零召回：没有缓存宽限，也没有“再宽限一轮”。
+        self.assertEqual(self.retrieve(retrieval_conn), [])
+        self.assertEqual(write_conn.examples["mem-current-cost"]["status"],
+                         "revoked")
+        # 撤销恰好追加一条不可变事件：actor、理由与 revision 全部落账。
+        self.assertEqual([(event[1], event[2], event[3], event[4], event[5])
+                          for event in write_conn.events],
+                         [("mem-current-cost", 2, "reviewer-a", "revoked",
+                           "证据失效，立即撤销")])
+
+    def test_each_version_dimension_invalidates_without_auto_upgrade(self):
+        from bi_agent.runtime.versions import VersionSet
+        from tests.fakeconn import memory_versions_dict
+
+        retrieval_conn, write_conn = self.wired()
+        current = baseline_versions()
+        probes = {
+            "schema_version": "reporting/2099-01-01.probe",
+            "semantic_catalog_version": "semantic/2099-01-01.probe",
+            "data_catalog_version": current.data_catalog_version + 1,
+            "metric_version": "metrics/2099-01-01.probe",
+            "policy_version": "multi-source-policy/2099-01-01.probe",
+            "source_registry_version": "sources/2099-01-01.probe",
+            "graph_version": "business_query-graph/2099-01-01.probe",
+        }
+        # 七个维度一个不少：VersionSet 加字段时这条断言当场红，不许静默漏维度。
+        self.assertEqual(frozenset(probes), frozenset(VersionSet.model_fields))
+        for field in VersionSet.model_fields:
+            with self.subTest(field=field):
+                changed = current.model_copy(update={field: probes[field]})
+                self.assertNotEqual(changed, current)
+                self.assertEqual(
+                    self.retrieve(retrieval_conn, current_versions=changed), [])
+        # 没有任何自动升级：存储例保持 approved、版本要求原封不动、revision 不动，
+        # 检索路径零写入、零事件——版本迁移只能走人工 supersede/重批。
+        row = write_conn.examples["mem-current-cost"]
+        self.assertEqual(row["status"], "approved")
+        self.assertEqual(row["approval_revision"], 1)
+        self.assertEqual(row["version_requirements"], memory_versions_dict())
+        self.assertEqual(write_conn.writes, [])
+        self.assertEqual(write_conn.events, [])
+
+    def test_superseded_examples_never_retrieve(self):
+        from bi_agent.query_memory.models import ApprovalCommand
+        from bi_agent.query_memory.repository import QueryMemoryRepository
+
+        retrieval_conn, write_conn = self.wired()
+        self.assertEqual(self.retrieve(retrieval_conn), ["mem-current-cost"])
+        QueryMemoryRepository(write_conn).transition(
+            "mem-current-cost",
+            command=ApprovalCommand(action="supersede", reason="口径已升级重审",
+                                    replacement_ref="mem-rev-2"),
+            actor_subject_id="reviewer-a")
+        # 旧例被替换后立刻出投影：后续检索只能召回仍然 approved 的行，被替换的
+        # 旧例无论词项多匹配都不再出现。
+        self.assertEqual(self.retrieve(retrieval_conn), [])
+        row = write_conn.examples["mem-current-cost"]
+        self.assertEqual((row["status"], row["approval_revision"]),
+                         ("superseded", 2))
+        self.assertEqual([(event[4], event[6]) for event in write_conn.events],
+                         [("superseded", "mem-rev-2")])
+
+
 # --- 计划 Task 5：路由接入，但不自动学习 -----------------------------------------
 #
 # 门禁开时，主层在第一次模型路由前从 approved 投影视图逐域读取（每域最多 3 条），
