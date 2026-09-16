@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import Sequence
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -248,6 +248,234 @@ class QueryMemoryConn:
             self.writes.append((self._depth, "event", values[0]))
             return Rows([])
         raise AssertionError(f"未预期的SQL：{text}")
+
+
+# --- 持续库存监控 repository 替身（计划 Task 2） -------------------------------
+#
+# 只回答 bi_agent.monitoring.repository 的三条 SQL：策略读取、活跃告警读取、
+# 以及唯一一条 bi.commit_inventory_monitor_scan 调用。SQL 函数内部的写序
+# （run → artifact → 按 dedupe_key 排序的 alert/event/outbox）在替身里按同序
+# 模拟，`fail_at` 钩子能在任一步抛出与 SQL 侧同名的稳定错误码，用来钉两件事：
+# repository 把函数失败映射成固定非秘密 RuntimeError，以及任一步失败后五类行
+# 零残留。白名单之外的任何 SQL 一律显式报错：repository 不存在第二条任意 SQL
+# 通路，也不得在事务外调用提交函数。
+
+# 提交函数的注入点 → SQL 侧同名稳定错误码（两边单边改名都会在用例现场炸出来）。
+MONITOR_STEP_CODES = {
+    "commit_call": "monitor_commit_failed",
+    "create_run": "monitor_run_write_failed",
+    "save_artifact": "monitor_artifact_write_failed",
+    "lock_alert": "monitor_lock_unavailable",
+    "insert_alert": "monitor_alert_write_failed",
+    "insert_event": "monitor_event_write_failed",
+    "insert_outbox": "monitor_outbox_write_failed",
+}
+
+# 事件幂等身份：与 023 的 sha256(dedupe_key:generation:event_kind:fingerprint)
+# 同一四元组；替身用元组相等回答「这条事件写过了吗」，不重复实现哈希。
+MonitorEventIdentity = tuple[str, int, str, str]
+
+
+class MonitorConn:
+    """监控写路径（repository）的最小替身。
+
+    `policies` 是 policy_ref → 策略字典（键与 023 表列同名）；`alerts` 是初始
+    告警行（含 status/last_observed_at 等列）。`fail_at` 命中哪一步，提交就在
+    哪一步抛出稳定码：替身把整个提交函数当成一个原子单元，失败时本次调用的
+    全部暂存写入整体丢弃——回滚语义由替身自身保证，用例再断言 counts 全零。
+    """
+
+    def __init__(self, *, policies: dict[str, dict] | None = None,
+                 alerts: list[dict] | None = None, fail_at: str | None = None):
+        self.policies = dict(policies or {})
+        self.alerts = [dict(alert) for alert in (alerts or [])]
+        self.fail_at = fail_at
+        self.runs: list[dict] = []
+        self.artifacts: list[dict] = []
+        self.events: list[dict] = []
+        self.outbox: list[dict] = []
+        self.writes: list[tuple] = []   # (事务深度, "run"/"artifact"/"alert"/"event"/"outbox", ref)
+        self.sql_log: list[str] = []
+        self._depth = 0
+
+    def counts(self) -> dict[str, int]:
+        return {"runs": len(self.runs), "artifacts": len(self.artifacts),
+                "alerts": len(self.alerts), "events": len(self.events),
+                "outbox": len(self.outbox)}
+
+    @contextmanager
+    def transaction(self):
+        self._depth += 1
+        try:
+            yield
+        finally:
+            self._depth -= 1
+
+    def execute(self, sql: str, params: object = None) -> Rows:
+        text = " ".join(sql.split())
+        self.sql_log.append(text)
+        values = list(params or [])
+        if text.startswith("SELECT bi.commit_inventory_monitor_scan"):
+            return Rows([(self._commit(*values),)])
+        if text.startswith("SELECT policy_ref, threshold_policy_ref"):
+            policy = self.policies.get(values[0])
+            return Rows([]) if policy is None else Rows([(self._policy_tuple(policy))])
+        if "FROM bi.inventory_alert_instances" in text and "status IN" in text:
+            rows = [self._alert_tuple(alert) for alert in self.alerts
+                    if alert["policy_ref"] == values[0]
+                    and alert["status"] in ("open", "acknowledged")]
+            return Rows(sorted(rows, key=lambda row: row[0]))
+        raise AssertionError(f"未预期的SQL：{text}")
+
+    @staticmethod
+    def _policy_tuple(policy: dict) -> tuple:
+        return (policy["policy_ref"], policy["threshold_policy_ref"],
+                policy["owner_subject_id"], list(policy["shop_refs"]),
+                list(policy["inventory_pool_refs"]), list(policy["levels"]),
+                policy["cooldown_seconds"], policy["enabled"])
+
+    @staticmethod
+    def _alert_tuple(alert: dict) -> tuple:
+        return (alert["alert_ref"], alert["dedupe_key"], alert["generation"],
+                alert["status"], alert["last_observed_at"],
+                alert.get("last_notified_at"))
+
+    def _fail(self, step: str) -> None:
+        if self.fail_at == step:
+            raise psycopg.errors.RaiseException(MONITOR_STEP_CODES[step])
+
+    def _commit(self, policy_ref, source_payload, source_fingerprint, data_as_of,
+                decisions, observed_at) -> dict:
+        if self._depth != 1:
+            raise AssertionError("提交函数必须在 repository 的单事务里调用")
+        self._fail("commit_call")
+        policy = self.policies.get(policy_ref)
+        if policy is None:
+            raise psycopg.errors.RaiseException("monitor_policy_not_found")
+        if not policy["enabled"]:
+            raise psycopg.errors.RaiseException("monitor_policy_disabled")
+        entries = [_plain(decision) for decision in _plain(decisions)]
+        keys = [entry["dedupe_key"] for entry in entries]
+        if len(set(keys)) != len(keys):
+            raise psycopg.errors.RaiseException("monitor_invalid_decision")
+        # observed=false 只属于 updated：triggered/retriggered/resolved 都代表本轮
+        # 真看到了那一格（低、持续低、恢复正常），SQL 侧 023 同一规则。
+        if any(entry["event_kind"] != "updated" and not entry["observed"]
+               for entry in entries):
+            raise psycopg.errors.RaiseException("monitor_invalid_decision")
+        staged_runs: list[dict] = []
+        staged_artifacts: list[dict] = []
+        working_alerts = {alert["alert_ref"]: dict(alert) for alert in self.alerts}
+        staged_events: list[dict] = []
+        staged_outbox: list[dict] = []
+        staged_alert_writes: list[str] = []
+        transitions: list[dict] = []
+        self._fail("create_run")
+        run_id = uuid4()
+        artifact_id = uuid4()
+        attempt_no = len(self.runs) + 1
+        staged_runs.append({"run_id": run_id, "attempt_no": attempt_no,
+                            "subject_id": policy["owner_subject_id"]})
+        self._fail("save_artifact")
+        staged_artifacts.append({"artifact_id": artifact_id, "run_id": run_id})
+        seen_event_ids: set[MonitorEventIdentity] = {
+            (event["dedupe_key"], event["generation"], event["event_kind"],
+             event["source_fingerprint"]) for event in self.events}
+        for entry in sorted(entries, key=lambda item: item["dedupe_key"]):
+            self._fail("lock_alert")
+            key = entry["dedupe_key"]
+            generation = entry["generation"]
+            kind = entry["event_kind"]
+            identity: MonitorEventIdentity = (key, generation, kind,
+                                              source_fingerprint)
+            active = next((alert for alert in working_alerts.values()
+                           if alert["dedupe_key"] == key
+                           and alert["status"] in ("open", "acknowledged")), None)
+            history = [alert for alert in working_alerts.values()
+                       if alert["dedupe_key"] == key]
+            if active is not None:
+                if identity in seen_event_ids:
+                    continue   # 崩溃重放的同一批决策：事件已在，幂等跳过
+                if (active["status"] != entry["previous_status"]
+                        or generation != active["generation"]
+                        or entry["next_status"] not in
+                        (active["status"], "resolved", "suppressed")):
+                    raise psycopg.errors.RaiseException("monitor_invalid_transition")
+                alert_ref = active["alert_ref"]
+                self._fail("insert_alert")
+                staged_alert_writes.append(alert_ref)
+                active["status"] = entry["next_status"]
+                if entry["observed"]:
+                    active["last_observed_at"] = observed_at
+                if entry["notify"]:
+                    active["last_notified_at"] = observed_at
+                if entry["next_status"] == "resolved":
+                    active["resolved_at"] = observed_at
+            else:
+                if (kind != "triggered" or entry["previous_status"] is not None
+                        or entry["next_status"] != "open"
+                        or generation != len(history) + 1):
+                    raise psycopg.errors.RaiseException("monitor_invalid_transition")
+                if identity in seen_event_ids:
+                    continue   # 已解决代际上的重放：事件与首发都只算一次
+                alert_ref = f"alert-{uuid4().hex}"
+                self._fail("insert_alert")
+                staged_alert_writes.append(alert_ref)
+                working_alerts[alert_ref] = {
+                    "alert_ref": alert_ref, "dedupe_key": key,
+                    "generation": generation, "policy_ref": policy_ref,
+                    "rule_code": entry["rule_code"], "level": entry["level"],
+                    "sku_ref": entry["sku_ref"], "scope_ref": entry["scope_ref"],
+                    "status": "open", "opened_at": observed_at,
+                    "last_observed_at": observed_at if entry["observed"] else None,
+                    "last_notified_at": observed_at if entry["notify"] else None,
+                    "source_artifact_id": artifact_id}
+            self._fail("insert_event")
+            staged_events.append({"alert_ref": alert_ref, "event_kind": kind,
+                                  "previous_status": entry["previous_status"],
+                                  "next_status": entry["next_status"],
+                                  "source_artifact_id": artifact_id,
+                                  "idempotency_key": identity,
+                                  "dedupe_key": key, "generation": generation,
+                                  "source_fingerprint": source_fingerprint})
+            seen_event_ids.add(identity)
+            if entry["notify"] and kind in ("triggered", "retriggered", "resolved"):
+                self._fail("insert_outbox")
+                staged_outbox.append({"alert_ref": alert_ref,
+                                      "idempotency_key": identity,
+                                      "owner_subject_id": policy["owner_subject_id"],
+                                      "payload": {
+                                          "alert_ref": alert_ref,
+                                          "event_kind": kind,
+                                          "status": entry["next_status"],
+                                          "level": entry["level"],
+                                          "sku_ref": entry["sku_ref"],
+                                          "scope_ref": entry["scope_ref"],
+                                          "rule_code": entry["rule_code"],
+                                          "quantity": entry.get("quantity"),
+                                          "threshold": entry.get("threshold"),
+                                          "unit": entry.get("unit"),
+                                          "data_as_of": str(data_as_of)}})
+            transitions.append({"alert_ref": alert_ref, "dedupe_key": key,
+                                "previous_status": entry["previous_status"],
+                                "next_status": entry["next_status"],
+                                "event_kind": kind})
+        # 整个调用成功才升为已提交状态：失败路径上五类行零残留。
+        self.runs.extend(staged_runs)
+        self.artifacts.extend(staged_artifacts)
+        self.alerts = list(working_alerts.values())
+        self.events.extend(staged_events)
+        self.outbox.extend(staged_outbox)
+        for kind, ref, rows in (("run", "run_id", staged_runs),
+                                ("artifact", "artifact_id", staged_artifacts),
+                                ("alert", "alert_ref",
+                                 [{"alert_ref": ref} for ref in staged_alert_writes]),
+                                ("event", "alert_ref", staged_events),
+                                ("outbox", "alert_ref", staged_outbox)):
+            for row in rows:
+                self.writes.append((self._depth, kind, row[ref]))
+        return {"run_id": str(run_id), "artifact_id": str(artifact_id),
+                "attempt_no": attempt_no, "transitions": transitions}
 
 
 def price_audit_payload() -> dict:

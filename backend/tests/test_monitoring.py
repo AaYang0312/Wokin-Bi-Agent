@@ -16,8 +16,11 @@
 Task 1 只交付契约、配置与 gate；runner / repository / 状态机属后续 Task。
 """
 
+import hashlib
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+import psycopg
 
 # 监控侧登记用的"生产对账时点"固定值：只存在于测试夹具的合成场景里。
 RECONCILED_AT = datetime(2026, 9, 16, 8, 0, tzinfo=timezone.utc)
@@ -558,6 +561,280 @@ class MonitorSourceGateTests(unittest.TestCase):
             assert_monitor_sources_verified(
                 physical_only_policy(),
                 registrations=channel_only_registrations())
+
+
+# --- 计划 Task 2：MonitorRepository 的单事务持久化 -----------------------------
+
+from .fakeconn import MONITOR_STEP_CODES, MonitorConn
+
+MONITOR_NOW = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+SNAPSHOT_AT = MONITOR_NOW - timedelta(minutes=5)
+SNAPSHOT_ISO = SNAPSHOT_AT.isoformat()
+SOURCE_FINGERPRINT = hashlib.sha256(b"monitor-source").hexdigest()
+
+
+def _sku_ref(tag: str) -> str:
+    from bi_agent.catalog import ref_for_key
+    from bi_agent.catalog.models import EntityKind
+
+    return ref_for_key(EntityKind.SKU.value, tag)
+
+
+SKU_REF = _sku_ref("SKU1")
+POOL_REF = "pl-0123456789ab"
+WAREHOUSE_REF = "wh-0123456789ab"
+SCOPE_REF = f"{POOL_REF}|{WAREHOUSE_REF}"
+DEDUPE_KEY_A = hashlib.sha256(b"cell-a").hexdigest()
+DEDUPE_KEY_B = hashlib.sha256(b"cell-b").hexdigest()
+POLICY_REF = "inventory-monitor/1"
+
+
+def alerts_payload(**overrides) -> dict:
+    """一份对 inventory_alerts 载荷契约合法的最小来源载荷（合成引用）。"""
+    from bi_agent.runtime.models import validate_artifact_payload
+
+    row = {"level": "physical_total", "sku_ref": SKU_REF, "pool_ref": POOL_REF,
+           "warehouse_ref": WAREHOUSE_REF, "quantity": "10", "threshold": "10",
+           "unit": "piece", "inventory_status": "low",
+           "snapshot_at": SNAPSHOT_ISO, "batch_count": 1}
+    payload = {
+        "status": "partial",
+        "inventory": {
+            "expected_items": 1, "evaluated_items": 1, "scanned_items": 1,
+            "truncated": False, "all_safe": False, "counts": {"low": 1},
+            "levels": ["physical_total"], "threshold_source": "this_turn",
+            "pools": [{"pool_ref": POOL_REF, "connection_kind": "shared",
+                       "fresh": True, "scan_complete": True,
+                       "snapshot_at": SNAPSHOT_ISO}],
+            "freshness_policy_seconds": 86400,
+            "rule_version": "inventory-rules/2026-09-14.1"},
+        "data": [row],
+        "filters": {"as_of": "latest", "levels": ["physical_total"],
+                    "products": "selected",
+                    "thresholds": [{"level": "low_replenish", "sku_ref": SKU_REF,
+                                    "quantity": "10", "unit": "piece"}]},
+        "limitations": [],
+    }
+    payload.update(overrides)
+    # 基线本身必须合法：改坏形状的用例要在自己现场被证明是载荷不合法，而不是
+    # 基线本来就过不了校验。
+    validate_artifact_payload(payload, "inventory_alerts")
+    return payload
+
+
+def make_scan(**overrides):
+    from bi_agent.monitoring.models import MonitorAlertRow, MonitorScan
+
+    row = MonitorAlertRow(level="physical_total", status="low", sku_ref=SKU_REF,
+                          scope_ref=SCOPE_REF, quantity="10", threshold="10",
+                          unit="piece")
+    values = dict(policy_ref=POLICY_REF, source_artifact_payload=alerts_payload(),
+                  source_fingerprint=SOURCE_FINGERPRINT, data_as_of=MONITOR_NOW,
+                  fresh=True, complete_levels=("physical_total",), rows=(row,),
+                  diagnostics=())
+    values.update(overrides)
+    return MonitorScan(**values)
+
+
+SCAN = make_scan()
+
+
+def make_decision(**overrides):
+    from bi_agent.monitoring.models import AlertDecision
+
+    values = dict(dedupe_key=DEDUPE_KEY_A, generation=1, previous_status=None,
+                  next_status="open", event_kind="triggered", notify=True,
+                  observed=True, rule_code="low_replenish",
+                  level="physical_total", sku_ref=SKU_REF, scope_ref=SCOPE_REF)
+    values.update(overrides)
+    return AlertDecision(**values)
+
+
+def monitor_policy_dict(*, enabled: bool = True) -> dict:
+    return {"policy_ref": POLICY_REF,
+            "threshold_policy_ref": "inventory-thresholds/1",
+            "owner_subject_id": "owner-subject", "shop_refs": ["shop-a"],
+            "inventory_pool_refs": [POOL_REF],
+            "levels": ["physical_total", "shop_sellable"],
+            "cooldown_seconds": 3600, "enabled": enabled}
+
+
+def stored_alert(**overrides) -> dict:
+    values = dict(alert_ref="alert-open0001", dedupe_key=DEDUPE_KEY_A, generation=1,
+                  policy_ref=POLICY_REF, rule_code="low_replenish",
+                  level="physical_total", sku_ref=SKU_REF, scope_ref=SCOPE_REF,
+                  status="open", opened_at=SNAPSHOT_AT,
+                  last_observed_at=SNAPSHOT_AT, last_notified_at=SNAPSHOT_AT)
+    values.update(overrides)
+    return values
+
+
+def repository_with_failure(step: str | None):
+    from bi_agent.monitoring.repository import MonitorRepository
+
+    conn = MonitorConn(policies={POLICY_REF: monitor_policy_dict()}, fail_at=step)
+    return MonitorRepository(conn), conn
+
+
+class MonitorRepositoryTests(unittest.TestCase):
+    """计划 Task 2 Step 1：单事务提交、稳定错误映射与失败零残留。
+
+    用真库形状的替身（fakeconn.MonitorConn）注入每个写步骤的失败；真库上的
+    原子性、权限矩阵与并发由 tests.test_db 的 InventoryMonitorMigrationTests
+    另行证明（023 只在本机 *_test 库执行）。
+    """
+
+    def test_outbox_failure_rolls_back_alert_and_source_artifact(self):
+        repository, conn = repository_with_failure("insert_outbox")
+        with self.assertRaisesRegex(RuntimeError, "outbox_write_failed"):
+            repository.commit_scan(SCAN, (make_decision(),), now=MONITOR_NOW)
+        self.assertEqual(conn.counts(), {"runs": 0, "artifacts": 0, "alerts": 0,
+                                         "events": 0, "outbox": 0})
+        self.assertEqual(conn.writes, [], "失败的事务不得升任何写入")
+
+    def test_rollback_covers_every_injected_failure_step(self):
+        for step, code in MONITOR_STEP_CODES.items():
+            with self.subTest(step=step):
+                repository, conn = repository_with_failure(step)
+                with self.assertRaisesRegex(RuntimeError, code):
+                    repository.commit_scan(SCAN, (make_decision(),), now=MONITOR_NOW)
+                self.assertEqual(conn.counts(), {"runs": 0, "artifacts": 0,
+                                                 "alerts": 0, "events": 0,
+                                                 "outbox": 0})
+                self.assertEqual(conn.writes, [])
+
+    def test_commit_scan_calls_only_the_fixed_function_in_one_transaction(self):
+        repository, conn = repository_with_failure(None)
+        transitions = repository.commit_scan(SCAN, (make_decision(),), now=MONITOR_NOW)
+        self.assertEqual(conn.sql_log,
+                         ["SELECT bi.commit_inventory_monitor_scan("
+                          "%s, %s, %s, %s, %s, %s)"])
+        self.assertEqual(conn.counts(), {"runs": 1, "artifacts": 1, "alerts": 1,
+                                         "events": 1, "outbox": 1})
+        self.assertEqual([kind for _, kind, _ in conn.writes],
+                         ["run", "artifact", "alert", "event", "outbox"])
+        self.assertTrue(all(depth == 1 for depth, _, _ in conn.writes))
+        self.assertEqual(len(transitions), 1)
+        transition = transitions[0]
+        self.assertEqual((transition.previous_status, transition.next_status,
+                          transition.event_kind, transition.dedupe_key),
+                         (None, "open", "triggered", DEDUPE_KEY_A))
+        self.assertEqual(transition.source_artifact_ref,
+                         str(conn.artifacts[0]["artifact_id"]))
+
+    def test_commit_scan_enriches_decisions_with_their_own_row_fields(self):
+        repository, conn = repository_with_failure(None)
+        repository.commit_scan(SCAN, (make_decision(),), now=MONITOR_NOW)
+        self.assertEqual(conn.outbox[0]["payload"]["quantity"], "10")
+        self.assertEqual(conn.outbox[0]["payload"]["threshold"], "10")
+        self.assertEqual(conn.outbox[0]["payload"]["unit"], "piece")
+
+    def test_commit_scan_rejects_unsafe_source_payload_before_any_sql(self):
+        poisoned = alerts_payload()
+        poisoned["inventory"]["pools"][0]["evidence"] = "scan-evidence-text"
+        repository, conn = repository_with_failure(None)
+        with self.assertRaisesRegex(ValueError, "monitor_source_payload_unsafe"):
+            repository.commit_scan(make_scan(source_artifact_payload=poisoned),
+                                   (make_decision(),), now=MONITOR_NOW)
+        self.assertEqual(conn.sql_log, [], "未过验证的输入不得碰到数据库")
+
+    def test_commit_scan_rejects_artifact_type_outside_the_domain(self):
+        from unittest.mock import patch
+
+        repository, conn = repository_with_failure(None)
+        with patch("bi_agent.monitoring.repository.allows_artifact_type",
+                   return_value=False):
+            with self.assertRaisesRegex(ValueError,
+                                        "monitor_artifact_type_not_allowed"):
+                repository.commit_scan(SCAN, (make_decision(),), now=MONITOR_NOW)
+        self.assertEqual(conn.sql_log, [])
+
+    def test_commit_scan_revalidates_decisions_before_the_database(self):
+        repository, conn = repository_with_failure(None)
+        malformed = make_decision().model_construct(
+            **{**make_decision().model_dump(), "event_kind": "escalated"})
+        with self.assertRaisesRegex(ValueError, "monitor_invalid_decision"):
+            repository.commit_scan(SCAN, (malformed,), now=MONITOR_NOW)
+        with self.assertRaisesRegex(ValueError, "monitor_invalid_decision"):
+            # 同一格两条决策：冲突，不是重复强调（与 023 的 SQL 侧同一拒绝）。
+            repository.commit_scan(SCAN, (make_decision(), make_decision()),
+                                   now=MONITOR_NOW)
+        bad_key = make_decision().model_construct(
+            **{**make_decision().model_dump(), "dedupe_key": "XYZ"})
+        with self.assertRaisesRegex(ValueError, "monitor_invalid_decision"):
+            repository.commit_scan(SCAN, (bad_key,), now=MONITOR_NOW)
+        self.assertEqual(conn.sql_log, [])
+
+    def test_commit_scan_enforces_the_decision_budget_before_the_database(self):
+        decisions = tuple(make_decision(dedupe_key=hashlib.sha256(
+            str(index).encode()).hexdigest()) for index in range(501))
+        repository, conn = repository_with_failure(None)
+        with self.assertRaisesRegex(ValueError, "monitor_decision_budget_exceeded"):
+            repository.commit_scan(SCAN, decisions, now=MONITOR_NOW)
+        self.assertEqual(conn.sql_log, [])
+
+    def test_rowless_update_decision_writes_event_without_outbox(self):
+        """observed=false 的 updated：保留观测、只写审计事件，零 outbox。"""
+        repository, conn = repository_with_failure(None)
+        conn.alerts = [stored_alert()]
+        decision = make_decision(previous_status="open", next_status="open",
+                                 event_kind="updated", notify=False, observed=False)
+        transitions = repository.commit_scan(SCAN, (decision,), now=MONITOR_NOW)
+        self.assertEqual([(t.previous_status, t.next_status, t.event_kind)
+                          for t in transitions], [("open", "open", "updated")])
+        self.assertEqual(conn.counts(), {"runs": 1, "artifacts": 1, "alerts": 1,
+                                         "events": 1, "outbox": 0})
+
+    def test_load_policy_maps_rows_through_the_monitor_model(self):
+        repository, conn = repository_with_failure(None)
+        policy = repository.load_policy(POLICY_REF)
+        self.assertEqual((policy.policy_ref, policy.owner_subject_id, policy.enabled),
+                         (POLICY_REF, "owner-subject", True))
+        self.assertEqual(policy.levels, ("physical_total", "shop_sellable"))
+        with self.assertRaisesRegex(ValueError, "monitor_policy_not_found"):
+            repository.load_policy("inventory-monitor/404")
+
+    def test_load_policy_returns_disabled_policies_without_failing(self):
+        conn = MonitorConn(policies={POLICY_REF: monitor_policy_dict(enabled=False)})
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        policy = MonitorRepository(conn).load_policy(POLICY_REF)
+        self.assertFalse(policy.enabled)
+
+    def test_load_active_alerts_exposes_only_open_or_acknowledged(self):
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        conn = MonitorConn(policies={POLICY_REF: monitor_policy_dict()}, alerts=[
+            stored_alert(),
+            stored_alert(alert_ref="alert-ack00001", status="acknowledged"),
+            stored_alert(alert_ref="alert-done001", status="resolved",
+                         resolved_at=SNAPSHOT_AT)])
+        alerts = MonitorRepository(conn).load_active_alerts(POLICY_REF)
+        self.assertEqual([alert.alert_ref for alert in alerts],
+                         ["alert-ack00001", "alert-open0001"])
+        self.assertEqual([alert.generation for alert in alerts], [1, 1])
+
+    def test_database_read_failures_map_to_stable_non_secret_errors(self):
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        class BrokenConn(MonitorConn):
+            def execute(self, sql, params=None):
+                raise psycopg.errors.OperationalError("DSN or network detail")
+
+        repository = MonitorRepository(BrokenConn())
+        with self.assertRaisesRegex(RuntimeError, "monitor_policy_read_failed"):
+            repository.load_policy(POLICY_REF)
+        with self.assertRaisesRegex(RuntimeError, "monitor_alerts_read_failed"):
+            repository.load_active_alerts(POLICY_REF)
+        repository, _ = repository_with_failure(None)
+        conn = repository.conn
+        conn.fail_at = None
+        conn.execute = lambda sql, params=None: (_ for _ in ()).throw(
+            psycopg.errors.OperationalError("secret detail"))
+        with self.assertRaises(RuntimeError) as caught:
+            repository.commit_scan(SCAN, (make_decision(),), now=MONITOR_NOW)
+        self.assertEqual(str(caught.exception), "monitor_commit_failed")
+        self.assertNotIn("secret detail", str(caught.exception))
 
 
 if __name__ == "__main__":  # pragma: no cover

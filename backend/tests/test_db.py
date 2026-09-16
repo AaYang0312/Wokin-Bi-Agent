@@ -4,6 +4,7 @@
 无测试DSN时显式skip——skip不是通过证明。
 """
 
+import hashlib
 import json
 import os
 import unittest
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 import psycopg
+from psycopg.types.json import Jsonb
 
 from .dbfixtures import (PRODUCT_DAILY_COLUMNS, PRODUCT_DAILY_COLUMNS_AFTER_005,
                        connect_test_db)
@@ -2627,6 +2629,933 @@ class IsolatedAnalysisMigrationTests(unittest.TestCase):
                 "VALUES (%s, %s, 'analysis_result_typo', '{}')",
                 (uuid4(), self.run_id))
         self.conn.execute("ROLLBACK TO SAVEPOINT type_probe")
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class InventoryMonitorMigrationTests(unittest.TestCase):
+    """计划 Task 2 Step 3/5：023 幂等、bi_monitor 最小权限、单事务原子提交。
+
+    与 021/022 同一协议：全部 DDL 在管理员外层事务里跑（结束按 Rollback 协议
+    退出），共享测试库只保留由命令行显式提交的那份 023；因此需要第二个连接的
+    并发用例先探测已提交的函数，缺席时 skip 并报出原因，绝不在用例里提交 DDL。
+    """
+
+    MIGRATION = "023_continuous_inventory_notifications.sql"
+    SERVICE_CHAT = "00000000-0000-4000-8000-000000000023"
+    SERVICE_MESSAGE = "00000000-0000-4000-8000-000000000024"
+    SERVICE_SUBJECT = "inventory-monitor-service"
+    COMMIT_FUNCTION = ("bi.commit_inventory_monitor_scan(text,jsonb,text,"
+                       "timestamptz,jsonb,timestamptz)")
+    DELIVER_FUNCTION = "bi.deliver_inventory_outbox(timestamptz,integer)"
+    READ_FUNCTION = "bi.mark_inventory_notification_read(text,text)"
+    ACK_FUNCTION = "bi.acknowledge_inventory_alert(text,text)"
+    OBSERVED = datetime(2026, 9, 17, 12, tzinfo=BEIJING)
+    LATER = OBSERVED + timedelta(hours=1)
+    FINGERPRINT = hashlib.sha256(b"monitor-source").hexdigest()
+    DEDUPE_KEY = hashlib.sha256(b"cell-a").hexdigest()
+    POOL_REF = "pl-0123456789ab"
+    WAREHOUSE_REF = "wh-0123456789ab"
+    SCOPE_REF = f"{POOL_REF}|{WAREHOUSE_REF}"
+
+    def setUp(self):
+        self.conn = connect_test_db(self)
+        self.conn.execute(self._migration_sql())
+
+    def _migration_sql(self) -> str:
+        from pathlib import Path
+
+        path = Path(__file__).parents[1] / "sql" / self.MIGRATION
+        return path.read_text(encoding="utf-8")
+
+    @staticmethod
+    def _sku_ref(tag: str) -> str:
+        from bi_agent.catalog import ref_for_key
+        from bi_agent.catalog.models import EntityKind
+
+        return ref_for_key(EntityKind.SKU.value, tag)
+
+    def _alerts_payload(self) -> dict:
+        """一份对 inventory_alerts 契约合法的最小来源载荷（合成引用）。"""
+        snapshot = (self.OBSERVED - timedelta(minutes=5)).isoformat()
+        return {
+            "status": "partial",
+            "inventory": {
+                "expected_items": 1, "evaluated_items": 1, "scanned_items": 1,
+                "truncated": False, "all_safe": False, "counts": {"low": 1},
+                "levels": ["physical_total"], "threshold_source": "this_turn",
+                "pools": [{"pool_ref": self.POOL_REF,
+                           "connection_kind": "shared", "fresh": True,
+                           "scan_complete": True, "snapshot_at": snapshot}],
+                "freshness_policy_seconds": 86400,
+                "rule_version": "inventory-rules/2026-09-14.1"},
+            "data": [{"level": "physical_total", "sku_ref": self._sku_ref("SKU1"),
+                      "pool_ref": self.POOL_REF,
+                      "warehouse_ref": self.WAREHOUSE_REF,
+                      "quantity": "10", "threshold": "10", "unit": "piece",
+                      "inventory_status": "low", "snapshot_at": snapshot,
+                      "batch_count": 1}],
+            "filters": {"as_of": "latest", "levels": ["physical_total"],
+                        "products": "selected",
+                        "thresholds": [{"level": "low_replenish",
+                                        "sku_ref": self._sku_ref("SKU1"),
+                                        "quantity": "10", "unit": "piece"}]},
+            "limitations": [],
+        }
+
+    def _decision(self, **overrides) -> dict:
+        values = {"dedupe_key": self.DEDUPE_KEY, "generation": 1,
+                  "previous_status": None, "next_status": "open",
+                  "event_kind": "triggered", "notify": True, "observed": True,
+                  "rule_code": "low_replenish", "level": "physical_total",
+                  "sku_ref": self._sku_ref("SKU1"), "scope_ref": self.SCOPE_REF,
+                  "quantity": "10", "threshold": "10", "unit": "piece"}
+        values.update(overrides)
+        return values
+
+    def _seed_policy(self, policy_ref: str = "inventory-monitor/1", *,
+                     enabled: bool = True,
+                     owner: str = "owner-subject") -> None:
+        self.conn.execute(
+            """INSERT INTO bi.inventory_monitor_policies (
+                   policy_ref, threshold_policy_ref, owner_subject_id, shop_refs,
+                   inventory_pool_refs, levels, cooldown_seconds, enabled)
+               VALUES (%s, 'inventory-thresholds/1', %s, ARRAY['shop-a'],
+                       ARRAY[%s], ARRAY['physical_total','shop_sellable'],
+                       3600, %s)
+               ON CONFLICT (policy_ref) DO UPDATE SET enabled = EXCLUDED.enabled,
+                   owner_subject_id = EXCLUDED.owner_subject_id""",
+            (policy_ref, owner, self.POOL_REF, enabled))
+
+    def _commit(self, decisions, *, policy_ref: str = "inventory-monitor/1",
+                fingerprint: str | None = None, payload: dict | None = None,
+                observed_at: datetime | None = None) -> dict:
+        row = self.conn.execute(
+            "SELECT bi.commit_inventory_monitor_scan(%s, %s, %s, %s, %s, %s)",
+            (policy_ref, Jsonb(payload or self._alerts_payload()),
+             fingerprint or self.FINGERPRINT, self.OBSERVED, Jsonb(decisions),
+             observed_at or self.OBSERVED)).fetchone()
+        return row[0]
+
+    def _savepoint(self):
+        return self.conn.transaction()
+
+    def _key_counts(self, key: str, fingerprint: str) -> dict[str, int]:
+        return {
+            "runs": self.conn.execute(
+                "SELECT count(*) FROM bi.query_runs WHERE request_fingerprint = %s",
+                (fingerprint,)).fetchone()[0],
+            "artifacts": self.conn.execute(
+                "SELECT count(*) FROM bi.query_artifacts a JOIN bi.query_runs r "
+                "ON r.id = a.run_id WHERE r.request_fingerprint = %s",
+                (fingerprint,)).fetchone()[0],
+            "alerts": self.conn.execute(
+                "SELECT count(*) FROM bi.inventory_alert_instances "
+                "WHERE dedupe_key = %s", (key,)).fetchone()[0],
+            "events": self.conn.execute(
+                "SELECT count(*) FROM bi.inventory_alert_events e "
+                "JOIN bi.inventory_alert_instances a ON a.alert_ref = e.alert_ref "
+                "WHERE a.dedupe_key = %s", (key,)).fetchone()[0],
+            "outbox": self.conn.execute(
+                "SELECT count(*) FROM bi.notification_outbox o "
+                "JOIN bi.inventory_alert_instances a ON a.alert_ref = o.alert_ref "
+                "WHERE a.dedupe_key = %s", (key,)).fetchone()[0],
+        }
+
+    # -- 迁移编号、幂等与形状 -------------------------------------------------
+
+    def test_023_is_the_next_numbered_migration_after_022(self):
+        from pathlib import Path
+
+        sql_dir = Path(__file__).parents[1] / "sql"
+        files = sorted(path.name for path in sql_dir.glob("*.sql"))
+        self.assertIn(self.MIGRATION, files)
+        self.assertGreater(files.index(self.MIGRATION),
+                           files.index("022_isolated_analysis_artifacts.sql"))
+        self.assertEqual([name for name in files if name.startswith("023")],
+                         [self.MIGRATION], "同一编号不能有两份迁移")
+
+    def test_replaying_023_is_idempotent(self):
+        self.conn.execute(self._migration_sql())   # 第二次重放必须原样通过
+        objects = self.conn.execute(
+            """SELECT table_name FROM information_schema.tables
+               WHERE table_schema='bi' AND table_name IN
+                     ('inventory_monitor_policies', 'inventory_alert_instances',
+                      'inventory_alert_events', 'notification_outbox',
+                      'in_app_notifications')
+               UNION ALL
+               SELECT table_name FROM information_schema.views
+               WHERE table_schema='reporting'
+                     AND table_name='v_inventory_notifications'
+               ORDER BY 1""").fetchall()
+        self.assertEqual([row[0] for row in objects], [
+            "in_app_notifications", "inventory_alert_events",
+            "inventory_alert_instances", "inventory_monitor_policies",
+            "notification_outbox", "v_inventory_notifications"])
+        roles = dict(self.conn.execute(
+            """SELECT rolname, rolcanlogin FROM pg_roles
+               WHERE rolname IN ('bi_monitor', 'bi_app', 'bi_approver')""").fetchall())
+        self.assertFalse(roles["bi_monitor"],
+                         "监控身份必须是 NOLOGIN：它只能经独立 DSN 的会话使用")
+        self.assertTrue(roles["bi_app"])
+        chat = self.conn.execute(
+            """SELECT subject_id, title FROM bi.app_chats WHERE id = %s""",
+            (self.SERVICE_CHAT,)).fetchone()
+        self.assertEqual(chat, (self.SERVICE_SUBJECT, "库存监控服务运行"))
+        message = self.conn.execute(
+            "SELECT chat_id, role FROM bi.app_messages WHERE id = %s",
+            (self.SERVICE_MESSAGE,)).fetchone()
+        self.assertEqual((str(message[0]), message[1]),
+                         (self.SERVICE_CHAT, "user"))
+
+    def test_exact_shapes_are_frozen(self):
+        columns = dict(self.conn.execute(
+            """SELECT table_name, array_agg(column_name::text ORDER BY column_name)
+               FROM information_schema.columns
+               WHERE table_schema='bi' AND table_name IN
+                     ('inventory_monitor_policies', 'inventory_alert_instances',
+                      'inventory_alert_events', 'notification_outbox',
+                      'in_app_notifications')
+               GROUP BY table_name""").fetchall())
+        self.assertEqual(columns["inventory_monitor_policies"], [
+            "cooldown_seconds", "created_at", "enabled", "inventory_pool_refs",
+            "levels", "owner_subject_id", "policy_ref", "shop_refs",
+            "threshold_policy_ref"])
+        self.assertEqual(columns["inventory_alert_instances"], [
+            "acknowledged_at", "acknowledged_by", "alert_ref", "dedupe_key",
+            "generation", "last_notified_at", "last_observed_at", "level",
+            "opened_at", "policy_ref", "resolved_at", "rule_code",
+            "scope_ref", "sku_ref", "source_artifact_id", "status"])
+        self.assertEqual(columns["inventory_alert_events"], [
+            "alert_ref", "created_at", "event_kind", "id", "idempotency_key",
+            "next_status", "previous_status", "source_artifact_id"])
+        self.assertEqual(columns["notification_outbox"], [
+            "alert_ref", "attempts", "available_at", "delivered_at", "event_id",
+            "id", "idempotency_key", "owner_subject_id", "payload", "topic"])
+        self.assertEqual(columns["in_app_notifications"], [
+            "alert_ref", "created_at", "event_kind", "idempotency_key",
+            "notification_ref", "owner_subject_id", "payload", "read_at"])
+        index = self.conn.execute(
+            """SELECT indexdef FROM pg_indexes
+               WHERE schemaname='bi' AND indexname='inventory_one_active_alert_idx'""").fetchone()[0]
+        self.assertIn("dedupe_key", index)
+        self.assertIn("WHERE", index)
+        for status in ("open", "acknowledged"):
+            self.assertIn(f"'{status}'", index)
+        check = self.conn.execute(
+            """SELECT pg_get_constraintdef(oid) FROM pg_constraint
+               WHERE conrelid = 'bi.notification_outbox'::regclass
+                 AND contype = 'c'""").fetchall()
+        self.assertTrue(any("inventory_notification_payload_safe" in row[0]
+                            for row in check), check)
+        functions = dict(self.conn.execute(
+            """SELECT p.proname, prosecdef::text || '|' || coalesce(proconfig[1], '')
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname = 'bi' AND p.proname IN
+                     ('commit_inventory_monitor_scan', 'deliver_inventory_outbox',
+                      'mark_inventory_notification_read',
+                      'acknowledge_inventory_alert',
+                      'inventory_notification_payload_safe')""").fetchall())
+        for name in ("commit_inventory_monitor_scan", "deliver_inventory_outbox",
+                     "mark_inventory_notification_read",
+                     "acknowledge_inventory_alert"):
+            self.assertEqual(functions[name], "true|search_path=pg_catalog, bi",
+                             name)
+        # 载荷 validator 是 IMMUTABLE：CHECK 与函数内校验共用同一份不可变判定。
+        volatility = self.conn.execute(
+            """SELECT provolatile FROM pg_proc p
+               JOIN pg_namespace n ON n.oid = p.pronamespace
+               WHERE n.nspname='bi'
+                 AND p.proname='inventory_notification_payload_safe'""").fetchone()[0]
+        self.assertEqual(volatility, "i")
+
+    def test_notification_payload_safety_holds_at_every_depth(self):
+        forbidden = ("shop_id", "pool_id", "warehouse_id", "erp_sku_id",
+                     "subject_id", "dsn", "evidence", "scan_evidence")
+        safe = json.dumps({"alert_ref": "alert-x", "rows": [{"quantity": "1"}]})
+        self.assertTrue(self.conn.execute(
+            "SELECT bi.inventory_notification_payload_safe(%s::jsonb)",
+            (safe,)).fetchone()[0])
+        for key in forbidden:
+            for depth in range(4):
+                node = {key: "x"}   # 禁键必须是"键"：作为值出现不构成泄漏
+                for _ in range(depth):
+                    node = {"nested": node}   # 逐层包深：数组与对象都不得漏
+                poisoned = json.dumps({"payload": node})
+                with self.subTest(key=key, depth=depth):
+                    self.assertFalse(self.conn.execute(
+                        "SELECT bi.inventory_notification_payload_safe(%s::jsonb)",
+                        (poisoned,)).fetchone()[0])
+                array_poisoned = json.dumps({"rows": [{"cells": [node]}]})
+                self.assertFalse(self.conn.execute(
+                    "SELECT bi.inventory_notification_payload_safe(%s::jsonb)",
+                    (array_poisoned,)).fetchone()[0])
+
+    # -- bi_monitor / bi_app 权限矩阵 ----------------------------------------
+
+    def test_bi_monitor_privilege_matrix(self):
+        privileges = self.conn.execute(
+            """SELECT
+                   has_table_privilege('bi_monitor',
+                       'bi.inventory_monitor_policies', 'SELECT'),
+                   has_table_privilege('bi_monitor',
+                       'bi.inventory_alert_instances', 'INSERT'),
+                   has_table_privilege('bi_monitor',
+                       'bi.inventory_alert_instances', 'SELECT'),
+                   has_table_privilege('bi_monitor',
+                       'bi.inventory_alert_events', 'INSERT'),
+                   has_table_privilege('bi_monitor',
+                       'bi.notification_outbox', 'INSERT'),
+                   has_table_privilege('bi_monitor',
+                       'bi.in_app_notifications', 'UPDATE'),
+                   has_table_privilege('bi_monitor', 'bi.query_runs', 'INSERT'),
+                   has_table_privilege('bi_monitor', 'bi.app_messages', 'SELECT'),
+                   has_table_privilege('bi_monitor',
+                       'bi.physical_stock_items', 'SELECT'),
+                   has_function_privilege('bi_monitor', %s, 'EXECUTE'),
+                   has_function_privilege('bi_monitor', %s, 'EXECUTE'),
+                   has_function_privilege('bi_monitor', %s, 'EXECUTE'),
+                   has_function_privilege('bi_monitor', %s, 'EXECUTE'),
+                   has_schema_privilege('bi_monitor', 'bi', 'USAGE'),
+                   has_schema_privilege('bi_monitor', 'reporting', 'USAGE')
+               """, (self.COMMIT_FUNCTION, self.DELIVER_FUNCTION,
+                    self.READ_FUNCTION, self.ACK_FUNCTION)).fetchone()
+        self.assertEqual(privileges, (
+            True,    # 策略可读：CLI 每轮加载已批准策略
+            False, False, False, False, False,   # 告警/事件/outbox/通知零直接写读
+            False,   # 不给 runtime 运行面任何直接写
+            False,   # 聊天底表不可读
+            False,   # 库存底表不可读
+            True, True,   # commit/deliver 两函数
+            False, False,  # read/ack 两函数只属于 bi_app
+            True, True), privileges)
+        inventory_views = (
+            "reporting.v_inventory_pools", "reporting.v_inventory_pool_shops",
+            "reporting.v_physical_stock_snapshots", "reporting.v_physical_stock_items",
+            "reporting.v_channel_stock_snapshots", "reporting.v_channel_stock_items",
+            "reporting.v_inventory_threshold_policies", "reporting.v_shops",
+            "reporting.v_catalog_version")
+        for view in inventory_views:
+            with self.subTest(view=view):
+                self.assertTrue(self.conn.execute(
+                    "SELECT has_table_privilege('bi_monitor', %s, 'SELECT')",
+                    (view,)).fetchone()[0])
+        self.assertFalse(self.conn.execute(
+            "SELECT has_table_privilege('bi_monitor', 'reporting.v_payments', 'SELECT')"
+        ).fetchone()[0])
+
+    def test_bi_monitor_denials_are_enforced_by_the_role(self):
+        self._seed_policy()
+        self.conn.execute("SET LOCAL ROLE bi_monitor")
+        denials = (
+            "SELECT count(*) FROM bi.app_messages",
+            "SELECT count(*) FROM bi.physical_stock_items",
+            "INSERT INTO bi.inventory_alert_instances (alert_ref, dedupe_key, "
+            "generation, policy_ref, rule_code, level, sku_ref, scope_ref, status, "
+            "source_artifact_id, opened_at, last_observed_at) "
+            "VALUES ('alert-x', '%s', 1, 'inventory-monitor/1', 'low_replenish', "
+            "'physical_total', 'ent-00000000', 's', 'open', "
+            "'00000000-0000-0000-0000-000000000000', now(), now())" % self.DEDUPE_KEY,
+            "INSERT INTO bi.notification_outbox (topic, owner_subject_id, alert_ref, "
+            "event_id, idempotency_key, payload) VALUES ('inventory_alert', 'o', "
+            "'alert-x', 1, 'k', '{}')",
+            "UPDATE bi.in_app_notifications SET read_at = now()",
+            "SELECT count(*) FROM reporting.v_payments",
+        )
+        for statement in denials:
+            with self.subTest(sql=statement[:40]), \
+                    self.assertRaises(psycopg.errors.InsufficientPrivilege), \
+                    self.conn.transaction():
+                self.conn.execute(statement)
+        # 获准的读取面：库存视图与策略可读。
+        self.conn.execute("SELECT count(*) FROM reporting.v_inventory_pools")
+        self.conn.execute("SELECT count(*) FROM bi.inventory_monitor_policies")
+        self.conn.execute("RESET ROLE")
+
+    def test_bi_app_privilege_matrix(self):
+        privileges = self.conn.execute(
+            """SELECT
+                   has_table_privilege('bi_app',
+                       'bi.inventory_alert_instances', 'SELECT'),
+                   has_table_privilege('bi_app',
+                       'bi.notification_outbox', 'SELECT'),
+                   has_table_privilege('bi_app',
+                       'bi.in_app_notifications', 'SELECT'),
+                   has_table_privilege('bi_app',
+                       'reporting.v_inventory_notifications', 'SELECT'),
+                   has_function_privilege('bi_app', %s, 'EXECUTE'),
+                   has_function_privilege('bi_app', %s, 'EXECUTE'),
+                   has_function_privilege('bi_app', %s, 'EXECUTE'),
+                   has_function_privilege('bi_app', %s, 'EXECUTE')
+               """, (self.COMMIT_FUNCTION, self.DELIVER_FUNCTION,
+                    self.READ_FUNCTION, self.ACK_FUNCTION)).fetchone()
+        self.assertEqual(privileges, (
+            False, False, False,   # 告警/事件/outbox/通知底表零直接读
+            True,                   # owner 过滤的 API 投影可读
+            False, False, True, True), privileges)
+
+    # -- 提交函数：状态迁移、observed、outbox 规则、幂等与回滚 ------------------
+
+    def test_commit_creates_run_artifact_alert_event_and_outbox(self):
+        self._seed_policy()
+        result = self._commit([self._decision()])
+        self.assertEqual(result["attempt_no"], 1)
+        transitions = result["transitions"]
+        self.assertEqual([(t["previous_status"], t["next_status"],
+                           t["event_kind"], t["dedupe_key"]) for t in transitions],
+                         [(None, "open", "triggered", self.DEDUPE_KEY)])
+        run = self.conn.execute(
+            """SELECT domain, attempt_no, status, subject_id, chat_id, user_message_id,
+                      request_fingerprint FROM bi.query_runs
+               WHERE request_fingerprint = %s""",
+            (self.FINGERPRINT,)).fetchone()
+        self.assertEqual(run[0], "inventory_watch")
+        self.assertEqual((run[1], run[2], run[3]),
+                         (1, "succeeded", self.SERVICE_SUBJECT))
+        self.assertEqual((str(run[4]), str(run[5])),
+                         (self.SERVICE_CHAT, self.SERVICE_MESSAGE))
+        self.assertEqual(run[6], self.FINGERPRINT)
+        artifact = self.conn.execute(
+            """SELECT a.artifact_type, a.run_id = r.id FROM bi.query_artifacts a
+               JOIN bi.query_runs r ON r.id = a.run_id
+               WHERE r.request_fingerprint = %s""",
+            (self.FINGERPRINT,)).fetchone()
+        self.assertEqual(artifact[0], "inventory_alerts")
+        self.assertTrue(artifact[1])
+        alert = self.conn.execute(
+            """SELECT status, generation, level, sku_ref, scope_ref, rule_code,
+                      policy_ref, opened_at, last_observed_at, last_notified_at
+               FROM bi.inventory_alert_instances WHERE dedupe_key = %s""",
+            (self.DEDUPE_KEY,)).fetchone()
+        self.assertEqual((alert[0], alert[1], alert[2]),
+                         ("open", 1, "physical_total"))
+        self.assertEqual((alert[4], alert[5]), (self.SCOPE_REF, "low_replenish"))
+        self.assertEqual(alert[7], self.OBSERVED)
+        expected_key = hashlib.sha256(
+            f"{self.DEDUPE_KEY}:1:triggered:{self.FINGERPRINT}".encode()).hexdigest()
+        event = self.conn.execute(
+            """SELECT e.event_kind, e.previous_status, e.next_status,
+                      e.idempotency_key, e.source_artifact_id = a.source_artifact_id
+               FROM bi.inventory_alert_events e
+               JOIN bi.inventory_alert_instances a ON a.alert_ref = e.alert_ref
+               WHERE a.dedupe_key = %s""", (self.DEDUPE_KEY,)).fetchone()
+        self.assertEqual((event[0], event[1], event[2]),
+                         ("triggered", None, "open"))
+        self.assertEqual(event[3], expected_key)
+        self.assertTrue(event[4])
+        outbox = self.conn.execute(
+            """SELECT o.topic, o.owner_subject_id, o.idempotency_key, o.attempts,
+                      o.payload->>'quantity', o.payload->>'threshold',
+                      o.payload->>'unit', o.payload->>'scope_ref'
+               FROM bi.notification_outbox o
+               JOIN bi.inventory_alert_instances a ON a.alert_ref = o.alert_ref
+               WHERE a.dedupe_key = %s""", (self.DEDUPE_KEY,)).fetchone()
+        self.assertEqual(outbox[0], "inventory_alert")
+        self.assertEqual(outbox[1], "owner-subject")
+        self.assertEqual((outbox[2], outbox[3]), (expected_key, 0))
+        self.assertEqual((outbox[4], outbox[5], outbox[6], outbox[7]),
+                         ("10", "10", "piece", self.SCOPE_REF))
+
+    def test_commit_rejects_unsafe_payload_and_malformed_decisions(self):
+        self._seed_policy()
+        baseline = {"runs": 0}
+        poisoned_payload = self._alerts_payload()
+        poisoned_payload["inventory"]["pools"][0]["scan_evidence"] = "raw"
+        cases = (
+            ("monitor_source_payload_unsafe", [self._decision()],
+             dict(payload=poisoned_payload)),
+            ("monitor_source_payload_unsafe", [self._decision()],
+             dict(fingerprint="not-a-fingerprint")),
+            ("monitor_invalid_decision", [{k: v for k, v in self._decision().items()
+                                           if k != "observed"}], {}),
+            ("monitor_invalid_decision", [self._decision(event_kind="escalated")], {}),
+            ("monitor_invalid_decision", [self._decision(notify="yes")], {}),
+            ("monitor_invalid_decision",
+             [self._decision(), self._decision()], {}),   # 同一键两次
+            ("monitor_invalid_decision", [self._decision(dedupe_key="XYZ")], {}),
+            ("monitor_invalid_decision", [self._decision(observed=False)], {}),
+            ("monitor_invalid_decision", [self._decision(event_kind="updated",
+                                                         notify=True,
+                                                         previous_status="open",
+                                                         next_status="open")], {}),
+            ("monitor_policy_not_found", [self._decision()],
+             dict(policy_ref="inventory-monitor/404")),
+        )
+        for code, decisions, kwargs in cases:
+            with self.subTest(code=code), \
+                    self.assertRaisesRegex(psycopg.errors.RaiseException, code), \
+                    self._savepoint():
+                self._commit(decisions, **kwargs)
+        self.conn.execute("SAVEPOINT budget_probe")
+        budget = [self._decision(dedupe_key=hashlib.sha256(
+            str(i).encode()).hexdigest()) for i in range(501)]
+        with self.assertRaisesRegex(psycopg.errors.RaiseException,
+                                    "monitor_decision_budget_exceeded"):
+            self._commit(budget)
+        self.conn.execute("ROLLBACK TO SAVEPOINT budget_probe")
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.query_runs WHERE request_fingerprint = %s",
+            (self.FINGERPRINT,)).fetchone()[0], baseline["runs"])
+
+    def test_commit_rejects_disabled_policy(self):
+        self._seed_policy(enabled=False)
+        with self.assertRaisesRegex(psycopg.errors.RaiseException,
+                                    "monitor_policy_disabled"):
+            self._commit([self._decision()])
+
+    def test_commit_enforces_stored_state_transitions_and_generations(self):
+        self._seed_policy()
+        self._commit([self._decision()])   # gen1 open
+        resolved_fingerprint = hashlib.sha256(b"resolved-source").hexdigest()
+        self._commit([self._decision(event_kind="resolved", previous_status="open",
+                                     next_status="resolved", quantity="11")],
+                     fingerprint=resolved_fingerprint, observed_at=self.LATER)
+        status = self.conn.execute(
+            "SELECT status FROM bi.inventory_alert_instances WHERE dedupe_key = %s",
+            (self.DEDUPE_KEY,)).fetchone()[0]
+        self.assertEqual(status, "resolved")
+        cases = (
+            # 同代际重开：generation 必须推进到 2（换一份指纹，避开崩溃重放的
+            # 幂等跳过：同键/同代际/同事件种类/同指纹的事件已存在时按重放处理）
+            ("monitor_invalid_transition", [self._decision()],
+             dict(fingerprint=hashlib.sha256(b"invalid-reopen").hexdigest())),
+            ("monitor_invalid_transition",
+             [self._decision(generation=3)],
+             dict(fingerprint=hashlib.sha256(b"invalid-gen3").hexdigest())),
+            ("monitor_invalid_transition",
+             [self._decision(generation=2, event_kind="updated",
+                             previous_status="open", next_status="open",
+                             notify=False)],
+             dict(fingerprint=hashlib.sha256(b"invalid-updated").hexdigest())),
+            # 无活跃告警时的 updated/resolved：没有可保留或可解除的对象
+            ("monitor_invalid_transition",
+             [self._decision(dedupe_key=hashlib.sha256(b"new").hexdigest(),
+                             event_kind="updated", previous_status="open",
+                             next_status="open", notify=False)], {}),
+        )
+        for code, decisions, kwargs in cases:
+            with self.subTest(code=code), \
+                    self.assertRaisesRegex(psycopg.errors.RaiseException, code), \
+                    self._savepoint():
+                self._commit(decisions, **kwargs)
+        # 正确的第二代：resolved 之后再下降 → 新 generation，而不是复活旧行。
+        result = self._commit([self._decision(generation=2)],
+                              fingerprint=hashlib.sha256(b"gen2").hexdigest(),
+                              observed_at=self.LATER)
+        alerts = self.conn.execute(
+            """SELECT generation, status FROM bi.inventory_alert_instances
+               WHERE dedupe_key = %s ORDER BY generation""",
+            (self.DEDUPE_KEY,)).fetchall()
+        self.assertEqual(alerts, [(1, "resolved"), (2, "open")])
+        self.assertEqual(len(result["transitions"]), 1)
+
+    def test_observed_flag_controls_last_observed_at(self):
+        self._seed_policy()
+        self._commit([self._decision()])   # last_observed_at = OBSERVED
+        self._commit([self._decision(event_kind="updated", previous_status="open",
+                                     next_status="open", notify=False,
+                                     observed=False)],
+                     fingerprint=hashlib.sha256(b"stale-source").hexdigest(),
+                     observed_at=self.LATER)
+        kept = self.conn.execute(
+            "SELECT last_observed_at FROM bi.inventory_alert_instances "
+            "WHERE dedupe_key = %s", (self.DEDUPE_KEY,)).fetchone()[0]
+        self.assertEqual(kept, self.OBSERVED,
+                         "缺扫描/退场保留不得把'没看到'记成'刚看到'")
+        later_fingerprint = hashlib.sha256(b"later-source").hexdigest()
+        self._commit([self._decision(event_kind="updated", previous_status="open",
+                                     next_status="open", notify=False,
+                                     observed=True)],
+                     fingerprint=later_fingerprint, observed_at=self.LATER)
+        advanced = self.conn.execute(
+            "SELECT last_observed_at FROM bi.inventory_alert_instances "
+            "WHERE dedupe_key = %s", (self.DEDUPE_KEY,)).fetchone()[0]
+        self.assertEqual(advanced, self.LATER)
+
+    def test_outbox_is_written_only_for_triggered_retriggered_resolved(self):
+        self._seed_policy()
+        self._commit([self._decision()])
+        updated_fp = hashlib.sha256(b"updated").hexdigest()
+        self._commit([self._decision(event_kind="updated", previous_status="open",
+                                     next_status="open", notify=False,
+                                     observed=True)],
+                     fingerprint=updated_fp, observed_at=self.LATER)
+        suppressed_fp = hashlib.sha256(b"suppressed").hexdigest()
+        self._commit([self._decision(event_kind="updated", previous_status="open",
+                                     next_status="suppressed", notify=False,
+                                     observed=False)],
+                     fingerprint=suppressed_fp, observed_at=self.LATER)
+        kinds = self.conn.execute(
+            """SELECT e.event_kind FROM bi.inventory_alert_events e
+               JOIN bi.inventory_alert_instances a ON a.alert_ref = e.alert_ref
+               WHERE a.dedupe_key = %s ORDER BY e.event_kind""",
+            (self.DEDUPE_KEY,)).fetchall()
+        self.assertEqual([row[0] for row in kinds],
+                         ["triggered", "updated", "updated"])
+        outbox = self.conn.execute(
+            """SELECT count(*) FROM bi.notification_outbox o
+               JOIN bi.inventory_alert_instances a ON a.alert_ref = o.alert_ref
+               WHERE a.dedupe_key = %s""", (self.DEDUPE_KEY,)).fetchone()[0]
+        self.assertEqual(outbox, 1, "updated/suppressed 是审计事件，不是通知")
+        self.assertEqual(self.conn.execute(
+            "SELECT status FROM bi.inventory_alert_instances "
+            "WHERE dedupe_key = %s", (self.DEDUPE_KEY,)).fetchone()[0],
+            "suppressed")
+
+    def test_commit_replay_is_idempotent(self):
+        """崩溃重放：同键/同代际/同事件种类/同指纹的决策只算一次首发。"""
+        self._seed_policy()
+        self._commit([self._decision()])
+        self._commit([self._decision()],
+                     fingerprint=self.FINGERPRINT,   # 同一指纹的整批重试
+                     observed_at=self.LATER)
+        counts = self._key_counts(self.DEDUPE_KEY, self.FINGERPRINT)
+        self.assertEqual(counts["alerts"], 1)
+        self.assertEqual(counts["events"], 1, "同一事实重复扫描只算一次首发")
+        self.assertEqual(counts["outbox"], 1)
+
+    def test_acknowledge_inventory_alert_owner_and_status_rules(self):
+        self._seed_policy()
+        self._commit([self._decision()])
+        alert_ref = self.conn.execute(
+            "SELECT alert_ref FROM bi.inventory_alert_instances "
+            "WHERE dedupe_key = %s", (self.DEDUPE_KEY,)).fetchone()[0]
+        first = self.conn.execute(
+            "SELECT bi.acknowledge_inventory_alert(%s, 'owner-subject')",
+            (alert_ref,)).fetchone()[0]
+        self.assertEqual(first["status"], "acknowledged")
+        second = self.conn.execute(
+            "SELECT bi.acknowledge_inventory_alert(%s, 'owner-subject')",
+            (alert_ref,)).fetchone()[0]
+        self.assertEqual(second, first, "重复确认幂等：不翻新 acknowledged_at")
+        row = self.conn.execute(
+            "SELECT acknowledged_by, acknowledged_at IS NOT NULL, status "
+            "FROM bi.inventory_alert_instances WHERE alert_ref = %s",
+            (alert_ref,)).fetchone()
+        self.assertEqual((row[0], row[1], row[2]),
+                         ("owner-subject", True, "acknowledged"))
+        for actor, code in (("other-subject", "inventory_alert_not_found"),
+                            (None, None)):
+            if actor is None:
+                with self.subTest(actor=actor), \
+                        self.assertRaisesRegex(psycopg.errors.RaiseException,
+                                               "inventory_alert_not_found"), \
+                        self._savepoint():
+                    self.conn.execute(
+                        "SELECT bi.acknowledge_inventory_alert(%s, %s)",
+                        ("alert-missing", "owner-subject"))
+                continue
+            with self.subTest(actor=actor), \
+                    self.assertRaisesRegex(psycopg.errors.RaiseException, code), \
+                    self._savepoint():
+                self.conn.execute(
+                    "SELECT bi.acknowledge_inventory_alert(%s, %s)",
+                    (alert_ref, actor))
+        resolved_fp = hashlib.sha256(b"resolved").hexdigest()
+        self._commit([self._decision(event_kind="resolved",
+                                     previous_status="acknowledged",
+                                     next_status="resolved", quantity="11")],
+                     fingerprint=resolved_fp, observed_at=self.LATER)
+        with self.assertRaisesRegex(psycopg.errors.RaiseException,
+                                    "inventory_alert_not_acknowledgeable"), \
+                self._savepoint():
+            self.conn.execute(
+                "SELECT bi.acknowledge_inventory_alert(%s, 'owner-subject')",
+                (alert_ref,))
+
+    def test_mark_inventory_notification_read_owner_rules(self):
+        self._seed_policy()
+        self._commit([self._decision()])
+        self.conn.execute("SELECT bi.deliver_inventory_outbox(%s, 100)",
+                          (self.OBSERVED,))
+        notification = self.conn.execute(
+            "SELECT notification_ref, owner_subject_id FROM bi.in_app_notifications"
+        ).fetchone()
+        self.assertEqual(notification[1], "owner-subject")
+        first = self.conn.execute(
+            "SELECT bi.mark_inventory_notification_read(%s, 'owner-subject')",
+            (notification[0],)).fetchone()[0]
+        self.assertIsNotNone(first["read_at"])
+        second = self.conn.execute(
+            "SELECT bi.mark_inventory_notification_read(%s, 'owner-subject')",
+            (notification[0],)).fetchone()[0]
+        self.assertEqual(second["read_at"], first["read_at"],
+                         "重复已读幂等：保留第一次已读时间")
+        for ref, actor in ((notification[0], "other-subject"),
+                           ("ntf-missing", "owner-subject")):
+            with self.subTest(actor=actor, ref=ref != notification[0]), \
+                    self.assertRaisesRegex(psycopg.errors.RaiseException,
+                                           "inventory_notification_not_found"), \
+                    self._savepoint():
+                self.conn.execute(
+                    "SELECT bi.mark_inventory_notification_read(%s, %s)",
+                    (ref, actor))
+
+    def test_delivery_is_at_least_once_with_exactly_one_notification(self):
+        self._seed_policy()
+        self._commit([self._decision()])
+        summary = self.conn.execute(
+            "SELECT bi.deliver_inventory_outbox(%s, 100)",
+            (self.OBSERVED,)).fetchone()[0]
+        self.assertEqual(summary, {"selected": 1, "delivered": 1, "retried": 0,
+                                   "dead_lettered": 0})
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.in_app_notifications").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.notification_outbox WHERE delivered_at IS NULL"
+        ).fetchone()[0], 0)
+        summary = self.conn.execute(
+            "SELECT bi.deliver_inventory_outbox(%s, 100)",
+            (self.LATER,)).fetchone()[0]
+        self.assertEqual(summary["selected"], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.in_app_notifications").fetchone()[0], 1)
+        # 崩溃重放：通知插入成功而 outbox 状态未推进 → 重投递恰好补出同一份。
+        self.conn.execute(
+            "DELETE FROM bi.in_app_notifications")
+        self.conn.execute(
+            "UPDATE bi.notification_outbox SET delivered_at = NULL")
+        summary = self.conn.execute(
+            "SELECT bi.deliver_inventory_outbox(%s, 100)",
+            (self.LATER,)).fetchone()[0]
+        self.assertEqual(summary["delivered"], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*), count(DISTINCT idempotency_key) "
+            "FROM bi.in_app_notifications").fetchone(), (1, 1))
+
+    def test_delivery_failure_backs_off_a_single_row(self):
+        self._seed_policy()
+        self._commit([self._decision()])
+        self.conn.execute(
+            """CREATE FUNCTION bi.m023_inject_delivery_failure() RETURNS trigger
+               LANGUAGE plpgsql AS $fn$ BEGIN
+                 RAISE EXCEPTION 'injected_delivery_failure';
+               END $fn$""")
+        self.conn.execute(
+            """CREATE TRIGGER m023_delivery_failure
+               BEFORE INSERT ON bi.in_app_notifications
+               FOR EACH ROW EXECUTE FUNCTION bi.m023_inject_delivery_failure()""")
+        summary = self.conn.execute(
+            "SELECT bi.deliver_inventory_outbox(%s, 100)",
+            (self.OBSERVED,)).fetchone()[0]
+        self.assertEqual(summary, {"selected": 1, "delivered": 0, "retried": 1,
+                                   "dead_lettered": 0})
+        row = self.conn.execute(
+            """SELECT attempts, delivered_at, available_at > %s
+               FROM bi.notification_outbox""", (self.OBSERVED,)).fetchone()
+        self.assertEqual((row[0], row[1], row[2]), (1, None, True))
+        self.conn.execute("DROP TRIGGER m023_delivery_failure "
+                          "ON bi.in_app_notifications")
+        self.conn.execute("DROP FUNCTION bi.m023_inject_delivery_failure()")
+        summary = self.conn.execute(
+            "SELECT bi.deliver_inventory_outbox(%s, 100)",
+            (self.OBSERVED + timedelta(hours=1),)).fetchone()[0]
+        self.assertEqual(summary["delivered"], 1)
+
+    def test_delivery_dead_letters_after_twenty_attempts(self):
+        self._seed_policy()
+        self._commit([self._decision()])
+        self.conn.execute(
+            "UPDATE bi.notification_outbox SET attempts = 19")
+        self.conn.execute(
+            """CREATE FUNCTION bi.m023_inject_delivery_failure() RETURNS trigger
+               LANGUAGE plpgsql AS $fn$ BEGIN
+                 RAISE EXCEPTION 'injected_delivery_failure';
+               END $fn$""")
+        self.conn.execute(
+            """CREATE TRIGGER m023_delivery_failure
+               BEFORE INSERT ON bi.in_app_notifications
+               FOR EACH ROW EXECUTE FUNCTION bi.m023_inject_delivery_failure()""")
+        summary = self.conn.execute(
+            "SELECT bi.deliver_inventory_outbox(%s, 100)",
+            (self.OBSERVED,)).fetchone()[0]
+        self.assertEqual(summary["dead_lettered"], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT attempts, delivered_at FROM bi.notification_outbox"
+        ).fetchone(), (20, None))
+
+    def test_outbox_write_failure_rolls_back_the_whole_commit(self):
+        self._seed_policy()
+        self.conn.execute(
+            """CREATE FUNCTION bi.m023_inject_outbox_failure() RETURNS trigger
+               LANGUAGE plpgsql AS $fn$ BEGIN
+                 RAISE EXCEPTION 'injected_outbox_failure';
+               END $fn$""")
+        self.conn.execute(
+            """CREATE TRIGGER m023_outbox_failure
+               BEFORE INSERT ON bi.notification_outbox
+               FOR EACH ROW EXECUTE FUNCTION bi.m023_inject_outbox_failure()""")
+        with self.assertRaisesRegex(psycopg.errors.RaiseException,
+                                    "monitor_outbox_write_failed"), \
+                self._savepoint():
+            self._commit([self._decision()])
+        self.assertEqual(self._key_counts(self.DEDUPE_KEY, self.FINGERPRINT),
+                         {"runs": 0, "artifacts": 0, "alerts": 0, "events": 0,
+                          "outbox": 0},
+                         "任一步失败：运行、来源、告警、事件、outbox 整批回滚")
+
+    def test_partial_unique_index_backstops_one_active_alert_per_key(self):
+        self._seed_policy()
+        self._commit([self._decision()])
+        run_id, artifact_id = self.conn.execute(
+            """SELECT r.id, a.id FROM bi.query_runs r
+               JOIN bi.query_artifacts a ON a.run_id = r.id
+               WHERE r.request_fingerprint = %s""",
+            (self.FINGERPRINT,)).fetchone()
+        with self.assertRaises(psycopg.errors.UniqueViolation), self._savepoint():
+            self.conn.execute(
+                    """INSERT INTO bi.inventory_alert_instances (
+                           alert_ref, dedupe_key, generation, policy_ref,
+                           rule_code, level, sku_ref, scope_ref, status,
+                           source_artifact_id, opened_at, last_observed_at)
+                       VALUES ('alert-dup', %s, 2, 'inventory-monitor/1',
+                               'low_replenish', 'physical_total', %s, %s,
+                               'open', %s, now(), now())""",
+                    (self.DEDUPE_KEY, self._sku_ref("SKU1"), self.SCOPE_REF,
+                     artifact_id))
+
+    def test_repository_commits_one_scan_against_the_real_database(self):
+        from bi_agent.catalog import ref_for_key
+        from bi_agent.catalog.models import EntityKind
+        from bi_agent.monitoring.models import (AlertDecision, MonitorAlertRow,
+                                                MonitorScan)
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        self._seed_policy()
+        sku_ref = ref_for_key(EntityKind.SKU.value, "SKU1")
+        row = MonitorAlertRow(level="physical_total", status="low",
+                              sku_ref=sku_ref, scope_ref=self.SCOPE_REF,
+                              quantity="10", threshold="10", unit="piece")
+        scan = MonitorScan(
+            policy_ref="inventory-monitor/1",
+            source_artifact_payload=self._alerts_payload(),
+            source_fingerprint=self.FINGERPRINT, data_as_of=self.OBSERVED,
+            fresh=True, complete_levels=("physical_total",), rows=(row,),
+            diagnostics=())
+        decision = AlertDecision(
+            dedupe_key=self.DEDUPE_KEY, generation=1, previous_status=None,
+            next_status="open", event_kind="triggered", notify=True,
+            observed=True, rule_code="low_replenish", level="physical_total",
+            sku_ref=sku_ref, scope_ref=self.SCOPE_REF)
+        repository = MonitorRepository(self.conn)
+        policy = repository.load_policy("inventory-monitor/1")
+        self.assertEqual(policy.owner_subject_id, "owner-subject")
+        self.assertEqual(repository.load_active_alerts("inventory-monitor/1"), ())
+        transitions = repository.commit_scan(scan, (decision,), now=self.OBSERVED)
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual((transitions[0].previous_status, transitions[0].next_status,
+                          transitions[0].event_kind),
+                         (None, "open", "triggered"))
+        self.assertEqual(transitions[0].source_artifact_ref,
+                         str(self.conn.execute(
+                             "SELECT source_artifact_id FROM "
+                             "bi.inventory_alert_instances WHERE dedupe_key = %s",
+                             (self.DEDUPE_KEY,)).fetchone()[0]))
+        active = repository.load_active_alerts("inventory-monitor/1")
+        self.assertEqual([alert.status for alert in active], ["open"])
+        self.assertEqual([alert.dedupe_key for alert in active], [self.DEDUPE_KEY])
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class InventoryMonitorConcurrencyTests(unittest.TestCase):
+    """计划 Task 2 Step 5 的并发证据：per-key advisory xact lock 串行化同键提交。
+
+    本类**不申请外层事务、也不在用例内应用 023**：外层事务里的迁移 DDL/授权
+    锁会持续到事务结束，第二个连接对监控表的任何写入都会等到那时（锁冲突已
+    由独立探针证明，非猜测）；因此全部读写都走显式提交的连接，只依赖已提交
+    到本机测试库的 023——缺已提交迁移时 skip 并报出原因，绝不在用例里提交
+    DDL。产生的行在本用例内清理，共享测试库只保留 023 自身的结构。
+    """
+
+    MIGRATION_TESTS = InventoryMonitorMigrationTests
+
+    def setUp(self):
+        self.dsn = os.environ["BI_TEST_ADMIN_DSN"]
+        probe = psycopg.connect(self.dsn, autocommit=True)
+        try:
+            # 与 connect_test_db 同一守卫：只允许本机 *_test 库，否则当场失败。
+            if not probe.info.dbname.endswith("_test") or \
+                    (probe.info.host or "") not in LOCAL_HOSTS:
+                self.fail("并发用例必须连接本机 *_test 数据库")
+            probe.execute("SET statement_timeout = '5s'")
+            present = probe.execute(
+                "SELECT to_regprocedure(%s)",
+                (self.MIGRATION_TESTS.COMMIT_FUNCTION,)).fetchone()[0]
+        finally:
+            probe.close()
+        if present is None:
+            self.skipTest("023 尚未提交到本机测试库（仅在事务内应用过）")
+
+    def test_advisory_lock_serializes_the_same_dedupe_key(self):
+        tests = self.MIGRATION_TESTS
+        # 迁移用例类的实例只当夹具用：OBSERVED/FINGERPRINT/载荷与决策构造器都
+        # 是同一份常量与形状，避免两处手抄后漂移。
+        fixture = tests("test_023_is_the_next_numbered_migration_after_022")
+        key = fixture.DEDUPE_KEY
+        first = psycopg.connect(self.dsn, autocommit=True)
+        first.execute("SET statement_timeout = '10s'")
+        locker = psycopg.connect(self.dsn)
+        second = psycopg.connect(self.dsn)
+        try:
+            # 已提交的策略行：commit 函数必须能读到它，才会走到 per-key 锁。
+            first.execute(
+                """INSERT INTO bi.inventory_monitor_policies (
+                       policy_ref, threshold_policy_ref, owner_subject_id, shop_refs,
+                       inventory_pool_refs, levels, cooldown_seconds, enabled)
+                   VALUES ('inventory-monitor/1', 'inventory-thresholds/1',
+                           'owner-subject', ARRAY['shop-a'], ARRAY[%s],
+                           ARRAY['physical_total','shop_sellable'], 3600, true)
+                   ON CONFLICT (policy_ref) DO UPDATE SET enabled = true""",
+                (fixture.POOL_REF,))
+            decision = fixture._decision()
+            locker.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                           (key,))
+            second.execute("SET LOCAL lock_timeout = '400ms'")
+            with self.assertRaises(psycopg.errors.LockNotAvailable):
+                second.execute(
+                    "SELECT bi.commit_inventory_monitor_scan("
+                    "%s, %s, %s, %s, %s, %s)",
+                    ("inventory-monitor/1", Jsonb(fixture._alerts_payload()),
+                     fixture.FINGERPRINT, fixture.OBSERVED, Jsonb([decision]),
+                     fixture.OBSERVED)).fetchone()
+            second.rollback()   # 败者整批回滚：零 run/artifact/告警/事件/outbox
+            locker.rollback()   # 释放 per-key 锁
+            result = second.execute(
+                "SELECT bi.commit_inventory_monitor_scan(%s, %s, %s, %s, %s, %s)",
+                ("inventory-monitor/1", Jsonb(fixture._alerts_payload()),
+                 fixture.FINGERPRINT, fixture.OBSERVED, Jsonb([decision]),
+                 fixture.OBSERVED)).fetchone()[0]
+            second.commit()
+            self.assertEqual(result["transitions"][0]["next_status"], "open")
+            committed = second.execute(
+                """SELECT count(*), count(DISTINCT status)
+                     FROM bi.inventory_alert_instances
+                    WHERE dedupe_key = %s""", (key,)).fetchone()
+            self.assertEqual(committed, (1, 1),
+                             "advisory lock 串行化后：同键只有一个活跃告警")
+        finally:
+            # 清理本用例提交到共享测试库的行：只保留 023 自身的结构。
+            second.rollback()
+            for statement, params in (
+                    ("DELETE FROM bi.notification_outbox o USING "
+                     "bi.inventory_alert_instances a WHERE o.alert_ref = a.alert_ref "
+                     "AND a.dedupe_key = %s", (key,)),
+                    ("DELETE FROM bi.inventory_alert_events e USING "
+                     "bi.inventory_alert_instances a WHERE e.alert_ref = a.alert_ref "
+                     "AND a.dedupe_key = %s", (key,)),
+                    ("DELETE FROM bi.inventory_alert_instances WHERE dedupe_key = %s",
+                     (key,)),
+                    ("DELETE FROM bi.query_artifacts WHERE run_id IN (SELECT id FROM "
+                     "bi.query_runs WHERE request_fingerprint = %s)",
+                     (fixture.FINGERPRINT,)),
+                    ("DELETE FROM bi.query_runs WHERE request_fingerprint = %s",
+                     (fixture.FINGERPRINT,)),
+                    ("DELETE FROM bi.inventory_monitor_policies WHERE policy_ref = %s",
+                     ("inventory-monitor/1",))):
+                first.execute(statement, params)
+            locker.rollback()
+            second.close()
+            first.close()
+            locker.close()
 
 
 if __name__ == "__main__":
