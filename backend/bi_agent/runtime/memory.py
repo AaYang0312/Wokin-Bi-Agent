@@ -21,6 +21,7 @@ from .models import (
     RunStatus,
     RunTransition,
     StaleRunRevision,
+    StoredArtifact,
     validate_artifact_payload,
     validate_coverage_payload,
     validate_event_payload,
@@ -204,6 +205,32 @@ class MemoryQueryRunStore:
                     and run.get("status") == RunStatus.SUCCEEDED.value):
                 return run["id"]
         return None
+
+    def load_artifact_for_analysis(self, artifact_id: UUID, *,
+                                   subject_id: str) -> StoredArtifact:
+        """分析读取（计划 Task 2 Step 3）：与 Postgres 实现同一条资格判据。
+
+        不存在、跨 subject、非成功运行、缺血缘都报同一个
+        `analysis_source_not_found`：读不到就是读不到，不告诉他人工件存在。
+        payload/coverage/provenance 一律深拷贝，调用方的改写不会串回存储层。
+        """
+        artifact = self.artifacts.get(artifact_id)
+        run = self.runs.get(artifact["run_id"]) if artifact is not None else None
+        if (artifact is None or run is None
+                or run.get("subject_id") != subject_id
+                or run.get("status") != RunStatus.SUCCEEDED.value
+                or run.get("provenance") is None):
+            raise ValueError("analysis_source_not_found")
+        coverage = artifact.get("coverage")
+        return StoredArtifact(
+            ref=ArtifactRef(id=artifact["id"], type=artifact["artifact_type"]),
+            run_id=artifact["run_id"],
+            subject_id=run["subject_id"],
+            artifact_type=artifact["artifact_type"],
+            payload=deepcopy(artifact["payload"]),
+            data_as_of=artifact.get("data_as_of"),
+            coverage=deepcopy(coverage) if coverage is not None else None,
+            provenance=run["provenance"].model_copy(deep=True))
 
     def finish(self, run_id: UUID, completion: RunCompletion) -> None:
         completion = self._revalidate_completion(completion)

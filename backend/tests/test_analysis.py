@@ -11,10 +11,20 @@
 - `isolated_analysis` 只发 `analysis_result`，且它不是任何领域的数据集来源；
 - 公开载荷校验拒绝 `sql/prompt/tool_calls/raw_rows` 键：分析结果永远不是查询通道；
 - 门禁默认关与严格 true/false 的解析在 tests.test_core.ConfigTests。
+
+计划 Task 2 追加（授权不可变 Artifact loader）：
+
+- 不是 owner / 不存在 / 非成功运行 → 同一个 `analysis_source_not_found`，无法枚举；
+- 只接受三个数据集类型；版本逐项对当前常量，过期即拒；
+- 投影只收精确十进制（float 与超长数字串拒收），fingerprint 与行序/键序无关；
+- 实体引用必须落在当前授权集合或来源 entities 投影内；loader 不碰 conn。
 """
 
 import unittest
+from datetime import datetime, timezone
 from decimal import Decimal
+import time
+from uuid import uuid4
 
 UUID_V4 = "00000000-0000-4000-8000-000000000001"
 FINGERPRINT = "a" * 64
@@ -374,15 +384,308 @@ class AnalysisRegistryContractTests(unittest.TestCase):
         self.assertEqual(missing, set(),
                          "登记节点必须先进入 PersistenceNode 词表")
 
-    def test_package_ships_only_the_contract_slice(self):
+    def test_package_ships_only_the_delivered_slices(self):
         import pathlib
 
         import bi_agent.analysis as analysis
 
         shipped = sorted(path.name for path in
                          pathlib.Path(analysis.__file__).parent.glob("*.py"))
-        self.assertEqual(shipped, ["__init__.py", "models.py"],
-                         "Task 1 只交付契约切片；loader/graph 等按各自 Task 登记")
+        # Task 1 契约 + Task 2 授权 loader；graph/summarizer 等按各自 Task 登记。
+        self.assertEqual(shipped, ["__init__.py", "loader.py", "models.py"])
+
+
+class _LandmineConn:
+    """loader 决不允许碰 conn：任何属性访问都当场炸（钉“不自动重查数据库”）。"""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"loader touched conn.{name}")
+
+
+class _ScriptedReader:
+    """实现 ArtifactReader 协议的最小替身：原样返回构造好的 StoredArtifact。"""
+
+    def __init__(self, stored=None):
+        self.stored = stored
+        self.calls: list[tuple] = []
+
+    def load_artifact_for_analysis(self, artifact_id, *, subject_id):
+        self.calls.append((artifact_id, subject_id))
+        if isinstance(self.stored, Exception):
+            raise self.stored
+        return self.stored
+
+
+# 测试引用由 (kind, ERP主键) 同源派生，与仓库其它测试共用一套拼写。
+def _ref(kind: str, key: str) -> str:
+    from bi_agent.catalog import ref_for_key
+
+    return ref_for_key(kind, key)
+
+
+S1 = _ref("shop", "S1")
+P1 = _ref("product", "P1")
+
+
+def _row(**overrides):
+    row = {"shop_ref": S1, "day": "2026-09-01",
+           "paid_amount": "12.30", "paid_orders": 3}
+    row.update(overrides)
+    return row
+
+
+def _dataset_payload(*rows, entities=None, coverage=None):
+    if coverage is _OMIT:
+        payload = {"status": "ok", "metric_definition": {},
+                   "limitations": [], "data_as_of": None,
+                   "filters": {}, "data": list(rows)}
+    else:
+        if coverage is None:
+            coverage = {"status": "complete", "start": "2026-09-01",
+                        "end": "2026-09-08", "gaps": []}
+        payload = {"status": "ok", "metric_definition": {},
+                   "coverage": coverage, "limitations": [], "data_as_of": None,
+                   "filters": {}, "data": list(rows)}
+    if entities is not None:
+        payload["entities"] = entities
+    return payload
+
+
+# 哨兵：显式区分「载荷不带 coverage 键」与「使用默认 complete 覆盖」。
+_OMIT = object()
+
+
+def _entities(*refs):
+    return [{"ref": ref, "kind": "shop", "name_source": "unresolved"}
+            for ref in refs]
+
+
+def _stored_artifact(*, artifact_type="metric_result", payload=None,
+                     subject_id="u1", provenance=None, data_as_of=None,
+                     coverage=None):
+    from bi_agent.runtime.artifacts import QueryProvenance
+    from bi_agent.runtime.models import ArtifactRef, StoredArtifact
+
+    return StoredArtifact(
+        ref=ArtifactRef(id=uuid4(), type=artifact_type),
+        run_id=uuid4(), subject_id=subject_id, artifact_type=artifact_type,
+        payload=payload if payload is not None else _dataset_payload(_row()),
+        data_as_of=data_as_of, coverage=coverage,
+        provenance=provenance if provenance is not None else QueryProvenance())
+
+
+def _context(store, *, subject_id="u1", shop_refs=None):
+    from bi_agent.commerce.models import DomainContext
+
+    refs = shop_refs if shop_refs is not None else {"S1": S1}
+    return DomainContext(
+        subject_id=subject_id, allowed_shop_ids=frozenset(refs), shop_refs=refs,
+        conn=_LandmineConn(), store=store,
+        chat_id=uuid4(), user_message_id=uuid4(), root_request_id=uuid4(),
+        now=datetime(2026, 9, 15, tzinfo=timezone.utc),
+        deadline=time.monotonic() + 30)
+
+
+def _load(stored, *, context=None):
+    from bi_agent.analysis.loader import load_analysis_dataset
+
+    return load_analysis_dataset(str(stored.ref.id) if stored is not None
+                                 else str(uuid4()),
+                                 context=context or _context(_ScriptedReader(stored)))
+
+
+class AnalysisLoaderTests(unittest.TestCase):
+    """计划 Task 2 Step 1/4：授权、类型、版本、大小与投影纪律，全部在分析前拒绝。"""
+
+    def test_wrong_owner_type_version_and_size_fail_before_projection(self):
+        stale = _stored_artifact(provenance=_provenance(metric_version="metrics/2026-09-01.1"))
+        big = _stored_artifact(payload=_dataset_payload(
+            *(_row(paid_amount=str(index)) for index in range(501))))
+        cases = [
+            (_stored_artifact(subject_id="subject-b"), "analysis_source_not_found"),
+            (_stored_artifact(artifact_type="chart_spec"),
+             "analysis_source_type_unsupported"),
+            (stale, "analysis_source_version_mismatch"),
+            (big, "analysis_source_too_large"),
+        ]
+        for stored, reason in cases:
+            with self.subTest(reason=reason), \
+                    self.assertRaisesRegex(ValueError, f"^{reason}$"):
+                _load(stored)
+
+    def test_not_found_and_cross_owner_are_indistinguishable(self):
+        from bi_agent.analysis.loader import load_analysis_dataset
+
+        context = _context(_ScriptedReader(ValueError("analysis_source_not_found")))
+        with self.assertRaisesRegex(ValueError, "^analysis_source_not_found$"):
+            load_analysis_dataset(str(uuid4()), context=context)
+        # 跨 owner 与不存在都走同一个码：读不到就是读不到，无法枚举他人 Artifact。
+        context = _context(_ScriptedReader(ValueError("analysis_source_not_found")))
+        with self.assertRaisesRegex(ValueError, "^analysis_source_not_found$"):
+            load_analysis_dataset("not-a-uuid", context=context)
+
+    def test_only_dataset_schemas_are_sources(self):
+        for artifact_type in ("chart_spec", "price_audit", "inventory_alerts",
+                              "exploration_result", "analysis_result"):
+            with self.subTest(artifact_type=artifact_type):
+                stored = _stored_artifact(artifact_type=artifact_type,
+                                          payload={"status": "ok"})
+                with self.assertRaisesRegex(ValueError,
+                                            "^analysis_source_type_unsupported$"):
+                    _load(stored)
+
+    def test_fingerprint_is_stable_across_key_and_row_order(self):
+        from bi_agent.analysis.loader import dataset_fingerprint
+
+        rows = [
+            {"shop_ref": S1, "day": "2026-09-01",
+             "paid_amount": "12.30", "paid_orders": 3},
+            {"paid_amount": "1.00", "day": "2026-09-02",
+             "shop_ref": S1, "product_ref": P1},
+        ]
+        entities = _entities(S1) + [{"ref": P1, "kind": "product",
+                                     "name_source": "unresolved"}]
+        first = _load(_stored_artifact(payload=_dataset_payload(
+            *rows, entities=entities)))
+        reordered = [dict(reversed(list(row.items()))) for row in reversed(rows)]
+        second = _load(_stored_artifact(payload=_dataset_payload(
+            *reordered, entities=entities)))
+        self.assertEqual(first.source_fingerprint, second.source_fingerprint)
+        # 反向突变：内容真的变了指纹必须变，防“恒等指纹”假绿。
+        changed = _load(_stored_artifact(payload=_dataset_payload(
+            *rows, {"shop_ref": S1, "day": "2026-09-01", "paid_amount": "13.30"},
+            entities=entities)))
+        self.assertNotEqual(first.source_fingerprint, changed.source_fingerprint)
+        observations = sorted(first.observations, key=lambda item: item.row_ref)
+        self.assertEqual(dataset_fingerprint(tuple(observations)),
+                         first.source_fingerprint)
+
+    def test_projection_keeps_exact_decimals_and_never_float(self):
+        dataset = _load(_stored_artifact(payload=_dataset_payload(
+            {"shop_ref": S1, "paid_amount": "12.30", "paid_orders": 3})))
+        observation = dataset.observations[0]
+        self.assertEqual(observation.metrics["paid_amount"], Decimal("12.30"))
+        self.assertEqual(observation.metrics["paid_orders"], Decimal(3))
+        self.assertEqual(observation.dimensions, {"shop_ref": S1})
+
+        # float 是 JSON 通道进不来、也绝不能从读回侧放进来：直接在 StoredArtifact
+        # 里携带 float（绕过写入校验）时，loader 必须拒收而不是转 Decimal。
+        smuggled = _dataset_payload({"shop_ref": S1, "paid_amount": 12.30})
+        with self.assertRaisesRegex(ValueError, "^analysis_source_invalid$"):
+            _load(_stored_artifact(payload=smuggled))
+
+    def test_unauthorized_entity_dimension_is_rejected(self):
+        stranger = _ref("shop", "OTHER")
+        with self.assertRaisesRegex(ValueError, "^analysis_dimension_unauthorized$"):
+            _load(_stored_artifact(payload=_dataset_payload(
+                {"shop_ref": stranger, "paid_amount": "1.00"})))
+        # 来源 entities 投影里的引用与当前授权同权：两家都放行（计划 Step 4）。
+        payload = _dataset_payload(
+            {"shop_ref": stranger, "paid_amount": "1.00"},
+            entities=[{"ref": stranger, "kind": "shop",
+                       "name_source": "unresolved"}])
+        dataset = _load(_stored_artifact(payload=payload))
+        self.assertEqual(dataset.observations[0].dimensions["shop_ref"], stranger)
+
+    def test_internal_identifier_tampering_is_rejected_before_projection(self):
+        """内部主键禁令由载荷重校验执行：文本列不夹带长数字串，篡改即拒。"""
+        with self.assertRaisesRegex(ValueError, "^analysis_source_invalid$"):
+            _load(_stored_artifact(payload=_dataset_payload(
+                {"shop_ref": S1, "paid_amount": "12.30",
+                 "notice": "订单446655440000已核对"})))
+
+    def test_row_without_any_metric_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "^analysis_source_metric_missing$"):
+            _load(_stored_artifact(payload=_dataset_payload(
+                {"shop_ref": S1, "day": "2026-09-01",
+                 "paid_amount": None, "paid_orders": None})))
+
+    def test_duplicate_rows_are_rejected_not_deduplicated(self):
+        duplicate = _row()
+        with self.assertRaisesRegex(ValueError, "^analysis_row_ref_duplicate$"):
+            _load(_stored_artifact(payload=_dataset_payload(duplicate, dict(duplicate))))
+
+    def test_row_field_budget_is_enforced(self):
+        # 真实数值列拼出的 11 指标行：重校验放行，但超出投影预算即拒。
+        wide = {"shop_ref": S1, "paid_amount": "1", "paid_orders": "1",
+                "quantity": "1", "product_paid_amount": "1", "refund_amount": "1",
+                "sales_amount": "1", "sold_quantity": "1", "sales_share": "1",
+                "weighted_avg_paid_price": "1",
+                "product_gross_profit_reference": "1",
+                "erp_gross_profit_reference": "1"}
+        with self.assertRaisesRegex(ValueError, "^analysis_source_too_large$"):
+            _load(_stored_artifact(payload=_dataset_payload(wide)))
+
+    def test_canonical_projection_size_is_bounded(self):
+        fat = {"shop_ref": S1, "paid_orders": "1" * 50, "quantity": "1" * 50,
+               "product_paid_amount": "1" * 50, "refund_amount": "1" * 50,
+               "sales_amount": "1" * 50, "sold_quantity": "1" * 50,
+               "sales_share": "1" * 50,
+               "weighted_avg_paid_price": "1" * 50,
+               "product_gross_profit_reference": "1" * 50}
+        rows = [dict(fat, paid_amount=str(index)) for index in range(500)]
+        self.assertEqual(len({row["paid_amount"] for row in rows}), 500,
+                         "行必须互不相同，否则先撞重复而不是尺寸")
+        with self.assertRaisesRegex(ValueError, "^analysis_source_too_large$"):
+            _load(_stored_artifact(payload=_dataset_payload(*rows)))
+
+    def test_coverage_must_be_complete_or_gapped_partial(self):
+        for coverage in (_OMIT,
+                         {"status": "partial", "start": "2026-09-01",
+                          "end": "2026-09-08", "gaps": []},
+                         {"status": "missing", "start": "2026-09-01",
+                          "end": "2026-09-08", "gaps": []},
+                         {"status": "complete", "start": "2026-09-01",
+                          "end": "2026-09-08", "gaps": ["2026-09-02~2026-09-03"]}):
+            with self.subTest(coverage=coverage):
+                with self.assertRaisesRegex(
+                        ValueError, "^analysis_source_coverage_incomplete$"):
+                    _load(_stored_artifact(payload=_dataset_payload(
+                        _row(), coverage=coverage)))
+        partial = _load(_stored_artifact(payload=_dataset_payload(
+            _row(),
+            coverage={"status": "partial", "start": "2026-09-01",
+                      "end": "2026-09-08", "gaps": ["2026-09-02~2026-09-03"]})))
+        self.assertEqual(len(partial.observations), 1)
+
+    def test_future_data_as_of_is_rejected(self):
+        from datetime import timedelta
+
+        stored = _stored_artifact(
+            payload=_dataset_payload(_row()),
+            data_as_of=datetime(2026, 9, 16, tzinfo=timezone.utc))
+        with self.assertRaisesRegex(ValueError, "^analysis_source_time_invalid$"):
+            _load(stored)
+        stale_ok = _stored_artifact(
+            payload=_dataset_payload(_row()),
+            data_as_of=datetime(2026, 9, 15, tzinfo=timezone.utc) - timedelta(days=1))
+        self.assertEqual(len(_load(stale_ok).observations), 1)
+
+    def test_dataset_carries_frozen_source_identity(self):
+        from bi_agent.commerce.metrics import (COMMERCE_GRAPH_VERSION,
+                                               COMMERCE_METRIC_VERSION)
+
+        stored = _stored_artifact(payload=_dataset_payload(_row()))
+        dataset = _load(stored)
+        self.assertEqual(dataset.source_artifact_ref, str(stored.ref.id))
+        self.assertEqual(dataset.metric_version, stored.provenance.metric_version)
+        self.assertEqual(dataset.limitations, ())
+        # commerce 形状的当前常量同样是“当前版本”：血缘随领域，不随 business_query。
+        commerce = _stored_artifact(provenance=_provenance(
+            metric_version=COMMERCE_METRIC_VERSION,
+            graph_version=COMMERCE_GRAPH_VERSION))
+        self.assertEqual(_load(commerce).metric_version, COMMERCE_METRIC_VERSION)
+
+
+def _provenance(*, metric_version=None, graph_version=None):
+    from bi_agent.runtime.artifacts import QueryProvenance
+
+    fields = {}
+    if metric_version is not None:
+        fields["metric_version"] = metric_version
+    if graph_version is not None:
+        fields["graph_version"] = graph_version
+    return QueryProvenance(**fields)
 
 
 if __name__ == "__main__":

@@ -1092,3 +1092,116 @@ class IsolatedAnalysisRegistryTests(unittest.TestCase):
                 "analysis_version": "isolated-analysis/2026-09-14.1",
                 "findings": [], "narrative": [], "hypotheses": [],
                 "unsupported_claims": [], "limitations": []}, "metric_result")
+
+
+class StoredArtifactContractTests(unittest.TestCase):
+    """计划 Task 2 Step 3：跨 Store 返回的只读 Artifact 快照与读取协议。"""
+
+    def test_stored_artifact_is_frozen_and_complete(self):
+        from bi_agent.runtime.artifacts import QueryProvenance
+        from bi_agent.runtime.models import ArtifactRef, StoredArtifact
+
+        stored = StoredArtifact(
+            ref=ArtifactRef(id=uuid4(), type="metric_result"),
+            run_id=uuid4(), subject_id="u1", artifact_type="metric_result",
+            payload={"status": "ok"}, data_as_of=None, coverage=None,
+            provenance=QueryProvenance())
+        with self.assertRaises(ValidationError):
+            stored.payload = {}
+        with self.assertRaises(ValidationError):
+            StoredArtifact(
+                ref=ArtifactRef(id=uuid4(), type="metric_result"),
+                run_id=uuid4(), subject_id="u1", artifact_type="metric_result",
+                payload={"status": "ok"}, data_as_of=None, coverage=None,
+                provenance=QueryProvenance(), sql="select 1")
+        with self.assertRaises(ValidationError):
+            # 血缘缺失的快照不存在：版本核验必须建立在真实血缘上。
+            StoredArtifact(
+                ref=ArtifactRef(id=uuid4(), type="metric_result"),
+                run_id=uuid4(), subject_id="u1", artifact_type="metric_result",
+                payload={"status": "ok"}, data_as_of=None, coverage=None,
+                provenance=None)
+
+    def test_reader_protocol_declares_the_analysis_entry(self):
+        from bi_agent.runtime.models import ArtifactReader
+
+        self.assertTrue(hasattr(ArtifactReader, "load_artifact_for_analysis"))
+
+
+class MemoryArtifactReaderTests(unittest.TestCase):
+    """内存 Store 的分析读取：owner/成功状态/血缘缺一即同码拒，返回深拷贝。"""
+
+    def setUp(self):
+        from bi_agent.data_quality import QUALITY_RULE
+        from bi_agent.runtime.artifacts import QueryProvenance
+
+        self.store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+        self.run_id = self.store.create_run(NewQueryRun(
+            chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
+            tool_call_id="call_1", attempt_no=1,
+            normalized_request={"shop_refs": [S1_REF]},
+            state={"node": "received"},
+            # 血缘与生产方同形：quality_rule 非空（空串不满足血缘校验器）。
+            provenance=QueryProvenance(quality_rule=QUALITY_RULE)))
+        self.artifact_id = self.store.save_artifact(self.run_id, NewArtifact(
+            payload={"status": "ok", "data": [{"shop_ref": S1_REF,
+                                               "paid_amount": "12.30"}]})).id
+        self.store.finish(self.run_id, RunCompletion(
+            expected_revision=0, node="finalize", status=RunStatus.SUCCEEDED,
+            state={"node": "finalize"}))
+
+    def _load(self, artifact_id=None, *, subject_id="u1"):
+        from bi_agent.runtime.models import StoredArtifact
+
+        stored = self.store.load_artifact_for_analysis(
+            self.artifact_id if artifact_id is None else artifact_id,
+            subject_id=subject_id)
+        self.assertIsInstance(stored, StoredArtifact)
+        return stored
+
+    def test_succeeded_owned_artifact_loads_with_provenance(self):
+        stored = self._load()
+        self.assertEqual(stored.ref.id, self.artifact_id)
+        self.assertEqual(stored.artifact_type, "metric_result")
+        self.assertEqual(stored.subject_id, "u1")
+        self.assertEqual(stored.run_id, self.run_id)
+        self.assertEqual(stored.payload["data"][0]["shop_ref"], S1_REF)
+        from bi_agent.sources import METRIC_VERSION
+
+        self.assertEqual(stored.provenance.metric_version, METRIC_VERSION)
+        self.assertIsNotNone(stored.provenance.source_registry_version)
+
+    def test_returns_deep_copies_that_cannot_alias_the_store(self):
+        first = self._load()
+        first.payload["data"][0]["paid_amount"] = "999"
+        second = self._load()
+        self.assertEqual(second.payload["data"][0]["paid_amount"], "12.30")
+        self.assertEqual(
+            self.store.artifacts[self.artifact_id]["payload"]["data"][0]["paid_amount"],
+            "12.30")
+
+    def test_missing_cross_owner_and_unsucceeded_are_the_same_rejection(self):
+        from bi_agent.runtime.models import RunCompletion, RunStatus, RunTransition
+
+        with self.assertRaisesRegex(ValueError, "^analysis_source_not_found$"):
+            self._load(artifact_id=uuid4())
+        with self.assertRaisesRegex(ValueError, "^analysis_source_not_found$"):
+            self._load(subject_id="subject-b")
+
+        other = self.store.create_run(NewQueryRun(
+            chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
+            tool_call_id="call_2", attempt_no=1,
+            state={"node": "received"}))
+        running_artifact = self.store.save_artifact(other, NewArtifact(
+            payload={"status": "ok", "data": [{"shop_ref": S1_REF,
+                                               "paid_amount": "1.00"}]})).id
+        with self.assertRaisesRegex(ValueError, "^analysis_source_not_found$"):
+            self._load(artifact_id=running_artifact)
+        self.store.transition(other, RunTransition(
+            expected_revision=0, node="resolve_parameters",
+            status=RunStatus.FAILED, state={"node": "resolve_parameters"}))
+        self.store.finish(other, RunCompletion(
+            expected_revision=1, node="finalize", status=RunStatus.FAILED,
+            state={"node": "finalize"}))
+        with self.assertRaisesRegex(ValueError, "^analysis_source_not_found$"):
+            self._load(artifact_id=running_artifact)

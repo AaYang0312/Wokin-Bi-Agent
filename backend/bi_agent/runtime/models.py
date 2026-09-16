@@ -2342,3 +2342,31 @@ class QueryRunStore(Protocol):
     def save_artifact(self, run_id: UUID, artifact: NewArtifact) -> ArtifactRef: ...
 
     def finish(self, run_id: UUID, completion: RunCompletion) -> None: ...
+
+
+class StoredArtifact(BaseModel):
+    """已落库 Artifact 的只读快照（计划 2026-09-14-isolated-analysis-agent.md Task 2）。
+
+    两种 Store 返回同一形状：成功运行 + 精确 owner + 真实血缘缺一不可，否则
+    统一报 `analysis_source_not_found`（与“不存在”不可区分，防枚举）。payload
+    与 coverage 必须是深拷贝：调用方改写投影不得串回存储层。血缘是必填项——
+    分析前的版本核验只能建立在真实血缘上，没有血缘就没有快照。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    ref: ArtifactRef
+    run_id: UUID
+    subject_id: str
+    artifact_type: str
+    payload: dict[str, object]
+    data_as_of: datetime | None = None
+    coverage: dict[str, object] | None = None
+    provenance: QueryProvenance
+
+
+class ArtifactReader(Protocol):
+    """分析读取协议：Memory 与 Postgres Store 都实现同一入口（结构子类型）。"""
+
+    def load_artifact_for_analysis(self, artifact_id: UUID, *,
+                                   subject_id: str) -> StoredArtifact: ...

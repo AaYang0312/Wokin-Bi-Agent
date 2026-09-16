@@ -1657,3 +1657,122 @@ class QueryMemoryLifecycleDatabaseTests(unittest.TestCase):
             "SELECT normalized_request FROM bi.approved_query_examples "
             "WHERE example_ref=%s", (record.example_ref,)).fetchone()[0]
         self.assertFalse(set(stored) & FORBIDDEN_VALUE_KEYS)
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class AnalysisArtifactDatabaseTests(unittest.TestCase):
+    """计划 Task 2 Step 5：Postgres 侧的分析读取与内存 Store 语义逐字一致。"""
+
+    def setUp(self):
+        self.conn = connect_test_db(self)
+
+    def _seed(self, *, subject: str = "u1", status: str = "succeeded",
+              with_provenance: bool = True):
+        from psycopg.types.json import Jsonb
+
+        from bi_agent.runtime.artifacts import QueryProvenance
+
+        provenance = QueryProvenance()
+        chat_id, message_id, run_id = uuid4(), uuid4(), uuid4()
+        self.conn.execute(
+            "INSERT INTO bi.app_chats(id, subject_id, title) VALUES (%s, %s, '查询')",
+            (chat_id, subject))
+        self.conn.execute(
+            "INSERT INTO bi.app_messages(id, chat_id, role, content, status) "
+            "VALUES (%s, %s, 'user', '查询销售额', 'complete')",
+            (message_id, chat_id))
+        self.conn.execute(
+            "INSERT INTO bi.query_runs(id, chat_id, user_message_id, subject_id, "
+            "tool_call_id, domain, attempt_no, status, normalized_request, state) "
+            "VALUES (%s, %s, %s, %s, 'call_1', 'business_query', 1, %s, '{}', '{}')",
+            (run_id, chat_id, message_id, subject, status))
+        if with_provenance:
+            self.conn.execute(
+                """INSERT INTO bi.query_provenance (
+                       run_id, template_id, template_version, metric_version,
+                       schema_version, catalog_version, mapping_version,
+                       policy_version, graph_version, source_registry_version)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (run_id, provenance.template_id, provenance.template_version,
+                 provenance.metric_version, provenance.schema_version,
+                 provenance.catalog_version, provenance.mapping_version,
+                 provenance.policy_version, provenance.graph_version,
+                 provenance.source_registry_version))
+        payload = {"status": "ok", "metric_definition": {},
+                   "coverage": {"status": "complete", "start": "2026-09-01",
+                                "end": "2026-09-08", "gaps": []},
+                   "limitations": [], "data_as_of": None, "filters": {},
+                   "data": [{"shop_ref": S1_REF, "day": "2026-09-01",
+                             "paid_amount": "12.30", "paid_orders": 3}]}
+        store = PostgresQueryRunStore(self.conn, forbidden_values={"S1"})
+        artifact_id = store.save_artifact(run_id, NewArtifact(
+            artifact_type="metric_result", payload=payload)).id
+        return run_id, artifact_id, payload
+
+    def _store(self):
+        return PostgresQueryRunStore(self.conn, forbidden_values={"S1"})
+
+    def test_succeeded_owned_artifact_loads_and_projects_exactly(self):
+        from datetime import datetime, timezone
+
+        from bi_agent.analysis.loader import load_analysis_dataset
+        from bi_agent.commerce.models import DomainContext
+
+        run_id, artifact_id, payload = self._seed()
+        stored = self._store().load_artifact_for_analysis(artifact_id, subject_id="u1")
+        self.assertEqual((stored.run_id, stored.subject_id,
+                          stored.artifact_type), (run_id, "u1", "metric_result"))
+        self.assertEqual(stored.payload, payload)
+
+        context = DomainContext(
+            subject_id="u1", allowed_shop_ids=frozenset({S1_REF, S2_REF}),
+            shop_refs={"S1": S1_REF, "S2": S2_REF},
+            conn=self.conn, store=self._store(),
+            chat_id=uuid4(), user_message_id=uuid4(), root_request_id=uuid4(),
+            now=datetime(2026, 9, 15, tzinfo=timezone.utc), deadline=1e12)
+        dataset = load_analysis_dataset(str(artifact_id), context=context)
+        self.assertEqual(dataset.observations[0].metrics["paid_amount"],
+                         Decimal("12.30"))
+        self.assertEqual(dataset.observations[0].dimensions["shop_ref"], S1_REF)
+
+    def test_ineligible_sources_are_indistinguishably_rejected(self):
+        _, artifact_id, _ = self._seed()
+        _, failed_artifact, _ = self._seed(status="failed")
+        _, cross_artifact, _ = self._seed(subject="subject-b")
+        _, orphan_artifact, _ = self._seed(with_provenance=False)
+        store = self._store()
+        for bad, subject in ((uuid4(), "u1"), (failed_artifact, "u1"),
+                             (cross_artifact, "u1"), (orphan_artifact, "u1"),
+                             (artifact_id, "subject-b")):
+            with self.subTest(subject=subject), \
+                    self.assertRaisesRegex(ValueError,
+                                           "^analysis_source_not_found$"):
+                store.load_artifact_for_analysis(bad, subject_id=subject)
+
+    def test_memory_and_postgres_readers_agree_on_the_same_artifact(self):
+        from bi_agent.runtime.memory import MemoryQueryRunStore
+
+        _, artifact_id, payload = self._seed()
+        pg_stored = self._store().load_artifact_for_analysis(
+            artifact_id, subject_id="u1")
+
+        memory = MemoryQueryRunStore(forbidden_values={"S1"})
+        memory.runs[pg_stored.run_id] = {
+            "id": pg_stored.run_id, "chat_id": uuid4(), "user_message_id": uuid4(),
+            "subject_id": "u1", "tool_call_id": "call_1", "domain": "business_query",
+            "attempt_no": 1, "status": "succeeded", "current_node": "finalize",
+            "revision": 1, "normalized_request": {}, "state": {"node": "finalize"},
+            "error_code": None, "root_request_id": pg_stored.run_id,
+            "request_fingerprint": None, "recovery_count": 0,
+            "provenance": pg_stored.provenance, "started_at": None,
+            "updated_at": None, "completed_at": None,
+        }
+        memory.artifacts[artifact_id] = {
+            "id": artifact_id, "run_id": pg_stored.run_id,
+            "artifact_type": "metric_result", "payload": payload,
+            "data_as_of": None, "coverage": None,
+            "dataset_ref": None, "chart_version": None, "created_at": None,
+        }
+        memory_stored = memory.load_artifact_for_analysis(artifact_id, subject_id="u1")
+        self.assertEqual(memory_stored.payload, pg_stored.payload)
+        self.assertEqual(memory_stored.provenance, pg_stored.provenance)

@@ -10,7 +10,7 @@ from psycopg import errors
 from pydantic import ValidationError
 from psycopg.types.json import Jsonb
 
-from .artifacts import TERMINATION_REASONS, verify_chart_pairing
+from .artifacts import (TERMINATION_REASONS, QueryProvenance, verify_chart_pairing)
 from .domain_registry import allows_artifact_type, allows_node
 from .models import (
     ArtifactPersistenceError,
@@ -25,6 +25,7 @@ from .models import (
     RunTransition,
     SchemaOutdated,
     StaleRunRevision,
+    StoredArtifact,
     validate_artifact_payload,
     validate_coverage_payload,
     validate_event_payload,
@@ -217,6 +218,51 @@ class PostgresQueryRunStore:
             (subject_id, fingerprint),
         ).fetchone()
         return row[0] if row is not None else None
+
+    def load_artifact_for_analysis(self, artifact_id: UUID, *,
+                                   subject_id: str) -> StoredArtifact:
+        """分析读取（计划 Task 2 Step 3）：一次 JOIN 拿全快照，判据与内存 Store 同一句。
+
+        `r.subject_id` 与 `r.status='succeeded'` 在 SQL 里限定：跨 owner、非成功、
+        不存在与缺血缘（JOIN 不到 provenance）都返回零行，统一报
+        `analysis_source_not_found`，不在响应里区分这四种情况。数据库失败仍走
+        消毒后的 `ArtifactPersistenceError`，异常原文不外泄。
+        """
+        try:
+            row = self.conn.execute(
+                """SELECT a.id, a.run_id, a.artifact_type, a.payload,
+                          a.data_as_of, a.coverage, r.subject_id,
+                          p.template_id, p.template_version, p.metric_version,
+                          p.schema_version, p.catalog_version, p.mapping_version,
+                          p.policy_version, p.graph_version,
+                          p.source_registry_version, p.basis_signature,
+                          p.quality_rule, p.source_batches, p.data_as_of
+                   FROM bi.query_artifacts AS a
+                   JOIN bi.query_runs AS r ON r.id = a.run_id
+                   JOIN bi.query_provenance AS p ON p.run_id = r.id
+                   WHERE a.id = %s AND r.subject_id = %s
+                     AND r.status = 'succeeded'""",
+                (artifact_id, subject_id),
+            ).fetchone()
+        except errors.Error:
+            raise ArtifactPersistenceError() from None
+        if row is None:
+            raise ValueError("analysis_source_not_found")
+        # 血缘行在写入时已过 QueryProvenance 校验、列上有 btrim CHECK；这里按列
+        # 原样重建。quality_rule 在库里可空（015），而模型默认值 "" 本身不满足
+        # 校验器（空串在构造时不校验、显式传入才校验），所以用 model_construct
+        # 原样回填，NULL 回到模型默认 ""——不伪造任何值。
+        provenance = QueryProvenance.model_construct(
+            template_id=row[7], template_version=row[8], metric_version=row[9],
+            schema_version=row[10], catalog_version=row[11],
+            mapping_version=row[12], policy_version=row[13],
+            graph_version=row[14], source_registry_version=row[15],
+            basis_signature=tuple(row[16] or ()), quality_rule=row[17] or "",
+            source_batches=tuple(row[18] or ()), data_as_of=row[19])
+        return StoredArtifact(
+            ref=ArtifactRef(id=row[0], type=row[2]), run_id=row[1],
+            subject_id=row[6], artifact_type=row[2], payload=row[3],
+            data_as_of=row[4], coverage=row[5], provenance=provenance)
 
     def transition(self, run_id: UUID, transition: RunTransition) -> None:
         transition = self._revalidate_transition(transition)
