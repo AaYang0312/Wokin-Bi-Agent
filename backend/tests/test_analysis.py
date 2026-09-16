@@ -27,6 +27,19 @@
 - MAD 同指标 ≥4 个观测、阈值 3.5，mad=0 编码为 `mad_zero_non_median`；
 - followups 只有三条固定证据模板，不给采购/改价/投放类建议；
 - gold fixture 逐字段比对：反序输入不变，错期望与改输入都必须转红。
+
+计划 Task 4 追加（无工具叙事总结与 claim 守卫）：
+
+- 模型只收验证过的 finding 与 limitations，tools 恒为 `[]`，超时沿用主请求
+  剩余 deadline（剩余不足 2 秒不发调用）；
+- 每条 fact/observation 必须引用存在的 finding_ref，文本中的数字 token 必须
+  逐字出现在所引 finding 的 values 里；
+- 因果/行动语言、未知引用、多余响应字段、非 JSON 文本一律进
+  unsupported_claims，绝不伪装成事实；hypothesis 必须自带“假设/待验证”；
+- 模型失败/超时/空回复降级为 `narrative_unavailable` limitation，确定性
+  findings 原样保留；输入预算 8,000 token 在任何模型调用之前拒绝；
+- import 守卫把 calculations/summarizer 钉在批准面上，并把模型调用钉成
+  唯一形状 `model.complete(messages, [], timeout_s=timeout_s)`。
 """
 
 import copy
@@ -403,10 +416,11 @@ class AnalysisRegistryContractTests(unittest.TestCase):
 
         shipped = sorted(path.name for path in
                          pathlib.Path(analysis.__file__).parent.glob("*.py"))
-        # Task 1 契约 + Task 2 授权 loader + Task 3 确定性计算；
-        # graph/summarizer 等按各自 Task 登记。
-        self.assertEqual(shipped, ["__init__.py", "calculations.py", "loader.py",
-                                   "models.py"])
+        # Task 1 契约 + Task 2 授权 loader + Task 3 确定性计算 + Task 4 总结器
+        # 与 import 守卫；graph/tool 等按 Task 5 登记。
+        self.assertEqual(shipped, ["__init__.py", "calculations.py",
+                                   "import_guard.py", "loader.py", "models.py",
+                                   "summarizer.py"])
 
 
 class _LandmineConn:
@@ -1099,6 +1113,622 @@ class AnalysisGoldTests(unittest.TestCase):
         metrics[metric] = str(Decimal(metrics[metric]) + Decimal("1"))
         self.assertNotEqual(self._payloads(perturbed),
                             case["expected_findings"])
+
+
+# ---------------------------------------------------------------------------
+# 计划 Task 4：无工具叙事总结与 claim 守卫的共用替身与构造器
+# ---------------------------------------------------------------------------
+
+
+class _Reply:
+    """`ChatModel.complete` 返回值的最小替身：总结器只读 `.text`。"""
+
+    def __init__(self, text):
+        self.text = text
+
+
+class RecordingModel:
+    """记录每次 complete() 的 tools/timeout/messages，并回复构造时给的文本。"""
+
+    def __init__(self, text=""):
+        self.text = text
+        self.calls: list[dict[str, object]] = []
+
+    def complete(self, messages, tools, *, timeout_s):
+        self.calls.append({
+            "tools": list(tools),
+            "timeout_s": timeout_s,
+            "messages_as_text": "\n".join(message.content or ""
+                                          for message in messages),
+        })
+        return _Reply(self.text)
+
+
+class FakeModel(RecordingModel):
+    """计划伪代码里的命名；行为与 RecordingModel 一致。"""
+
+
+class FailingModel:
+    """模型失败替身：按现有 ChatModel 契约抛 `ModelError`，绝不发网络请求。"""
+
+    def __init__(self, code="timeout"):
+        self.code = code
+        self.calls: list[dict[str, object]] = []
+
+    def complete(self, messages, tools, *, timeout_s):
+        from bi_agent.llm import ModelError
+
+        self.calls.append({"tools": list(tools), "timeout_s": timeout_s})
+        raise ModelError(self.code)
+
+
+def _summarizer_findings():
+    return (_finding("finding-a"),
+            _finding("finding-b",
+                     values={"share": "0.000000", "value": "0.00"}))
+
+
+def _summarizer_dataset(*, limitations=()):
+    return _calc_dataset(
+        (_calc_obs("row-001", {"paid_amount": Decimal("12.30")}),
+         _calc_obs("row-002", {"paid_amount": Decimal("7.70")})),
+        limitations=limitations)
+
+
+def _deadline(seconds=30.0):
+    return time.monotonic() + seconds
+
+
+def _narrative_reply(*, text="paid_amount 的值为 12.30，贡献占比 1.000000。",
+                     finding_refs=("finding-a",), claim_kind="observation",
+                     extra=None):
+    item = {"text": text, "finding_refs": list(finding_refs),
+            "claim_kind": claim_kind}
+    if extra:
+        item.update(extra)
+    return json.dumps({"narrative": [item]}, ensure_ascii=False)
+
+
+class AnalysisSummarizerTests(unittest.TestCase):
+    """计划 Task 4：空 tools、因果降级、失败保底、预算与剩余 deadline。"""
+
+    def test_model_receives_findings_and_empty_tools(self):
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        model = RecordingModel(_narrative_reply(finding_refs=["finding-a"]))
+        result = summarize_findings(_summarizer_findings(), limitations=(),
+                                    model=model, timeout_s=3.0)
+        self.assertEqual(model.calls[0]["tools"], [])
+        self.assertNotIn("database",
+                         str(model.calls[0]["messages_as_text"]).lower())
+        self.assertEqual(model.calls[0]["timeout_s"], 3.0)
+        # 通过守卫的叙事按原引用发布，且不夹带任何无证据说法。
+        self.assertEqual(result.narrative[0].finding_refs, ("finding-a",))
+        self.assertEqual(result.unsupported_claims, ())
+
+    def test_uncited_causal_claim_is_not_published_as_fact(self):
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        result = summarize_findings(
+            _summarizer_findings(), limitations=(),
+            model=FakeModel("销量下降是因为广告停投"), timeout_s=3.0)
+        self.assertEqual(result.narrative, ())
+        self.assertEqual(result.unsupported_claims, ("销量下降是因为广告停投",))
+
+    def test_model_failure_keeps_deterministic_findings(self):
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        result = run_isolated_analysis(_summarizer_dataset(),
+                                       model=FailingModel(),
+                                       kinds=("contribution",),
+                                       deadline=_deadline())
+        self.assertTrue(result.findings)
+        self.assertIn("narrative_unavailable", result.limitations)
+        self.assertEqual(result.narrative, ())
+        self.assertEqual(result.unsupported_claims, ())
+
+    def test_verbatim_numbers_publish_but_invented_numbers_do_not(self):
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        good = summarize_findings(_summarizer_findings(), limitations=(),
+                                  model=RecordingModel(_narrative_reply()),
+                                  timeout_s=3.0)
+        self.assertEqual(len(good.narrative), 1)
+        self.assertEqual(good.unsupported_claims, ())
+        bad = summarize_findings(
+            _summarizer_findings(), limitations=(),
+            model=RecordingModel(_narrative_reply(
+                text="paid_amount 约为 12.31。")),
+            timeout_s=3.0)
+        self.assertEqual(bad.narrative, ())
+        self.assertEqual(bad.unsupported_claims, ("paid_amount 约为 12.31。",))
+
+    def test_numeric_evidence_is_checked_per_value_not_across_boundary(self):
+        """P2 回归：0.5 与 20 拼出 0.520，不能让挑造的 520 冒充逐字证据。"""
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        findings = (_finding("finding-a",
+                             values={"share": "0.5", "value": "20"}),)
+        fabricated = summarize_findings(
+            findings, limitations=(),
+            model=RecordingModel(_narrative_reply(
+                text="paid_amount 合计 520。",
+                finding_refs=("finding-a",))),
+            timeout_s=3.0)
+        self.assertEqual(fabricated.narrative, ())
+        self.assertEqual(fabricated.unsupported_claims,
+                         ("paid_amount 合计 520。",))
+        # 正向对照：逐字出现在单个 value 里的数字照常发布。
+        verbatim = summarize_findings(
+            findings, limitations=(),
+            model=RecordingModel(_narrative_reply(
+                text="paid_amount 的值为 20，占比 0.5。",
+                finding_refs=("finding-a",))),
+            timeout_s=3.0)
+        self.assertEqual(len(verbatim.narrative), 1)
+        self.assertEqual(verbatim.unsupported_claims, ())
+
+    def test_unknown_finding_ref_is_never_published(self):
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        result = summarize_findings(
+            _summarizer_findings(), limitations=(),
+            model=RecordingModel(_narrative_reply(finding_refs=["finding-zz"])),
+            timeout_s=3.0)
+        self.assertEqual(result.narrative, ())
+        self.assertEqual(len(result.unsupported_claims), 1)
+
+    def test_causal_and_action_language_stays_out_even_with_valid_citations(self):
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        for text in ("paid_amount 为 12.30，因为广告停投。",
+                     "paid_amount 为 12.30，导致库存偏低。",
+                     "paid_amount 为 12.30，应该立即补货。",
+                     "paid_amount 为 12.30，建议马上采购。",
+                     "paid_amount 为 12.30，系统将自动改价。"):
+            with self.subTest(text=text):
+                result = summarize_findings(
+                    _summarizer_findings(), limitations=(),
+                    model=RecordingModel(_narrative_reply(text=text)),
+                    timeout_s=3.0)
+                self.assertEqual(result.narrative, ())
+                self.assertEqual(result.unsupported_claims, (text,))
+
+    def test_hypothesis_requires_pending_validation_marker(self):
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        unmarked = summarize_findings(
+            _summarizer_findings(), limitations=(),
+            model=RecordingModel(_narrative_reply(
+                text="paid_amount 的 12.30 也许与促销有关。",
+                claim_kind="hypothesis")),
+            timeout_s=3.0)
+        self.assertEqual(unmarked.hypotheses, ())
+        self.assertEqual(unmarked.narrative, ())
+        self.assertEqual(len(unmarked.unsupported_claims), 1)
+        marked_text = "假设 paid_amount 的 12.30 与促销有关，待验证。"
+        marked = summarize_findings(
+            _summarizer_findings(), limitations=(),
+            model=RecordingModel(_narrative_reply(
+                text=marked_text, claim_kind="hypothesis")),
+            timeout_s=3.0)
+        self.assertEqual(marked.hypotheses, (marked_text,))
+        self.assertEqual(marked.narrative, ())
+        self.assertEqual(marked.unsupported_claims, ())
+
+    def test_causal_wording_is_unsupported_in_hypotheses_too(self):
+        """P2 回归（严格安全解释）：含因果词的假设句进 unsupported，不进 hypotheses。"""
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        result = summarize_findings(
+            _summarizer_findings(), limitations=(),
+            model=RecordingModel(_narrative_reply(
+                text="假设 paid_amount 的 12.30 因为广告停投下滑，待验证。",
+                claim_kind="hypothesis")),
+            timeout_s=3.0)
+        self.assertEqual(result.hypotheses, ())
+        self.assertEqual(result.narrative, ())
+        self.assertEqual(result.unsupported_claims,
+                         ("假设 paid_amount 的 12.30 因为广告停投下滑，待验证。",))
+        # 正向对照：无因果词的合格假设句照旧发布。
+        marked = summarize_findings(
+            _summarizer_findings(), limitations=(),
+            model=RecordingModel(_narrative_reply(
+                text="假设 paid_amount 的 12.30 与促销有关，待验证。",
+                claim_kind="hypothesis")),
+            timeout_s=3.0)
+        self.assertEqual(marked.hypotheses,
+                         ("假设 paid_amount 的 12.30 与促销有关，待验证。",))
+
+    def test_malformed_and_extra_field_replies_move_to_unsupported(self):
+        from bi_agent.analysis.summarizer import (NarrativeResult,
+                                                  summarize_findings)
+
+        cases = [
+            ("free_text", "看起来整体平稳。"),
+            ("object_with_extra_field",
+             json.dumps({"narrative": [], "confidence": 1}, ensure_ascii=False)),
+            ("item_with_extra_field", _narrative_reply(extra={"score": 1})),
+            ("item_is_not_object",
+             json.dumps(["看起来整体平稳。"], ensure_ascii=False)),
+        ]
+        for label, reply in cases:
+            with self.subTest(case=label):
+                result = summarize_findings(_summarizer_findings(),
+                                            limitations=(),
+                                            model=RecordingModel(reply),
+                                            timeout_s=3.0)
+                self.assertEqual(result.narrative, ())
+                self.assertTrue(result.unsupported_claims)
+        # 恰好 {"narrative": []} 是合法的“无可叙事”：不产生任何 claim。
+        empty = summarize_findings(
+            _summarizer_findings(), limitations=(),
+            model=RecordingModel(json.dumps({"narrative": []})), timeout_s=3.0)
+        self.assertEqual(empty, NarrativeResult())
+
+    def test_overlong_malformed_reply_degrades_without_losing_findings(self):
+        """P1 回归：装不进有界 claim 通道的畸形回复必须降级，不得炸运行。"""
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        model = RecordingModel("x" * 499 + " tail")
+        result = run_isolated_analysis(_summarizer_dataset(), model=model,
+                                       kinds=("contribution",),
+                                       deadline=_deadline())
+        self.assertTrue(result.findings)
+        self.assertIn("narrative_unavailable", result.limitations)
+        self.assertEqual(result.narrative, ())
+        self.assertEqual(result.unsupported_claims, ())
+        self.assertEqual(len(model.calls), 1)
+
+    def test_truncated_claim_never_keeps_trailing_whitespace(self):
+        """P1 回归：claim 文本截断落点为空白时必须再 strip，不得入库尾随空白。"""
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        result = summarize_findings(
+            _summarizer_findings(), limitations=(),
+            model=RecordingModel(_narrative_reply(text="y" * 499 + " tail")),
+            timeout_s=3.0)
+        self.assertEqual(result.narrative, ())
+        self.assertEqual(result.unsupported_claims, ("y" * 499,))
+
+    def test_empty_reply_degrades_to_narrative_unavailable(self):
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        model = RecordingModel(None)
+        result = run_isolated_analysis(_summarizer_dataset(), model=model,
+                                       kinds=("contribution",),
+                                       deadline=_deadline())
+        self.assertTrue(result.findings)
+        self.assertIn("narrative_unavailable", result.limitations)
+        self.assertEqual(result.narrative, ())
+        self.assertEqual(result.unsupported_claims, ())
+        self.assertEqual(len(model.calls), 1)
+
+    def test_no_model_and_short_deadline_skip_the_model_call(self):
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        without_model = run_isolated_analysis(
+            _summarizer_dataset(), model=None, kinds=("contribution",),
+            deadline=_deadline())
+        self.assertIn("narrative_unavailable", without_model.limitations)
+        self.assertTrue(without_model.findings)
+
+        model = RecordingModel(_narrative_reply())
+        result = run_isolated_analysis(_summarizer_dataset(), model=model,
+                                       kinds=("contribution",),
+                                       deadline=_deadline(1.0))
+        self.assertEqual(model.calls, [])
+        self.assertIn("narrative_unavailable", result.limitations)
+        self.assertTrue(result.findings)
+
+    def test_remaining_deadline_is_passed_as_timeout(self):
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        model = RecordingModel(_narrative_reply())
+        run_isolated_analysis(_summarizer_dataset(), model=model,
+                              kinds=("contribution",), deadline=_deadline(30.0))
+        timeout_s = model.calls[0]["timeout_s"]
+        self.assertGreater(timeout_s, 2.0)
+        self.assertLessEqual(timeout_s, 30.0)
+
+    def test_input_token_bound_rejects_before_any_model_call(self):
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        oversized = tuple(
+            _finding(f"finding-{index:03d}",
+                     values={f"value_{position}": "9" * 200
+                             for position in range(10)})
+            for index in range(100))
+        model = RecordingModel(_narrative_reply())
+        with self.assertRaisesRegex(ValueError, "^narrative_input_too_large$"):
+            summarize_findings(oversized, limitations=(), model=model,
+                               timeout_s=3.0)
+        self.assertEqual(model.calls, [])
+
+    def test_prompt_carries_only_findings_and_limitations(self):
+        from bi_agent.analysis.summarizer import summarize_findings
+
+        model = RecordingModel(_narrative_reply())
+        summarize_findings(_summarizer_findings(),
+                           limitations=("coverage_partial",),
+                           model=model, timeout_s=3.0)
+        prompt = str(model.calls[0]["messages_as_text"])
+        self.assertIn("finding-a", prompt)
+        self.assertIn("coverage_partial", prompt)
+        self.assertIn("paid_amount", prompt)
+        # 来源行投影、实体值与内部通道词汇到不了模型。
+        for banned in ("ent-shop-a", "psycopg", "database", "select ", "http"):
+            self.assertNotIn(banned, prompt.lower())
+
+    def test_run_publishes_guarded_narrative_with_provenance(self):
+        from bi_agent.analysis.calculations import compute_findings
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        dataset = _summarizer_dataset(limitations=("coverage_partial",))
+        first, second = compute_findings(dataset, ("contribution",))
+        self.assertEqual(first.values["value"], "12.30")
+        self.assertEqual(first.values["contribution"], "0.615000")
+        self.assertEqual(second.values["value"], "7.70")
+        reply = json.dumps({"narrative": [
+            {"text": "paid_amount 的值为 12.30，贡献占比 0.615000。",
+             "finding_refs": [first.finding_ref], "claim_kind": "observation"},
+            {"text": "假设 12.30 主要来自单笔大额订单，待验证。",
+             "finding_refs": [first.finding_ref], "claim_kind": "hypothesis"},
+            {"text": "7.70 的下滑是因为竞争加剧。",
+             "finding_refs": [second.finding_ref], "claim_kind": "fact"},
+        ]}, ensure_ascii=False)
+        result = run_isolated_analysis(dataset, model=RecordingModel(reply),
+                                       kinds=("contribution",),
+                                       deadline=_deadline())
+        self.assertEqual(len(result.narrative), 1)
+        self.assertEqual(result.narrative[0]["finding_refs"],
+                         (first.finding_ref,))
+        self.assertEqual(result.hypotheses,
+                         ("假设 12.30 主要来自单笔大额订单，待验证。",))
+        self.assertEqual(result.unsupported_claims, ("7.70 的下滑是因为竞争加剧。",))
+        self.assertEqual(result.limitations, ("coverage_partial",))
+        payload = result.model_dump(mode="json")
+        self.assertEqual(validate_artifact_payload(payload, "analysis_result"),
+                         payload)
+
+    def test_missing_previous_records_the_plan_limitation(self):
+        from bi_agent.analysis.calculations import PREVIOUS_PERIOD_UNAVAILABLE
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        partial = run_isolated_analysis(
+            _calc_dataset(
+                (_calc_obs("row-001", {"paid_amount": Decimal("12.30")},
+                           {"paid_amount": Decimal("10.00")}),
+                 _calc_obs("row-002", {"paid_amount": Decimal("7.70")}))),
+            model=None, kinds=("contribution", "change_decomposition"),
+            deadline=_deadline())
+        self.assertIn(PREVIOUS_PERIOD_UNAVAILABLE, partial.limitations)
+        self.assertIn("narrative_unavailable", partial.limitations)
+        complete = run_isolated_analysis(
+            _calc_dataset(
+                (_calc_obs("row-001", {"paid_amount": Decimal("12.30")},
+                           {"paid_amount": Decimal("10.00")}),
+                 _calc_obs("row-002", {"paid_amount": Decimal("7.70")},
+                           {"paid_amount": Decimal("7.70")}))),
+            model=None, kinds=("contribution", "change_decomposition"),
+            deadline=_deadline())
+        self.assertNotIn(PREVIOUS_PERIOD_UNAVAILABLE, complete.limitations)
+
+    def test_derived_limitations_take_precedence_at_the_19_boundary(self):
+        """P2 回归：19 条数据集码 + 2 条派生码必须封顶在 20，不得炸结果构造。"""
+        from bi_agent.analysis.calculations import PREVIOUS_PERIOD_UNAVAILABLE
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        dataset = _calc_dataset(
+            (_calc_obs("row-001", {"paid_amount": Decimal("12.30")}),),
+            limitations=tuple(f"code_{index:02d}" for index in range(19)))
+        result = run_isolated_analysis(dataset, model=None,
+                                       kinds=("contribution",
+                                              "change_decomposition"),
+                                       deadline=_deadline())
+        self.assertTrue(result.findings)
+        self.assertEqual(len(result.limitations), 20)
+        self.assertEqual(result.limitations[:2],
+                         (PREVIOUS_PERIOD_UNAVAILABLE, "narrative_unavailable"))
+        self.assertEqual(result.limitations[2:],
+                         tuple(f"code_{index:02d}" for index in range(18)))
+
+    def test_derived_limitations_win_the_cap_at_20_dataset_codes(self):
+        """P2 回归：20 条数据集码 + 2 条派生码——派生码优先，溢出按序去尾。"""
+        from bi_agent.analysis.calculations import PREVIOUS_PERIOD_UNAVAILABLE
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        codes = tuple(f"code_{index:02d}" for index in range(20))
+        dataset = _calc_dataset(
+            (_calc_obs("row-001", {"paid_amount": Decimal("12.30")}),),
+            limitations=codes)
+        result = run_isolated_analysis(dataset, model=None,
+                                       kinds=("contribution",
+                                              "change_decomposition"),
+                                       deadline=_deadline())
+        self.assertTrue(result.findings)
+        self.assertEqual(len(result.limitations), 20)
+        self.assertEqual(result.limitations[:2],
+                         (PREVIOUS_PERIOD_UNAVAILABLE, "narrative_unavailable"))
+        self.assertEqual(result.limitations[2:], codes[:18])
+        self.assertNotIn("code_18", result.limitations)
+        self.assertNotIn("code_19", result.limitations)
+
+    def test_model_failure_with_a_full_limitation_book_keeps_findings(self):
+        """P2 回归：20 条数据集码 + 模型失败降级——findings 原样保留。"""
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        codes = tuple(f"code_{index:02d}" for index in range(20))
+        dataset = _calc_dataset(
+            (_calc_obs("row-001", {"paid_amount": Decimal("12.30")}),),
+            limitations=codes)
+        result = run_isolated_analysis(dataset, model=FailingModel(),
+                                       kinds=("contribution",),
+                                       deadline=_deadline())
+        self.assertTrue(result.findings)
+        self.assertEqual(result.limitations,
+                         ("narrative_unavailable",) + codes[:19])
+        self.assertNotIn("code_19", result.limitations)
+
+    def test_18_dataset_codes_plus_two_derived_fit_exactly(self):
+        """边界：18 + 2 恰好 20，全部保留——回归护栏。"""
+        from bi_agent.analysis.calculations import PREVIOUS_PERIOD_UNAVAILABLE
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        codes = tuple(f"code_{index:02d}" for index in range(18))
+        dataset = _calc_dataset(
+            (_calc_obs("row-001", {"paid_amount": Decimal("12.30")}),),
+            limitations=codes)
+        result = run_isolated_analysis(dataset, model=None,
+                                       kinds=("contribution",
+                                              "change_decomposition"),
+                                       deadline=_deadline())
+        self.assertTrue(result.findings)
+        self.assertEqual(result.limitations,
+                         (PREVIOUS_PERIOD_UNAVAILABLE, "narrative_unavailable")
+                         + codes)
+
+    def test_dataset_code_duplicating_a_derived_code_is_deduped(self):
+        """数据集码与派生码同名时去重，且派生码排前（优先级钉住）。"""
+        from bi_agent.analysis.calculations import PREVIOUS_PERIOD_UNAVAILABLE
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        dataset = _calc_dataset(
+            (_calc_obs("row-001", {"paid_amount": Decimal("12.30")}),),
+            limitations=("narrative_unavailable", "coverage_partial"))
+        result = run_isolated_analysis(dataset, model=None,
+                                       kinds=("contribution",
+                                              "change_decomposition"),
+                                       deadline=_deadline())
+        self.assertEqual(result.limitations,
+                         (PREVIOUS_PERIOD_UNAVAILABLE, "narrative_unavailable",
+                          "coverage_partial"))
+
+    def test_results_are_deterministic_for_identical_inputs(self):
+        from bi_agent.analysis.summarizer import run_isolated_analysis
+
+        def one_run():
+            return run_isolated_analysis(
+                _summarizer_dataset(),
+                model=RecordingModel(_narrative_reply()),
+                kinds=("contribution",), deadline=_deadline(5.0))
+
+        self.assertEqual(one_run().model_dump(mode="json"),
+                         one_run().model_dump(mode="json"))
+
+
+class AnalysisImportBoundaryTests(unittest.TestCase):
+    """计划 Task 4 Step 4：AST import 白名单 + 钉死的模型调用形状。"""
+
+    @staticmethod
+    def _source(name):
+        import bi_agent.analysis.calculations as calculations_module
+
+        base = pathlib.Path(calculations_module.__file__).parent
+        return (base / name).read_text(encoding="utf-8")
+
+    def test_isolated_modules_import_only_approved_surface(self):
+        from bi_agent.analysis.import_guard import import_violations
+
+        for name in ("calculations.py", "summarizer.py"):
+            with self.subTest(module=name):
+                self.assertEqual(import_violations(self._source(name)), ())
+
+    def test_guard_rejects_every_planned_forbidden_module(self):
+        from bi_agent.analysis.import_guard import import_violations
+
+        for module in ("os", "pathlib", "subprocess", "socket", "httpx",
+                       "requests", "psycopg"):
+            source = f"import {module}\nfrom {module} import connect\n"
+            with self.subTest(module=module):
+                self.assertTrue(import_violations(source))
+
+    def test_dynamic_import_channels_are_rejected(self):
+        """P1 回归：__import__ 不经过 import 语句，单扫 import 节点会静默漏放。"""
+        from bi_agent.analysis.import_guard import import_violations
+
+        for source in ('handle = __import__("psycopg").connect\n',
+                       'module = __import__("os")\n',
+                       'value = eval("1+1")\n',
+                       'exec("import os")\n'):
+            with self.subTest(source=source):
+                self.assertTrue(import_violations(source))
+        # 属性形式的 re.compile 不是裸名动态调用，不得误报。
+        self.assertEqual(
+            import_violations("import re\npattern = re.compile('a')\n"), ())
+
+    def test_guard_rejects_repository_tool_and_sync_channels(self):
+        from bi_agent.analysis.import_guard import import_violations
+
+        for module in ("bi_agent.runtime.repository", "bi_agent.analysis.tool",
+                       "bi_agent.commerce.sync", "bi_agent.agent",
+                       "bi_agent.analysis.loader"):
+            with self.subTest(module=module):
+                self.assertTrue(import_violations(f"import {module}\n"))
+
+    def test_absolute_internal_import_returns_a_verdict_not_a_crash(self):
+        """P2 回归：`import bi_agent.analysis.models` 必须给出判定而非 TypeError。"""
+        from bi_agent.analysis.import_guard import import_violations
+
+        self.assertEqual(
+            import_violations("import bi_agent.analysis.models\n"), ())
+        self.assertEqual(
+            import_violations("import bi_agent.analysis.models as models\n"), ())
+        self.assertEqual(import_violations(
+            "from bi_agent.analysis.models import Finding\n"), ())
+        # 禁用对照：同一模块的 star 导入仍被点名。
+        self.assertEqual(import_violations(
+            "from bi_agent.analysis.models import *\n"),
+            ("import_banned_star:bi_agent.analysis.models",))
+
+    def test_chat_model_type_surface_is_the_only_bi_agent_import(self):
+        from bi_agent.analysis.import_guard import import_violations
+
+        self.assertEqual(import_violations(
+            "from bi_agent.llm import ChatModel, Message\n"), ())
+        self.assertEqual(import_violations(
+            "from bi_agent.llm import ChatModel, Message, ModelReply, "
+            "ModelError\n"), ())
+        self.assertTrue(import_violations(
+            "from bi_agent.llm import CompatibleChatModel\n"))
+        self.assertTrue(import_violations("import bi_agent.llm\n"))
+
+    def test_relative_imports_are_limited_to_models_and_calculations(self):
+        from bi_agent.analysis.import_guard import import_violations
+
+        self.assertEqual(import_violations("from .models import Finding\n"), ())
+        self.assertEqual(import_violations(
+            "from .calculations import compute_findings\n"), ())
+        for source in ("from .loader import load_analysis_dataset\n",
+                       "from . import loader\n",
+                       "from ..runtime.models import ArtifactRef\n",
+                       "from .models import *\n"):
+            with self.subTest(source=source):
+                self.assertTrue(import_violations(source))
+
+    def test_syntax_errors_fail_closed(self):
+        from bi_agent.analysis.import_guard import import_violations
+
+        self.assertEqual(import_violations("def broken(:\n"), ("parse_error",))
+
+    def test_summarizer_pins_the_exact_model_call_shape(self):
+        from bi_agent.analysis.import_guard import model_call_violations
+
+        self.assertEqual(model_call_violations(self._source("summarizer.py")), ())
+        self.assertEqual(
+            model_call_violations(self._source("calculations.py"),
+                                  expected_calls=0), ())
+        header = ("def fake(messages, tools, timeout_s, model):\n"
+                  "    reply = ")
+        for call in ("model.complete(messages, tools, timeout_s=timeout_s)",
+                     "model.complete(messages, [], timeout)",
+                     "model.complete(messages, [{}], timeout_s=timeout_s)",
+                     "model.complete(payload, [], timeout_s=timeout_s)",
+                     "model.complete(messages, [], **kwargs)",
+                     "model.complete(messages, [], timeout_s=remaining_time)"):
+            with self.subTest(call=call):
+                self.assertTrue(model_call_violations(f"{header}{call}\n"))
 
 
 if __name__ == "__main__":
