@@ -257,13 +257,24 @@ def analyze_artifact(
 
 ### 9.1 前置与首版渠道
 
-除 Task 11 外，本子项目还要求 InventoryWatchGraph 对通知策略所依赖的库存层级已有真实来源登记、freshness policy、完整扫描证据和生产对账。没有来源时调度器保持 disabled，不周期性发送“无法判断”。
+除 Task 11 外，本子项目还要求 InventoryWatchGraph 对通知策略所依赖的库存层级已有真实来源登记、freshness policy、完整扫描证据和生产对账。**该门禁按层级分别判定**：
+
+- 已核验登记只替自己那一层说话。`physical_total` 已取证而 `shop_sellable` 无来源时，策略仍可就实物层出告警；这种组合是所有者 2026-09-17 选定的目标形态（Option A），不是待修缺陷。反过来，策略请求的层级里一个都没核验时该策略以 disabled 退出；没有任何可用层级时调度器整体保持 disabled。两种情形下都不周期性发送“无法判断”通知。
+- 缺已核验登记的层级既不能触发也不能解除：runner 把交给 graph 的**请求层级与 `DomainContext` 授权投影**同时收窄到已核验子集（只核验实物 ⇒ 仅获准池 + 空店铺授权投影；只核验渠道 ⇒ 仅店铺范围，池授权为空；两层都核验 ⇒ 两者都带），因此这一层在监控路径上根本没有行、没有去重键，也不占 `expected_items`，它的快照与店铺事实根本不被读取：graph 的渠道快照读以店铺授权非空为闸（`inventory/graph.py:613-620`），渠道侧的新鲜/扫描声明、时点并集与独有 SKU 都进不了物理轮的聚合（`inventory/graph.py:671`、`:676-683`、`:1033-1039`）；它的缺失由 gate 自己的**闭集**固定码与计数（`monitor_level_unverified` + `inventory_monitor_level_unverified_total{level}`）表达，而不是靠向 graph 多问一次、拿它出的 `unsupported` 占位行当表达。聊天路径不变：那里仍由 graph 自己报 `inventory_physical_source_unverified`、`inventory_channel_source_unverified`、`inventory_channel_snapshot_missing`。任何未核验层级的缺席或诊断，都不得使已在跑的已核验层级变得不完整。
+- 缺数量永远不是零，也不做层级替位：不得把 `physical_total` 复制、扇出或换算成逐店可售量，也不得拿渠道缺口当实物补货依据，反之亦然；店铺级触发与解除只能由已核验的店铺级来源支撑。
+- 缺失层级不产生面向用户的周期性提醒；只有固定诊断与固定计数。
+- 一格要进入状态迁移，先得能被唯一识别：`scope_ref` 只能来自该行自己层级的 opaque 引用（实物 = 池 + 仓库一对，渠道 = 店铺）。预警载荷契约本身允许这些引用键缺席（只强制层级/SKU/状态），而 graph 在**已核验**的实物层也会出这种行：点名了某 SKU 但本轮没有快照时是一格无池无仓库的 `unknown` 占位行。它由 runner 排除在状态机输入之外，只记固定诊断与固定计数——不借另一层级的引用、不拼一个默认作用域、不补零、不生成去重键，因此既不触发也不解除。
+- 来源 Artifact 是 graph 的**展示投影**（最多 `MAX_DISPLAY_ITEMS = 20` 行），不是全量行集：期望项超过这个上限时投影必被截断，而截断在 graph 里是“业务发现”不是失败。投影被截断的这一轮对任何已核验层级都不算完整：既不首发也不解除，也不得声称 500 行来源已全量持久化，或没出现的格子都安全。扩大决策投影是需要所有者另行决定的变更。
+
+这一区分不降低任何一层的取证要求：本节的“可按层跑”只指已核验层级可以先出告警；把某一层定为“当前无权威来源、按 `data_missing`/unknown 处理”必须是日期化来源验收加所有者明确决定的结论（`2026-09-14-inventory-source-acceptance.md` 的 2026-09-17 追加节就是这份记录），而不是把“本轮没读到数据”当成默认的静默降级。2026-09-17 所有者决定与它的授权边界见 `docs/superpowers/research/2026-09-17-continuous-inventory-local-development-exception.md`，逐层取证台账见 `docs/superpowers/research/2026-09-14-inventory-source-acceptance.md`。
 
 首版通知渠道确定为**应用内通知中心 + PostgreSQL outbox**。不在本项目内接入邮件、短信、企业微信、Slack 或任意 webhook；将来增加外部渠道时实现独立 sink 并单独评审凭证、收件范围和重试政策。调度使用部署主机的受控计划任务调用 CLI，不创建 Codex 自动化。
 
 ### 9.2 状态与公共契约
 
-告警生命周期为 `open → acknowledged → resolved`，另有 `suppressed`。唯一去重键由策略版本、库存层级、商品/SKU、店铺或库存池作用域和规则码组成；同一事实重复扫描只更新 `last_observed_at`，不创建第二条 open 告警。
+告警生命周期为 `open → acknowledged → resolved`，另有 `suppressed`。唯一去重键由策略版本、库存层级、商品/SKU、店铺或库存池作用域和规则码组成；作用域引用只能由该行自身层级给出（实物=池 + 仓库、渠道=店铺），缺任一成员就不是一格可去重的告警；同一事实重复扫描只更新 `last_observed_at`，不创建第二条 open 告警。
+
+策略里的 `levels` 是**请求**层级，不是已核验层级：运行时已核验集合只能从来源注册表派生，`complete_levels` 只能是“已核验且本轮扫描完整”的子集。未核验层级的行不进入状态迁移、不生成去重键：在监控路径上 runner 只把已核验子集发给 graph——同时把图上下文的授权投影收窄到同样的范围（策略存储里的请求层级与 opaque refs 原样保留，永不收窄，两者不是一个字段）——所以 graph 不会为它出 `unsupported` + null 数量的占位行，也就没有可供它计算的去重键；作为第二道闸，runner 仍按已核验集合过滤一次载荷里的行，但已持久化载荷与 fingerprint 不因过滤而改变。聊天路径仍可同时请求两层并由 graph 自己报未核验限制码。
 
 ```python
 class MonitorRunRequest(BaseModel):
@@ -290,13 +301,15 @@ def run_inventory_monitor(
 
 ### 9.3 调度、解除与投递
 
-每次调度以专用服务身份加载已批准策略和授权范围，调用现有 InventoryWatchGraph 生成不可变来源 Artifact，再在单事务中计算状态迁移并写 outbox。通知页面按用户授权过滤，显示数量、单位、阈值、来源快照时间、作用域和原因。
+每次调度以专用服务身份加载已批准策略和授权范围，调用现有 InventoryWatchGraph 生成不可变来源 Artifact（只请求已核验的那部分层级，并把图上下文的授权投影收窄到同样范围——物理轮空店铺投影下不读渠道快照、不产生店铺声明），再在单事务中计算状态迁移并写 outbox。通知页面按用户授权过滤，显示数量、单位、阈值、来源快照时间、作用域和原因。
 
 - 首次低于或等于阈值产生 `triggered`。
 - 状态持续但数值未发生有意义变化时只更新观测时间，不重复通知。
 - 经过配置的冷却期后仍异常可产生 `retriggered`；冷却期属于版本化策略。
-- 只有新的、完整且 fresh 的扫描证明已恢复到阈值以上才能 `resolved`；缺数据、过期或扫描不完整保持原状态并记录诊断。
-- acknowledge 不等于 resolved；策略删除把告警置 `suppressed`，不能伪装成库存恢复。
+- 只有新的、完整且 fresh、且属于**该告警自身层级**的扫描证明已恢复到阈值以上才能 `resolved`；缺数据、过期、扫描不完整或该层级已不再核验都保持原状态并记录诊断。
+- 一个曾经核验的渠道源停止供数（本轮没有它的快照）不能把 open/acknowledged 的渠道告警报成恢复；能力或来源退场只能走 `suppressed`，永远不是 `resolved`。
+- 展示投影被截断（`inventory.truncated` 为 true 或限制码里出现 `inventory_display_truncated`）的这一轮，所有已核验请求层级都不算完整：既不 triggered 也不 resolved，保持原状态并记固定诊断与计数。投影截断不是“库存都安全”，也不是“已恢复”。
+- acknowledge 不等于 resolved；策略删除或来源/能力撤销把告警置 `suppressed`，不能伪装成库存恢复。
 - outbox 采用 at-least-once 投递和稳定幂等键；页面消费成功后记录 delivery，不因页面刷新重复创建事件。
 
 ### 9.4 验收
@@ -304,7 +317,14 @@ def run_inventory_monitor(
 - 相同快照重复运行、调度并发和进程崩溃恢复都只保留一个 open 告警与一个首次触发事件。
 - 低库存、恰好阈值、恢复、再次下降、stale、扫描缺页、无阈值、单位冲突和共享库存池均有状态机测试。
 - 三店共享 100 件仍只按实物库存池计 100；渠道 0/实物充足只产生配额候选，不误发采购告警。
+- 策略请求两层而只有 `physical_total` 核验时：runner 递给 graph 的 `levels` 只有 `physical_total`，且图上下文的店铺授权投影为空、池授权只含策略在册池——底层仓库里即使存在过期/不完整的渠道快照、渠道独有 SKU 与无档案店铺，本轮对渠道快照零查询，载荷（行、`data_as_of`、`source_batches`、去重全集）与 fingerprint 里零出现；实物层照常 triggered/updated/resolved，渠道层零告警、零 outbox 行、零通知，固定诊断与固定计数里能看到该层未核验（不是靠 graph 的渠道占位行）；在载荷行集里给出一条缺 `pool_ref`/`warehouse_ref` 的实物行时，实物层其余格子仍可首发。只核验 `shop_sellable` 时对称成立：池授权投影为空、对实物快照零查询，实物侧事实进不了载荷与指纹。
+- 已核验层级被撤销登记后：该层 open/acknowledged 告警走 `suppressed`，`resolved` 计数保持 0；恢复事件必须等到新的、同层级、fresh 且完整的扫描。
+- 不出现任何“因缺数据而发”的用户通知：缺失层级只增加诊断与指标，不写 outbox。
+- `inventory_snapshot_missing` 按本轮真正在跑的范围双向用例：实物侧用例是在册池缺 `inventory/pools[]` 声明 ⇒ 去掉 `physical_total`；店铺侧用例只在 `shop_sellable` 本轮在跑时成立——`shop_not_synced` 伴随的同码只去掉 `shop_sellable`；物理轮（空店铺投影）里店铺侧产生点结构上不存在，同码出现即投影契约违约、当聚合码本轮去掉全部已核验层级，不得默认归给实物一层，也不得因此把已核验实物层永久弄哑，更不得据此把请求或投影改宽。
+- 缺 `pool_ref`/`warehouse_ref`（实物）或 `shop_ref`（渠道）的 graph 行：不进入状态机输入、不生成去重键、零 triggered、零 resolved、零 outbox，只出现固定诊断码与固定计数；用例必须盖住已核验实物层里的 `unknown` 占位行。
+- 构造一份 `status=partial`（截断时 `all_safe` 必为 false，所以不会是 `ok`）、带 500 个期望项与 20 行展示投影的来源 Artifact：本轮零 triggered、零 resolved、零 outbox，open/acknowledged 保持原状态，且固定计数能看到这一轮。
 - 越权用户看不到告警或关联名称；日志和 outbox 不含真实底层 ID、DSN 或快照证据原文。
+- monitor 图契约修订（空店铺投影下节点 1 不再以 `inventory_scope_empty` 终止、授权池对按池授权集直接派生）只覆盖「上下文无店铺授权且请求不含 `shop_sellable`」的形状；聊天路径行为逐字不变（原库存测试零回退）。
 - 调度关闭、来源被撤销或策略失效后不再产生新告警，现有历史仍可审计。
 
 ## 10. 文件和数据边界
@@ -332,7 +352,9 @@ def run_inventory_monitor(
 5. feature gate 关闭时的原行为回归；
 6. 日期化验收报告和 runbook 更新。
 
-语义目录 → SQL → 记忆严格按依赖顺序实施。隔离分析在 Task 11 门禁通过后可以作为独立泳道实施，不等待语义目录，也不共享未发布接口。库存通知的代码计划可以提前评审，实际实现必须等真实库存来源门禁满足。
+语义目录 → SQL → 记忆严格按依赖顺序实施。隔离分析在 Task 11 门禁通过后可以作为独立泳道实施，不等待语义目录，也不共享未发布接口。库存通知的代码计划可以提前评审，**生产实现与实际启用必须等 §9.1 的逐层来源门禁与 §4 发布门禁满足**。
+
+2026-09-17 所有者决定：在库存来源验收仍为 FAIL、生产保持 disabled 的前提下，只解除“不得写后置功能代码”的本地实施限制，允许按 `docs/superpowers/research/2026-09-17-continuous-inventory-local-development-exception.md` 实施库存通知计划 Task 1–6：只跑本机 `*_test` 库、离线与 stub 测试，`INVENTORY_MONITOR_ENABLED` 默认 false，迁移 023 只在本机测试库执行。该例外不修改本节任何发布标准，不把未执行验证记为通过，也不替任何层级宣告来源就绪。
 
 计划文件固定为：
 
