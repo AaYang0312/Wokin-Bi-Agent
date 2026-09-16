@@ -100,6 +100,10 @@ PersistenceNode = Literal[
     # 逐格分开是为了归因：检索/编译/AST/成本/只读执行各自会失败在不同的地方。
     "select_schema", "assess_readiness", "compile_query", "validate_ast",
     "estimate_cost", "execute_readonly",
+    # 隔离分析图（计划 Task 1 的固定六节点链；finalize 已在词表里）。加载与
+    # 校验分开是为了归因：失权/版本错配在模型调用前就拒绝。
+    "load_source", "validate_source", "compute_findings",
+    "summarize_findings", "persist_analysis",
 ]
 ErrorCode = Literal[
     "missing_parameters", "invalid_parameters", "forbidden", "deadline_exceeded",
@@ -1737,6 +1741,28 @@ def _prices_agree(actual: object, expected: object, status: str) -> bool:
 _EXPLORATION_PAYLOAD_KEYS = frozenset({
     "template_version", "catalog_version", "statement_fingerprint", "columns", "rows",
     "basis", "coverage", "diagnostics", "limitations"})
+# 隔离分析载荷（计划 Task 1）：与探索载荷键集完全不相交，判别位互不干扰。
+_ANALYSIS_PAYLOAD_KEYS = frozenset({
+    "source_artifact_ref", "source_fingerprint", "analysis_version", "findings",
+    "narrative", "hypotheses", "unsupported_claims", "limitations"})
+_ANALYSIS_FINDING_KEYS = frozenset({
+    "finding_ref", "kind", "metric", "row_refs", "values", "statement_code"})
+_ANALYSIS_NARRATIVE_KEYS = frozenset({"text", "finding_refs", "claim_kind"})
+_ANALYSIS_KINDS = frozenset({"contribution", "change_decomposition",
+                             "anomaly_candidates", "followups"})
+_ANALYSIS_CLAIM_KINDS = frozenset({"fact", "observation", "hypothesis"})
+_ANALYSIS_REF_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-"
+                              r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_ANALYSIS_ROW_RE = re.compile(r"^row-[a-z0-9-]{1,60}$")
+_ANALYSIS_FINDING_RE = re.compile(r"^finding-[a-z0-9-]{1,60}$")
+_ANALYSIS_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
+# 与 bi_agent.analysis.models 的 `_FORBIDDEN_KEYS` 同一词表：values 映射的键也是
+# 键，查询通道词汇在任意层级都拒（独立编译，理由同 `_ANALYSIS_VERSION_RE`）。
+_ANALYSIS_FORBIDDEN_KEYS = frozenset({"sql", "prompt", "tool_calls", "raw_rows"})
+# 与 bi_agent.analysis.models 的 `_VERSION_RE` 同一形状：`isolated-analysis/2026-09-14.1`。
+# 这里独立编译一份，是为了 runtime 不反向 import analysis 包（隔离边界归 analysis 侧）。
+_ANALYSIS_VERSION_RE = re.compile(
+    r"^[a-z0-9]+(-[a-z0-9]+)*/[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+$")
 _EXPLORATION_COLUMN_KEYS = frozenset({"ref", "data_type"})
 _EXPLORATION_COLUMN_REQUIRED = frozenset({"ref", "data_type"})
 # 口径凭证的键集与数据集那一支同源（`_BASIS_ITEM_KEYS`），但判别位不同：探索层按稳定
@@ -1921,6 +1947,90 @@ def _exploration_payload(value: object) -> dict[str, object]:
     return payload
 
 
+def _analysis_payload(value: object) -> dict[str, object]:
+    """隔离分析的公开载荷：`AnalysisResult` 的 JSON 形状（计划 Task 1）。
+
+    键集白名单本身就拒掉 `sql/prompt/tool_calls/raw_rows`：分析结果不携带任何
+    查询通道，也不带实体展示投影。数值只以十进制文本出现在 finding values
+    里，float 到不了持久化层；narrative 的逐条引用存在性由 Task 4 的守卫在
+    写入前判，这里只钉形状。给模型与公开发的是同一份形状（与探索载荷同一
+    做派）：这份载荷里没有可以在给模型时剔掉的东西。
+    """
+    payload = _mapping(value, allowed=_ANALYSIS_PAYLOAD_KEYS,
+                       required=_ANALYSIS_PAYLOAD_KEYS)
+    for key in ("source_artifact_ref", "source_fingerprint", "analysis_version"):
+        if not isinstance(payload[key], str):
+            _unsafe_payload()
+    if not _ANALYSIS_REF_RE.fullmatch(payload["source_artifact_ref"]):
+        _unsafe_payload()
+    if not _SHA256_HEX_RE.fullmatch(payload["source_fingerprint"]):
+        _unsafe_payload()
+    if not _ANALYSIS_VERSION_RE.fullmatch(payload["analysis_version"]):
+        _unsafe_payload()
+
+    findings = payload["findings"]
+    if not isinstance(findings, list) or len(findings) > 500:
+        _unsafe_payload()
+    for finding in findings:
+        if (not isinstance(finding, dict)
+                or finding.keys() != _ANALYSIS_FINDING_KEYS):
+            _unsafe_payload()
+        if (not isinstance(finding["finding_ref"], str)
+                or not _ANALYSIS_FINDING_RE.fullmatch(finding["finding_ref"])):
+            _unsafe_payload()
+        _string_in(finding["kind"], _ANALYSIS_KINDS)
+        if (not isinstance(finding["metric"], str)
+                or not _ANALYSIS_KEY_RE.fullmatch(finding["metric"])):
+            _unsafe_payload()
+        row_refs = finding["row_refs"]
+        if not isinstance(row_refs, list) or not 1 <= len(row_refs) <= 500:
+            _unsafe_payload()
+        for row_ref in row_refs:
+            if not isinstance(row_ref, str) or not _ANALYSIS_ROW_RE.fullmatch(row_ref):
+                _unsafe_payload()
+        values = finding["values"]
+        if not isinstance(values, dict) or len(values) > 10:
+            _unsafe_payload()
+        for key, item in values.items():
+            if (not isinstance(key, str) or key in _ANALYSIS_FORBIDDEN_KEYS
+                    or not _ANALYSIS_KEY_RE.fullmatch(key)):
+                _unsafe_payload()
+            if (not isinstance(item, str) or not item or item != item.strip()
+                    or len(item) > 200):
+                _unsafe_payload()
+        if (not isinstance(finding["statement_code"], str)
+                or not _ANALYSIS_KEY_RE.fullmatch(finding["statement_code"])):
+            _unsafe_payload()
+
+    narrative = payload["narrative"]
+    if not isinstance(narrative, list) or len(narrative) > 20:
+        _unsafe_payload()
+    for item in narrative:
+        if not isinstance(item, dict) or item.keys() != _ANALYSIS_NARRATIVE_KEYS:
+            _unsafe_payload()
+        if (not isinstance(item["text"], str) or not item["text"]
+                or item["text"] != item["text"].strip()
+                or len(item["text"]) > 500):
+            _unsafe_payload()
+        refs = item["finding_refs"]
+        if not isinstance(refs, list) or not 1 <= len(refs) <= 5:
+            _unsafe_payload()
+        for ref in refs:
+            if not isinstance(ref, str) or not _ANALYSIS_FINDING_RE.fullmatch(ref):
+                _unsafe_payload()
+        _string_in(item["claim_kind"], _ANALYSIS_CLAIM_KINDS)
+
+    for key in ("hypotheses", "unsupported_claims", "limitations"):
+        entries = payload[key]
+        if not isinstance(entries, list) or len(entries) > 20:
+            _unsafe_payload()
+        for entry in entries:
+            if (not isinstance(entry, str) or not entry
+                    or entry != entry.strip() or len(entry) > 500):
+                _unsafe_payload()
+    return payload
+
+
 def validate_model_payload(value: object,
                            artifact_type: str = "metric_result") -> dict[str, object]:
     """给模型的载荷：与公开载荷共用同一判别位，只是不含展示名。"""
@@ -1930,6 +2040,8 @@ def validate_model_payload(value: object,
         return _inventory_alerts_payload(value, public=False)
     if artifact_type == "exploration_result":
         return _exploration_payload(value)
+    if artifact_type == "analysis_result":
+        return _analysis_payload(value)
     if isinstance(value, dict) and set(value) == _EXPLORATION_PAYLOAD_KEYS:
         # `DomainResult.model_payload` 的校验器只有值、没有类型：探索载荷那九个键就是它
         # 自己的判别位（与数据集键集完全不相交）。反过来显式传类型仍走上面那一支，
@@ -1956,6 +2068,9 @@ def validate_artifact_payload(value: object,
     if artifact_type == "exploration_result":
         # 受控探索只发安全结果：键集与数据集完全不交，判别位就是唯一的分发依据。
         return _exploration_payload(value)
+    if artifact_type == "analysis_result":
+        # 隔离分析只发确定性 finding + 经守卫的叙述：键集与数据集完全不交。
+        return _analysis_payload(value)
     return _public_metric_payload(value, public=True)
 
 

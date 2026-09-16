@@ -35,6 +35,10 @@ class AppSettings(BaseModel):
     approved_query_memory_enabled: bool = False
     approver_subjects: frozenset[str] = frozenset()
     approver_dsn: SecretStr | None = None
+    # 隔离分析（子项目 D）默认关：关闭时不注册 analyze_artifact Tool、不读取
+    # Artifact，聊天行为与没有这个功能的版本一致（计划 Task 1 Step 5）。
+    # 本切片的门禁开启不需要附加环境项；loader/graph 属后续 Task。
+    isolated_analysis_enabled: bool = False
 
 
 class SyncSettings(BaseModel):
@@ -145,6 +149,9 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
         if approver_dsn_raw == app_dsn.get_secret_value():
             raise ValueError("APPROVED_QUERY_MEMORY_APPROVER_DSN_MUST_DIFFER")
         approver_dsn = SecretStr(approver_dsn_raw)
+    # 门禁解析沿用 `_flag` 的严格 true/false：缺席与空白都是关，
+    # "1"/"yes"/"True" 之类一律当场报错（计划 Task 1 Step 5）。
+    isolated_analysis_enabled = _flag(env, "ISOLATED_ANALYSIS_ENABLED")
     return AppSettings(
         app_dsn=app_dsn,
         shop_ids=shop_ids,
@@ -157,6 +164,7 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
         approved_query_memory_enabled=approved_query_memory_enabled,
         approver_subjects=approver_subjects,
         approver_dsn=approver_dsn,
+        isolated_analysis_enabled=isolated_analysis_enabled,
     )
 
 

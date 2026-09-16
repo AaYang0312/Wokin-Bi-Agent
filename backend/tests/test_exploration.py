@@ -3418,8 +3418,11 @@ class ExplorationDomainContractTests(unittest.TestCase):
         # 既有领域也不许借道发探索结果。
         for domain in sorted(BASELINE_DOMAINS):
             self.assertFalse(allows_artifact_type(domain, EXPLORATION_ARTIFACT_TYPE), domain)
-        self.assertEqual(domains(), tuple(sorted(BASELINE_DOMAINS | {EXPLORATION_DOMAIN})),
-                         "登记新领域不得改掉既有清单")
+        # 既有五域必须仍在：登记新领域不得删除既有清单（子集断言与
+        # test_runtime_db 的 020 重放同一做派：域清单只增不缩，后续泳道
+        # 登记新域不破本用例；新域自身的行为由它自己的计划用例钉）。
+        self.assertTrue(set(BASELINE_DOMAINS | {EXPLORATION_DOMAIN}) <= set(domains()),
+                        "登记新领域不得删除既有清单")
 
     def test_exploration_nodes_are_writable_and_unlisted_nodes_are_not(self):
         from bi_agent.runtime.domain_registry import allows_node

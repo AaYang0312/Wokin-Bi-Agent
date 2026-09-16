@@ -2531,5 +2531,103 @@ class ApprovedQueryMemoryMigrationTests(unittest.TestCase):
                                       True, True), privileges)
 
 
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class IsolatedAnalysisMigrationTests(unittest.TestCase):
+    """隔离分析计划 Task 1 Step 4：022 幂等，白名单只扩不缩，未知值仍被拒。
+
+    与 021 同一协议：全部 DDL 在管理员外层事务里跑（结束按 Rollback 协议退出），
+    共享测试库只保留由命令行显式提交的那份迁移。020 与 022 是两条独立泳道：
+    两份迁移都以「读现定义 → 合并额外取值 → 重建」的方式重申完整白名单，
+    谁后跑谁负责合并，不靠顺序运气——本类在已应用 020 的库上重放 022，
+    正是「022 后跑」这一侧的证据。
+    """
+
+    MIGRATION = "022_isolated_analysis_artifacts.sql"
+    DOMAINS = ("business_query", "commerce_performance", "listing_price_audit",
+               "inventory_watch", "controlled_sql_exploration",
+               "isolated_analysis")
+    TYPES = ("metric_result", "comparison_table", "trend_series", "chart_spec",
+             "price_audit", "inventory_alerts", "exploration_result",
+             "analysis_result")
+
+    def setUp(self):
+        self.conn = connect_test_db(self)
+
+    def _migration_sql(self) -> str:
+        from pathlib import Path
+
+        path = Path(__file__).parents[1] / "sql" / self.MIGRATION
+        return path.read_text(encoding="utf-8")
+
+    def _constraint_members(self, table: str, name: str) -> set[str]:
+        definition = self.conn.execute(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = %s::regclass AND conname = %s",
+            (table, name)).fetchone()
+        self.assertIsNotNone(definition, f"{name} 必须存在")
+        import re
+
+        return set(re.findall(r"'([a-z_]+)'", definition[0]))
+
+    def _seed_run(self, *, run_id, domain: str) -> None:
+        """预置一条指定领域的 query_run（artifact 探针的外键依赖）。"""
+        chat_id, message_id = uuid4(), uuid4()
+        self.conn.execute(
+            "INSERT INTO bi.app_chats(id, subject_id, title) VALUES (%s, 'subject-a', '分析')",
+            (chat_id,))
+        self.conn.execute(
+            "INSERT INTO bi.app_messages(id, chat_id, role, content, status) "
+            "VALUES (%s, %s, 'user', '分析这份结果', 'complete')",
+            (message_id, chat_id))
+        self.conn.execute(
+            "INSERT INTO bi.query_runs(id, chat_id, user_message_id, subject_id, "
+            "tool_call_id, domain, attempt_no, normalized_request, state) "
+            "VALUES (%s, %s, %s, 'subject-a', 'call_1', %s, 1, '{}', '{}')",
+            (run_id, chat_id, message_id, domain))
+
+    def test_022_is_the_next_numbered_migration_after_021(self):
+        """迁移编号已冻结：022 只属于本计划，而且排在 021 之后。"""
+        from pathlib import Path
+
+        sql_dir = Path(__file__).parents[1] / "sql"
+        files = sorted(path.name for path in sql_dir.glob("*.sql"))
+        self.assertIn(self.MIGRATION, files)
+        self.assertGreater(files.index(self.MIGRATION),
+                           files.index("021_approved_query_memory.sql"))
+        self.assertEqual([name for name in files if name.startswith("022")],
+                         [self.MIGRATION], "同一编号不能有两份迁移")
+
+    def test_replaying_022_is_idempotent_and_keeps_every_registered_value(self):
+        self.conn.execute(self._migration_sql())
+        self.conn.execute(self._migration_sql())
+        self.assertEqual(self._constraint_members(
+            "bi.query_runs", "query_runs_domain_check"), set(self.DOMAINS))
+        self.assertEqual(self._constraint_members(
+            "bi.query_artifacts", "query_artifacts_artifact_type_check"),
+            set(self.TYPES))
+
+    def test_unknown_domain_and_artifact_type_still_rejected(self):
+        self.conn.execute(self._migration_sql())
+        # 正向探针：新领域可写运行，新类型可写 Artifact。
+        self.run_id = uuid4()
+        self._seed_run(run_id=self.run_id, domain="isolated_analysis")
+        self.conn.execute(
+            "INSERT INTO bi.query_artifacts(id, run_id, artifact_type, payload) "
+            "VALUES (%s, %s, 'analysis_result', '{}')", (uuid4(), self.run_id))
+        for bad_domain in ("isolated_analysis_typo", "nope"):
+            with self.subTest(domain=bad_domain):
+                self.conn.execute("SAVEPOINT domain_probe")
+                with self.assertRaises(psycopg.errors.CheckViolation):
+                    self._seed_run(run_id=uuid4(), domain=bad_domain)
+                self.conn.execute("ROLLBACK TO SAVEPOINT domain_probe")
+        self.conn.execute("SAVEPOINT type_probe")
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            self.conn.execute(
+                "INSERT INTO bi.query_artifacts(id, run_id, artifact_type, payload) "
+                "VALUES (%s, %s, 'analysis_result_typo', '{}')",
+                (uuid4(), self.run_id))
+        self.conn.execute("ROLLBACK TO SAVEPOINT type_probe")
+
+
 if __name__ == "__main__":
     unittest.main()

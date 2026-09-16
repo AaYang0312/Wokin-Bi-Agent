@@ -1026,3 +1026,69 @@ class MemoryQueryRunStoreTests(unittest.TestCase):
         self.assertEqual(str(context.exception), "finish_requires_terminal_status")
         self.assertEqual(self.store.runs[run_id]["revision"], 0)
         self.assertIsNone(self.store.runs[run_id]["completed_at"])
+
+
+class IsolatedAnalysisRegistryTests(unittest.TestCase):
+    """计划 Task 1：`isolated_analysis` 领域与 `analysis_result` 类型的登记边界。
+
+    登记即边界：这个领域能写什么节点、能发什么 Artifact，由注册表一处回答；
+    数据库 CHECK 的同源由 tests.test_db 的迁移用例钉住。
+    """
+
+    def test_isolated_analysis_emits_only_analysis_result(self):
+        from bi_agent.runtime.domain_registry import (
+            ARTIFACT_TYPES, DATASET_ARTIFACT_TYPES, DomainSpec, allows_artifact_type,
+            domains, known_domain, spec_for)
+
+        self.assertTrue(known_domain("isolated_analysis"))
+        self.assertIn("isolated_analysis", domains())
+        self.assertIsInstance(spec_for("isolated_analysis"), DomainSpec)
+        self.assertTrue(allows_artifact_type("isolated_analysis", "analysis_result"))
+        for other_type in ARTIFACT_TYPES - {"analysis_result"}:
+            self.assertFalse(
+                allows_artifact_type("isolated_analysis", other_type),
+                f"isolated_analysis 不得产出 {other_type}")
+
+    def test_analysis_result_is_not_a_dataset_type(self):
+        from bi_agent.runtime.domain_registry import (ARTIFACT_TYPES,
+                                                      DATASET_ARTIFACT_TYPES)
+
+        self.assertIn("analysis_result", ARTIFACT_TYPES)
+        self.assertNotIn("analysis_result", DATASET_ARTIFACT_TYPES,
+                         "分析结果不是数据集：图表不得引用它，它也不进数据集配对")
+
+    def test_analysis_result_payload_validates_against_the_contract(self):
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        payload = {
+            "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+            "source_fingerprint": "a" * 64,
+            "analysis_version": "isolated-analysis/2026-09-14.1",
+            "findings": [{
+                "finding_ref": "finding-a", "kind": "contribution",
+                "metric": "paid_amount", "row_refs": ["row-001"],
+                "values": {"share": "1.000000"},
+                "statement_code": "contribution_share"}],
+            "narrative": [], "hypotheses": [], "unsupported_claims": [],
+            "limitations": [],
+        }
+        self.assertEqual(validate_artifact_payload(payload, "analysis_result"),
+                         payload)
+        with self.assertRaises(ValueError):
+            validate_artifact_payload(dict(payload, findings="nope"),
+                                      "analysis_result")
+
+    def test_other_artifact_payload_shapes_are_unchanged(self):
+        """新增类型不得改变既有判别位：旧载荷仍按旧分支校验。"""
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        with self.assertRaises(ValueError):
+            validate_artifact_payload({"kind": "bar"}, "analysis_result")
+        with self.assertRaises(ValueError):
+            # analysis_result 形状冒充 metric_result 也必须被旧分支拒掉。
+            validate_artifact_payload({
+                "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+                "source_fingerprint": "a" * 64,
+                "analysis_version": "isolated-analysis/2026-09-14.1",
+                "findings": [], "narrative": [], "hypotheses": [],
+                "unsupported_claims": [], "limitations": []}, "metric_result")

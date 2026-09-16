@@ -159,7 +159,8 @@ class ConfigTests(unittest.TestCase):
             set(AppSettings.model_fields),
             {"app_dsn", "shop_ids", "environment", "allowed_subjects", "public_origin",
              "auth_subject_header", "semantic_catalog_enabled", "controlled_sql_enabled",
-             "approved_query_memory_enabled", "approver_subjects", "approver_dsn"})
+             "approved_query_memory_enabled", "approver_subjects", "approver_dsn",
+             "isolated_analysis_enabled"})
         self.assertIs(AppSettings.model_fields["controlled_sql_enabled"].default, False)
 
     def test_env_example_ships_the_controlled_sql_gate_closed(self):
@@ -270,6 +271,44 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(assignments, ["APPROVED_QUERY_MEMORY_ENABLED=false"])
         self.assertIn("APP_APPROVER_SUBJECTS=\n", text)
         self.assertIn("BI_APPROVER_DSN=\n", text)
+
+    def test_isolated_analysis_gate_defaults_off_and_accepts_only_true_false(self):
+        """隔离分析计划 Task 1：门禁默认关，开关沿用 `_flag` 严格 true/false。
+
+        与记忆门禁不同，本切片的门禁开启不需要任何附加环境项（loader/graph 属
+        后续 Task）；但关与缺席必须给出逐字同一份设置，非法文本必须当场报错，
+        不能静默翻转。
+        """
+        import pathlib
+
+        from bi_agent.config import AppSettings, load_app_settings
+
+        env = valid_app_env()
+        self.assertFalse(load_app_settings(env).isolated_analysis_enabled)
+        for off in ("false", " false ", ""):
+            with self.subTest(off=off):
+                self.assertFalse(load_app_settings(
+                    {**env, "ISOLATED_ANALYSIS_ENABLED": off}
+                ).isolated_analysis_enabled)
+        for on in ("true", " true "):
+            with self.subTest(on=on):
+                self.assertTrue(load_app_settings(
+                    {**env, "ISOLATED_ANALYSIS_ENABLED": on}
+                ).isolated_analysis_enabled)
+        for bad in ("TRUE", "True", "1", "0", "yes", "no", "on", "off",
+                    "enabled", "tru", "false 1", ";", "true; DROP TABLE bi.orders"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValueError,
+                                            "ISOLATED_ANALYSIS_ENABLED"):
+                    load_app_settings(
+                        {**env, "ISOLATED_ANALYSIS_ENABLED": bad})
+        self.assertIs(
+            AppSettings.model_fields["isolated_analysis_enabled"].default, False)
+        text = (pathlib.Path(__file__).resolve().parents[2] / ".env.example"
+                ).read_text(encoding="utf-8")
+        assignments = [line for line in text.splitlines()
+                       if line.startswith("ISOLATED_ANALYSIS_ENABLED=")]
+        self.assertEqual(assignments, ["ISOLATED_ANALYSIS_ENABLED=false"])
 
     def test_selected_provider_uses_its_own_key(self):
         from bi_agent.config import load_model_settings

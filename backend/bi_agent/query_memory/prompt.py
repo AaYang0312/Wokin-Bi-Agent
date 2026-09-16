@@ -167,8 +167,9 @@ def _exploration_versions(_conn: Any) -> VersionSet:
     return exploration_versions()
 
 
-# 域 → 当前版本集的固定映射：键集与 domain_registry 的登记域逐一相等（用例钉住）。
-# 新域必须在登记的同时给出自己的冻结形状，这里不存在会猜的默认值。
+# 域 → 当前版本集的固定映射：这五个是 approved 记忆计划 Task 5 冻结的
+# memory-capable chat 域（隔离分析等非 chat 门禁域不在其内，用例钉住）。
+# 新 chat 域必须在登记的同时给出自己的冻结形状，这里不存在会猜的默认值。
 CURRENT_MEMORY_VERSIONS: dict[str, Callable[[Any], VersionSet]] = {
     "business_query": _business_query_versions,
     "commerce_performance": _commerce_versions,

@@ -20,6 +20,9 @@ ARTIFACT_TYPES = frozenset({
     "inventory_alerts",
     # 受控 SQL 探索（计划 Task 5）：安全结果 + 口径/覆盖/诊断/限制，永远没有 SQL 原文。
     "exploration_result",
+    # 隔离分析（计划 Task 1）：对已持久化 Artifact 的确定性分析结果；它不是
+    # 数据集类型（不进 DATASET_ARTIFACT_TYPES），图表不得引用它。
+    "analysis_result",
 })
 
 # 数据集与图表必须成对同版本：chart_spec 只能引用这两类数据集 Artifact。
@@ -84,6 +87,13 @@ EXPLORATION_NODES = frozenset({
     "select_schema", "authorize_scope", "assess_readiness", "compile_query",
     "validate_ast", "estimate_cost", "execute_readonly", "persist_artifact", "finalize",
 })
+# 隔离分析（计划 Task 1 的固定六节点链）。推进顺序由 `analysis/graph.py` 的状态机
+# 决定（Task 5），这里只回答"这个领域能不能写这个节点"。与价审/库存同一做派：
+# 必须与图上的节点枚举逐项相等（由用例比对）。
+ANALYSIS_NODES = frozenset({
+    "load_source", "validate_source", "compute_findings",
+    "summarize_findings", "persist_analysis", "finalize",
+})
 
 _REGISTRY: dict[str, DomainSpec] = {
     "business_query": DomainSpec(
@@ -113,6 +123,11 @@ _REGISTRY: dict[str, DomainSpec] = {
     "controlled_sql_exploration": DomainSpec(
         name="controlled_sql_exploration", nodes=EXPLORATION_NODES,
         artifact_types=frozenset({"exploration_result"}),
+    ),
+    # 隔离分析只发这一种 Artifact：它不是数据集类型，也不借道既有领域的节点链。
+    "isolated_analysis": DomainSpec(
+        name="isolated_analysis", nodes=ANALYSIS_NODES,
+        artifact_types=frozenset({"analysis_result"}),
     ),
 }
 
@@ -150,6 +165,6 @@ def allows_node(domain: str, node: object) -> bool:
     return node in entry.nodes
 
 
-__all__ = ["ARTIFACT_TYPES", "COMMERCE_NODES", "DATASET_ARTIFACT_TYPES", "DomainSpec",
+__all__ = ["ANALYSIS_NODES", "ARTIFACT_TYPES", "COMMERCE_NODES", "DATASET_ARTIFACT_TYPES", "DomainSpec",
            "DomainUnknown", "EXPLORATION_NODES", "INVENTORY_NODES", "LISTING_NODES",
            "allows_artifact_type", "allows_node", "domains", "known_domain", "spec_for"]

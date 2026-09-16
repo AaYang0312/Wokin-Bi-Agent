@@ -409,8 +409,15 @@ class QueryMemoryLifecycleTests(unittest.TestCase):
         from bi_agent.runtime import domain_registry
         from bi_agent.query_memory.repository import _TOOL_FOR_DOMAIN
 
+        # approved 记忆 Task 5 冻结的五个 memory-capable chat 域：门禁域
+        # （如隔离分析）没有 expected_tool，也不进记忆，刻意不在这个集合里。
+        memory_capable_domains = {"business_query", "commerce_performance",
+                                  "listing_price_audit", "inventory_watch",
+                                  "controlled_sql_exploration"}
+        self.assertTrue(memory_capable_domains <= set(domain_registry.domains()),
+                        "记忆域必须是已登记域的子集：不能登记之外的域")
         self.assertEqual(set(_TOOL_FOR_DOMAIN) | {"commerce_performance"},
-                         set(domain_registry.domains()))
+                         memory_capable_domains)
 
     def test_draft_insert_and_drafted_event_share_one_transaction(self):
         conn = self._conn()
@@ -1304,7 +1311,12 @@ class CurrentMemoryVersionsTests(unittest.TestCase):
         from bi_agent.query_memory.prompt import CURRENT_MEMORY_VERSIONS
         from bi_agent.runtime import domain_registry
 
-        self.assertEqual(set(CURRENT_MEMORY_VERSIONS), set(domain_registry.domains()))
+        # 同上一条：五个 memory-capable chat 域的冻结形状；门禁域刻意不在内。
+        memory_capable_domains = {"business_query", "commerce_performance",
+                                  "listing_price_audit", "inventory_watch",
+                                  "controlled_sql_exploration"}
+        self.assertTrue(memory_capable_domains <= set(domain_registry.domains()))
+        self.assertEqual(set(CURRENT_MEMORY_VERSIONS), memory_capable_domains)
 
     def test_business_query_shape_matches_a_fresh_succeeded_run_freeze(self):
         from bi_agent.query_memory.prompt import current_memory_versions
