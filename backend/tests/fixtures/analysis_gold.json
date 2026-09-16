@@ -1,0 +1,567 @@
+{
+  "cases": [
+    {
+      "name": "contribution_change_two_rows",
+      "kinds": ["contribution", "change_decomposition"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {
+            "row_ref": "row-a",
+            "dimensions": {"shop": "ent-shop-a"},
+            "metrics": {"paid_amount": "30.00"},
+            "previous_metrics": {"paid_amount": "20.00"}
+          },
+          {
+            "row_ref": "row-b",
+            "dimensions": {"shop": "ent-shop-b"},
+            "metrics": {"paid_amount": "70.00"},
+            "previous_metrics": {"paid_amount": "80.00"}
+          }
+        ],
+        "limitations": []
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-70bdf9c782c038c4191e648e",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-a"],
+          "values": {"contribution": "0.300000", "value": "30.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-464b7d5331bbaadcc93603f8",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-b"],
+          "values": {"contribution": "0.700000", "value": "70.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-625f421e1af81ab139fbc0c9",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-a"],
+          "values": {"current": "30.00", "previous": "20.00", "change": "10.00", "change_rate": "0.500000"},
+          "statement_code": "change_vs_previous"
+        },
+        {
+          "finding_ref": "finding-a0db577fe39ca6e3f2fd4f3c",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-b"],
+          "values": {"current": "70.00", "previous": "80.00", "change": "-10.00", "change_rate": "-0.125000"},
+          "statement_code": "change_vs_previous"
+        }
+      ]
+    },
+    {
+      "name": "zero_total_no_contribution",
+      "kinds": ["contribution"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {
+            "row_ref": "row-a",
+            "dimensions": {"shop": "ent-shop-a"},
+            "metrics": {"paid_amount": "-50.00"},
+            "previous_metrics": {}
+          },
+          {
+            "row_ref": "row-b",
+            "dimensions": {"shop": "ent-shop-b"},
+            "metrics": {"paid_amount": "50.00"},
+            "previous_metrics": {}
+          }
+        ],
+        "limitations": []
+      },
+      "expected_findings": []
+    },
+    {
+      "name": "previous_zero_omits_rate",
+      "kinds": ["change_decomposition"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {
+            "row_ref": "row-a",
+            "dimensions": {"shop": "ent-shop-a"},
+            "metrics": {"paid_amount": "25.00"},
+            "previous_metrics": {"paid_amount": "0.00"}
+          }
+        ],
+        "limitations": []
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-625f421e1af81ab139fbc0c9",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-a"],
+          "values": {"current": "25.00", "previous": "0.00", "change": "25.00"},
+          "statement_code": "change_vs_previous"
+        }
+      ]
+    },
+    {
+      "name": "mad_all_equal_is_silent",
+      "kinds": ["anomaly_candidates"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {"row_ref": "row-001", "dimensions": {"shop": "ent-shop-1"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-002", "dimensions": {"shop": "ent-shop-2"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-003", "dimensions": {"shop": "ent-shop-3"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-004", "dimensions": {"shop": "ent-shop-4"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}}
+        ],
+        "limitations": []
+      },
+      "expected_findings": []
+    },
+    {
+      "name": "mad_zero_non_median_uses_code",
+      "kinds": ["anomaly_candidates"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {"row_ref": "row-001", "dimensions": {"shop": "ent-shop-1"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-002", "dimensions": {"shop": "ent-shop-2"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-003", "dimensions": {"shop": "ent-shop-3"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-004", "dimensions": {"shop": "ent-shop-4"}, "metrics": {"paid_amount": "50.00"}, "previous_metrics": {}}
+        ],
+        "limitations": []
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-f1c03a27bbd14e3ce84f6bd4",
+          "kind": "anomaly_candidates",
+          "metric": "paid_amount",
+          "row_refs": ["row-004"],
+          "values": {"method": "median_absolute_deviation", "score": "mad_zero_non_median", "value": "50.00", "center": "10.00", "mad": "0.00"},
+          "statement_code": "mad_outlier_candidate"
+        }
+      ]
+    },
+    {
+      "name": "mad_flags_extreme_outlier",
+      "kinds": ["anomaly_candidates"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {"row_ref": "row-001", "dimensions": {"shop": "ent-shop-1"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-002", "dimensions": {"shop": "ent-shop-2"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-003", "dimensions": {"shop": "ent-shop-3"}, "metrics": {"paid_amount": "11.00"}, "previous_metrics": {}},
+          {"row_ref": "row-004", "dimensions": {"shop": "ent-shop-4"}, "metrics": {"paid_amount": "100.00"}, "previous_metrics": {}}
+        ],
+        "limitations": []
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-f1c03a27bbd14e3ce84f6bd4",
+          "kind": "anomaly_candidates",
+          "metric": "paid_amount",
+          "row_refs": ["row-004"],
+          "values": {"method": "median_absolute_deviation", "score": "120.735500", "value": "100.00", "center": "10.50", "mad": "0.50"},
+          "statement_code": "mad_outlier_candidate"
+        }
+      ]
+    },
+    {
+      "name": "mad_negative_outlier",
+      "kinds": ["anomaly_candidates"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {"row_ref": "row-001", "dimensions": {"shop": "ent-shop-1"}, "metrics": {"paid_amount": "-10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-002", "dimensions": {"shop": "ent-shop-2"}, "metrics": {"paid_amount": "-10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-003", "dimensions": {"shop": "ent-shop-3"}, "metrics": {"paid_amount": "-11.00"}, "previous_metrics": {}},
+          {"row_ref": "row-004", "dimensions": {"shop": "ent-shop-4"}, "metrics": {"paid_amount": "-100.00"}, "previous_metrics": {}}
+        ],
+        "limitations": []
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-f1c03a27bbd14e3ce84f6bd4",
+          "kind": "anomaly_candidates",
+          "metric": "paid_amount",
+          "row_refs": ["row-004"],
+          "values": {"method": "median_absolute_deviation", "score": "120.735500", "value": "-100.00", "center": "-10.50", "mad": "0.50"},
+          "statement_code": "mad_outlier_candidate"
+        }
+      ]
+    },
+    {
+      "name": "mad_needs_four_observations",
+      "kinds": ["anomaly_candidates"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {"row_ref": "row-001", "dimensions": {"shop": "ent-shop-1"}, "metrics": {"paid_amount": "1.00"}, "previous_metrics": {}},
+          {"row_ref": "row-002", "dimensions": {"shop": "ent-shop-2"}, "metrics": {"paid_amount": "1.00"}, "previous_metrics": {}},
+          {"row_ref": "row-003", "dimensions": {"shop": "ent-shop-3"}, "metrics": {"paid_amount": "999.00"}, "previous_metrics": {}}
+        ],
+        "limitations": []
+      },
+      "expected_findings": []
+    },
+    {
+      "name": "multiple_metrics_deterministic_order",
+      "kinds": ["contribution", "change_decomposition"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {
+            "row_ref": "row-a",
+            "dimensions": {"shop": "ent-shop-a"},
+            "metrics": {"paid_amount": "30.00", "quantity": "2.00"},
+            "previous_metrics": {"paid_amount": "20.00", "quantity": "1.00"}
+          },
+          {
+            "row_ref": "row-b",
+            "dimensions": {"shop": "ent-shop-b"},
+            "metrics": {"paid_amount": "70.00", "quantity": "3.00"},
+            "previous_metrics": {"paid_amount": "80.00", "quantity": "1.00"}
+          }
+        ],
+        "limitations": []
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-70bdf9c782c038c4191e648e",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-a"],
+          "values": {"contribution": "0.300000", "value": "30.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-464b7d5331bbaadcc93603f8",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-b"],
+          "values": {"contribution": "0.700000", "value": "70.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-e7040cb27bdf1608bdf03fc7",
+          "kind": "contribution",
+          "metric": "quantity",
+          "row_refs": ["row-a"],
+          "values": {"contribution": "0.400000", "value": "2.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-421507875b31720f96945ec3",
+          "kind": "contribution",
+          "metric": "quantity",
+          "row_refs": ["row-b"],
+          "values": {"contribution": "0.600000", "value": "3.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-625f421e1af81ab139fbc0c9",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-a"],
+          "values": {"current": "30.00", "previous": "20.00", "change": "10.00", "change_rate": "0.500000"},
+          "statement_code": "change_vs_previous"
+        },
+        {
+          "finding_ref": "finding-a0db577fe39ca6e3f2fd4f3c",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-b"],
+          "values": {"current": "70.00", "previous": "80.00", "change": "-10.00", "change_rate": "-0.125000"},
+          "statement_code": "change_vs_previous"
+        },
+        {
+          "finding_ref": "finding-082b84b7d2f9d2e8dc2b8fd0",
+          "kind": "change_decomposition",
+          "metric": "quantity",
+          "row_refs": ["row-a"],
+          "values": {"current": "2.00", "previous": "1.00", "change": "1.00", "change_rate": "1.000000"},
+          "statement_code": "change_vs_previous"
+        },
+        {
+          "finding_ref": "finding-1b42af7367cb309440f22172",
+          "kind": "change_decomposition",
+          "metric": "quantity",
+          "row_refs": ["row-b"],
+          "values": {"current": "3.00", "previous": "1.00", "change": "2.00", "change_rate": "2.000000"},
+          "statement_code": "change_vs_previous"
+        }
+      ]
+    },
+    {
+      "name": "limitations_produce_coverage_followups",
+      "kinds": ["followups"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {"row_ref": "row-001", "dimensions": {"shop": "ent-shop-1"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-002", "dimensions": {"shop": "ent-shop-2"}, "metrics": {"paid_amount": "10.00"}, "previous_metrics": {}},
+          {"row_ref": "row-003", "dimensions": {"shop": "ent-shop-3"}, "metrics": {"paid_amount": "11.00"}, "previous_metrics": {}},
+          {"row_ref": "row-004", "dimensions": {"shop": "ent-shop-4"}, "metrics": {"paid_amount": "100.00"}, "previous_metrics": {}}
+        ],
+        "limitations": ["coverage_partial"]
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-0f0c13083dac5e834f4b3cdf",
+          "kind": "followups",
+          "metric": "paid_amount",
+          "row_refs": ["row-001", "row-002", "row-003", "row-004"],
+          "values": {"followup": "检查 coverage gaps"},
+          "statement_code": "inspect_coverage_gaps"
+        }
+      ]
+    },
+    {
+      "name": "all_kinds_gate_and_reconcile",
+      "kinds": ["contribution", "change_decomposition", "anomaly_candidates", "followups"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {
+            "row_ref": "row-001",
+            "dimensions": {"shop": "ent-shop-1"},
+            "metrics": {"paid_amount": "10.00"},
+            "previous_metrics": {"paid_amount": "10.00"}
+          },
+          {
+            "row_ref": "row-002",
+            "dimensions": {"shop": "ent-shop-2"},
+            "metrics": {"paid_amount": "10.00"},
+            "previous_metrics": {"paid_amount": "10.00"}
+          },
+          {
+            "row_ref": "row-003",
+            "dimensions": {"shop": "ent-shop-3"},
+            "metrics": {"paid_amount": "10.00"},
+            "previous_metrics": {"paid_amount": "10.00"}
+          },
+          {
+            "row_ref": "row-004",
+            "dimensions": {"shop": "ent-shop-4"},
+            "metrics": {"paid_amount": "100.00"},
+            "previous_metrics": {}
+          }
+        ],
+        "limitations": ["coverage_partial"]
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-bcc59c6f055fc84c5c4051a8",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-001"],
+          "values": {"contribution": "0.076923", "value": "10.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-c957b636b0cb7d2b4e65f50b",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-002"],
+          "values": {"contribution": "0.076923", "value": "10.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-db194a238e84fbfd286fa609",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-003"],
+          "values": {"contribution": "0.076923", "value": "10.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-359a611b72644c22b39cbf2c",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-004"],
+          "values": {"contribution": "0.769231", "value": "100.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-e51db72a5a76ce25d746df06",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-001"],
+          "values": {"current": "10.00", "previous": "10.00", "change": "0.00", "change_rate": "0.000000"},
+          "statement_code": "change_vs_previous"
+        },
+        {
+          "finding_ref": "finding-4180dd6eacd05ab9fc72c669",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-002"],
+          "values": {"current": "10.00", "previous": "10.00", "change": "0.00", "change_rate": "0.000000"},
+          "statement_code": "change_vs_previous"
+        },
+        {
+          "finding_ref": "finding-89985527187d693883e741bc",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-003"],
+          "values": {"current": "10.00", "previous": "10.00", "change": "0.00", "change_rate": "0.000000"},
+          "statement_code": "change_vs_previous"
+        },
+        {
+          "finding_ref": "finding-f1c03a27bbd14e3ce84f6bd4",
+          "kind": "anomaly_candidates",
+          "metric": "paid_amount",
+          "row_refs": ["row-004"],
+          "values": {"method": "median_absolute_deviation", "score": "mad_zero_non_median", "value": "100.00", "center": "10.00", "mad": "0.00"},
+          "statement_code": "mad_outlier_candidate"
+        },
+        {
+          "finding_ref": "finding-0f0c13083dac5e834f4b3cdf",
+          "kind": "followups",
+          "metric": "paid_amount",
+          "row_refs": ["row-001", "row-002", "row-003", "row-004"],
+          "values": {"followup": "检查 coverage gaps"},
+          "statement_code": "inspect_coverage_gaps"
+        },
+        {
+          "finding_ref": "finding-66a34a5fef0ace3464eb91a9",
+          "kind": "followups",
+          "metric": "paid_amount",
+          "row_refs": ["row-004"],
+          "values": {"followup": "补充 previous period"},
+          "statement_code": "supply_previous_period"
+        },
+        {
+          "finding_ref": "finding-7ad71fabd0bf774a38f76a56",
+          "kind": "followups",
+          "metric": "paid_amount",
+          "row_refs": ["row-004"],
+          "values": {"followup": "核对 row-004 的来源批次"},
+          "statement_code": "verify_source_batch"
+        }
+      ]
+    },
+    {
+      "name": "extreme_decimals_stay_exact",
+      "kinds": ["contribution", "change_decomposition"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {
+            "row_ref": "row-a",
+            "dimensions": {"shop": "ent-shop-a"},
+            "metrics": {"paid_amount": "60000000000000000000000.00"},
+            "previous_metrics": {"paid_amount": "59000000000000000000000.00"}
+          },
+          {
+            "row_ref": "row-b",
+            "dimensions": {"shop": "ent-shop-b"},
+            "metrics": {"paid_amount": "40000000000000000000000.00"},
+            "previous_metrics": {"paid_amount": "40000000000000000000000.00"}
+          }
+        ],
+        "limitations": []
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-70bdf9c782c038c4191e648e",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-a"],
+          "values": {"contribution": "0.600000", "value": "60000000000000000000000.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-464b7d5331bbaadcc93603f8",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-b"],
+          "values": {"contribution": "0.400000", "value": "40000000000000000000000.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-625f421e1af81ab139fbc0c9",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-a"],
+          "values": {"current": "60000000000000000000000.00", "previous": "59000000000000000000000.00", "change": "1000000000000000000000.00", "change_rate": "0.016949"},
+          "statement_code": "change_vs_previous"
+        },
+        {
+          "finding_ref": "finding-a0db577fe39ca6e3f2fd4f3c",
+          "kind": "change_decomposition",
+          "metric": "paid_amount",
+          "row_refs": ["row-b"],
+          "values": {"current": "40000000000000000000000.00", "previous": "40000000000000000000000.00", "change": "0.00", "change_rate": "0.000000"},
+          "statement_code": "change_vs_previous"
+        }
+      ]
+    },
+    {
+      "name": "duplicate_rows_are_never_deduplicated",
+      "kinds": ["contribution"],
+      "dataset": {
+        "source_artifact_ref": "00000000-0000-4000-8000-000000000001",
+        "source_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_version": "metrics/2026-09-12.1",
+        "observations": [
+          {"row_ref": "row-a", "dimensions": {"shop": "ent-shop-a"}, "metrics": {"paid_amount": "20.00"}, "previous_metrics": {}},
+          {"row_ref": "row-a", "dimensions": {"shop": "ent-shop-a"}, "metrics": {"paid_amount": "20.00"}, "previous_metrics": {}},
+          {"row_ref": "row-b", "dimensions": {"shop": "ent-shop-b"}, "metrics": {"paid_amount": "60.00"}, "previous_metrics": {}}
+        ],
+        "limitations": []
+      },
+      "expected_findings": [
+        {
+          "finding_ref": "finding-70bdf9c782c038c4191e648e",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-a"],
+          "values": {"contribution": "0.200000", "value": "20.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-70bdf9c782c038c4191e648e",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-a"],
+          "values": {"contribution": "0.200000", "value": "20.00"},
+          "statement_code": "contribution_share"
+        },
+        {
+          "finding_ref": "finding-464b7d5331bbaadcc93603f8",
+          "kind": "contribution",
+          "metric": "paid_amount",
+          "row_refs": ["row-b"],
+          "values": {"contribution": "0.600000", "value": "60.00"},
+          "statement_code": "contribution_share"
+        }
+      ]
+    }
+  ]
+}

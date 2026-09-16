@@ -18,8 +18,20 @@
 - 只接受三个数据集类型；版本逐项对当前常量，过期即拒；
 - 投影只收精确十进制（float 与超长数字串拒收），fingerprint 与行序/键序无关；
 - 实体引用必须落在当前授权集合或来源 entities 投影内；loader 不碰 conn。
+
+计划 Task 3 追加（确定性 Decimal 计算）：
+
+- 每个数值都来自 Decimal 纯函数：精确运算遇 Inexact 即稳定失败，除法只
+  量化一次，全程无 float；finding 与观测顺序、指标键序无关；
+- 缺 previous 不造零基线；previous=0 只发绝对变化；总额为 0 不发贡献；
+- MAD 同指标 ≥4 个观测、阈值 3.5，mad=0 编码为 `mad_zero_non_median`；
+- followups 只有三条固定证据模板，不给采购/改价/投放类建议；
+- gold fixture 逐字段比对：反序输入不变，错期望与改输入都必须转红。
 """
 
+import copy
+import json
+import pathlib
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -391,8 +403,10 @@ class AnalysisRegistryContractTests(unittest.TestCase):
 
         shipped = sorted(path.name for path in
                          pathlib.Path(analysis.__file__).parent.glob("*.py"))
-        # Task 1 契约 + Task 2 授权 loader；graph/summarizer 等按各自 Task 登记。
-        self.assertEqual(shipped, ["__init__.py", "loader.py", "models.py"])
+        # Task 1 契约 + Task 2 授权 loader + Task 3 确定性计算；
+        # graph/summarizer 等按各自 Task 登记。
+        self.assertEqual(shipped, ["__init__.py", "calculations.py", "loader.py",
+                                   "models.py"])
 
 
 class _LandmineConn:
@@ -677,6 +691,49 @@ class AnalysisLoaderTests(unittest.TestCase):
         self.assertEqual(_load(commerce).metric_version, COMMERCE_METRIC_VERSION)
 
 
+# ---------------------------------------------------------------------------
+# 计划 Task 3：确定性 Decimal 计算的共用构造器与访问器
+# ---------------------------------------------------------------------------
+
+
+def _calc_obs(row_ref, metrics, previous_metrics=None):
+    return _observation(row_ref=row_ref, metrics=metrics,
+                        previous_metrics=previous_metrics or {})
+
+
+def _calc_dataset(observations, *, limitations=()):
+    from bi_agent.analysis.models import AnalysisDataset
+
+    return AnalysisDataset(
+        source_artifact_ref=UUID_V4, source_fingerprint=FINGERPRINT,
+        metric_version=METRIC_VERSION, observations=tuple(observations),
+        limitations=tuple(limitations))
+
+
+def _compute_rows(observations, kinds, *, limitations=()):
+    from bi_agent.analysis.calculations import compute_findings
+
+    return compute_findings(_calc_dataset(observations, limitations=limitations),
+                            tuple(kinds))
+
+
+def _dump(finding):
+    return finding.model_dump(mode="json")
+
+
+def _single_row_finding(findings, row_ref, kind=None):
+    matched = [item for item in findings if item.row_refs == (row_ref,)
+               and (kind is None or item.kind == kind)]
+    if len(matched) != 1:
+        raise AssertionError(f"expected exactly one finding for {row_ref}, "
+                             f"got {len(matched)}")
+    return matched[0]
+
+
+def _value(findings, row_ref, key, kind=None):
+    return _single_row_finding(findings, row_ref, kind).values[key]
+
+
 def _provenance(*, metric_version=None, graph_version=None):
     from bi_agent.runtime.artifacts import QueryProvenance
 
@@ -686,6 +743,362 @@ def _provenance(*, metric_version=None, graph_version=None):
     if graph_version is not None:
         fields["graph_version"] = graph_version
     return QueryProvenance(**fields)
+
+
+class AnalysisCalculationTests(unittest.TestCase):
+    """计划 Task 3：Decimal 纯函数、顺序不变、fail-closed 与固定模板。"""
+
+    def test_contribution_and_change_reconcile_exactly(self):
+        findings = _compute_rows(
+            (_calc_obs("row-a", {"paid_amount": Decimal("30.00")},
+                       {"paid_amount": Decimal("20.00")}),
+             _calc_obs("row-b", {"paid_amount": Decimal("70.00")},
+                       {"paid_amount": Decimal("80.00")})),
+            ("contribution", "change_decomposition"))
+        self.assertEqual(_value(findings, "row-a", "contribution",
+                                kind="contribution"), "0.300000")
+        self.assertEqual(_value(findings, "row-b", "contribution",
+                                kind="contribution"), "0.700000")
+        self.assertEqual(_value(findings, "row-a", "change",
+                                kind="change_decomposition"), "10.00")
+        self.assertEqual(_value(findings, "row-b", "change",
+                                kind="change_decomposition"), "-10.00")
+        self.assertEqual(_value(findings, "row-b", "change_rate",
+                                kind="change_decomposition"), "-0.125000")
+        changes = sum((Decimal(item.values["change"]) for item in findings
+                       if item.kind == "change_decomposition"), Decimal(0))
+        self.assertEqual(changes, Decimal("0.00"))
+
+    def test_contribution_rounding_stays_within_the_plan_bound(self):
+        rows = tuple(
+            _calc_obs(f"row-{index:03d}", {"paid_amount": Decimal(value)})
+            for index, value in enumerate(("1.00", "2.00", "10.00"), start=1))
+        findings = _compute_rows(rows, ("contribution",))
+        total = sum((Decimal(item.values["contribution"])
+                     for item in findings), Decimal(0))
+        self.assertLessEqual(abs(total - Decimal(1)),
+                             Decimal("0.000001") * len(rows))
+        self.assertEqual(total, Decimal("1.000000"))
+
+    def test_zero_total_publishes_no_contribution(self):
+        findings = _compute_rows(
+            (_calc_obs("row-a", {"paid_amount": Decimal("-50.00")}),
+             _calc_obs("row-b", {"paid_amount": Decimal("50.00")})),
+            ("contribution",))
+        self.assertEqual(findings, ())
+
+    def test_change_rate_is_omitted_when_previous_is_zero(self):
+        findings = _compute_rows(
+            (_calc_obs("row-a", {"paid_amount": Decimal("25.00")},
+                       {"paid_amount": Decimal("0.00")}),),
+            ("change_decomposition",))
+        finding = _single_row_finding(findings, "row-a")
+        self.assertEqual(finding.values,
+                         {"current": "25.00", "previous": "0.00",
+                          "change": "25.00"})
+        self.assertNotIn("change_rate", finding.values)
+
+    def test_missing_previous_never_becomes_a_zero_baseline(self):
+        from bi_agent.analysis.calculations import PREVIOUS_PERIOD_UNAVAILABLE
+
+        self.assertEqual(PREVIOUS_PERIOD_UNAVAILABLE,
+                         "previous_period_unavailable")
+        findings = _compute_rows(
+            (_calc_obs("row-a", {"paid_amount": Decimal("10.00")},
+                       {"paid_amount": Decimal("10.00")}),
+             _calc_obs("row-b", {"paid_amount": Decimal("20.00")})),
+            ("change_decomposition",))
+        self.assertEqual([item.row_refs for item in findings], [("row-a",)])
+
+    def test_mad_flags_outlier_without_float(self):
+        findings = _compute_rows(
+            tuple(_calc_obs(f"row-{index:03d}", {"paid_amount": Decimal(value)})
+                  for index, value in enumerate(
+                      ("10.00", "10.00", "11.00", "100.00"), start=1)),
+            ("anomaly_candidates",))
+        self.assertEqual([item.row_refs[0] for item in findings], ["row-004"])
+        finding = findings[0]
+        self.assertEqual(finding.values["method"], "median_absolute_deviation")
+        self.assertEqual(finding.values["score"], "120.735500")
+        self.assertEqual(finding.values["center"], "10.50")
+        self.assertEqual(finding.values["mad"], "0.50")
+        self.assertEqual(finding.statement_code, "mad_outlier_candidate")
+
+    def test_mad_needs_four_observations(self):
+        findings = _compute_rows(
+            tuple(_calc_obs(f"row-{index:03d}", {"paid_amount": Decimal(value)})
+                  for index, value in enumerate(("1.00", "1.00", "999.00"),
+                                                start=1)),
+            ("anomaly_candidates",))
+        self.assertEqual(findings, ())
+
+    def test_mad_zero_with_all_equal_values_is_silent(self):
+        findings = _compute_rows(
+            tuple(_calc_obs(f"row-{index:03d}", {"paid_amount": Decimal("10.00")})
+                  for index in range(1, 5)),
+            ("anomaly_candidates",))
+        self.assertEqual(findings, ())
+
+    def test_mad_zero_non_median_is_encoded_as_a_code(self):
+        findings = _compute_rows(
+            tuple(_calc_obs(f"row-{index:03d}", {"paid_amount": Decimal(value)})
+                  for index, value in enumerate(
+                      ("10.00", "10.00", "10.00", "50.00"), start=1)),
+            ("anomaly_candidates",))
+        finding = _single_row_finding(findings, "row-004")
+        self.assertEqual(finding.values["score"], "mad_zero_non_median")
+        self.assertEqual(finding.values["center"], "10.00")
+        self.assertEqual(finding.values["mad"], "0.00")
+
+    def test_mad_handles_negative_metrics_symmetrically(self):
+        findings = _compute_rows(
+            tuple(_calc_obs(f"row-{index:03d}", {"paid_amount": Decimal(value)})
+                  for index, value in enumerate(
+                      ("-10.00", "-10.00", "-11.00", "-100.00"), start=1)),
+            ("anomaly_candidates",))
+        finding = _single_row_finding(findings, "row-004")
+        self.assertEqual(finding.values["score"], "120.735500")
+        self.assertEqual(finding.values["center"], "-10.50")
+        self.assertEqual(finding.values["value"], "-100.00")
+
+    def test_multiple_metrics_are_sorted_and_independent(self):
+        findings = _compute_rows(
+            (_calc_obs("row-a", {"paid_amount": Decimal("30.00"),
+                                 "quantity": Decimal("2.00")},
+                       {"paid_amount": Decimal("20.00"),
+                        "quantity": Decimal("1.00")}),
+             _calc_obs("row-b", {"paid_amount": Decimal("70.00"),
+                                 "quantity": Decimal("3.00")},
+                       {"paid_amount": Decimal("80.00"),
+                        "quantity": Decimal("1.00")})),
+            ("contribution", "change_decomposition"))
+        identity = [(item.kind, item.metric, item.row_refs)
+                    for item in findings]
+        self.assertEqual(identity, [
+            ("contribution", "paid_amount", ("row-a",)),
+            ("contribution", "paid_amount", ("row-b",)),
+            ("contribution", "quantity", ("row-a",)),
+            ("contribution", "quantity", ("row-b",)),
+            ("change_decomposition", "paid_amount", ("row-a",)),
+            ("change_decomposition", "paid_amount", ("row-b",)),
+            ("change_decomposition", "quantity", ("row-a",)),
+            ("change_decomposition", "quantity", ("row-b",)),
+        ])
+        shares = {(item.metric, item.row_refs[0]): item.values["contribution"]
+                  for item in findings if item.kind == "contribution"}
+        self.assertEqual(shares, {
+            ("paid_amount", "row-a"): "0.300000",
+            ("paid_amount", "row-b"): "0.700000",
+            ("quantity", "row-a"): "0.400000",
+            ("quantity", "row-b"): "0.600000",
+        })
+
+    def test_output_is_invariant_under_observation_and_key_order(self):
+        rows = (_calc_obs("row-a", {"paid_amount": Decimal("30.00"),
+                                    "quantity": Decimal("2.00")},
+                          {"paid_amount": Decimal("20.00"),
+                           "quantity": Decimal("1.00")}),
+                _calc_obs("row-b", {"paid_amount": Decimal("70.00"),
+                                    "quantity": Decimal("3.00")},
+                          {"paid_amount": Decimal("80.00"),
+                           "quantity": Decimal("1.00")}))
+        kinds = ("contribution", "change_decomposition",
+                 "anomaly_candidates", "followups")
+        base = [_dump(item) for item in _compute_rows(rows, kinds)]
+        flipped = [_dump(item) for item in _compute_rows(
+            tuple(_calc_obs(item.row_ref,
+                            dict(reversed(list(item.metrics.items()))),
+                            dict(reversed(list(item.previous_metrics.items()))))
+                  for item in reversed(rows)), kinds)]
+        self.assertEqual(base, flipped)
+        # 反向突变：数值真的变了输出必须变，防“恒等输出”假绿。
+        bumped = (_calc_obs("row-a", {"paid_amount": Decimal("31.00"),
+                                      "quantity": Decimal("2.00")},
+                            {"paid_amount": Decimal("20.00"),
+                             "quantity": Decimal("1.00")}),
+                  rows[1])
+        self.assertNotEqual(base,
+                            [_dump(item) for item in _compute_rows(bumped, kinds)])
+
+    def test_extreme_bounded_decimals_stay_exact(self):
+        findings = _compute_rows(
+            (_calc_obs("row-a", {"paid_amount":
+                                 Decimal("60000000000000000000000.00")},
+                       {"paid_amount":
+                        Decimal("59000000000000000000000.00")}),
+             _calc_obs("row-b", {"paid_amount":
+                                 Decimal("40000000000000000000000.00")},
+                       {"paid_amount":
+                        Decimal("40000000000000000000000.00")})),
+            ("contribution", "change_decomposition"))
+        shares = {(item.metric, item.row_refs[0]): item.values["contribution"]
+                  for item in findings if item.kind == "contribution"}
+        self.assertEqual(shares, {
+            ("paid_amount", "row-a"): "0.600000",
+            ("paid_amount", "row-b"): "0.400000",
+        })
+        finding = _single_row_finding(findings, "row-a",
+                                      kind="change_decomposition")
+        self.assertEqual(finding.values["change"],
+                         "1000000000000000000000.00")
+        self.assertEqual(finding.values["change_rate"], "0.016949")
+
+    def test_oversized_or_overprecise_values_fail_closed(self):
+        with self.assertRaisesRegex(ValueError,
+                                    "^analysis_value_out_of_range$"):
+            _compute_rows((_calc_obs(
+                "row-a", {"paid_amount": Decimal("1" + "0" * 30)}),),
+                ("contribution",))
+        with self.assertRaisesRegex(ValueError,
+                                    "^analysis_value_out_of_range$"):
+            _compute_rows(
+                (_calc_obs("row-a", {"paid_amount": Decimal("0." + "1" * 250)},
+                           {"paid_amount": Decimal("0." + "2" * 250)}),),
+                ("change_decomposition",))
+
+    def test_repeated_kinds_are_computed_once(self):
+        rows = (_calc_obs("row-a", {"paid_amount": Decimal("30.00")}),)
+        base = [_dump(item) for item in _compute_rows(rows, ("contribution",))]
+        repeated = [_dump(item) for item in
+                    _compute_rows(rows, ("contribution", "contribution"))]
+        self.assertEqual(base, repeated)
+
+    def test_unknown_kind_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "^analysis_kind_invalid$"):
+            _compute_rows(
+                (_calc_obs("row-a", {"paid_amount": Decimal("1.00")}),),
+                ("contribution", "python"))
+
+    def test_followups_use_only_the_three_fixed_templates(self):
+        rows = [_calc_obs("row-001", {"paid_amount": Decimal("10.00")},
+                          {"paid_amount": Decimal("10.00")}),
+                _calc_obs("row-002", {"paid_amount": Decimal("10.00")},
+                          {"paid_amount": Decimal("10.00")}),
+                _calc_obs("row-003", {"paid_amount": Decimal("11.00")},
+                          {"paid_amount": Decimal("10.00")}),
+                _calc_obs("row-004", {"paid_amount": Decimal("100.00")})]
+        kinds = ("contribution", "change_decomposition",
+                 "anomaly_candidates", "followups")
+        findings = _compute_rows(rows, kinds, limitations=("coverage_partial",))
+        followups = [item for item in findings if item.kind == "followups"]
+        self.assertEqual([item.statement_code for item in followups],
+                         ["inspect_coverage_gaps", "supply_previous_period",
+                          "verify_source_batch"])
+        texts = {item.values["followup"] for item in followups}
+        self.assertEqual(texts, {"检查 coverage gaps", "补充 previous period",
+                                 "核对 row-004 的来源批次"})
+        for item in findings:
+            for text in item.values.values():
+                for banned in ("采购", "改价", "投放", "立即", "自动"):
+                    self.assertNotIn(banned, text)
+
+    def test_followups_are_gated_by_their_evidence_kinds(self):
+        rows = (_calc_obs("row-001", {"paid_amount": Decimal("10.00")}),
+                _calc_obs("row-002", {"paid_amount": Decimal("100.00")}))
+        self.assertEqual(_compute_rows(rows, ("followups",)), ())
+        gated = _compute_rows(rows, ("followups",),
+                              limitations=("coverage_partial",))
+        self.assertEqual([item.statement_code for item in gated],
+                         ["inspect_coverage_gaps"])
+        self.assertEqual(gated[0].row_refs, ("row-001", "row-002"))
+
+    def test_statement_code_vocabulary_is_fixed(self):
+        rows = [_calc_obs("row-001", {"paid_amount": Decimal("10.00")},
+                          {"paid_amount": Decimal("10.00")}),
+                _calc_obs("row-002", {"paid_amount": Decimal("10.00")}),
+                _calc_obs("row-003", {"paid_amount": Decimal("10.00")}),
+                _calc_obs("row-004", {"paid_amount": Decimal("100.00")})]
+        findings = _compute_rows(rows, ("contribution", "change_decomposition",
+                                        "anomaly_candidates", "followups"),
+                                 limitations=("coverage_partial",))
+        self.assertEqual({item.statement_code for item in findings},
+                         {"contribution_share", "change_vs_previous",
+                          "mad_outlier_candidate", "verify_source_batch",
+                          "supply_previous_period", "inspect_coverage_gaps"})
+
+    def test_package_reexports_the_calculation_surface(self):
+        import bi_agent.analysis
+        from bi_agent.analysis import calculations
+
+        self.assertIs(bi_agent.analysis.compute_findings,
+                      calculations.compute_findings)
+        self.assertIs(bi_agent.analysis.PREVIOUS_PERIOD_UNAVAILABLE,
+                      calculations.PREVIOUS_PERIOD_UNAVAILABLE)
+
+
+class AnalysisGoldTests(unittest.TestCase):
+    """gold fixture：每个字段逐字相等；反序输入不变；错期望与改输入都转红。"""
+
+    @staticmethod
+    def _cases():
+        path = pathlib.Path(__file__).parent / "fixtures" / "analysis_gold.json"
+        return json.loads(path.read_text(encoding="utf-8"))["cases"]
+
+    def _payloads(self, case):
+        from bi_agent.analysis.calculations import compute_findings
+        from bi_agent.analysis.models import AnalysisDataset, AnalysisObservation
+
+        data = case["dataset"]
+        dataset = AnalysisDataset(
+            source_artifact_ref=data["source_artifact_ref"],
+            source_fingerprint=data["source_fingerprint"],
+            metric_version=data["metric_version"],
+            observations=tuple(AnalysisObservation(**observation)
+                               for observation in data["observations"]),
+            limitations=tuple(data["limitations"]))
+        return [finding.model_dump(mode="json") for finding in
+                compute_findings(dataset, tuple(case["kinds"]))]
+
+    @staticmethod
+    def _flipped(case):
+        data = case["dataset"]
+        observations = []
+        for observation in reversed(data["observations"]):
+            observations.append({
+                "row_ref": observation["row_ref"],
+                "dimensions": dict(
+                    reversed(list(observation["dimensions"].items()))),
+                "metrics": dict(
+                    reversed(list(observation["metrics"].items()))),
+                "previous_metrics": dict(
+                    reversed(list(observation["previous_metrics"].items()))),
+            })
+        return {**case, "dataset": {**data, "observations": observations}}
+
+    def test_every_gold_case_matches_field_by_field(self):
+        for case in self._cases():
+            with self.subTest(case=case["name"]):
+                self.assertEqual(self._payloads(case),
+                                 case["expected_findings"])
+
+    def test_gold_findings_survive_reversed_input_order(self):
+        for case in self._cases():
+            with self.subTest(case=case["name"]):
+                self.assertEqual(self._payloads(self._flipped(case)),
+                                 case["expected_findings"])
+
+    def test_gold_expectations_are_not_tautological(self):
+        case = copy.deepcopy(self._cases()[0])
+        original = self._payloads(case)
+        self.assertEqual(original, case["expected_findings"])
+        # 错期望：改一个数值字符，比较必须立刻转红。
+        wrong = copy.deepcopy(case["expected_findings"])
+        key, value = next(iter(wrong[0]["values"].items()))
+        wrong[0]["values"][key] = value[:-1] + ("1" if value[-1] != "1" else "2")
+        self.assertNotEqual(original, wrong)
+        # 错引用：finding_ref 变了也必须被发现。
+        wrong_ref = copy.deepcopy(case["expected_findings"])
+        tail = wrong_ref[0]["finding_ref"][-1]
+        wrong_ref[0]["finding_ref"] = (
+            wrong_ref[0]["finding_ref"][:-1] + ("0" if tail != "0" else "1"))
+        self.assertNotEqual(original, wrong_ref)
+        # 改输入：数据动一格，输出必须跟着动。
+        perturbed = copy.deepcopy(case)
+        metrics = perturbed["dataset"]["observations"][0]["metrics"]
+        metric = next(iter(metrics))
+        metrics[metric] = str(Decimal(metrics[metric]) + Decimal("1"))
+        self.assertNotEqual(self._payloads(perturbed),
+                            case["expected_findings"])
 
 
 if __name__ == "__main__":
