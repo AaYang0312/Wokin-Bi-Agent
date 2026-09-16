@@ -549,7 +549,8 @@ class OperatorFixture(unittest.TestCase):
               store: MemoryQueryRunStore | None = None,
               conn: Any = None,
               deadline_patch: float | None = None,
-              approved_query_memory_enabled: bool = False):
+              approved_query_memory_enabled: bool = False,
+              isolated_analysis_enabled: bool = False):
         """一句话过一遍主层：真实图、真实库、脚本模型。
 
         这是“离线集成”而不是“真实模型验收”：模型侧只提供预制回合，因此这些用例
@@ -557,6 +558,7 @@ class OperatorFixture(unittest.TestCase):
         """
         model = mock.Mock()
         model.complete.side_effect = list(replies)
+        self.last_model = model
         allowed = self._allow() if allowed is None else allowed
         state = state or SessionState(subject=f"t11-agent-{self.tag}")
         patches = []
@@ -570,7 +572,8 @@ class OperatorFixture(unittest.TestCase):
         self.addCleanup(lambda: [patch.stop() for patch in patches])
         return answer(question, state, model=model, conn=self.conn if conn is None
                       else conn, allowed_shop_ids=allowed, now=NOW, run_store=store,
-                      approved_query_memory_enabled=approved_query_memory_enabled)
+                      approved_query_memory_enabled=approved_query_memory_enabled,
+                      isolated_analysis_enabled=isolated_analysis_enabled)
 
 
 def _is_database_class(node: ast.AST) -> bool:
@@ -1904,6 +1907,112 @@ class OperatorAgentRoutingTests(OperatorFixture):
         self.assertNotIn(self.shops["1"], model_side, "ERP 店铺主键不进模型历史")
         self.assertIn("验收店", json.dumps(turn.artifacts[0]["entities"],
                                           ensure_ascii=False))
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class OperatorAnalysisWorkflowTests(OperatorFixture):
+    """隔离分析 Task 5 Step 6 的四工作流回归：分析门禁开着时，四个既有运营
+    工作流的分发与产物逐字不变。
+
+    每个工作流跑两遍（门禁关 / 开），脚本模型都只调固定 Tool：两遍的 Artifact
+    类型与错误状态必须完全一致；开着时唯一差异是模型多看到一个只读
+    `analyze_artifact`。分析图自身的门禁与持久化由 tests.test_analysis 钉。
+    """
+
+    def _assert_gate_on_matches_baseline(self, question: str, replies,
+                                         expected_types: list[str]):
+        baseline = self._turn(question, replies, isolated_analysis_enabled=False)
+        enabled = self._turn(question, replies, isolated_analysis_enabled=True)
+        self.assertEqual([item["artifact_type"] for item in enabled.artifacts],
+                         expected_types)
+        self.assertEqual([item["artifact_type"] for item in baseline.artifacts],
+                         expected_types,
+                         "先确认基线本身拿到预期产物，再比对门禁差异")
+        self.assertEqual((baseline.error_code, baseline.text),
+                         (enabled.error_code, enabled.text),
+                         "分析门禁不得改变既有工作流的回答")
+        offered = [item["function"]["name"] for item in
+                   self.last_model.complete.call_args_list[0].args[1]]
+        self.assertEqual(offered[-1], "analyze_artifact", "开着时只追加这一个只读 Tool")
+        self.assertNotIn("analysis_result",
+                         json.dumps(enabled.artifacts, ensure_ascii=False),
+                         "脚本模型没调分析 Tool，就不该有分析产物")
+
+    def test_product_workflow_is_unchanged_with_the_gate_on(self):
+        self._archive(PRODUCT, "直钉枪")
+        for key in ("1", "2"):
+            self._shop(key)
+            self._cover(key)
+            self._sale(key, f"E{key}", quantity="1", amount="100", cost="40")
+        replies = [
+            _reply(calls=[_call("analyze_product_performance", {
+                "product": {"text": "直钉枪"},
+                "scope": {"mode": "all_authorized"},
+                "start": START.isoformat(), "end": END.isoformat(),
+                "metrics": ["sold_quantity", "sales_amount"],
+                "sales_basis": "erp_effective_parent", "profit_basis": "none"})]),
+            _reply(text="两家店的销量见下方表格")]
+        self._assert_gate_on_matches_baseline(
+            "直钉枪在所有店铺近七天卖得怎么样？", replies,
+            ["metric_result", "trend_series"])
+
+    def test_comparison_workflow_is_unchanged_with_the_gate_on(self):
+        for key, amount in (("1", "100"), ("2", "400")):
+            self._shop(key)
+            self._cover(key)
+            self._sale(key, f"E{key}", quantity="1" if key == "1" else "4",
+                       amount=amount)
+        replies = [
+            _reply(calls=[_call("compare_performance", {
+                "scope": {"mode": "all_authorized"},
+                "start": START.isoformat(), "end": END.isoformat(),
+                "group_by": "platform",
+                "metrics": ["sales_amount"],
+                "sales_basis": "erp_effective_parent", "profit_basis": "none"})]),
+            _reply(text="对比见下表")]
+        self._assert_gate_on_matches_baseline(
+            "各平台支付金额对比", replies,
+            ["comparison_table", "trend_series", "chart_spec", "chart_spec"])
+
+    def test_listing_workflow_is_unchanged_with_the_gate_on(self):
+        self._shop("1", platform="tb")
+        self._cover("1")
+        self._sale("1", "E1", sku=SKU_A, quantity="1", amount="19.90", cost="8")
+        self._map("1", listing="L1", sku=SKU_A, platform="tb")
+        self._snapshot("1", items=[{"listing_id": "L1",
+                                     "erp_sku_id": self._sku(SKU_A),
+                                     "list_amount": "19.90"}], platform="tb")
+        self._register_listing_source("tb")
+        replies = [
+            _reply(calls=[_call("audit_listing_prices", {
+                "product": {"text": "直钉枪"},
+                "scope": {"mode": "all_authorized"},
+                "expected_prices": [price_rule("19.90")],
+                "price_basis": "list_price", "as_of": "latest"})]),
+            _reply(text="这一格一致")]
+        self._assert_gate_on_matches_baseline(
+            "直钉枪 6mm 在获准店铺的标价是 19.90，都对不对？", replies,
+            ["price_audit"])
+
+    def test_inventory_workflow_is_unchanged_with_the_gate_on(self):
+        for key in ("1", "2"):
+            self._shop(key, platform="tb")
+            self._cover(key)
+            self._sale(key, f"E{key}", sku=SKU_A, quantity="1", amount="19.90")
+        self._pool("a", connection="shared", shops=("1", "2"))
+        self._physical("a", warehouse="wh-a", sku=SKU_A, quantity="100")
+        for key in ("1", "2"):
+            self._channel_stock(key, sku=SKU_A,
+                                quantity="0" if key == "1" else "50")
+        self._register_inventory_sources()
+        replies = [
+            _reply(calls=[_call("inspect_inventory", {
+                "products": "all", "scope": {"mode": "all_authorized"},
+                "levels": ["physical_total", "shop_sellable"],
+                "as_of": "latest"})]),
+            _reply(text="预警见下表")]
+        self._assert_gate_on_matches_baseline(
+            "看一下全商品总库存和店铺预警", replies, ["inventory_alerts"])
 
 
 @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")

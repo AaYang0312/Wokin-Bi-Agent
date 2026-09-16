@@ -3594,5 +3594,266 @@ class QueryMemoryAgentIntegrationTests(unittest.TestCase):
         self.assertNotIn("mem-first", system_messages[1].content)
 
 
+class IsolatedAnalysisAgentIntegrationTests(unittest.TestCase):
+    """主 Agent 的隔离分析接线（计划 isolated-analysis Task 5 Step 5–6）。
+
+    这里只钉主层该钉的五件事：
+      1. `ISOLATED_ANALYSIS_ENABLED` 关着（默认）时 Tool 列表逐字不变；
+      2. 开着时只追加一个只读 `analyze_artifact`，六份固定 Tool 的顺序与描述不变；
+      3. Tool schema 只有 artifact_ref 与 analysis_kinds，问题/SQL/店铺主键/数据行
+         都没有入口；
+      4. 一次 Tool 调用 = 一次图执行，同轮第二次分析被拒；上下文里的授权与
+         deadline 全部由服务端注入；
+      5. 分析 Artifact 的载荷（findings/narrative/limitations）回到模型与展示层，
+         模型侧永远没有 ERP 主键。
+
+    图内部的六道门、授权拒绝与 fail-closed 持久化由 tests.test_analysis 钉；
+    Postgres 侧的读取语义由 tests.test_runtime_db 钉。
+    """
+
+    NOW = AgentTests.NOW
+
+    def setUp(self):
+        from bi_agent.runtime.memory import MemoryQueryRunStore
+
+        self.run_store = MemoryQueryRunStore(forbidden_values={"S1"})
+
+    def _conn(self):
+        return ShopCatalogConn([("S1", "店铺A")])
+
+    def _seed_source_artifact(self):
+        """在内存 Store 里落一份可分析的来源 Artifact（成功运行 + 真血缘）。"""
+        from bi_agent.analysis.loader import load_analysis_dataset
+        from bi_agent.commerce.models import DomainContext
+        from bi_agent.runtime.artifacts import QueryProvenance
+        from bi_agent.runtime.models import (NewArtifact, NewQueryRun,
+                                             RunCompletion, RunStatus)
+        from uuid import uuid4
+        payload = {"status": "ok", "metric_definition": {},
+                   "coverage": {"status": "complete", "start": "2026-09-01",
+                                "end": "2026-09-08", "gaps": []},
+                   "limitations": [], "data_as_of": None, "filters": {},
+                   "data": [{"shop_ref": S1_REF, "day": "2026-09-01",
+                             "paid_amount": "12.30", "paid_orders": 3}]}
+        run_id = self.run_store.create_run(NewQueryRun(
+            chat_id=uuid4(), user_message_id=uuid4(), subject_id="u1",
+            tool_call_id="seed", domain="business_query", attempt_no=1,
+            normalized_request={"shop_refs": [S1_REF]},
+            provenance=QueryProvenance(quality_rule=QUALITY_RULE),
+            state={"node": "persist_artifact", "status": "running",
+                   "revision": 0,
+                   "normalized_request": {"shop_refs": [S1_REF]}}))
+        ref = self.run_store.save_artifact(run_id, NewArtifact(
+            artifact_type="metric_result", payload=payload,
+            coverage=payload["coverage"]))
+        self.run_store.finish(run_id, RunCompletion(
+            expected_revision=0, node="finalize", status=RunStatus.SUCCEEDED,
+            state={"node": "finalize", "status": "succeeded", "revision": 1,
+                   "run_id": str(run_id),
+                   "normalized_request": {"shop_refs": [S1_REF]}},
+            payload={"tool_status": "ok", "target_status": "success"},
+            termination_reason="succeeded"))
+        return ref
+
+    def _tools_sent(self, model):
+        return model.complete.call_args_list[0].args[1]
+
+    def _turn(self, question, calls, *, enabled, allowed=None):
+        from bi_agent.agent import SessionState, answer
+
+        model = Mock()
+        model.complete.side_effect = list(calls)
+        turn = answer(question, SessionState(subject="u1"), model=model,
+                      conn=self._conn(),
+                      allowed_shop_ids=(frozenset({"S1"}) if allowed is None
+                                        else allowed),
+                      now=self.NOW, run_store=self.run_store,
+                      isolated_analysis_enabled=enabled)
+        return turn, model
+
+    # -- 1) 门禁关着：逐字不变 ---------------------------------------------
+
+    def test_disabled_gate_leaves_the_tool_snapshot_byte_identical(self):
+        from bi_agent.agent import _tool_schemas
+
+        baseline = json.dumps(_tool_schemas(), ensure_ascii=False, sort_keys=True)
+        _turn, model = self._turn("最近7天店铺A的支付金额",
+                                  [_reply(text="直接回答")], enabled=False)
+        sent = json.dumps(self._tools_sent(model), ensure_ascii=False,
+                          sort_keys=True)
+        self.assertEqual(sent, baseline, "feature off 时送给模型的 Tool 列表必须逐字相同")
+
+    def test_disabled_gate_keeps_a_forged_analysis_call_unknown(self):
+        from bi_agent.agent import _tool_schemas
+
+        _turn, model = self._turn("分析一下", [
+            _reply(calls=[ToolCall(id="c1", name="analyze_artifact",
+                                   arguments={"artifact_ref": "0" * 8,
+                                              "analysis_kinds": ["contribution"]})]),
+            _reply(text="没有这个工具")], enabled=False)
+        sent_messages = model.complete.call_args_list[1].args[0]
+        tool_message = next(message for message in sent_messages
+                            if message.role == "tool")
+        self.assertIn("unknown_tool", tool_message.content,
+                      "没公告的 Tool 不跑：伪造的名字拿不到入口")
+        self.assertEqual([run for run in self.run_store.runs.values()
+                          if run["domain"] == "isolated_analysis"], [],
+                         "门禁关着时不建任何分析运行")
+
+    # -- 2) 门禁开着：只追加一个只读 Tool ---------------------------------
+
+    def test_enabled_gate_appends_exactly_one_readonly_tool_last(self):
+        from bi_agent.agent import _tool_schemas
+
+        fixed_names = [item["function"]["name"] for item in _tool_schemas()]
+        _turn, model = self._turn("最近7天店铺A的支付金额",
+                                  [_reply(text="先不分析")], enabled=True)
+        tools = self._tools_sent(model)
+        self.assertEqual([item["function"]["name"] for item in tools],
+                         fixed_names + ["analyze_artifact"])
+        schema = tools[-1]["function"]["parameters"]
+        self.assertEqual(schema["properties"].keys(),
+                         {"artifact_ref", "analysis_kinds"})
+        self.assertIs(schema["additionalProperties"], False,
+                      "schema 不给任何附加键留入口")
+        forbidden = ("question", "sql", "shop_id", "shop_ids",
+                     "allowed_shop_ids", "data", "rows", "tools")
+        blob = json.dumps(tools[-1], ensure_ascii=False)
+        for key in forbidden:
+            self.assertNotIn(f'"{key}"', blob)
+
+    def test_analysis_kinds_enum_matches_the_contract(self):
+        from bi_agent.analysis.tool import analysis_request_schema
+
+        schema = analysis_request_schema()
+        self.assertEqual(schema["properties"]["analysis_kinds"]["items"]["enum"],
+                         ["contribution", "change_decomposition",
+                          "anomaly_candidates", "followups"])
+        self.assertEqual(schema["properties"]["analysis_kinds"]["maxItems"], 8)
+
+    def _finding_ref_of_source(self, ref) -> str:
+        """用真 loader + 真计算学出确定性 finding_ref，叙事才能真的发布。"""
+        import time as time_module
+        from uuid import uuid4
+
+        from bi_agent.analysis.calculations import compute_findings
+        from bi_agent.analysis.loader import load_analysis_dataset
+        from bi_agent.commerce.models import DomainContext
+
+        dataset = load_analysis_dataset(str(ref.id), context=DomainContext(
+            subject_id="u1", allowed_shop_ids=frozenset({"S1"}),
+            shop_refs={"S1": S1_REF}, conn=self._conn(), store=self.run_store,
+            chat_id=uuid4(), user_message_id=uuid4(), root_request_id=uuid4(),
+            now=self.NOW, deadline=time_module.monotonic() + 30))
+        return compute_findings(dataset, ("contribution",))[0].finding_ref
+
+    # -- 3) Tool 调用：一个上下文、一次图、同轮一次 -----------------------
+
+    def _analysis_call(self, ref, call_id="c1"):
+        return ToolCall(id=call_id, name="analyze_artifact",
+                        arguments={"artifact_ref": str(ref),
+                                   "analysis_kinds": ["contribution"]})
+
+    def test_one_analysis_call_runs_the_graph_once_and_persists_one_artifact(self):
+        ref = self._seed_source_artifact()
+        finding_ref = self._finding_ref_of_source(ref)
+        narrative = json.dumps({"narrative": [{
+            "text": "paid_amount 的值为 12.30，贡献占比 1.000000。",
+            "finding_refs": [finding_ref], "claim_kind": "observation"}]},
+            ensure_ascii=False)
+        turn, model = self._turn("分析一下这份结果", [
+            _reply(calls=[self._analysis_call(ref.id)]),
+            _reply(text=narrative),          # 主层模型兼任叙事总结：同一份契约
+            _reply(text="分析见下")], enabled=True)
+        self.assertIsNone(turn.error_code)
+        analysis_runs = [run for run in self.run_store.runs.values()
+                         if run["domain"] == "isolated_analysis"]
+        self.assertEqual(len(analysis_runs), 1, "一次工具调用只建一条运行")
+        self.assertEqual(analysis_runs[0]["status"], "succeeded")
+        artifacts = [item for item in turn.artifacts
+                     if item["artifact_type"] == "analysis_result"]
+        self.assertEqual(len(artifacts), 1)
+        self.assertTrue(artifacts[0]["findings"])
+        self.assertEqual(artifacts[0]["narrative"][0]["claim_kind"], "observation")
+        self.assertNotIn("narrative_unavailable", artifacts[0]["limitations"])
+        # 叙事那次模型调用的 tools 恒为空列表（与主层调用区分开）。
+        narrative_tools = model.complete.call_args_list[1].args[1]
+        self.assertEqual(narrative_tools, [])
+        # 载荷回到模型：findings 在工具消息里，ERP 主键不在。
+        tool_messages = [message for message in turn.state.turns
+                         if message.role == "tool"]
+        model_side = tool_messages[-1].content or ""
+        self.assertIn("finding_ref", model_side)
+        self.assertNotIn("S1", model_side, "ERP 主键不进模型历史")
+
+    def test_second_analysis_call_in_the_same_turn_is_refused(self):
+        ref = self._seed_source_artifact()
+        turn, _model = self._turn("分析两次", [
+            _reply(calls=[self._analysis_call(ref.id, "c1"),
+                          self._analysis_call(ref.id, "c2")]),
+            _reply(text="{\"narrative\": []}"),
+            _reply(text="分析见下")], enabled=True)
+        analysis_runs = [run for run in self.run_store.runs.values()
+                         if run["domain"] == "isolated_analysis"]
+        self.assertEqual(len(analysis_runs), 1, "同轮第二次分析不建运行")
+        tool_messages = [message for message in turn.state.turns
+                         if message.role == "tool"]
+        self.assertIn("duplicate_analysis", tool_messages[-1].content or "")
+
+    def test_analysis_arguments_are_server_resolved_not_model_trusted(self):
+        from bi_agent.analysis import tool as analysis_tool
+        from bi_agent.llm import ToolCall
+
+        ref = self._seed_source_artifact()
+        forged = ToolCall(id="c1", name="analyze_artifact", arguments={
+            "artifact_ref": str(ref.id), "analysis_kinds": ["contribution"],
+            "shop_ids": ["S1"]})
+        turn, _model = self._turn("带着越权参数分析", [
+            _reply(calls=[forged]), _reply(text="参数无效")], enabled=True)
+        analysis_runs = [run for run in self.run_store.runs.values()
+                         if run["domain"] == "isolated_analysis"]
+        self.assertEqual(len(analysis_runs), 1)
+        self.assertEqual(analysis_runs[0]["status"], "needs_input",
+                         "服务端专有键出现即 needs_input，不执行图")
+        self.assertEqual(analysis_runs[0]["termination_reason"],
+                         "invalid_parameters")
+        self.assertEqual([item for item in turn.artifacts
+                          if item["artifact_type"] == "analysis_result"], [])
+
+    def test_unknown_artifact_ref_asks_instead_of_leaking(self):
+        from uuid import uuid4
+
+        missing = uuid4()
+        turn, _model = self._turn("分析不存在的结果", [
+            _reply(calls=[self._analysis_call(missing)]),
+            _reply(text="没有找到")], enabled=True)
+        self.assertIsNone(turn.error_code)
+        analysis_runs = [run for run in self.run_store.runs.values()
+                         if run["domain"] == "isolated_analysis"]
+        self.assertEqual(analysis_runs[0]["status"], "needs_input")
+        tool_messages = [message for message in turn.state.turns
+                         if message.role == "tool"]
+        self.assertIn("invalid_parameters", tool_messages[-1].content or "")
+        self.assertNotIn("analysis_source_not_found",
+                         tool_messages[-1].content or "",
+                         "映射后的稳定码之外不泄露 loader 原因")
+        self.assertEqual(turn.artifacts, [])
+
+    def test_model_failure_still_publishes_findings_artifact(self):
+        from bi_agent.llm import ModelError
+
+        ref = self._seed_source_artifact()
+        turn, _model = self._turn("分析一下这份结果", [
+            _reply(calls=[self._analysis_call(ref.id)]),
+            ModelError("timeout"),                  # 叙事阶段失败：findings 保留
+            _reply(text="分析见下")], enabled=True)
+        artifacts = [item for item in turn.artifacts
+                     if item["artifact_type"] == "analysis_result"]
+        self.assertEqual(len(artifacts), 1)
+        self.assertTrue(artifacts[0]["findings"])
+        self.assertEqual(artifacts[0]["narrative"], [])
+        self.assertIn("narrative_unavailable", artifacts[0]["limitations"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -417,10 +417,10 @@ class AnalysisRegistryContractTests(unittest.TestCase):
         shipped = sorted(path.name for path in
                          pathlib.Path(analysis.__file__).parent.glob("*.py"))
         # Task 1 契约 + Task 2 授权 loader + Task 3 确定性计算 + Task 4 总结器
-        # 与 import 守卫；graph/tool 等按 Task 5 登记。
+        # 与 import 守卫 + Task 5 固定图与模型 Tool。
         self.assertEqual(shipped, ["__init__.py", "calculations.py",
-                                   "import_guard.py", "loader.py", "models.py",
-                                   "summarizer.py"])
+                                   "graph.py", "import_guard.py", "loader.py",
+                                   "models.py", "summarizer.py", "tool.py"])
 
 
 class _LandmineConn:
@@ -502,7 +502,7 @@ def _stored_artifact(*, artifact_type="metric_result", payload=None,
         provenance=provenance if provenance is not None else QueryProvenance())
 
 
-def _context(store, *, subject_id="u1", shop_refs=None):
+def _context(store, *, subject_id="u1", shop_refs=None, deadline=None):
     from bi_agent.commerce.models import DomainContext
 
     refs = shop_refs if shop_refs is not None else {"S1": S1}
@@ -511,7 +511,71 @@ def _context(store, *, subject_id="u1", shop_refs=None):
         conn=_LandmineConn(), store=store,
         chat_id=uuid4(), user_message_id=uuid4(), root_request_id=uuid4(),
         now=datetime(2026, 9, 15, tzinfo=timezone.utc),
-        deadline=time.monotonic() + 30)
+        deadline=time.monotonic() + 30 if deadline is None else deadline)
+
+
+class _GraphStore:
+    """图测试的 Store 替身：真 CAS 语义 + 可注入的读取/保存失败。
+
+    读取路径实现 ArtifactReader 协议（图的 metadata 读与 loader 的授权读都走
+    这里）；其余 create_run/transition/finish/save_artifact 委托内存 Store，
+    保证图写的每一格状态都过真实校验，而不是测试自己放水。
+    """
+
+    def __init__(self, stored=None, *, fail_save=False, fail_reads_after=None,
+                 read_error=None):
+        from bi_agent.runtime.memory import MemoryQueryRunStore
+
+        self.inner = MemoryQueryRunStore(forbidden_values={"S1"})
+        self.stored = stored
+        self.fail_save = fail_save
+        self.fail_reads_after = fail_reads_after
+        self.read_error = (read_error if read_error is not None
+                           else RuntimeError("simulated read outage"))
+        self.reads = 0
+        self.saves = 0
+
+    def load_artifact_for_analysis(self, artifact_id, *, subject_id):
+        self.reads += 1
+        if self.fail_reads_after is not None and self.reads > self.fail_reads_after:
+            raise self.read_error
+        if isinstance(self.stored, Exception):
+            raise self.stored
+        if self.stored is None:
+            # 与真实 Store 同一契约：不存在/跨 owner 都报同一个稳定码。
+            raise ValueError("analysis_source_not_found")
+        return self.stored
+
+    def save_artifact(self, run_id, artifact):
+        self.saves += 1
+        if self.fail_save:
+            raise RuntimeError("simulated artifact failure")
+        return self.inner.save_artifact(run_id, artifact)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+def _graph_stored(*, artifact_type="metric_result", payload=None,
+                  subject_id="u1", provenance=None, data_as_of=None,
+                  coverage=None):
+    """固定 ref 的来源快照：请求 ref 与存储 ref 必须一致，图才读得到。"""
+    from uuid import UUID
+
+    from bi_agent.runtime.models import ArtifactRef
+
+    stored = _stored_artifact(artifact_type=artifact_type, payload=payload,
+                              subject_id=subject_id, provenance=provenance,
+                              data_as_of=data_as_of, coverage=coverage)
+    return stored.model_copy(update={
+        "ref": ArtifactRef(id=UUID(UUID_V4), type=artifact_type)})
+
+
+def _analysis_request(ref=None, kinds=("contribution",)):
+    from bi_agent.analysis.models import AnalysisRequest
+
+    return AnalysisRequest(artifact_ref=ref or UUID_V4,
+                           analysis_kinds=list(kinds))
 
 
 def _load(stored, *, context=None):
@@ -1616,6 +1680,259 @@ class AnalysisSummarizerTests(unittest.TestCase):
 
         self.assertEqual(one_run().model_dump(mode="json"),
                          one_run().model_dump(mode="json"))
+
+
+class AnalysisGraphTests(unittest.TestCase):
+    """计划 Task 5：固定链、fail-closed 持久化、deadline 与稳定拒绝通道。
+
+    六个节点就是六道推进位，顺序死在 ANALYSIS_CHAIN；load/validate 是可信
+    服务层（Task 2 loader），compute/summarize 是纯分析运行（Task 3/4），
+    persist/finalize 走既有 QueryRunStore CAS 契约。所有拒绝都发生在模型
+    调用之前，公开位置只有稳定码，绝无 loader 异常原文。
+    """
+
+    _CHAIN_NODES = ["load_source", "validate_source", "compute_findings",
+                    "summarize_findings", "persist_analysis", "finalize"]
+
+    # -- 计划 Step 1 的两条骨架用例 ---------------------------------------
+
+    def test_artifact_failure_publishes_no_result(self):
+        from bi_agent.analysis.graph import analyze_artifact
+
+        store = _GraphStore(_graph_stored(), fail_save=True)
+        result = analyze_artifact(_analysis_request(), context=_context(store),
+                                  model=None)
+        self.assertEqual(result.status.value, "failed")
+        self.assertEqual(result.artifacts, [])
+        self.assertNotIn("findings", result.model_payload)
+        self.assertNotIn("narrative", result.model_payload)
+        # 一次写入，失败不重试：重复写就是对同一证据留两份说法。
+        self.assertEqual(store.saves, 1)
+        run = store.inner.runs[result.run_id]
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["error_code"], "artifact_persistence_failed")
+        self.assertEqual(run["termination_reason"], "persistence_failed")
+
+    def test_expired_deadline_never_loads_or_calls_model(self):
+        from bi_agent.analysis.graph import analyze_artifact
+
+        store = _GraphStore(_graph_stored())
+        model = RecordingModel()
+        result = analyze_artifact(
+            _analysis_request(),
+            context=_context(store, deadline=time.monotonic() - 1), model=model)
+        self.assertEqual(result.status.value, "failed")
+        self.assertEqual(result.model_payload["termination_reason"],
+                         "deadline_exceeded")
+        self.assertEqual(result.artifacts, [])
+        self.assertEqual(model.calls, [])
+        self.assertEqual(store.reads, 0, "过期 deadline 在任何读取之前拒绝")
+
+    # -- 授权 / 类型 / 版本：稳定码，不泄露原因原文 -----------------------
+
+    def test_not_found_and_cross_owner_are_needs_input(self):
+        from bi_agent.analysis.graph import analyze_artifact
+
+        for label, stored in (("不存在", None),
+                              ("跨 owner", _graph_stored(subject_id="subject-b"))):
+            with self.subTest(case=label):
+                store = _GraphStore(stored)
+                result = analyze_artifact(_analysis_request(),
+                                          context=_context(store), model=None)
+                self.assertEqual(result.status.value, "needs_input")
+                self.assertEqual(result.artifacts, [])
+                self.assertEqual(result.model_payload["termination_reason"],
+                                 "invalid_parameters")
+                # 原因码只在映射表里：公开载荷只带映射后的稳定码。
+                self.assertNotIn("analysis_source_not_found",
+                                 json.dumps(result.model_payload))
+                run = store.inner.runs[result.run_id]
+                self.assertEqual(run["status"], "needs_input")
+
+    def test_type_and_version_refusals_stay_unavailable_without_a_model(self):
+        from bi_agent.analysis.graph import analyze_artifact
+
+        stale = _graph_stored(
+            provenance=_provenance(metric_version="metrics/2026-09-01.1"))
+        chart = _graph_stored(artifact_type="chart_spec", payload={"kind": "bar"})
+        for label, stored, termination in (
+                ("图表来源", chart, "invalid_parameters"),
+                ("过期血缘", stale, "source_quality_failed")):
+            with self.subTest(case=label):
+                store = _GraphStore(stored)
+                model = RecordingModel()
+                result = analyze_artifact(_analysis_request(),
+                                          context=_context(store), model=model)
+                self.assertEqual(model.calls, [], "模型调用前必须拒绝")
+                self.assertEqual(result.artifacts, [])
+                expected_status = ("needs_input" if label == "图表来源"
+                                   else "failed")
+                self.assertEqual(result.status.value, expected_status)
+                self.assertEqual(result.model_payload["termination_reason"],
+                                 termination)
+
+    # -- 正向路径：固定链推进、恰好一份 artifact、双校验器过卡 ------------
+
+    def test_happy_path_persists_one_validated_artifact_along_the_chain(self):
+        from bi_agent.analysis.calculations import compute_findings
+        from bi_agent.analysis.graph import analyze_artifact
+        from bi_agent.runtime.models import (validate_artifact_payload,
+                                             validate_model_payload)
+
+        coverage = {"status": "complete", "start": "2026-09-01",
+                    "end": "2026-09-08", "gaps": []}
+        data_as_of = datetime(2026, 9, 8, tzinfo=timezone.utc)
+        stored = _graph_stored(coverage=coverage, data_as_of=data_as_of)
+        # 先用真 loader 学出确定性 finding_ref，叙事才能真的发布。
+        dataset = _load(_stored_artifact(payload=stored.payload,
+                                         subject_id=stored.subject_id,
+                                         provenance=stored.provenance,
+                                         coverage=coverage))
+        finding_ref = compute_findings(dataset.observations and dataset,
+                                       ("contribution",))[0].finding_ref
+        narrative = json.dumps({"narrative": [{
+            "text": "paid_amount 的值为 12.30，贡献占比 1.000000。",
+            "finding_refs": [finding_ref], "claim_kind": "observation"}]},
+            ensure_ascii=False)
+        store = _GraphStore(stored)
+        model = RecordingModel(narrative)
+        result = analyze_artifact(_analysis_request(), context=_context(store),
+                                  model=model)
+        self.assertEqual(result.status.value, "success")
+        self.assertEqual(len(result.artifacts), 1)
+        artifact = result.artifacts[0]
+        self.assertEqual(artifact.ref.type, "analysis_result")
+        payload = artifact.public_payload
+        self.assertEqual(payload["source_artifact_ref"], UUID_V4)
+        self.assertTrue(payload["findings"])
+        self.assertEqual(payload["narrative"][0]["claim_kind"], "observation")
+        self.assertNotIn("narrative_unavailable", payload["limitations"],
+                         "成功发布叙事时不带降级码")
+        # 两个持久化校验器都必须逐字放行同一份载荷。
+        self.assertEqual(validate_artifact_payload(payload, "analysis_result"),
+                         payload)
+        self.assertEqual(validate_model_payload(payload, "analysis_result"),
+                         payload)
+        # 模型面：工具恒为空，超时取自主请求剩余 deadline。
+        self.assertEqual(model.calls[0]["tools"], [])
+        self.assertGreater(model.calls[0]["timeout_s"], 0)
+        self.assertLessEqual(model.calls[0]["timeout_s"], 30.0)
+        # 运行记录：节点按固定链推进，终态 succeeded，恰好一份 artifact。
+        nodes = [event["node"] for event in store.inner.events[result.run_id]]
+        self.assertEqual(nodes, self._CHAIN_NODES)
+        run = store.inner.runs[result.run_id]
+        self.assertEqual(run["status"], "succeeded")
+        self.assertEqual(len(store.inner.artifacts), 1)
+        saved = next(iter(store.inner.artifacts.values()))
+        self.assertEqual(saved["artifact_type"], "analysis_result")
+        self.assertEqual(saved["data_as_of"], data_as_of, "来源时点原样回写")
+        self.assertEqual(saved["coverage"], coverage, "来源覆盖原样回写")
+
+    def test_model_failure_still_persists_deterministic_findings(self):
+        from bi_agent.analysis.graph import analyze_artifact
+
+        store = _GraphStore(_graph_stored())
+        result = analyze_artifact(_analysis_request(), context=_context(store),
+                                  model=FailingModel())
+        self.assertEqual(result.status.value, "success")
+        payload = result.artifacts[0].public_payload
+        self.assertTrue(payload["findings"])
+        self.assertEqual(payload["narrative"], [])
+        self.assertIn("narrative_unavailable", payload["limitations"])
+
+    def test_remaining_under_two_seconds_skips_the_model_call(self):
+        from bi_agent.analysis.graph import analyze_artifact
+
+        store = _GraphStore(_graph_stored())
+        model = RecordingModel()
+        result = analyze_artifact(
+            _analysis_request(),
+            context=_context(store, deadline=time.monotonic() + 1.0), model=model)
+        self.assertEqual(result.status.value, "success")
+        self.assertEqual(model.calls, [])
+        payload = result.artifacts[0].public_payload
+        self.assertIn("narrative_unavailable", payload["limitations"])
+        self.assertTrue(payload["findings"])
+
+    def test_oversized_metric_refuses_in_compute_before_any_model_call(self):
+        from bi_agent.analysis.graph import analyze_artifact
+
+        huge = "1" + "0" * 23                      # adjusted exponent 23 > 22
+        stored = _graph_stored(payload=_dataset_payload(_row(paid_amount=huge)))
+        store = _GraphStore(stored)
+        model = RecordingModel()
+        result = analyze_artifact(_analysis_request(), context=_context(store),
+                                  model=model)
+        self.assertEqual(result.status.value, "failed")
+        self.assertEqual(result.model_payload["termination_reason"],
+                         "contract_violation")
+        self.assertEqual(result.artifacts, [])
+        self.assertEqual(model.calls, [])
+        nodes = [event["node"] for event in store.inner.events[result.run_id]]
+        self.assertEqual(nodes[-1], "finalize")
+        self.assertNotIn("summarize_findings", nodes,
+                         "计算失败不得推进到模型节点")
+
+    def test_source_read_outage_fails_closed_as_unavailable(self):
+        """P2 回归：源库/读取故障走 FAILED/unavailable，不冒充稳定拒绝。
+
+        真实 Store 的契约（runtime/repository）：资格失败报
+        `ValueError(analysis_source_not_found)`，数据库失败报消毒后的
+        `ArtifactPersistenceError`。两者必须分流：故障是 retryable 的
+        unavailable（终止原因 upstream_unavailable），绝不是
+        needs_input/invalid_parameters，也不调模型、不写结果、不动来源。
+        """
+        from bi_agent.analysis.graph import analyze_artifact
+        from bi_agent.runtime.models import ArtifactPersistenceError
+
+        stored = _graph_stored()
+        source_snapshot = copy.deepcopy(stored.payload)
+        cases = [
+            ("元数据读取故障", RuntimeError("simulated connection loss"), 0),
+            ("loader 读取故障", ArtifactPersistenceError(), 1),
+        ]
+        for label, error, fail_after in cases:
+            with self.subTest(case=label):
+                store = _GraphStore(stored, fail_reads_after=fail_after,
+                                    read_error=error)
+                model = RecordingModel()
+                result = analyze_artifact(_analysis_request(),
+                                          context=_context(store), model=model)
+                self.assertEqual(result.status.value, "failed",
+                                 "基础设施故障不是 needs_input")
+                self.assertEqual(result.model_payload["termination_reason"],
+                                 "upstream_unavailable")
+                self.assertEqual(result.model_payload["status"], "unavailable")
+                self.assertNotIn("findings", result.model_payload)
+                self.assertEqual(result.error.code, "unavailable")
+                self.assertTrue(result.error.retryable,
+                                "源读取故障可重试，与资格拒绝不同类")
+                self.assertEqual(model.calls, [], "故障路径不调模型")
+                self.assertEqual(store.saves, 0, "故障路径不写 analysis_result")
+                self.assertEqual(result.artifacts, [])
+                self.assertEqual(store.inner.artifacts, {}, "不落任何 Artifact")
+                self.assertEqual(stored.payload, source_snapshot,
+                                 "来源快照一个字节不动")
+                evidence = json.dumps(result.model_payload) + json.dumps(
+                    store.inner.events[result.run_id], default=str) + json.dumps(
+                    store.inner.runs[result.run_id]["state"], default=str)
+                self.assertNotIn(str(error), evidence, "异常原文不进公开记录")
+                run = store.inner.runs[result.run_id]
+                self.assertEqual(run["status"], "failed")
+                self.assertEqual(run["termination_reason"], "upstream_unavailable")
+                self.assertEqual(run["error_code"], "unavailable")
+
+    def test_state_and_events_never_carry_raw_ids_or_source_rows(self):
+        from bi_agent.analysis.graph import analyze_artifact
+
+        store = _GraphStore(_graph_stored())
+        result = analyze_artifact(_analysis_request(), context=_context(store),
+                                  model=None)
+        evidence = json.dumps(store.inner.events[result.run_id], default=str) \
+            + json.dumps(store.inner.runs[result.run_id]["state"], default=str)
+        self.assertNotIn("S1", evidence, "ERP 主键不进运行记录")
+        self.assertNotIn("paid_amount", evidence,
+                         "来源行不进运行记录：分析证据只在 Artifact 里")
 
 
 class AnalysisImportBoundaryTests(unittest.TestCase):

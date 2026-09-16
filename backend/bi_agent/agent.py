@@ -349,7 +349,8 @@ def encode_sse(event: ChatEvent) -> bytes:
 def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: ChatModel,
                   allowed_shop_ids: frozenset[str], now: datetime,
                   controlled_sql_enabled: bool = False,
-                  approved_query_memory_enabled: bool = False) -> Iterator[ChatEvent]:
+                  approved_query_memory_enabled: bool = False,
+                  isolated_analysis_enabled: bool = False) -> Iterator[ChatEvent]:
     """保存可见消息并输出有限阶段事件；调用方负责会话锁和连接生命周期。"""
     from .chats import (
         load_chat_context,
@@ -386,6 +387,8 @@ def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: Cha
             controlled_sql_enabled=controlled_sql_enabled,
             # approved 查询记忆同样默认关：关着时连检索 SQL 都不存在（计划 Task 5）。
             approved_query_memory_enabled=approved_query_memory_enabled,
+            # 隔离分析默认关：关着时模型看不到分析 Tool，也不执行任何分析图。
+            isolated_analysis_enabled=isolated_analysis_enabled,
         )
         artifacts = list(turn.artifacts)
         if artifacts:
@@ -575,7 +578,8 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
            run_store: QueryRunStore | None = None,
            turn_context: TurnContext | None = None,
            controlled_sql_enabled: bool = False,
-           approved_query_memory_enabled: bool = False) -> TurnResult:
+           approved_query_memory_enabled: bool = False,
+           isolated_analysis_enabled: bool = False) -> TurnResult:
     deadline = time_module.monotonic() + TOTAL_BUDGET_SECONDS
     if run_store is None:
         run_store = MemoryQueryRunStore(forbidden_values=allowed_shop_ids)
@@ -621,6 +625,25 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
             question, allowed_shop_ids=allowed_shop_ids, shop_refs=state.shop_refs)
         if exploration_entry is not None:
             tools = tools + [exploration_entry]
+    # 隔离分析默认关：关着时 `tools` 仍是六份固定 Tool（探索也未开时逐字不变），
+    # 分析模块一行都不执行。开着也只追加这一个只读 Tool：参数只有 artifact_ref
+    # 与 analysis_kinds，授权、来源校验与持久化全部由服务端图决定（计划 Task 5
+    # Step 5）。本地开发例外之外仍不接 HTTP 层：与 controlled_sql 同一延迟策略。
+    analysis_tool_name: str | None = None
+    if isolated_analysis_enabled:
+        from .analysis import tool as _analysis_tool
+
+        analysis_tool_name = _analysis_tool.TOOL_NAME
+        tools = tools + [{
+            "type": "function",
+            "function": {
+                "name": _analysis_tool.TOOL_NAME,
+                "description": "对一条已持久化的数据集 Artifact 做确定性分析"
+                               "（贡献拆分/变化分解/异常候选/后续问题）。只读：不改"
+                               "来源、不查新数据，结果以新的分析 Artifact 发布；"
+                               "本轮最多调用一次",
+                "parameters": _analysis_tool.analysis_request_schema()},
+        }]
     offered_tools = [str(item["function"]["name"]) for item in tools]
     # approved 查询记忆默认关：关着时不 import、不读库、不多一段消息，回合与没有
     # 这个功能的版本逐字节相同。开着也在固定 Tool 可表达性判断（探索门禁）之后、
@@ -670,6 +693,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     listing_attempt_no = 0
     inventory_attempt_no = 0
     exploration_attempt_no = 0
+    analysis_attempt_no = 0
 
     for _ in range(MAX_MODEL_TURNS):
         remaining = deadline - time_module.monotonic()
@@ -930,6 +954,60 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     role="tool", tool_call_id=call.id,
                     content=json.dumps(domain_result.model_payload,
                                        ensure_ascii=False)))
+                continue
+            if analysis_tool_name is not None and call.name == analysis_tool_name:
+                # 一次分析 Tool 调用 = 一次图执行：artifact_ref 与 kinds 由服务端
+                # 重解，授权/来源校验/持久化全部在图内。同轮最多一次由调用计数
+                # 强制（第二次调用直接拒绝，不建运行）；分析输出本身不构成新的
+                # 工具通道，而当前工具集里也没有任何写 Tool 可被它触发。
+                if analysis_attempt_no >= 1:
+                    messages.append(Message(
+                        role="tool", tool_call_id=call.id,
+                        content=json.dumps(
+                            {"error": "duplicate_analysis",
+                             "detail": "本轮已执行过一次分析"},
+                            ensure_ascii=False)))
+                    continue
+                from .analysis.tool import execute_analysis_tool
+
+                analysis_attempt_no += 1
+                execution = execute_analysis_tool(
+                    call, DomainContext(
+                        subject_id=turn_context.subject_id,
+                        allowed_shop_ids=allowed_shop_ids,
+                        shop_refs=dict(state.shop_refs),
+                        conn=conn,
+                        store=run_store,
+                        chat_id=turn_context.chat_id,
+                        user_message_id=turn_context.user_message_id,
+                        root_request_id=turn_context.user_message_id,
+                        now=now,
+                        deadline=deadline,
+                        attempt_no=analysis_attempt_no),
+                    model=model)
+                domain_result = execution
+                if (domain_result.error is not None
+                        and domain_result.error.code
+                        in {"artifact_persistence_failed", "result_contract_violation"}):
+                    # 分析结果存不下不是降级：本轮已发出的结论全部作废（与其他
+                    # 领域的必需 Artifact 同一契约），来源 Artifact 不受影响。
+                    last_error = domain_result.error.public_message
+                    error_code = domain_result.error.code
+                    results.clear()
+                    artifacts.clear()
+                    stop_after_batch = True
+                    break
+                calls_used += 1
+                artifacts.extend(artifact_event_payload(artifact)
+                                 for artifact in domain_result.artifacts)
+                # 分析载荷给模型与公开发的是同一份形状（runtime 契约）：有
+                # Artifact 就发 Artifact 载荷，拒答时才回落到最小状态载荷。
+                analysis_payload = (domain_result.artifacts[0].public_payload
+                                    if domain_result.artifacts
+                                    else domain_result.model_payload)
+                messages.append(Message(
+                    role="tool", tool_call_id=call.id,
+                    content=json.dumps(analysis_payload, ensure_ascii=False)))
                 continue
             if call.arguments_error is not None or call.arguments is None:
                 if correction_used:
