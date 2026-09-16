@@ -16,7 +16,7 @@
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020 → 021`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020，approved 查询学习记忆的样例表、不可变事件表、`bi_approver` 审核角色与只含 approved 行的投影视图落在 021。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。缺 021 时审核 API 的投影视图不存在，approved 查询学习记忆保持关闭（审核路由按未启用返回 404），不影响其它功能。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020 → 021 → 022`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020，approved 查询学习记忆的样例表、不可变事件表、`bi_approver` 审核角色与只含 approved 行的投影视图落在 021，隔离分析的第五个领域 `isolated_analysis` 与 Artifact 类型 `analysis_result` 的两份 CHECK 扩展落在 022（它不建任何事实表）。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。缺 021 时审核 API 的投影视图不存在，approved 查询学习记忆保持关闭（审核路由按未启用返回 404），不影响其它功能。缺 022 时隔离分析的 `analysis_result` 写不进 Artifact 表（CHECK 拒绝），图在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的分析结果；门禁关闭时 022 是否已应用都不影响聊天。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
@@ -35,6 +35,7 @@ psql -d bi_agent -f backend/sql/018_listing_audit.sql
 psql -d bi_agent -f backend/sql/019_inventory_snapshots.sql
 psql -d bi_agent -f backend/sql/020_controlled_sql_exploration.sql
 psql -d bi_agent -f backend/sql/021_approved_query_memory.sql
+psql -d bi_agent -f backend/sql/022_isolated_analysis_artifacts.sql
 ```
 
 单实例：全程持有数据库 advisory 锁，重复启动立即失败。
@@ -418,6 +419,39 @@ uv run --locked --env-file ../.env.test python -m tests.acceptance --offline
 ### 回退
 
 回退 = 把 `APPROVED_QUERY_MEMORY_ENABLED` 改回 `false`（或删掉该变量）后重启：聊天回到无记忆基线，回合的消息、工具与 SQL 逐字等于关闭基线（测试钉住），审核面板随 404 消失。回退**不需要**回滚 021：样例、事件与视图留在库里仍可审计，已批准样例在下一次开启时按当时的版本精确匹配重新生效。不要为了让启动成功去删表、改授权或把门禁“先关掉当已解决”。
+
+## 隔离分析（默认关闭）
+
+`backend/bi_agent/analysis/` 是 Task 11 后置子项目 D：对当前用户仍有权读取的不可变数据集 Artifact（`metric_result` / `comparison_table` / `trend_series`）做确定性分析，数值全部由 Decimal 纯函数产生，可选模型只用字面空工具列表总结已验证 finding，失败时仍发布确定性结果。分析入口是一个只读 Tool（`analyze_artifact`），参数只有 `artifact_ref` 与 `analysis_kinds`；没有 SQL、店铺 ID、数据行或工具列表通道，同轮最多调用一次。
+
+### 门禁与启用前置
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `ISOLATED_ANALYSIS_ENABLED` | `false` | 隔离分析总开关；关闭时不注册 Tool、不读 Artifact、聊天与 Task 11 基线逐字相同 |
+
+- 取值只接受 `true` / `false`（其它写法启动即拒）；启用 = 置 `true` 后重启，无需其它变量。
+- 022 必须已应用（它只把 `isolated_analysis` 领域与 `analysis_result` 类型加进两份 CHECK，独立泳道，与 020/021 谁先谁后都幂等）；未应用时门禁开启的分析会在持久化那一步失败为 `persistence_failed`，不会发出没有证据的结果。
+- 每次分析前服务端都会重新检查：来源 run 的 `subject_id` 归属、当前授权实体集合、Artifact 类型（只认三种数据集）、schema/metric/policy/source/graph 版本、覆盖状态、大小（≤500 行 / 20 列 / 256 KiB 安全投影）与 fingerprint。任何一项不过都在**模型调用之前**拒绝；loader 内部的细分原因（不存在/类型/版本/时间/覆盖/大小/未授权维度等）在落库前统一翻译，**不会以原词持久化**。运行记录里持久化的稳定词表只有 `error_code`（`invalid_parameters` / `unavailable` / `deadline_exceeded` / `artifact_persistence_failed`）与 `termination_reason`（`invalid_parameters`、`upstream_unavailable`、`source_quality_failed`、`contract_violation`、`coverage_incomplete`、`result_too_large`、`forbidden`、`deadline_exceeded`、`persistence_failed`）：资格拒绝（不存在/类型/归属）走 `invalid_parameters`，其中**跨属主与不存在刻意不可区分**（不告诉他人工件存在）；来源质量问题走 `unavailable`，按 `source_quality_failed` / `contract_violation` / `coverage_incomplete` / `result_too_large` / `forbidden` 细分终止原因；源库/读取故障走 `unavailable` + `upstream_unavailable`。不自动重查数据库，也不把异常原文写进公开载荷或运行记录。
+- 前置回归（本机 `*_test`，串行）：
+
+```powershell
+Set-Location backend
+uv run --locked --env-file ../.env.test python -m unittest tests.test_analysis tests.test_core tests.test_operator_workflows -v
+uv run --locked --env-file ../.env.test python -m tests.acceptance --offline
+```
+
+### 版本推进与来源失权
+
+- 分析载荷冻结 `analysis_version = isolated-analysis/2026-09-14.1` 与来源 fingerprint；来源数据集不可变，分析结果引用它而从不改写或重查它。
+- 来源失权（撤销授权、能力降级、覆盖缺口）不影响已落库的分析结果（它是当时的确定性事实），但**下一次**分析会在模型调用前按当前授权重新拒绝；不存在“用旧授权继续分析”的路径。
+- 计算或版本规则升级 = 新的 `ANALYSIS_VERSION` + 新 gold set，旧 Artifact 按原版本原样保留可审计；系统不做自动重算或迁移。
+
+### 回退与诊断
+
+- 回退 = 把 `ISOLATED_ANALYSIS_ENABLED` 改回 `false`（或删掉该变量）后重启：Tool 列表回到 Task 11 基线，聊天逐字不变（测试钉住）。回退**不需要**回滚 022：两份 CHECK 只多出两个合法取值，已有 `analysis_result` 行仍可读可审计。
+- 模型叙述失败（超时、超 token、格式不合法、模型异常）不丢数：确定性 findings 照常发布，限制里记 `narrative_unavailable`；剩余 deadline 不足 2 秒整段跳过模型调用。持久化失败才是硬失败：状态 failed、零 Artifact、模型侧拿不到任何 findings。
+- 前端对 `analysis_result` 载荷整体验形后才渲染：验不过整卡拒绝（“未通过展示侧校验”），不猜形状、不补数字；“查看来源数据”按钮只在同一条消息里找到唯一匹配的数据集 Artifact 时可用。
 
 ## 同源部署
 

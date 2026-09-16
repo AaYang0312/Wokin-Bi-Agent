@@ -46,6 +46,15 @@ React/Vite 前端 → /api 代理 → FastAPI → 受限 Agent
 - 默认关闭：`APPROVED_QUERY_MEMORY_ENABLED=false`（`.env.example` 就是该值），启用还要求非空 `APP_APPROVER_SUBJECTS` 与不同于 `BI_APP_DSN` 的 `BI_APPROVER_DSN`。关闭时零记忆读取，聊天回合与无记忆基线逐字相同；回滚 = 把开关保持/改回 `false`。HTTP 生产启用与受控探索一样被刻意延后，需要单独的所有者决定。
 - 目前只完成本地开发与本地验收（[验收记录](docs/superpowers/research/2026-09-14-approved-query-memory-acceptance.md)）：不证明真实模型下的检索质量，也不改变 Task 11 统一发布门禁的状态。启用步骤、审核流程与回退见[运行手册](docs/runbook.md)，定名指标与观测口径见[指标口径](docs/metrics.md)。
 
+## 隔离分析（默认关闭）
+
+`backend/bi_agent/analysis/` 是 Task 11 后置子项目 D：对当前用户仍有权读取的不可变数据集 Artifact（`metric_result` / `comparison_table` / `trend_series`）做确定性贡献拆解、变化拆分与 MAD 异常候选分析。金额、数量、占比、得分全部由 Decimal 纯函数计算并与 gold set 逐项一致；可选模型只用 `complete(..., tools=[])`（字面空工具列表，AST 钉住）总结已验证 finding，失败时仍发布确定性结果。无证据的因果/行动结论只能进入 `unsupported_claims`，永不作为事实发布；分析运行本身没有数据库、文件、网络或业务 Tool 能力（import 守卫在测试里逐模块扫描）。
+
+- 结果以新 `analysis_result` Artifact 持久化并引用来源 fingerprint；持久化失败整次失败，不发布任何分析结果，来源 Artifact 一个字节都不动。
+- 前端按白名单渲染：载荷先整体验形（键集、正则、边界与后端同一纪律），验不过整卡拒绝；数值原样展示不重算；假设标“待验证”，证据不足的说法单独折叠，限制常显；“查看来源数据”按钮只在同一条消息里按引用找到唯一匹配的数据集时可用，不 fetch、不读缓存。
+- 默认关闭：`ISOLATED_ANALYSIS_ENABLED=false`（`.env.example` 就是该值）。关闭时不注册分析 Tool、不读取任何 Artifact、聊天与 Task 11 基线逐字相同；回滚 = 把开关保持/改回 `false`。迁移 `022` 只扩 domain/artifact 两份 CHECK，不建事实表。
+- 目前只完成本地开发与本地验收（[验收记录](docs/superpowers/research/2026-09-14-isolated-analysis-acceptance.md)）：不证明真实模型下的叙述质量，也不改变 Task 11 统一发布门禁的状态（第 4–7 项仍 open）。HTTP 生产启用与受控探索一样被刻意延后。启用前置与回退见[运行手册](docs/runbook.md)，观测口径见[指标口径](docs/metrics.md)。
+
 ## 本地启动
 
 需要 Python 3.11、Node.js 22、PostgreSQL 17。复制 `.env.example` 为 `.env.app`，只填写 API 所需的 `BI_APP_DSN`、店铺范围和一个模型 provider 配置；不要在其中放同步 DSN 或快麦凭证。
@@ -86,7 +95,7 @@ psql -d bi_agent -f backend/sql/004_query_runtime.sql
 
 它创建 `bi_sync`、报表只读身份 `bi_reader` 与 API 身份 `bi_app`，并建立可审计的查询运行记录。API 使用 `bi_app`，只能读取 `reporting` 视图和读写聊天与查询运行表。
 
-本机两个库（`bi_agent`、`bi_agent_test`）已经建好并随命名卷保留，重建容器不需要重跑 DDL；新克隆时按[运行手册](docs/runbook.md)的完整顺序在两个库各跑一遍（001 → 021）。
+本机两个库（`bi_agent`、`bi_agent_test`）已经建好并随命名卷保留，重建容器不需要重跑 DDL；新克隆时按[运行手册](docs/runbook.md)的完整顺序在两个库各跑一遍（001 → 022）。
 
 ## 数据同步
 

@@ -134,3 +134,44 @@ export type QueryMemoryDraft = {
 
 /** 审核能力探测结果：404=功能关（隐藏面板），403=无权限（显示拒绝）。 */
 export type ReviewAccess = 'available' | 'forbidden' | 'off' | 'unavailable'
+
+/**
+ * 隔离分析结果（后端 `analysis_result` Artifact 公开载荷）的展示侧词表。
+ *
+ * 这些类型只是**校验之后**的视图：载荷到达时仍是不可信输入，组件按这份形状逐项验
+ * （键集、正则、边界与后端 `runtime.models._analysis_payload` 同一纪律），验不过
+ * 就整卡拒绝渲染——类型声明不是信任凭据，验过才许上屏。
+ */
+export type AnalysisKind =
+  | 'contribution'
+  | 'change_decomposition'
+  | 'anomaly_candidates'
+  | 'followups'
+
+export type AnalysisClaimKind = 'fact' | 'observation' | 'hypothesis'
+
+export type AnalysisFindingView = {
+  finding_ref: string
+  kind: AnalysisKind
+  metric: string
+  row_refs: string[]
+  values: Record<string, string>
+  statement_code: string
+}
+
+export type AnalysisNarrativeView = {
+  text: string
+  finding_refs: string[]
+  claim_kind: AnalysisClaimKind
+}
+
+export type AnalysisPayloadView = {
+  source_artifact_ref: string
+  source_fingerprint: string
+  analysis_version: string
+  findings: AnalysisFindingView[]
+  narrative: AnalysisNarrativeView[]
+  hypotheses: string[]
+  unsupported_claims: string[]
+  limitations: string[]
+}

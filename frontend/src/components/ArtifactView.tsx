@@ -1,4 +1,5 @@
 import type { Artifact, DisplayEntity, DrilldownIntent } from '../types'
+import { AnalysisArtifact } from './AnalysisArtifact'
 import { ChartArtifact } from './ChartArtifact'
 import { ClockIcon, GaugeIcon, TableIcon } from './icons'
 
@@ -483,6 +484,10 @@ export function ArtifactView({
   // 库存预警卡片走自己的两级视图：两个口径永不并成一张表。
   if (artifact.artifact_type === 'inventory_alerts') {
     return <InventoryAlertsArtifact artifact={artifact} />
+  }
+  // 隔离分析卡片走自己的白名单渲染：载荷先整体验形，验不过整卡拒绝。
+  if (artifact.artifact_type === 'analysis_result') {
+    return <AnalysisArtifact artifact={artifact} datasets={datasets} />
   }
 
   return (

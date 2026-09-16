@@ -969,3 +969,60 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
 @media (max-width: 767px) {
   .review-dock { top: 0; bottom: 0; right: 0; width: 100vw; border-radius: 0; border: 0; }
 }
+
+/* 隔离分析卡片：确定性结论分块；证据不足的说法折叠，限制常显在卡片末尾。 */
+.analysis-findings { overflow-x: auto; }
+.analysis-kind + .analysis-kind { margin-top: 16px; }
+.analysis-kind-title {
+  margin: 0 0 6px;
+  color: var(--text-2);
+  font-size: 11.5px; font-weight: 600; letter-spacing: .04em;
+  text-transform: none;
+}
+.analysis-narrative { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+.analysis-narrative li { color: var(--text-2); font-size: 12.5px; line-height: 1.55; }
+.claim-badge {
+  display: inline-block;
+  margin-right: 7px;
+  padding: 1px 8px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-pill);
+  background: rgba(0, 0, 0, .26);
+  color: var(--text-3);
+  font-size: 10.5px;
+}
+.claim-hypothesis { border-color: rgba(240, 178, 64, .5); color: #f0b240; }
+.analysis-claims { margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+.analysis-claims li { color: var(--text-2); font-size: 12.5px; line-height: 1.55; }
+.analysis-unsupported {
+  margin-top: 12px;
+  padding: 8px 11px;
+  border: 1px solid rgba(240, 178, 64, .35);
+  border-radius: var(--r-sm);
+  background: rgba(240, 178, 64, .06);
+}
+.analysis-unsupported summary {
+  cursor: pointer;
+  color: #f0b240;
+  font-size: 12px; font-weight: 600;
+}
+.analysis-unsupported .analysis-claims { margin-top: 8px; }
+.analysis-source-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 10px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-pill);
+  background: rgba(0, 0, 0, .26);
+  color: var(--text-2);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.analysis-source-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent-line); }
+.analysis-source-btn:disabled { cursor: not-allowed; opacity: .5; }
+.analysis-source-detail {
+  margin: 8px 0 0;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}

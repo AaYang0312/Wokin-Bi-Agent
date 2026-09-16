@@ -409,6 +409,29 @@ SELECT count(*) FROM reporting.v_approved_query_examples;
 - 版本零召回是设计行为：七个版本维度任一失配即不可见，进入人工重审，不自动迁移；撤销在下一条检索立即生效。
 - 本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [approved 查询学习记忆本地验收记录](../research/2026-09-14-approved-query-memory-acceptance.md)；HTTP 生产启用被刻意延后（与 `CONTROLLED_SQL_ENABLED` 先例一致），Task 11 统一发布门禁第 4–7 项仍 open。
 
+## 4.8 隔离分析的观测口径（`backend/bi_agent/analysis/`，计划 Task 11 后置子项目 D）
+
+本功能默认关闭（`ISOLATED_ANALYSIS_ENABLED=false`），且仓库没有指标后端：以下是四个定名指标的**真实现状**与观测口径，不虚构未接入的计数器。当前每次门禁开启的分析都在 `bi.query_runs` / `bi.query_artifacts` 留有完整运行与 Artifact 记录；今天能直接派生的只有**已持久化的终态与码计数**（运行终态 status、`error_code`、`termination_reason` 与 Artifact 载荷内已登记行），分析 kind 与 loader 内部细分原因**不可派生**——须按下表逐项现状区分「可派生」与「目标插桩」。接入指标后端时必须使用这些名称与标签词表，不得另起名字。
+
+### 四个定名指标
+
+| 名称 | 现状 | 含义 |
+| --- | --- | --- |
+| `analysis_requests_total{status,kind}` | **目标插桩，当前不可从现有记录派生**：status 可由 `bi.query_runs`（domain=`isolated_analysis`）按运行终态统计，但 **kind 维度当前不可派生**——请求声明的 analysis kinds 不落库，且产出零 finding 的 kind 不留任何痕迹。接入指标后端时必须新增请求级插桩（按请求声明的每个 kind 各计一次）后才能按 kind 出数；在那之前只能提供按终态派生的 `analysis_requests_total{status}` | 衡量分析面被使用的频度与结果分布 |
+| `analysis_source_rejected_total{reason}` | 无独立计数器；今天能从 `bi.query_runs.error_code / termination_reason` 派生的只有**持久化后的粗粒度词表**（`error_code`：`invalid_parameters` / `unavailable` / `deadline_exceeded` / `artifact_persistence_failed`；`termination_reason` 另有 `source_quality_failed` / `contract_violation` / `coverage_incomplete` / `result_too_large` / `forbidden` / `upstream_unavailable` / `persistence_failed`）。loader 内部的细分原因（不存在/类型/版本/时间/覆盖/大小/未授权维度等）在落库前被翻译成上述通道，**不会以原词持久化**；要按 loader 原因粒度出数必须新增插桩 | 衡量模型前拒绝的分布；全部拒绝都发生在模型调用与任何写入之前 |
+| `analysis_narrative_failed_total` | 无独立计数器：由成功运行 Artifact 载荷 `limitations` 中的 `narrative_unavailable` 行派生（模型超时/超 token/格式不合法/异常时记录，确定性 findings 照常发布） | 衡量无工具叙述的降级频度 |
+| `analysis_unsupported_claim_total` | 无独立计数器：由成功运行 Artifact 载荷 `unsupported_claims` 数组长度派生（无证据因果/行动说法被守卫拦截的次数） | 衡量证据不足说法的拦截量 |
+
+- **label 边界**：维度只允许运行终态、分析 kind、拒绝码与载荷内已登记码；**任何问题文本、叙述文本、row_ref 内容、真实店铺/商品名称、用户 subject 或来源 Artifact 载荷都不得作为 label、tag 或样本**。
+- 计数异常的处置：集中在 `source_quality_failed` / `contract_violation` 时优先核对来源数据质量与版本血缘；集中在 `invalid_parameters` 时优先核对来源归属与类型（注意跨属主与不存在同码，不据此断言“存在但无权”）；`analysis_narrative_failed_total` 持续增长优先核对模型 provider 健康与剩余 deadline；两者都不影响确定性 findings 的正确性。
+
+### 不得从本功能读出的结论
+
+- 门禁关闭时零分析入口与零 Artifact 读取，聊天与 Task 11 基线逐字相同；本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [隔离分析本地验收记录](../research/2026-09-14-isolated-analysis-acceptance.md)。
+- 数值结论只来自 Decimal 纯函数与 gold set 对账；模型叙述只是已验证 finding 的总结，不能产生、改写或补充任何数字。
+- 分析不创造新数据能力：它只能消费当前用户已被授权读取的既有 Artifact，来源失权后下一次分析即拒绝。
+- HTTP 生产启用被刻意延后（与 `CONTROLLED_SQL_ENABLED` 先例一致），Task 11 统一发布门禁第 4–7 项仍 open。
+
 ## 5. 真实对账结果摘要
 
 ### 合成基准（已通过，冻结时刻 2026-09-08 09:00+08）
