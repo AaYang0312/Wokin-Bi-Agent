@@ -310,6 +310,23 @@ class ConfigTests(unittest.TestCase):
                        if line.startswith("ISOLATED_ANALYSIS_ENABLED=")]
         self.assertEqual(assignments, ["ISOLATED_ANALYSIS_ENABLED=false"])
 
+    def test_env_example_ships_the_monitor_gate_closed(self):
+        """`.env.example` 是部署方抄的那份：监控门禁写=false，身份三件套只留空名。
+
+        持续库存监控（计划 Task 1）默认关闭；变量只出现一次且不带任何凭证值，
+        独立 DSN / 服务主体 / 策略清单都只有名字没有示例秘密。
+        """
+        import pathlib
+
+        text = (pathlib.Path(__file__).resolve().parents[2] / ".env.example"
+                ).read_text(encoding="utf-8")
+        assignments = [line for line in text.splitlines()
+                       if line.startswith("INVENTORY_MONITOR_ENABLED=")]
+        self.assertEqual(assignments, ["INVENTORY_MONITOR_ENABLED=false"])
+        self.assertIn("BI_MONITOR_DSN=\n", text)
+        self.assertIn("MONITOR_SERVICE_SUBJECT=\n", text)
+        self.assertIn("MONITOR_POLICY_REFS=\n", text)
+
     def test_selected_provider_uses_its_own_key(self):
         from bi_agent.config import load_model_settings
 

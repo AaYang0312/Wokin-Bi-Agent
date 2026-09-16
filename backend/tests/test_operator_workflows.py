@@ -397,7 +397,8 @@ class OperatorFixture(unittest.TestCase):
             register_inventory_source(InventorySourceRegistration(
                 level=level,
                 channel="erp" if level == "physical_total" else "official_export",
-                evidence=f"probe-t11-{self.tag}-{level}", max_age_seconds=86400))
+                evidence=f"probe-t11-{self.tag}-{level}", max_age_seconds=86400,
+                scan_complete_supported=False, production_reconciled_at=None))
 
     def _snapshot(self, key: str, *, items: Sequence[dict[str, Any]],
                   platform: str = "tb", captured_at: datetime = FRESH,

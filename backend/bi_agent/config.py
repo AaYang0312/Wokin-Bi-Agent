@@ -65,6 +65,24 @@ class ModelSettings(BaseModel):
     base_url: str | None = None
 
 
+class MonitorSettings(BaseModel):
+    """持续库存监控（计划 2026-09-14-continuous-inventory-notifications Task 1）的
+    独立监控身份：``bi_monitor`` 不与 ``bi_app`` / ``bi_sync`` 共享任何连接。
+
+    默认全关；``enabled=False`` 时不装载 DSN / 主体 / 策略清单——功能关就是
+    全关（含配置面），与 approved 查询记忆的审核者设置同一口径。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    monitor_dsn: SecretStr | None = None
+    service_subject_id: str = ""
+    policy_refs: tuple[str, ...] = ()
+    max_policies: int = 100
+    run_deadline_seconds: int = 30
+
+
 def _required(env: Mapping[str, str], key: str) -> str:
     value = (env.get(key) or "").strip()
     if not value:
@@ -177,6 +195,47 @@ def load_sync_settings(env: Mapping[str, str]) -> SyncSettings:
         app_secret=SecretStr(_required(env, "KUAI_MAI_APP_SECRET")),
         access_token=SecretStr(_required(env, "KUAI_MAI_ACCESS_TOKEN")),
         refresh_token=SecretStr(_required(env, "KUAI_MAI_REFRESH_TOKEN")),
+    )
+
+
+def load_monitor_settings(env: Mapping[str, str]) -> MonitorSettings:
+    """加载持续库存监控配置（计划 Task 1 Step 4）。
+
+    只读取 ``INVENTORY_MONITOR_ENABLED`` / ``BI_MONITOR_DSN`` /
+    ``MONITOR_SERVICE_SUBJECT`` / ``MONITOR_POLICY_REFS`` 四个变量；disabled
+    时不要求任何秘密。enabled 时三件套（独立 DSN、服务主体、策略清单）缺一
+    不可、策略清单最多 100 个去重引用，且 ``BI_MONITOR_DSN`` 不得等于 app /
+    writer(同步) / approver 任一既有身份的 DSN——报错只给固定码，不回显任何
+    DSN 原文。
+    """
+    enabled = _flag(env, "INVENTORY_MONITOR_ENABLED")
+    if not enabled:
+        return MonitorSettings(enabled=False)
+    monitor_dsn_raw = (env.get("BI_MONITOR_DSN") or "").strip()
+    if not monitor_dsn_raw:
+        raise ValueError("INVENTORY_MONITOR_REQUIRES_BI_MONITOR_DSN")
+    subject = (env.get("MONITOR_SERVICE_SUBJECT") or "").strip()
+    if not subject:
+        raise ValueError("INVENTORY_MONITOR_REQUIRES_MONITOR_SERVICE_SUBJECT")
+    policy_refs = tuple(
+        part.strip()
+        for part in (env.get("MONITOR_POLICY_REFS") or "").split(",")
+        if part.strip())
+    if not policy_refs:
+        raise ValueError("INVENTORY_MONITOR_REQUIRES_MONITOR_POLICY_REFS")
+    if len(set(policy_refs)) != len(policy_refs):
+        raise ValueError("MONITOR_POLICY_REFS_MUST_BE_UNIQUE")
+    if len(policy_refs) > 100:
+        raise ValueError("MONITOR_POLICY_REFS_TOO_MANY")
+    for other in ("BI_APP_DSN", "BI_WRITER_DSN", "BI_APPROVER_DSN"):
+        other_dsn = (env.get(other) or "").strip()
+        if other_dsn and other_dsn == monitor_dsn_raw:
+            raise ValueError("MONITOR_DSN_MUST_BE_SEPARATE")
+    return MonitorSettings(
+        enabled=True,
+        monitor_dsn=SecretStr(monitor_dsn_raw),
+        service_subject_id=subject,
+        policy_refs=policy_refs,
     )
 
 

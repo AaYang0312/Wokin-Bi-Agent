@@ -420,6 +420,11 @@ class InventorySourceRegistryTests(unittest.TestCase):
         self.assertEqual(verified_inventory_sources(), {})
 
     def test_registration_requires_evidence_level_and_freshness_policy(self):
+        # 监控门禁（Task 1）新增的两个必填字段在负例里按合成事实填：没有任何
+        # 夹具声称存在完整扫描凭据或生产对账（scan_complete_supported=False、
+        # production_reconciled_at=None），报错仍只来自被测的那四个字段。
+        monitor_absent = {"scan_complete_supported": False,
+                          "production_reconciled_at": None}
         cases = (
             {"level": "physical_total", "channel": "erp", "evidence": "",
              "max_age_seconds": 86400},
@@ -437,14 +442,26 @@ class InventorySourceRegistryTests(unittest.TestCase):
             {"level": "shop_sellable", "channel": "pdd_api", "evidence": "probe-1",
              "max_age_seconds": 86400})
         for kwargs in cases:
-            with self.subTest(**kwargs):
+            merged = {**monitor_absent, **kwargs}
+            with self.subTest(**merged):
                 with self.assertRaises(ValueError):
-                    register_inventory_source(InventorySourceRegistration(**kwargs))
+                    register_inventory_source(InventorySourceRegistration(**merged))
+
+    def test_registration_requires_monitor_evidence_fields(self):
+        """监控门禁的两个新字段必填：缺省构造当场 TypeError，注册表仍为空。"""
+        with self.assertRaises(TypeError):
+            InventorySourceRegistration(
+                level="physical_total", channel="erp", evidence="probe-1",
+                max_age_seconds=86400)
+        self.assertEqual(verified_inventory_sources(), {})
 
     def test_registration_is_readable_per_level_after_it_is_made(self):
+        # 合成夹具不冒充监控级证据：聊天路径门禁不消费那两个字段，所以填合成
+        # 事实（False/None）；监控门禁要它们时由 tests.test_monitoring 显式给值。
         register_inventory_source(InventorySourceRegistration(
             level="physical_total", channel="erp", evidence="probe-1",
-            max_age_seconds=86400))
+            max_age_seconds=86400, scan_complete_supported=False,
+            production_reconciled_at=None))
         self.assertIsNotNone(verified_inventory_source("physical_total"))
         # 一个口径取证不等于另一个口径也成立：渠道可售要各自取证（spec §9）
         self.assertIsNone(verified_inventory_source("shop_sellable"))
@@ -930,7 +947,8 @@ class InventoryNodeTests(unittest.TestCase):
                                ("shop_sellable", "official_export")):
             register_inventory_source(InventorySourceRegistration(
                 level=level, channel=channel, evidence=f"probe-{self.tag}",
-                max_age_seconds=max_age_seconds))
+                max_age_seconds=max_age_seconds, scan_complete_supported=False,
+                production_reconciled_at=None))
 
     # -- 红线一：来源门禁 --------------------------------------------------
 
@@ -1728,7 +1746,8 @@ class InventoryGraphTests(unittest.TestCase):
                                ("shop_sellable", "official_export")):
             register_inventory_source(InventorySourceRegistration(
                 level=level, channel=channel, evidence=f"probe-t10-{self.tag}",
-                max_age_seconds=max_age_seconds))
+                max_age_seconds=max_age_seconds, scan_complete_supported=False,
+                production_reconciled_at=None))
 
     # -- 5.1 来源门禁 ------------------------------------------------------
 

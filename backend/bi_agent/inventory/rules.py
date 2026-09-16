@@ -473,12 +473,22 @@ class InventorySourceRegistration:
     """一个库存口径的已核验来源：证据、时效与通道。
 
     `level` 只能是两个口径之一：一次取证只回答"这个口径能不能信"。
+
+    `scan_complete_supported` 与 `production_reconciled_at` 是持续库存监控
+    （continuous-inventory 计划 Task 1 Step 5，所有者 2026-09-17 Option A）对
+    "登记凭什么算核验"的加严：两者必填、不可缺省。聊天路径的来源门禁
+    （`inventory/graph.py` 的 `check_inventory_source`）不消费它们；监控 gate
+    （`bi_agent.monitoring.source_gate`）按层级逐维检查——缺任一项只把那一层
+    排除出可运行集合，不影响其他层级。生产注册表保持为空：没有任何一层今天
+    带着这两项证据登记。
     """
 
     level: str
     channel: str
     evidence: str
     max_age_seconds: int
+    scan_complete_supported: bool
+    production_reconciled_at: datetime | None
 
     def __post_init__(self) -> None:
         level = str(self.level or "").strip().lower()
