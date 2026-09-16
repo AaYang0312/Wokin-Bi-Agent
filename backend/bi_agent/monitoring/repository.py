@@ -1,6 +1,8 @@
 """监控 repository：单事务提交与最小读取面（计划 Task 2）。
 
-这里只有三个方法：``load_policy``、``load_active_alerts``、``commit_scan``。
+这里只有四个方法：``load_policy``、``load_alert_history``（全生命周期，状态机
+输入面）、``load_active_alerts``（旧名，只 open/acknowledged）、
+``commit_scan``。
 ``commit_scan`` 先用 ``NewArtifact`` / ``validate_artifact_payload`` /
 ``allows_artifact_type`` / ``AlertDecision`` 重验输入（不接受的 JSON 一律在碰
 库之前被拒），再在一个 ``conn.transaction()`` 里只调用唯一一条固定 SQL——
@@ -48,10 +50,14 @@ _POLICY_SQL = (
     "inventory_pool_refs, levels, cooldown_seconds, enabled "
     "FROM bi.inventory_monitor_policies WHERE policy_ref = %s")
 _ACTIVE_ALERTS_SQL = (
-    "SELECT alert_ref, dedupe_key, generation, status, last_observed_at, "
-    "last_notified_at FROM bi.inventory_alert_instances "
+    "SELECT alert_ref, dedupe_key, generation, status, level, sku_ref, scope_ref, "
+    "last_observed_at, last_notified_at FROM bi.inventory_alert_instances "
     "WHERE policy_ref = %s AND status IN ('open','acknowledged') "
     "ORDER BY alert_ref")
+_ALERT_HISTORY_SQL = (
+    "SELECT alert_ref, dedupe_key, generation, status, level, sku_ref, scope_ref, "
+    "last_observed_at, last_notified_at FROM bi.inventory_alert_instances "
+    "WHERE policy_ref = %s ORDER BY alert_ref")
 _COMMIT_SQL = "SELECT bi.commit_inventory_monitor_scan(%s, %s, %s, %s, %s, %s)"
 
 
@@ -147,10 +153,30 @@ class MonitorRepository:
         except Exception as error:   # noqa: BLE001
             raise ValueError("monitor_policy_row_invalid") from error
 
+    def load_alert_history(self, policy_ref: str) -> tuple[StoredAlert, ...]:
+        """该策略的**全生命周期**告警（含 resolved/suppressed）：状态机输入面。
+
+        023 的首发校验要求 ``generation = max(全部历史)+1``（``history_generation
+        + 1``），所以恢复后再次下降必须让状态机看到终端历史行，否则会算出
+        generation 1 而整个提交以 ``monitor_invalid_transition`` 失败。终端行
+        只参与代际与含糊历史；抑制/保留/匹配/冷却与策略停用决策由状态机自行
+        收窄到 open/acknowledged（``decide_alert_transitions``）。
+        """
+        return self._load_alert_rows(_ALERT_HISTORY_SQL, policy_ref)
+
     def load_active_alerts(self, policy_ref: str) -> tuple[StoredAlert, ...]:
-        """该策略的 open/acknowledged 告警：状态机的全部既有状态。"""
+        """旧名保留：只回 open/acknowledged（Task 2 契约形状不变）。
+
+        它不是状态机的输入面——全历史请用 ``load_alert_history``（计划 Task 4
+        的 runner 必须把那里的返回值交给 ``decide_alert_transitions``），否则
+        resolved→再次下降的首发永远停在 generation 1，提交会被 SQL 侧拒绝。
+        """
+        return self._load_alert_rows(_ACTIVE_ALERTS_SQL, policy_ref)
+
+    def _load_alert_rows(self, sql: str,
+                         policy_ref: str) -> tuple[StoredAlert, ...]:
         try:
-            rows = self.conn.execute(_ACTIVE_ALERTS_SQL, (policy_ref,)).fetchall()
+            rows = self.conn.execute(sql, (policy_ref,)).fetchall()
         except psycopg.errors.Error as error:
             raise _stable_failure(error, "monitor_alerts_read_failed") from error
         alerts: list[StoredAlert] = []
@@ -158,8 +184,8 @@ class MonitorRepository:
             try:
                 alerts.append(StoredAlert(
                     alert_ref=row[0], dedupe_key=row[1], generation=row[2],
-                    status=row[3], last_observed_at=row[4],
-                    last_notified_at=row[5]))
+                    status=row[3], level=row[4], sku_ref=row[5], scope_ref=row[6],
+                    last_observed_at=row[7], last_notified_at=row[8]))
             except Exception as error:   # noqa: BLE001
                 raise ValueError("monitor_alert_row_invalid") from error
         return tuple(alerts)

@@ -320,10 +320,13 @@ class MonitorConn:
         if text.startswith("SELECT policy_ref, threshold_policy_ref"):
             policy = self.policies.get(values[0])
             return Rows([]) if policy is None else Rows([(self._policy_tuple(policy))])
-        if "FROM bi.inventory_alert_instances" in text and "status IN" in text:
+        if "FROM bi.inventory_alert_instances" in text:
+            # 同一份 9 元组列序；status 过滤的有无区分 active 读取面与全历史读取面
+            # （repository._ACTIVE_ALERTS_SQL 对 _ALERT_HISTORY_SQL）。
+            wanted = ("open", "acknowledged") if "status IN" in text else None
             rows = [self._alert_tuple(alert) for alert in self.alerts
                     if alert["policy_ref"] == values[0]
-                    and alert["status"] in ("open", "acknowledged")]
+                    and (wanted is None or alert["status"] in wanted)]
             return Rows(sorted(rows, key=lambda row: row[0]))
         raise AssertionError(f"未预期的SQL：{text}")
 
@@ -336,8 +339,10 @@ class MonitorConn:
 
     @staticmethod
     def _alert_tuple(alert: dict) -> tuple:
+        # 列序与 repository._ACTIVE_ALERTS_SQL 逐一对应（含 Task 3 的身份桥三列）。
         return (alert["alert_ref"], alert["dedupe_key"], alert["generation"],
-                alert["status"], alert["last_observed_at"],
+                alert["status"], alert["level"], alert["sku_ref"],
+                alert["scope_ref"], alert["last_observed_at"],
                 alert.get("last_notified_at"))
 
     def _fail(self, step: str) -> None:

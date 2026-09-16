@@ -13,10 +13,15 @@
 - 模型是 bounded/frozen 的状态机输入面：ref 排序、去重、非空；行必带本层级
   作用域引用；诊断码只收闭集；数量文本与 runtime 载荷契约同一形状。
 
-Task 1 只交付契约、配置与 gate；runner / repository / 状态机属后续 Task。
+Task 1 交付契约、配置与 gate；Task 2 交付单事务 repository；本文件同时承载
+计划 Task 3 的确定性状态机（``AlertStateMachineTests``）与 gold 转移矩阵
+（``AlertTransitionGoldTests``，tests/fixtures/inventory_monitor_transitions.json）。
+runner / CLI 属后续 Task。
 """
 
 import hashlib
+import json
+import pathlib
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -580,6 +585,12 @@ def _sku_ref(tag: str) -> str:
     return ref_for_key(EntityKind.SKU.value, tag)
 
 
+def _shop_ref(tag: str) -> str:
+    from bi_agent.catalog import ref_for_key
+
+    return ref_for_key("shop", tag)
+
+
 SKU_REF = _sku_ref("SKU1")
 POOL_REF = "pl-0123456789ab"
 WAREHOUSE_REF = "wh-0123456789ab"
@@ -813,6 +824,43 @@ class MonitorRepositoryTests(unittest.TestCase):
         self.assertEqual([alert.alert_ref for alert in alerts],
                          ["alert-ack00001", "alert-open0001"])
         self.assertEqual([alert.generation for alert in alerts], [1, 1])
+        # Task 3 的状态机需要真实身份才能为保留/退场产出带身份的决策：读取面
+        # 按 023 表列把 level/sku_ref/scope_ref 一并带回（2026-09-17 批准的
+        # StoredAlert 身份桥，见 models.StoredAlert 的文档字符串）。
+        self.assertEqual({(alert.level, alert.sku_ref, alert.scope_ref)
+                          for alert in alerts},
+                         {("physical_total", SKU_REF, SCOPE_REF)})
+
+    def test_load_alert_history_returns_full_lifecycle_with_identity(self):
+        """P1 回归：Task 4 交给状态机的读取面必须是全生命周期历史。
+
+        SQL 侧新首发要求 generation = max(全部历史)+1：resolved/suppressed 终态
+        行必须带着真实身份一起回来，否则恢复后再次下降会算出 generation 1，
+        整个提交以 monitor_invalid_transition 失败。旧名
+        ``load_active_alerts`` 保留原语义（只 open/acknowledged），文档写明。"""
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        conn = MonitorConn(policies={POLICY_REF: monitor_policy_dict()}, alerts=[
+            stored_alert(),
+            stored_alert(alert_ref="alert-ack00001", status="acknowledged"),
+            stored_alert(alert_ref="alert-done001", status="resolved",
+                         resolved_at=SNAPSHOT_AT),
+            stored_alert(alert_ref="alert-gone001", status="suppressed")])
+        repository = MonitorRepository(conn)
+        history = repository.load_alert_history(POLICY_REF)
+        self.assertEqual([alert.alert_ref for alert in history],
+                         ["alert-ack00001", "alert-done001", "alert-gone001",
+                          "alert-open0001"])
+        self.assertEqual([alert.status for alert in history],
+                         ["acknowledged", "resolved", "suppressed", "open"])
+        self.assertEqual([alert.generation for alert in history], [1, 1, 1, 1])
+        # 全历史行都带真实身份桥三列，一行不少。
+        self.assertEqual({(alert.level, alert.sku_ref, alert.scope_ref)
+                          for alert in history},
+                         {("physical_total", SKU_REF, SCOPE_REF)})
+        self.assertEqual([alert.status for alert in
+                          repository.load_active_alerts(POLICY_REF)],
+                         ["acknowledged", "open"])
 
     def test_database_read_failures_map_to_stable_non_secret_errors(self):
         from bi_agent.monitoring.repository import MonitorRepository
@@ -835,6 +883,568 @@ class MonitorRepositoryTests(unittest.TestCase):
             repository.commit_scan(SCAN, (make_decision(),), now=MONITOR_NOW)
         self.assertEqual(str(caught.exception), "monitor_commit_failed")
         self.assertNotIn("secret detail", str(caught.exception))
+
+
+# --- 计划 Task 3：确定性状态机、稳定去重键与事件幂等键 -------------------------
+
+STATE_NOW = datetime(2026, 9, 17, 12, tzinfo=timezone.utc)
+STATE_SNAPSHOT = STATE_NOW - timedelta(minutes=5)
+SHOP1_REF = _shop_ref("shop-1")
+SHOP2_REF = _shop_ref("shop-2")
+SKU2_REF = _sku_ref("SKU2")
+CHANNEL_SCOPE = SHOP1_REF
+
+
+def canonical_key_oracle(policy_version: str, level: str, sku_ref: str, scope_ref: str,
+                         rule_code: str) -> str:
+    """计划 Task 3 Step 3 公式的独立实现：钉哈希不借用被测函数本身。"""
+    payload = [policy_version, level, sku_ref, scope_ref, rule_code]
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def cell_key(*, level: str, sku_ref: str = SKU_REF, scope_ref: str | None = None,
+             policy_ref: str = POLICY_REF) -> str:
+    from bi_agent.inventory.rules import THRESHOLD_LEVEL_BY_LEVEL
+
+    if scope_ref is None:
+        scope_ref = SCOPE_REF if level == "physical_total" else CHANNEL_SCOPE
+    return canonical_key_oracle(policy_ref, level, sku_ref, scope_ref,
+                                THRESHOLD_LEVEL_BY_LEVEL[level])
+
+
+def state_policy(*, enabled: bool = True,
+                 levels: tuple[str, ...] = ("physical_total", "shop_sellable"),
+                 cooldown_seconds: int = 3600):
+    from bi_agent.monitoring.models import MonitorPolicy
+
+    return MonitorPolicy(
+        policy_ref=POLICY_REF, threshold_policy_ref="inventory-thresholds/1",
+        owner_subject_id="owner-subject",
+        shop_refs=("shop-a",) if "shop_sellable" in levels else (),
+        inventory_pool_refs=(POOL_REF,) if "physical_total" in levels else (),
+        levels=levels, cooldown_seconds=cooldown_seconds, enabled=enabled)
+
+
+def state_row(level: str = "physical_total", status: str = "low",
+              sku_ref: str = SKU_REF, scope_ref: str | None = None,
+              quantity: str | None = "1", threshold: str | None = "2",
+              unit: str = "piece"):
+    from bi_agent.monitoring.models import MonitorAlertRow
+
+    if scope_ref is None:
+        scope_ref = SCOPE_REF if level == "physical_total" else CHANNEL_SCOPE
+    return MonitorAlertRow(level=level, status=status, sku_ref=sku_ref,
+                           scope_ref=scope_ref, quantity=quantity,
+                           threshold=threshold, unit=unit)
+
+
+def state_scan(*, fresh: bool = True,
+               complete_levels: tuple[str, ...] = ("physical_total",),
+               rows: tuple = (), diagnostics: tuple = ()):  # noqa: ANN401
+    from bi_agent.monitoring.models import MonitorScan
+
+    return MonitorScan(policy_ref=POLICY_REF, source_artifact_payload={"data": []},
+                       source_fingerprint="0" * 64, data_as_of=STATE_SNAPSHOT,
+                       fresh=fresh, complete_levels=complete_levels,
+                       rows=tuple(rows), diagnostics=tuple(diagnostics))
+
+
+def stored_state_alert(*, alert_ref: str = "alert-open0001", status: str = "open",
+                       generation: int = 1, level: str = "physical_total",
+                       sku_ref: str = SKU_REF, scope_ref: str | None = None,
+                       key: str | None = None,
+                       last_observed_at: datetime = STATE_SNAPSHOT,
+                       last_notified_at: datetime | None = STATE_SNAPSHOT):
+    from bi_agent.inventory.rules import THRESHOLD_LEVEL_BY_LEVEL
+    from bi_agent.monitoring.models import StoredAlert
+
+    if scope_ref is None:
+        scope_ref = SCOPE_REF if level == "physical_total" else CHANNEL_SCOPE
+    if key is None:
+        key = canonical_key_oracle(POLICY_REF, level, sku_ref, scope_ref,
+                                   THRESHOLD_LEVEL_BY_LEVEL.get(level, "low_replenish"))
+    return StoredAlert(alert_ref=alert_ref, dedupe_key=key, generation=generation,
+                       status=status, level=level, sku_ref=sku_ref,
+                       scope_ref=scope_ref, last_observed_at=last_observed_at,
+                       last_notified_at=last_notified_at)
+
+
+def decide(scan, *, policy=None, active: tuple = (),
+           verified_levels: tuple[str, ...] = ("physical_total", "shop_sellable"),
+           now: datetime = STATE_NOW):
+    """计划测试里 ``decide(...)`` 速记：默认两层已核验、无历史告警、固定 now。"""
+    from bi_agent.monitoring.state_machine import decide_alert_transitions
+
+    return decide_alert_transitions(
+        scan, policy=policy or state_policy(), active=tuple(active),
+        verified_levels=verified_levels, now=now)
+
+
+def outbox_decisions(decisions) -> list:
+    """outbox 形状：023 只为 notify=true 的 triggered/retriggered/resolved 写投递。"""
+    return [d for d in decisions if d.notify
+            and d.event_kind in ("triggered", "retriggered", "resolved")]
+
+
+class AlertStateMachineTests(unittest.TestCase):
+    """计划 Task 3 Step 1 的焦点用例（逐字钉方向）+ 身份/闭集/幂等回归。"""
+
+    def test_threshold_equal_triggers_once_then_only_updates(self):
+        first = decide(state_scan(rows=[state_row(quantity="10", threshold="10")]))
+        self.assertEqual([d.event_kind for d in first], ["triggered"])
+        active = tuple(stored_state_alert(status=d.next_status,
+                                          generation=d.generation,
+                                          key=d.dedupe_key) for d in first)
+        second = decide(state_scan(rows=[state_row(quantity="10", threshold="10")]),
+                        active=active)
+        self.assertEqual([d.event_kind for d in second], ["updated"])
+        self.assertFalse(second[0].notify)
+        self.assertTrue(second[0].observed)
+
+    def test_only_fresh_complete_recovery_resolves(self):
+        for candidate in (state_scan(fresh=False,
+                                     rows=[state_row(quantity="11", status="normal")]),
+                          state_scan(complete_levels=(),
+                                     rows=[state_row(quantity="11", status="normal")])):
+            self.assertEqual(decide(candidate, active=(stored_state_alert(),))[0].next_status,
+                             "open")
+        resolved = decide(state_scan(rows=[state_row(quantity="11", status="normal")]),
+                          active=(stored_state_alert(),))
+        self.assertEqual(resolved[0].next_status, "resolved")
+        self.assertTrue(resolved[0].notify)
+        self.assertEqual(outbox_decisions(resolved), list(resolved))
+
+    def test_acknowledged_is_not_resolved_and_new_drop_creates_generation_two(self):
+        self.assertEqual(decide(state_scan(rows=[state_row()]),
+                                active=(stored_state_alert(status="acknowledged"),))[0].next_status,
+                         "acknowledged")
+        reopened = decide(state_scan(rows=[state_row()]),
+                          active=(stored_state_alert(status="resolved"),))
+        self.assertEqual(reopened[0].generation, 2)
+        self.assertEqual(reopened[0].event_kind, "triggered")
+        self.assertIsNone(reopened[0].previous_status)
+        self.assertEqual(outbox_decisions(reopened), list(reopened))
+
+    def test_verified_physical_still_alerts_while_channel_level_is_unverified(self):
+        decisions = decide(state_scan(rows=[state_row()]),
+                           verified_levels=("physical_total",))
+        self.assertEqual([(d.level, d.event_kind, d.next_status) for d in decisions],
+                         [("physical_total", "triggered", "open")])
+        self.assertFalse(any(d.level == "shop_sellable" for d in decisions))
+
+    def test_unverified_channel_level_emits_no_decisions_and_no_inferred_rows(self):
+        # 渠道层未核验又没有历史告警：不产生任何渠道决策。状态机只看 ref 不看数量，
+        # “实物 100 不得出现在渠道行里”由四件事钉住：runner 根本没把渠道层发给
+        # graph、graph 对被请求而未登记的层级逐行清空数量并置 unsupported、
+        # Task 4 runner 按 verified_levels 的第二道行过滤、以及本用例的 ref 断言。
+        scan = state_scan(rows=[state_row()])
+        decisions = decide(scan, verified_levels=("physical_total",))
+        self.assertEqual({d.level for d in decisions}, {"physical_total"})
+        self.assertEqual(len(decisions), len(scan.rows))
+
+    def test_withdrawn_channel_source_suppresses_but_never_resolves(self):
+        # 渠道层已有 active 告警而本轮不再核验该层 ⇒ 来源/能力退场，只能 suppressed。
+        channel_open = stored_state_alert(alert_ref="alert-chan0001",
+                                          level="shop_sellable",
+                                          scope_ref=SHOP1_REF)
+        channel_ack = stored_state_alert(alert_ref="alert-ack00001",
+                                         status="acknowledged",
+                                         level="shop_sellable",
+                                         scope_ref=SHOP2_REF)
+        decisions = decide(state_scan(rows=[state_row()]),
+                           active=(channel_open, channel_ack),
+                           verified_levels=("physical_total",))
+        channel = [d for d in decisions if d.level == "shop_sellable"]
+        self.assertEqual([(d.next_status, d.event_kind, d.notify) for d in channel],
+                         [("suppressed", "updated", False),
+                          ("suppressed", "updated", False)])
+        self.assertTrue(all(not d.observed for d in channel))
+        self.assertFalse(any(d.next_status == "resolved" for d in decisions))
+        # 退场抑制保留真实身份：身份逐字来自 StoredAlert，不是占位符。
+        self.assertEqual({(d.sku_ref, d.scope_ref) for d in channel},
+                         {(channel_open.sku_ref, channel_open.scope_ref),
+                          (channel_ack.sku_ref, channel_ack.scope_ref)})
+
+    def test_missing_scan_from_verified_channel_keeps_status_and_cannot_resolve(self):
+        # 渠道登记仍在，但本轮没有它的快照 ⇒ 该层不算完整，不解除也不写 outbox。
+        channel_open = stored_state_alert(alert_ref="alert-chan0001",
+                                          level="shop_sellable",
+                                          scope_ref=SHOP1_REF)
+        decisions = decide(state_scan(rows=[state_row()]), active=(channel_open,))
+        channel = [d for d in decisions if d.level == "shop_sellable"]
+        self.assertEqual([(d.next_status, d.event_kind, d.notify) for d in channel],
+                         [("open", "updated", False)])
+        self.assertFalse(channel[0].observed)  # 没看到就不是刚看到，不推进 last_observed_at
+        # 缺扫描的那一层自己零 outbox（实物层的正常首发不受牵连）。
+        self.assertEqual([d for d in outbox_decisions(decisions)
+                          if d.level == "shop_sellable"], [])
+        self.assertEqual((channel[0].sku_ref, channel[0].scope_ref),
+                         (channel_open.sku_ref, channel_open.scope_ref))
+
+    def test_withdrawn_retained_and_disabled_alerts_keep_true_identity(self):
+        # 2026-09-17 批准的 StoredAlert 身份桥回归：三条保留路径的决策身份都必须
+        # 逐字来自告警本身（不同 sku/scope 的告警不得互相串号，也不得出现占位符）。
+        other = stored_state_alert(alert_ref="alert-open0002", sku_ref=SKU2_REF,
+                                   scope_ref="pl-0123456789ab|wh-ffffffffffff")
+        retained = decide(state_scan(complete_levels=(), rows=[state_row()]),
+                          active=(other,))[0]
+        self.assertEqual((retained.level, retained.sku_ref, retained.scope_ref,
+                          retained.generation, retained.previous_status),
+                         ("physical_total", SKU2_REF,
+                          "pl-0123456789ab|wh-ffffffffffff", 1, "open"))
+        suppressed = decide(state_scan(rows=[state_row()]),
+                            policy=state_policy(enabled=False), active=(other,))[0]
+        self.assertEqual((suppressed.level, suppressed.sku_ref, suppressed.scope_ref,
+                          suppressed.next_status, suppressed.notify,
+                          suppressed.observed),
+                         ("physical_total", SKU2_REF,
+                          "pl-0123456789ab|wh-ffffffffffff", "suppressed", False,
+                          False))
+
+    def test_repository_history_feeds_generation_two_after_resolved(self):
+        """P1 回归：repository 全历史 → resolved 代上的再次下降必须发 generation 2。
+
+        SQL 侧 ``commit_inventory_monitor_scan`` 以全部历史算
+        ``history_generation + 1``；若读取面只给 open/acknowledged，这里会算出
+        generation 1，整个提交以 monitor_invalid_transition 失败。
+        """
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        conn = MonitorConn(policies={POLICY_REF: monitor_policy_dict()}, alerts=[
+            # 种子历史必须与 state_row() 的格子同键，否则另开一格。
+            stored_alert(alert_ref="alert-done0001", status="resolved",
+                         dedupe_key=cell_key(level="physical_total"),
+                         resolved_at=SNAPSHOT_AT)])
+        history = MonitorRepository(conn).load_alert_history(POLICY_REF)
+        decisions = decide(state_scan(rows=[state_row()]), active=history)
+        self.assertEqual([(decision.generation, decision.event_kind,
+                           decision.previous_status) for decision in decisions],
+                         [(2, "triggered", None)])
+        self.assertEqual(outbox_decisions(decisions), list(decisions))
+
+    def test_repository_history_feeds_generation_two_after_suppressed(self):
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        conn = MonitorConn(policies={POLICY_REF: monitor_policy_dict()}, alerts=[
+            stored_alert(alert_ref="alert-gone0001", status="suppressed",
+                         dedupe_key=cell_key(level="physical_total"))])
+        history = MonitorRepository(conn).load_alert_history(POLICY_REF)
+        decisions = decide(state_scan(rows=[state_row()]), active=history)
+        self.assertEqual([(decision.generation, decision.event_kind)
+                          for decision in decisions], [(2, "triggered")])
+
+    def test_generation_two_commit_passes_sql_side_generation_check(self):
+        """fakeconn 复刻的 SQL 侧校验：resolved gen1 历史 + generation 2 首发
+        → 事件/首发/outbox 各一，绝无 monitor_invalid_transition。"""
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        conn = MonitorConn(policies={POLICY_REF: monitor_policy_dict()}, alerts=[
+            stored_alert(alert_ref="alert-done0001", status="resolved",
+                         dedupe_key=cell_key(level="physical_total"),
+                         resolved_at=SNAPSHOT_AT)])
+        repository = MonitorRepository(conn)
+        history = repository.load_alert_history(POLICY_REF)
+        # make_scan() 是载荷契约合法的低库存扫描，格子与种子历史同键。
+        scan = make_scan()
+        transitions = repository.commit_scan(scan, decide(scan, active=history),
+                                             now=MONITOR_NOW)
+        self.assertEqual([(transition.event_kind, transition.next_status)
+                          for transition in transitions],
+                         [("triggered", "open")])
+        self.assertEqual(conn.counts(), {"runs": 1, "artifacts": 1, "alerts": 2,
+                                         "events": 1, "outbox": 1})
+
+    def test_policy_disabled_ignores_terminal_history_rows(self):
+        """策略停用只抑制 open/acknowledged：resolved/suppressed 终态行绝不拿决策。"""
+        history = (stored_state_alert(status="resolved"),
+                   stored_state_alert(alert_ref="alert-gone0001",
+                                      status="suppressed", sku_ref=SKU2_REF,
+                                      scope_ref="pl-0123456789ab|wh-ffffffffffff"),
+                   stored_state_alert(alert_ref="alert-open0002",
+                                      scope_ref="pl-0123456789ab|wh-111111111111"),
+                   stored_state_alert(alert_ref="alert-ack00002",
+                                      status="acknowledged",
+                                      scope_ref="pl-0123456789ab|wh-222222222222"))
+        decisions = decide(state_scan(rows=[state_row()]),
+                           policy=state_policy(enabled=False), active=history)
+        self.assertEqual(sorted((decision.previous_status, decision.next_status)
+                                for decision in decisions),
+                         [("acknowledged", "suppressed"), ("open", "suppressed")])
+        self.assertEqual({decision.event_kind for decision in decisions}, {"updated"})
+        self.assertTrue(all(not decision.notify and not decision.observed
+                            for decision in decisions))
+
+    def test_incomplete_round_ignores_terminal_history_rows(self):
+        """缺页轮的保留只落在活跃告警上；resolved 终态行不拿保留决策。"""
+        history = (stored_state_alert(status="resolved"),
+                   stored_state_alert(alert_ref="alert-open0002",
+                                      scope_ref="pl-0123456789ab|wh-111111111111"))
+        decisions = decide(state_scan(complete_levels=(), rows=[state_row()]),
+                           active=history)
+        self.assertEqual([(decision.previous_status, decision.next_status)
+                          for decision in decisions], [("open", "open")])
+        self.assertFalse(decisions[0].observed)
+
+    def test_terminal_history_never_receives_decisions(self):
+        """fresh+complete 轮里终端历史只参与代际：resolved 格再次下降发新
+        triggered；suppressed 格（无行、无 active）零决策，也绝不被抑制/保留。"""
+        history = (stored_state_alert(status="resolved"),
+                   stored_state_alert(alert_ref="alert-gone0001",
+                                      status="suppressed", sku_ref=SKU2_REF,
+                                      scope_ref="pl-0123456789ab|wh-ffffffffffff"))
+        decisions = decide(state_scan(rows=[state_row()]), active=history)
+        self.assertEqual([(decision.generation, decision.event_kind,
+                           decision.previous_status) for decision in decisions],
+                         [(2, "triggered", None)])
+        self.assertNotIn("suppressed", {decision.next_status
+                                        for decision in decisions})
+        self.assertEqual({decision.sku_ref for decision in decisions}, {SKU_REF})
+
+    def test_cooldown_retriggers_exactly_at_boundary(self):
+        inside = stored_state_alert(
+            last_notified_at=STATE_NOW - timedelta(seconds=3599))
+        decision = decide(state_scan(rows=[state_row()]), active=(inside,))[0]
+        self.assertEqual((decision.event_kind, decision.notify, decision.observed),
+                         ("updated", False, True))
+        at_boundary = stored_state_alert(
+            last_notified_at=STATE_NOW - timedelta(seconds=3600))
+        decision = decide(state_scan(rows=[state_row()]), active=(at_boundary,))[0]
+        self.assertEqual((decision.event_kind, decision.notify, decision.observed),
+                         ("retriggered", True, True))
+        self.assertEqual(decision.generation, 1)
+
+    def test_never_notified_active_retriggers(self):
+        never = stored_state_alert(last_notified_at=None)
+        decision = decide(state_scan(rows=[state_row()]), active=(never,))[0]
+        self.assertEqual((decision.event_kind, decision.notify), ("retriggered", True))
+
+    def test_duplicate_scan_rows_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "monitor_duplicate_row"):
+            decide(state_scan(rows=[state_row(), state_row()]))
+
+    def test_duplicate_active_alerts_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "monitor_duplicate_active_alert"):
+            decide(state_scan(rows=[state_row()]),
+                   active=(stored_state_alert(alert_ref="alert-a0000001"),
+                           stored_state_alert(alert_ref="alert-a0000002")))
+
+    def test_ambiguous_history_fail_closed(self):
+        with self.assertRaisesRegex(ValueError, "monitor_ambiguous_history"):
+            decide(state_scan(rows=[state_row()]),
+                   active=(stored_state_alert(alert_ref="alert-d0000001",
+                                              status="resolved"),
+                           stored_state_alert(alert_ref="alert-d0000002",
+                                              status="resolved")))
+
+    def test_naive_now_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "monitor_now_naive"):
+            decide(state_scan(rows=[state_row()]), now=STATE_NOW.replace(tzinfo=None))
+
+    def test_scan_policy_ref_mismatch_fail_closed(self):
+        scan = state_scan(rows=[state_row()])
+        mismatched = scan.model_copy(update={"policy_ref": "inventory-monitor/2"})
+        with self.assertRaisesRegex(ValueError, "monitor_policy_ref_mismatch"):
+            decide(mismatched)
+
+    def test_dedupe_key_matches_canonical_json_oracle_and_is_stable(self):
+        from bi_agent.monitoring.state_machine import dedupe_key
+
+        kwargs = dict(policy_version=POLICY_REF, level="physical_total",
+                      sku_ref=SKU_REF, scope_ref=SCOPE_REF, rule_code="low_replenish")
+        value = dedupe_key(**kwargs)
+        self.assertEqual(value, canonical_key_oracle(**kwargs))
+        self.assertRegex(value, r"^[0-9a-f]{64}$")
+        self.assertEqual(value, dedupe_key(**kwargs))
+
+    def test_dedupe_key_changes_only_with_its_five_members(self):
+        from bi_agent.monitoring.state_machine import dedupe_key
+
+        base = dict(policy_version=POLICY_REF, level="physical_total",
+                    sku_ref=SKU_REF, scope_ref=SCOPE_REF, rule_code="low_replenish")
+        baseline = dedupe_key(**base)
+        for changed in (dict(base, policy_version="inventory-monitor/1.1"),
+                        dict(base, sku_ref=SKU2_REF),
+                        dict(base, scope_ref="pl-0123456789cd|wh-0123456789ab"),
+                        dict(base, rule_code="low_quota"),
+                        # 作用域形状与层级绑定，层级的换键只能连同自己的作用域：
+                        # 键仍不同（level 成员在 canonical JSON 里）。
+                        dict(base, level="shop_sellable", scope_ref=CHANNEL_SCOPE,
+                             rule_code="low_quota")):
+            with self.subTest(changed=str(changed)):
+                self.assertNotEqual(dedupe_key(**changed), baseline)
+
+    def test_dedupe_key_rejects_inputs_outside_closed_shapes(self):
+        from bi_agent.monitoring.state_machine import dedupe_key
+
+        base = dict(policy_version=POLICY_REF, level="physical_total",
+                    sku_ref=SKU_REF, scope_ref=SCOPE_REF, rule_code="low_replenish")
+        for bad in (dict(base, policy_version="inventory-monitor/"),
+                    dict(base, policy_version="other/1"),
+                    dict(base, policy_version="inventory-monitor/-x"),
+                    dict(base, level="store_stock"),
+                    dict(base, sku_ref="SKU1"),
+                    dict(base, sku_ref="ent-XYZ"),
+                    dict(base, scope_ref=""),
+                    dict(base, scope_ref=" "),
+                    dict(base, scope_ref="pool-a|wh-a"),
+                    dict(base, scope_ref="pl-0123456789ab"),
+                    dict(base, rule_code="Low_Replenish"),
+                    dict(base, rule_code="")):
+            with self.subTest(bad=str(bad)):
+                with self.assertRaisesRegex(ValueError, "monitor_dedupe_"):
+                    dedupe_key(**bad)
+        # 渠道作用域 = 店铺 ref：同键函数按层级收自己的作用域形状。
+        dedupe_key(**dict(base, level="shop_sellable", scope_ref=CHANNEL_SCOPE,
+                          rule_code="low_quota"))
+
+    def test_event_idempotency_key_matches_sql_formula_and_is_stable(self):
+        from bi_agent.monitoring.state_machine import event_idempotency_key
+
+        key = cell_key(level="physical_total")
+        expected = hashlib.sha256(
+            f"{key}:1:triggered:{SOURCE_FINGERPRINT}".encode()).hexdigest()
+        self.assertEqual(event_idempotency_key(key, 1, "triggered",
+                                               SOURCE_FINGERPRINT), expected)
+        self.assertEqual(event_idempotency_key(key, 1, "triggered",
+                                               SOURCE_FINGERPRINT),
+                         event_idempotency_key(key, 1, "triggered",
+                                               SOURCE_FINGERPRINT))
+        self.assertNotEqual(event_idempotency_key(key, 1, "resolved",
+                                                  SOURCE_FINGERPRINT), expected)
+        self.assertNotEqual(event_idempotency_key(key, 2, "triggered",
+                                                  SOURCE_FINGERPRINT), expected)
+        for bad in (("XYZ", 1, "triggered", SOURCE_FINGERPRINT),
+                    (key, 0, "triggered", SOURCE_FINGERPRINT),
+                    (key, 1, "escalated", SOURCE_FINGERPRINT),
+                    (key, 1, "triggered", "zz")):
+            with self.subTest(bad=str(bad)):
+                with self.assertRaisesRegex(ValueError, "monitor_event_"):
+                    event_idempotency_key(*bad)
+
+    def test_unverifiable_or_negative_low_row_never_triggers(self):
+        # "low" 状态但 Decimal 复核做不了（0.5 件不符整数精度）或数量为负：
+        # fail closed——不首发，有 active 告警时只保留且 observed=false。
+        for quantity in ("0.5", "-1"):
+            with self.subTest(quantity=quantity):
+                scan = state_scan(rows=[state_row(quantity=quantity)])
+                self.assertEqual(decide(scan), ())
+                retained = decide(scan, active=(stored_state_alert(),))[0]
+                self.assertEqual((retained.event_kind, retained.observed,
+                                  retained.notify), ("updated", False, False))
+
+    def test_decisions_are_independent_of_input_order(self):
+        rows = (state_row(),
+                state_row(level="shop_sellable", quantity="1", threshold="5"),
+                state_row(sku_ref=SKU2_REF, quantity="0", threshold="4"))
+        active = (stored_state_alert(status="acknowledged"),
+                  stored_state_alert(alert_ref="alert-chan0001",
+                                     level="shop_sellable"))
+        baseline = decide(state_scan(rows=rows), active=active)
+        flipped = decide(state_scan(rows=tuple(reversed(rows))),
+                         active=tuple(reversed(active)))
+        self.assertEqual(baseline, flipped)
+        # 层内按 (sku_ref, scope_ref) 排序：ent-1b9814cb 先于 ent-efd0f37a。
+        self.assertEqual([d.event_kind for d in baseline],
+                         ["triggered", "updated", "updated"])
+
+    def test_stored_alert_carries_strict_identity(self):
+        from pydantic import ValidationError
+
+        alert = stored_state_alert()
+        self.assertEqual((alert.level, alert.sku_ref, alert.scope_ref),
+                         ("physical_total", SKU_REF, SCOPE_REF))
+        for bad in (dict(level="store_stock"), dict(sku_ref=""),
+                    dict(scope_ref=" "), dict(status="closed")):
+            with self.subTest(bad=str(bad)):
+                with self.assertRaises(ValidationError):
+                    stored_state_alert(**bad)
+
+
+class AlertTransitionGoldTests(unittest.TestCase):
+    """Task 3 Step 5 的 gold 转移矩阵：fixture 逐字段钉死，反序输入不变。
+
+    每条 case 固定 previous/scan/verified_levels/now/expected decisions/outbox
+    count；缺数据/保留/退场用例的 outbox 计数全为 0。dedupe key 是字面钉值，
+    改动 canonical 形状当场转红。
+    """
+
+    @staticmethod
+    def _cases():
+        path = pathlib.Path(__file__).parent / "fixtures" / \
+            "inventory_monitor_transitions.json"
+        return json.loads(path.read_text(encoding="utf-8"))["cases"]
+
+    @staticmethod
+    def _decide(case, *, scan=None, active=None):
+        from bi_agent.monitoring.models import (MonitorAlertRow, MonitorPolicy,
+                                                MonitorScan, StoredAlert)
+        from bi_agent.monitoring.state_machine import decide_alert_transitions
+
+        policy = MonitorPolicy.model_validate(case["policy"])
+        if scan is None:
+            scan_data = case["scan"]
+            scan = MonitorScan(
+                policy_ref=policy.policy_ref, source_artifact_payload={"data": []},
+                source_fingerprint="0" * 64, data_as_of=STATE_SNAPSHOT,
+                fresh=scan_data["fresh"],
+                complete_levels=tuple(scan_data["complete_levels"]),
+                rows=tuple(MonitorAlertRow.model_validate(row)
+                           for row in scan_data["rows"]),
+                diagnostics=tuple(scan_data["diagnostics"]))
+        if active is None:
+            active = tuple(StoredAlert.model_validate(alert)
+                           for alert in case["active"])
+        return decide_alert_transitions(
+            scan, policy=policy, active=active,
+            verified_levels=tuple(case["verified_levels"]),
+            now=datetime.fromisoformat(case["now"]))
+
+    def test_every_gold_case_matches_field_by_field(self):
+        for case in self._cases():
+            with self.subTest(case=case["name"]):
+                if case["expect_error"] is not None:
+                    with self.assertRaisesRegex(ValueError, case["expect_error"]):
+                        self._decide(case)
+                    continue
+                decisions = self._decide(case)
+                self.assertEqual([d.model_dump(mode="json") for d in decisions],
+                                 case["expected_decisions"])
+                self.assertEqual(len(outbox_decisions(decisions)),
+                                 case["expected_outbox_count"])
+                # 缺失/保留/退场永不产生用户事件：updated 决策一律 notify=False。
+                self.assertTrue(all(not d.notify for d in decisions
+                                    if d.event_kind == "updated"))
+
+    def test_gold_outcomes_survive_reversed_input_order(self):
+        from bi_agent.monitoring.models import StoredAlert
+
+        for case in self._cases():
+            if case["expect_error"] is not None:
+                continue
+            with self.subTest(case=case["name"]):
+                baseline = self._decide(case)
+                flipped_active = tuple(reversed(
+                    [StoredAlert.model_validate(alert) for alert in case["active"]]))
+                flipped = self._decide(case, scan=self._flipped_scan_rows(case),
+                                       active=flipped_active)
+                self.assertEqual(baseline, flipped)
+                self.assertEqual([d.model_dump(mode="json") for d in flipped],
+                                 case["expected_decisions"])
+
+    def _flipped_scan_rows(self, case):
+        from bi_agent.monitoring.models import MonitorAlertRow, MonitorScan
+
+        scan_data = case["scan"]
+        scan = MonitorScan(
+            policy_ref=case["policy"]["policy_ref"],
+            source_artifact_payload={"data": []}, source_fingerprint="0" * 64,
+            data_as_of=STATE_SNAPSHOT, fresh=scan_data["fresh"],
+            complete_levels=tuple(scan_data["complete_levels"]),
+            rows=tuple(reversed([MonitorAlertRow.model_validate(row)
+                                 for row in scan_data["rows"]])),
+            diagnostics=tuple(scan_data["diagnostics"]))
+        return scan
 
 
 if __name__ == "__main__":  # pragma: no cover

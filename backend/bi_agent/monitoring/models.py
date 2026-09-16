@@ -202,7 +202,15 @@ class AlertTransition(BaseModel):
 
 
 class StoredAlert(BaseModel):
-    """已持久化告警的状态机视图：generation 从 1 起。"""
+    """已持久化告警的状态机视图：generation 从 1 起。
+
+    ``level`` / ``sku_ref`` / ``scope_ref`` 是 2026-09-17 批准的身份桥
+    （计划 Task 3）：保留/退场抑制的 ``AlertDecision`` 必须携带真实身份，而
+    dedupe key 是单向哈希，纯状态机不能从它反推身份；读取面因此把 023
+    ``bi.inventory_alert_instances`` 既有的这三列一并带回。行上仍不携
+    ``rule_code``：首版只有阈值规则，规则码由状态机以固定常量参与 dedupe key
+    （``state_machine``），不从存储读。
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -210,8 +218,18 @@ class StoredAlert(BaseModel):
     dedupe_key: str
     generation: int = Field(ge=1)
     status: AlertStatus
+    level: Literal["physical_total", "shop_sellable"]
+    sku_ref: str = Field(min_length=1)
+    scope_ref: str = Field(min_length=1)
     last_observed_at: datetime
     last_notified_at: datetime | None
+
+    @field_validator("sku_ref", "scope_ref")
+    @classmethod
+    def _identity_is_present(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("monitor_alert_identity_required")
+        return value
 
 
 class AlertDecision(BaseModel):

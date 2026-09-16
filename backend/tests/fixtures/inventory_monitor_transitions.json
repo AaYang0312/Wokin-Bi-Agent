@@ -1,0 +1,1970 @@
+{
+  "comment": "计划 2026-09-14-continuous-inventory-notifications.md Task 3 Step 5 的 gold 转移矩阵。dedupe_key 是 sha256(canonical JSON of [policy_version, level, sku_ref, scope_ref, rule_code]) 的字面钉值；expected_decisions 与 expected_outbox_count 为逐字段 gold 期望（notify=true 且 event_kind 属于 triggered/retriggered/resolved 才计入 outbox 形状）；expect_error 非 null 时状态机必须以该固定码 ValueError fail closed。缺数据/保留/退场用例的 outbox 计数全为 0：缺失永远不产生用户事件。",
+  "cases": [
+    {
+      "name": "low_triggers_with_no_history",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          },
+          {
+            "level": "shop_sellable",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "ent-7092f313",
+            "quantity": "1",
+            "threshold": "5",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        },
+        {
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313"
+        }
+      ],
+      "expected_outbox_count": 2,
+      "expect_error": null
+    },
+    {
+      "name": "equal_threshold_triggers",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "10",
+            "threshold": "10",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 1,
+      "expect_error": null
+    },
+    {
+      "name": "normal_without_history_emits_nothing",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "normal",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "11",
+            "threshold": "10",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "second_drop_after_resolved_creates_generation_two",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-done0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "resolved",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 2,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 1,
+      "expect_error": null
+    },
+    {
+      "name": "persistent_low_within_cooldown_updates_only",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:30:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "cooldown_just_before_boundary_updates",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:00:01+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "cooldown_exactly_at_boundary_retriggers",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:00:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "retriggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 1,
+      "expect_error": null
+    },
+    {
+      "name": "acknowledged_low_stays_acknowledged",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-ack00001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "acknowledged",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "acknowledged",
+          "next_status": "acknowledged",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "stale_scan_retains_and_never_triggers_or_resolves",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": false,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "normal",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "11",
+            "threshold": "10",
+            "unit": "piece"
+          },
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-1b9814cb",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "missing_page_retains_all_active_levels",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        },
+        {
+          "alert_ref": "alert-chan0001",
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "status": "open",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [],
+        "diagnostics": [
+          "inventory_scan_incomplete"
+        ],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        },
+        {
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "policy_disabled_suppresses_active_only",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": false
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        },
+        {
+          "alert_ref": "alert-ack00001",
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "status": "acknowledged",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "suppressed",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        },
+        {
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "previous_status": "acknowledged",
+          "next_status": "suppressed",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "only_physical_verified_without_channel_history",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total"
+      ],
+      "active": [],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 1,
+      "expect_error": null
+    },
+    {
+      "name": "withdrawn_channel_suppresses_and_never_resolves",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-chan0001",
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "status": "open",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        },
+        {
+          "alert_ref": "alert-chan0002",
+          "dedupe_key": "f13e8c050729cbf41f268ad9cd4699f3d2c9bc76ff04aa766ca7d8bd157019a3",
+          "generation": 1,
+          "status": "acknowledged",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-5857f345",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        },
+        {
+          "dedupe_key": "f13e8c050729cbf41f268ad9cd4699f3d2c9bc76ff04aa766ca7d8bd157019a3",
+          "generation": 1,
+          "previous_status": "acknowledged",
+          "next_status": "suppressed",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-5857f345"
+        },
+        {
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "suppressed",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313"
+        }
+      ],
+      "expected_outbox_count": 1,
+      "expect_error": null
+    },
+    {
+      "name": "bypass_injected_unverified_row_dropped_physical_still_decides",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total"
+      ],
+      "active": [],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          },
+          {
+            "level": "shop_sellable",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "ent-7092f313",
+            "quantity": "1",
+            "threshold": "5",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 1,
+      "expect_error": null
+    },
+    {
+      "name": "verified_channel_missing_rows_retained",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-chan0001",
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "status": "open",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total"
+        ],
+        "diagnostics": [
+          "inventory_channel_snapshot_missing"
+        ],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        },
+        {
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313"
+        }
+      ],
+      "expected_outbox_count": 1,
+      "expect_error": null
+    },
+    {
+      "name": "only_channel_verified_physical_withdrawn_symmetric",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "shop_sellable",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "ent-7092f313",
+            "quantity": "1",
+            "threshold": "5",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "suppressed",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        },
+        {
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313"
+        }
+      ],
+      "expected_outbox_count": 1,
+      "expect_error": null
+    },
+    {
+      "name": "unknown_row_retains_without_resolving",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "unknown",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": null,
+            "threshold": null,
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "unconfigured_row_retains",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "unconfigured",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "5",
+            "threshold": null,
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "data_anomaly_from_unit_conflict_retains",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "data_anomaly",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": null,
+            "threshold": null,
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "shared_pool_one_physical_key_three_shop_cells",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "100",
+            "threshold": "200",
+            "unit": "piece"
+          },
+          {
+            "level": "shop_sellable",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "ent-7092f313",
+            "quantity": "1",
+            "threshold": "5",
+            "unit": "piece"
+          },
+          {
+            "level": "shop_sellable",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "ent-5857f345",
+            "quantity": "1",
+            "threshold": "5",
+            "unit": "piece"
+          },
+          {
+            "level": "shop_sellable",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "ent-7761ee1d",
+            "quantity": "1",
+            "threshold": "5",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        },
+        {
+          "dedupe_key": "f13e8c050729cbf41f268ad9cd4699f3d2c9bc76ff04aa766ca7d8bd157019a3",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-5857f345"
+        },
+        {
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313"
+        },
+        {
+          "dedupe_key": "01730bd32c370e6ddfebea83a48aeaa30fbb8efd37576ebe55d86adfb2332ae7",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7761ee1d"
+        }
+      ],
+      "expected_outbox_count": 4,
+      "expect_error": null
+    },
+    {
+      "name": "duplicate_scan_rows_fail_closed",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          },
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [],
+      "expected_outbox_count": 0,
+      "expect_error": "monitor_duplicate_row"
+    },
+    {
+      "name": "duplicate_active_keys_fail_closed",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        },
+        {
+          "alert_ref": "alert-open0002",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 2,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [],
+      "expected_outbox_count": 0,
+      "expect_error": "monitor_duplicate_active_alert"
+    },
+    {
+      "name": "ambiguous_history_fail_closed",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-done0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "resolved",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        },
+        {
+          "alert_ref": "alert-done0002",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "resolved",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [],
+      "expected_outbox_count": 0,
+      "expect_error": "monitor_ambiguous_history"
+    },
+    {
+      "name": "truncated_shape_empty_complete_levels_retain_all",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [
+          "pl-0123456789ab"
+        ],
+        "levels": [
+          "physical_total",
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "physical_total",
+        "shop_sellable"
+      ],
+      "active": [
+        {
+          "alert_ref": "alert-open0001",
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "status": "open",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        },
+        {
+          "alert_ref": "alert-ack00001",
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "status": "acknowledged",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313",
+          "last_observed_at": "2026-09-17T11:55:00+00:00",
+          "last_notified_at": "2026-09-17T11:55:00+00:00"
+        }
+      ],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [],
+        "diagnostics": [
+          "inventory_display_truncated"
+        ],
+        "rows": [
+          {
+            "level": "physical_total",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "quantity": "1",
+            "threshold": "2",
+            "unit": "piece"
+          },
+          {
+            "level": "shop_sellable",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "ent-7092f313",
+            "quantity": "1",
+            "threshold": "5",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "97c9d866c5bd62cf56620a9a1a1b6f5525f78e20c431d83b460fd4c8c7ec5401",
+          "generation": 1,
+          "previous_status": "open",
+          "next_status": "open",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_replenish",
+          "level": "physical_total",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "pl-0123456789ab|wh-0123456789ab"
+        },
+        {
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "previous_status": "acknowledged",
+          "next_status": "acknowledged",
+          "event_kind": "updated",
+          "notify": false,
+          "observed": false,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313"
+        }
+      ],
+      "expected_outbox_count": 0,
+      "expect_error": null
+    },
+    {
+      "name": "channel_only_policy_channel_triggers",
+      "policy": {
+        "policy_ref": "inventory-monitor/1",
+        "threshold_policy_ref": "inventory-thresholds/1",
+        "owner_subject_id": "owner-subject",
+        "shop_refs": [
+          "shop-a"
+        ],
+        "inventory_pool_refs": [],
+        "levels": [
+          "shop_sellable"
+        ],
+        "cooldown_seconds": 3600,
+        "enabled": true
+      },
+      "verified_levels": [
+        "shop_sellable"
+      ],
+      "active": [],
+      "scan": {
+        "fresh": true,
+        "complete_levels": [
+          "shop_sellable"
+        ],
+        "diagnostics": [],
+        "rows": [
+          {
+            "level": "shop_sellable",
+            "status": "low",
+            "sku_ref": "ent-efd0f37a",
+            "scope_ref": "ent-7092f313",
+            "quantity": "1",
+            "threshold": "5",
+            "unit": "piece"
+          }
+        ]
+      },
+      "now": "2026-09-17T12:00:00+00:00",
+      "expected_decisions": [
+        {
+          "dedupe_key": "f3bbb3e0f52cfd37c95d3db278a3eead75b810d70d91606f4b4d8d984727f9ee",
+          "generation": 1,
+          "previous_status": null,
+          "next_status": "open",
+          "event_kind": "triggered",
+          "notify": true,
+          "observed": true,
+          "rule_code": "low_quota",
+          "level": "shop_sellable",
+          "sku_ref": "ent-efd0f37a",
+          "scope_ref": "ent-7092f313"
+        }
+      ],
+      "expected_outbox_count": 1,
+      "expect_error": null
+    }
+  ]
+}
