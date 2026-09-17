@@ -15,8 +15,10 @@
 
 Task 1 交付契约、配置与 gate；Task 2 交付单事务 repository；本文件同时承载
 计划 Task 3 的确定性状态机（``AlertStateMachineTests``）与 gold 转移矩阵
-（``AlertTransitionGoldTests``，tests/fixtures/inventory_monitor_transitions.json）。
-runner / CLI 属后续 Task。
+（``AlertTransitionGoldTests``，tests/fixtures/inventory_monitor_transitions.json）、
+计划 Task 4 的 runner（``MonitorRunnerTests`` / ``MonitorRunnerDatabaseTests``）与 CLI，
+以及计划 Task 5 的投递 wrapper（``OutboxDeliveryTests``）与缺层零投递
+（``MissingLevelDeliveryTests``）。通知授权 API 的用例在 tests.test_api.py。
 """
 
 import hashlib
@@ -24,6 +26,7 @@ import io
 import json
 import pathlib
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import psycopg
@@ -2530,6 +2533,272 @@ class MonitorConsoleScriptTests(unittest.TestCase):
         self.assertTrue(callable(run_inventory_graph))
         self.assertTrue(callable(run_main))
         self.assertTrue(callable(deliver_main))
+
+
+# --- 计划 Task 5：at-least-once 投递 wrapper 与缺层零投递 ---------------------
+#
+# wrapper 的离线用例用本地替身（只认唯一一条固定 SQL，替身事务在异常时丢弃
+# 全部暂存写入）：固定 SQL/单事务、limit 边界、时区要求、稳定非秘密错误、
+# 崩溃回滚后重试不重复、结果逐字验证进 DeliverySummary。真库上的至少一次/
+# 恰好一份/崩溃重试由 OutboxDeliveryDatabaseTests 另证（023 只在本机 *_test
+# 库执行）；023 函数自身语义的主矩阵在 tests.test_db。
+
+
+class _SimulatedCrash(Exception):
+    """计划 Task 5 Step 1 的崩溃形状：通知已插入、事务尚未提交时进程死掉。"""
+
+
+class _OutboxDeliveryConn:
+    """投递 wrapper 的最小替身：只认 ``SELECT bi.deliver_inventory_outbox``。
+
+    ``pending`` 是尚未投递的 outbox 行数；每次成功调用按 023 函数的对外行为
+    模拟：选中 min(pending, 1) 行 → 通知落库 → delivered_at 推进 → 下一轮
+    选中 0 行（至少一次 + 幂等键去重的净效果是恰好一份通知）。白名单之外的
+    SQL 一律显式报错——wrapper 没有第二条 SQL 通路，也不接任何外部 sink。
+    """
+
+    def __init__(self, *, pending: int = 1, result: dict | None = None,
+                 fail_after_insert: bool = False,
+                 db_error: Exception | None = None) -> None:
+        self.pending = pending
+        self.result = result             # 原样返回的函数结果（形状验证用例）
+        self.fail_after_insert = fail_after_insert
+        self.db_error = db_error
+        self.notifications: list[str] = []
+        self.sql_log: list[str] = []
+        self.execute_depths: list[int] = []
+        self._depth = 0
+
+    @contextmanager
+    def transaction(self):
+        self._depth += 1
+        committed_notifications = list(self.notifications)
+        committed_pending = self.pending
+        try:
+            yield
+        except BaseException:
+            # 整体回滚：崩溃前暂存的通知与 outbox 推进一起消失。
+            self.notifications = committed_notifications
+            self.pending = committed_pending
+            raise
+        finally:
+            self._depth -= 1
+
+    def execute(self, sql, params=None):
+        text = " ".join(sql.split())
+        self.sql_log.append(text)
+        if not text.startswith("SELECT bi.deliver_inventory_outbox"):
+            raise AssertionError(f"投递 wrapper 不得执行其它 SQL：{text}")
+        self.execute_depths.append(self._depth)
+        if self.db_error is not None:
+            raise self.db_error
+        if self.fail_after_insert:
+            self.notifications.append("ntf-crash")   # 崩溃前通知已插入
+            raise _SimulatedCrash
+        if self.result is not None:
+            from tests.fakeconn import Rows
+
+            return Rows([(dict(self.result),)])
+        selected = min(self.pending, 1)
+        self.pending -= selected
+        self.notifications.extend(f"ntf-{index}" for index in range(selected))
+        from tests.fakeconn import Rows
+
+        return Rows([({"selected": selected, "delivered": selected,
+                       "retried": 0, "dead_lettered": 0},)])
+
+
+class OutboxDeliveryTests(unittest.TestCase):
+    """计划 Task 5 Step 1：投递幂等、崩溃重试与 wrapper 调用纪律。"""
+
+    def test_same_outbox_delivered_twice_creates_one_notification(self):
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+
+        conn = _OutboxDeliveryConn(pending=1)
+        first = deliver_inventory_outbox(conn, now=MONITOR_NOW, limit=100)
+        second = deliver_inventory_outbox(conn, now=MONITOR_NOW, limit=100)
+        self.assertEqual((first.selected, first.delivered), (1, 1))
+        self.assertEqual((second.selected, second.delivered), (0, 0))
+        self.assertEqual(len(conn.notifications), 1,
+                         "同一 outbox 投递两次只算一份通知")
+
+    def test_crash_after_insert_retries_without_duplicate(self):
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+
+        crashing = _OutboxDeliveryConn(pending=1, fail_after_insert=True)
+        with self.assertRaises(_SimulatedCrash):
+            deliver_inventory_outbox(crashing, now=MONITOR_NOW, limit=100)
+        self.assertEqual(crashing.notifications, [], "崩溃事务的通知必须回滚")
+        conn = _OutboxDeliveryConn(pending=1)
+        summary = deliver_inventory_outbox(conn, now=MONITOR_NOW, limit=100)
+        self.assertEqual(summary.delivered, 1)
+        self.assertEqual(conn.notifications, ["ntf-0"], "重试只补出恰好一份")
+
+    def test_only_the_fixed_sql_runs_inside_one_transaction(self):
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+        from bi_agent.monitoring.models import DeliverySummary
+
+        conn = _OutboxDeliveryConn()
+        summary = deliver_inventory_outbox(conn, now=MONITOR_NOW, limit=100)
+        self.assertIsInstance(summary, DeliverySummary)
+        self.assertEqual((summary.selected, summary.delivered, summary.retried,
+                          summary.dead_lettered), (1, 1, 0, 0))
+        self.assertEqual(conn.sql_log,
+                         ["SELECT bi.deliver_inventory_outbox(%(now)s, %(limit)s)"])
+        self.assertEqual(conn.execute_depths, [1], "固定函数只在单事务内调用")
+
+    def test_limit_must_be_between_1_and_100(self):
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+
+        for bad in (0, 101, -1):
+            with self.subTest(limit=bad):
+                conn = _OutboxDeliveryConn()
+                with self.assertRaisesRegex(ValueError,
+                                            "monitor_delivery_limit_out_of_range"):
+                    deliver_inventory_outbox(conn, now=MONITOR_NOW, limit=bad)
+                self.assertEqual(conn.sql_log, [], "越界 limit 不得碰到数据库")
+
+    def test_now_must_be_timezone_aware(self):
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+
+        conn = _OutboxDeliveryConn()
+        with self.assertRaisesRegex(ValueError, "monitor_delivery_now_naive"):
+            deliver_inventory_outbox(conn, now=datetime(2026, 9, 17, 12), limit=100)
+        self.assertEqual(conn.sql_log, [], "naive now 不得碰到数据库")
+
+    def test_database_failures_fold_into_a_stable_non_secret_error(self):
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+
+        conn = _OutboxDeliveryConn(db_error=psycopg.errors.OperationalError(
+            "connection refused to 127.0.0.1:5432 detail"))
+        with self.assertRaisesRegex(RuntimeError, "monitor_delivery_failed"):
+            deliver_inventory_outbox(conn, now=MONITOR_NOW, limit=100)
+        self.assertNotIn("connection refused", str(RuntimeError("monitor_delivery_failed")))
+        self.assertEqual(conn.notifications, [])
+
+    def test_fixed_result_is_validated_into_the_strict_summary(self):
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+
+        for bad in ({"selected": 1, "delivered": 1, "retried": 0},           # 缺键
+                    {"selected": 1, "delivered": 1, "retried": 0,
+                     "dead_lettered": 0, "extra": 1},                       # 多键
+                    {"selected": 200, "delivered": 1, "retried": 0,
+                     "dead_lettered": 0}):                                  # 越界
+            with self.subTest(result=sorted(bad)):
+                conn = _OutboxDeliveryConn(result=bad)
+                with self.assertRaisesRegex(RuntimeError,
+                                            "monitor_delivery_result_invalid"):
+                    deliver_inventory_outbox(conn, now=MONITOR_NOW, limit=100)
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class OutboxDeliveryDatabaseTests(unittest.TestCase):
+    """真库上的投递 wrapper：经 023 函数的至少一次/恰好一份/崩溃重试。"""
+
+    def setUp(self) -> None:
+        from psycopg.types.json import Jsonb
+
+        self.jsonb = Jsonb
+        self.conn = connect_test_db(self)
+        self.conn.execute(
+            "INSERT INTO bi.inventory_monitor_policies (policy_ref, "
+            "threshold_policy_ref, owner_subject_id, shop_refs, "
+            "inventory_pool_refs, levels, cooldown_seconds, enabled) "
+            "VALUES (%s, 'inventory-thresholds/1', 'owner-subject', "
+            "ARRAY['shop-a']::text[], ARRAY[%s]::text[], "
+            "ARRAY['physical_total','shop_sellable']::text[], 3600, true) "
+            "ON CONFLICT (policy_ref) DO UPDATE SET enabled = true, "
+            "owner_subject_id = 'owner-subject'",
+            (POLICY_REF, POOL_REF))
+        decision = {**make_decision().model_dump(),
+                    "quantity": "10", "threshold": "10", "unit": "piece"}
+        self.conn.execute(
+            "SELECT bi.commit_inventory_monitor_scan(%s, %s, %s, %s, %s, %s)",
+            (POLICY_REF, self.jsonb(alerts_payload()), SOURCE_FINGERPRINT,
+             MONITOR_NOW, self.jsonb([decision]), MONITOR_NOW))
+
+    def _deliver(self):
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+
+        return deliver_inventory_outbox(self.conn, now=MONITOR_NOW, limit=100)
+
+    def _notification_counts(self) -> tuple[int, int]:
+        return self.conn.execute(
+            "SELECT count(*), count(DISTINCT idempotency_key) "
+            "FROM bi.in_app_notifications").fetchone()
+
+    def test_at_least_once_delivery_creates_exactly_one_notification(self):
+        summary = self._deliver()
+        self.assertEqual((summary.selected, summary.delivered, summary.retried,
+                          summary.dead_lettered), (1, 1, 0, 0))
+        self.assertEqual(self._notification_counts(), (1, 1))
+        replay = self._deliver()
+        self.assertEqual((replay.selected, replay.delivered), (0, 0))
+        self.assertEqual(self._notification_counts(), (1, 1), "重投不产生第二份")
+
+    def test_crash_after_notification_retries_without_duplicate(self):
+        self._deliver()
+        # 崩溃形状：通知已写入而 outbox 未推进（提交前进程死掉留下的状态）。
+        self.conn.execute("DELETE FROM bi.in_app_notifications")
+        self.conn.execute(
+            "UPDATE bi.notification_outbox SET delivered_at = NULL, attempts = 0")
+        summary = self._deliver()
+        self.assertEqual(summary.delivered, 1)
+        self.assertEqual(self._notification_counts(), (1, 1))
+
+    def test_out_of_range_limit_fails_before_touching_the_database(self):
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+
+        with self.assertRaisesRegex(ValueError,
+                                    "monitor_delivery_limit_out_of_range"):
+            deliver_inventory_outbox(self.conn, now=MONITOR_NOW, limit=101)
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class MissingLevelDeliveryTests(unittest.TestCase):
+    """计划 Task 5 Step 1：缺来源层级只以固定诊断存在——零 outbox、零通知。
+
+    通知授权 API 的对应断言（GET 只回已核验层级的事件）在
+    tests.test_api.NotificationApiTests 里以同一形状覆盖。
+    """
+
+    def test_missing_channel_level_diagnostics_never_reach_outbox_or_api(self):
+        from psycopg.types.json import Jsonb
+
+        conn = connect_test_db(self)
+        # 策略请求两层（Option A 形态）：本轮只有实物层核验，诊断里带 gate 的
+        # 固定码 monitor_level_unverified——渠道层没有被问过，因此没有渠道
+        # 决策、没有渠道 outbox 行、也没有渠道通知可投递。
+        conn.execute(
+            "INSERT INTO bi.inventory_monitor_policies (policy_ref, "
+            "threshold_policy_ref, owner_subject_id, shop_refs, "
+            "inventory_pool_refs, levels, cooldown_seconds, enabled) "
+            "VALUES (%s, 'inventory-thresholds/1', 'owner-subject', "
+            "ARRAY['shop-a']::text[], ARRAY[%s]::text[], "
+            "ARRAY['physical_total','shop_sellable']::text[], 3600, true) "
+            "ON CONFLICT (policy_ref) DO UPDATE SET enabled = true, "
+            "owner_subject_id = 'owner-subject'",
+            (POLICY_REF, POOL_REF))
+        decision = {**make_decision().model_dump(),   # 只有实物层的首发决策
+                    "quantity": "10", "threshold": "10", "unit": "piece"}
+        conn.execute(
+            "SELECT bi.commit_inventory_monitor_scan(%s, %s, %s, %s, %s, %s)",
+            (POLICY_REF, Jsonb(alerts_payload()), SOURCE_FINGERPRINT,
+             MONITOR_NOW, Jsonb([decision]), MONITOR_NOW))
+        from bi_agent.monitoring.delivery import deliver_inventory_outbox
+
+        deliver_inventory_outbox(conn, now=MONITOR_NOW, limit=100)
+        outbox_levels = [row[0] for row in conn.execute(
+            "SELECT payload->>'level' FROM bi.notification_outbox").fetchall()]
+        self.assertEqual(outbox_levels, ["physical_total"])
+        self.assertNotIn("shop_sellable", outbox_levels,
+                         "缺来源层级不得写 outbox")
+        notification_levels = [row[0] for row in conn.execute(
+            "SELECT a.level FROM bi.in_app_notifications n "
+            "JOIN bi.inventory_alert_instances a ON a.alert_ref = n.alert_ref"
+        ).fetchall()]
+        self.assertEqual(notification_levels, ["physical_total"],
+                         "缺来源层级不得进通知中心")
 
 
 if __name__ == "__main__":  # pragma: no cover

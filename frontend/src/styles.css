@@ -950,8 +950,7 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
 .review-btn.primary:hover { color: var(--text-on-accent); filter: brightness(1.08); }
 .review-btn.danger:hover { color: var(--danger); border-color: rgba(255, 107, 111, .4); }
 .review-form { display: grid; gap: 10px; }
-.review-field { display: grid; gap: 4px; color: var(--text-2); font-size: 12px; }
-.review-field textarea, .review-field select {
+.review-field { display: grid; gap: 4px; color: var(--text-2); font-size: 12px; }.review-field textarea, .review-field select {
   width: 100%;
   border: 1px solid var(--hair-strong);
   border-radius: var(--r-sm);
@@ -968,6 +967,7 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
 
 @media (max-width: 767px) {
   .review-dock { top: 0; bottom: 0; right: 0; width: 100vw; border-radius: 0; border: 0; }
+  .notif-panel { left: 12px; right: 12px; width: auto; bottom: 108px; }
 }
 
 /* 隔离分析卡片：确定性结论分块；证据不足的说法折叠，限制常显在卡片末尾。 */
@@ -1026,3 +1026,104 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
   font-variant-numeric: tabular-nums;
   word-break: break-all;
 }
+
+/* ---------------------------------------------------------------------------
+ * 库存通知中心（持续库存通知计划 Task 5）：入口固定在右下（审核按钮上方），
+ * 面板复用既有表面 token；只使用已通过对比度门禁的既有颜色变量，不新引入色值。
+ * ------------------------------------------------------------------------- */
+.notif-toggle {
+  position: fixed; right: 18px; bottom: 64px; z-index: 25;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 14px;
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface-raised);
+  color: var(--text-2);
+  font-size: 12px; font-weight: 600;
+  box-shadow: var(--shadow-float), var(--inset-hi);
+  backdrop-filter: blur(18px) saturate(150%);
+  transition: color .16s var(--ease-out), border-color .16s var(--ease-out), transform .16s var(--ease-out);
+}
+.notif-toggle:hover { color: var(--text); border-color: var(--accent-line); }
+.notif-toggle:active { transform: translateY(1px); }
+.notif-toggle.open { color: var(--accent-soft); border-color: var(--accent-line); background: var(--accent-veil); }
+.notif-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 18px; height: 18px; padding: 0 5px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.notif-panel {
+  position: fixed; right: 12px; bottom: 110px; z-index: 40;
+  width: min(430px, calc(100vw - 24px));
+  max-height: min(600px, calc(100vh - 140px));
+  display: flex; flex-direction: column;
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-lg);
+  background: var(--surface-solid);
+  box-shadow: var(--shadow-float);
+  overflow: hidden;
+}
+.notif-head {
+  flex: 0 0 auto;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--hair);
+}
+.notif-title { margin: 0; font-size: 15px; font-weight: 660; letter-spacing: -.01em; }
+.notif-subtitle { margin: 2px 0 0; color: var(--text-3); font-size: 11px; }
+.notif-error {
+  margin: 0 0 10px; padding: 10px 12px;
+  border: 1px solid rgba(255, 107, 111, .32);
+  border-radius: var(--r-md);
+  background: rgba(255, 107, 111, .10);
+  color: #ffb4b7;
+  font-size: 13px;
+}
+.notif-body { overflow-y: auto; min-height: 0; padding: 12px 16px 18px; display: grid; gap: 10px; align-content: start; }
+.notif-empty { margin: 0; color: var(--text-3); font-size: 12.5px; }
+.notif-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.notif-card {
+  display: grid; gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--hair);
+  border-radius: var(--r-md);
+  background: var(--surface-raised);
+}
+.notif-card.unread { border-color: var(--accent-line); box-shadow: 0 0 0 3px var(--accent-veil); }
+.notif-card-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.notif-kind { font-size: 12.5px; font-weight: 660; color: var(--text); }
+.notif-kind.kind-resolved { color: var(--ok); }
+.notif-tag {
+  padding: 2px 8px;
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-pill);
+  color: var(--text-3);
+  font-size: 11px;
+}
+.notif-tag.status-open { color: var(--accent-soft); border-color: var(--accent-line); }
+.notif-tag.status-acknowledged { color: var(--text-2); }
+.notif-tag.status-resolved { color: var(--ok); border-color: rgba(79, 209, 165, .4); }
+.notif-line { margin: 0; font-size: 13px; color: var(--text); line-height: 1.6; }
+.notif-meta {
+  margin: 0;
+  display: flex; flex-wrap: wrap; gap: 4px 10px;
+  color: var(--text-2); font-size: 11.5px;
+  word-break: break-all;
+}
+.notif-guard { margin: 0; color: var(--text-3); font-size: 11.5px; }
+.notif-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.notif-btn {
+  display: inline-flex; align-items: center;
+  padding: 6px 12px;
+  border: 1px solid var(--hair-strong);
+  border-radius: var(--r-pill);
+  background: var(--surface-raised);
+  color: var(--text-2);
+  font-size: 12px; font-weight: 600;
+  cursor: pointer;
+}
+.notif-btn:hover { color: var(--text); border-color: var(--accent-line); }
+.notif-btn.primary { border-color: var(--accent-line); color: var(--accent-soft); background: var(--accent-veil); }
+.notif-btn.primary:hover { color: var(--text-on-accent); filter: brightness(1.08); }

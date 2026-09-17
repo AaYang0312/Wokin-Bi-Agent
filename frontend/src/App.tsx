@@ -1,13 +1,19 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
-  ApiError, createChat, deleteChat, listChats, loadMessages, probeReviewAccess,
+  ApiError, acknowledgeInventoryAlert, createChat, deleteChat, listChats,
+  listNotifications, loadMessages, markNotificationRead, probeReviewAccess,
   renameChat, sendMessage,
 } from './api'
 import { ChatView } from './components/ChatView'
+import {
+  NotificationCenter, createNotificationPoller, parseNotificationList,
+} from './components/NotificationCenter'
 import { QueryMemoryReviewSection } from './components/QueryMemoryReview'
 import { Sidebar } from './components/Sidebar'
-import type { Artifact, ChatMessage, ChatSummary, ReviewAccess } from './types'
+import type {
+  Artifact, ChatMessage, ChatSummary, InventoryNotification, ReviewAccess,
+} from './types'
 
 const stageText: Record<string, string> = {
   thinking: '正在理解问题…',
@@ -61,6 +67,9 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [reviewAccess, setReviewAccess] = useState<ReviewAccess | null>(null)
   const [reviewOpen, setReviewOpen] = useState(false)
+  const [notifications, setNotifications] = useState<InventoryNotification[]>([])
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [notificationsError, setNotificationsError] = useState<string | null>(null)
   const narrow = useNarrow()
   const controller = useRef<AbortController | null>(null)
   const selectedRef = useRef<string | null>(null)
@@ -87,6 +96,60 @@ export default function App() {
     })
     return () => { cancelled = true }
   }, [])
+
+  // 库存通知（计划 Task 5）：启动拉一次（服务端上限 100 条），之后每 60 秒且
+  // 仅当页面可见时刷新——这是 UI 轮询，不是业务调度；卸载时把定时器与可见性
+  // 监听一并清理。任何一项载荷过不了运行时解析就整体拒绝并提示，不渲染。
+  const refreshNotifications = useCallback(async () => {
+    try {
+      const parsed = parseNotificationList(await listNotifications())
+      if (!parsed.ok) {
+        setNotificationsError('通知数据不符合契约，已拒绝渲染')
+        return
+      }
+      setNotifications(parsed.notifications)
+      setNotificationsError(null)
+    } catch (caught) {
+      setNotificationsError(
+        caught instanceof ApiError || caught instanceof Error
+          ? caught.message : '加载库存通知失败')
+    }
+  }, [])
+
+  useEffect(() => {
+    const poller = createNotificationPoller({
+      refresh: refreshNotifications,
+      isVisible: () => document.visibilityState === 'visible',
+      schedule: (tick, intervalMs) => {
+        const id = window.setInterval(tick, intervalMs)
+        return () => window.clearInterval(id)
+      },
+      onVisibilityChange: (handler) => {
+        document.addEventListener('visibilitychange', handler)
+        return () => document.removeEventListener('visibilitychange', handler)
+      },
+    })
+    poller.start()
+    return () => poller.stop()
+  }, [refreshNotifications])
+
+  async function readNotification(notificationRef: string) {
+    try {
+      await markNotificationRead(notificationRef)
+      await refreshNotifications()
+    } catch (caught) {
+      setNotificationsError(caught instanceof Error ? caught.message : '标记已读失败')
+    }
+  }
+
+  async function acknowledgeAlert(alertRef: string) {
+    try {
+      await acknowledgeInventoryAlert(alertRef)
+      await refreshNotifications()
+    } catch (caught) {
+      setNotificationsError(caught instanceof Error ? caught.message : '确认失败')
+    }
+  }
 
   // 窄屏抽屉的焦点交接：开时进入抽屉，收时回给触发按钮（inert 会把焦点丢给 body）。
   useEffect(() => {
@@ -209,6 +272,11 @@ export default function App() {
     <div className="app-shell">
       <ReviewEntry access={reviewAccess} open={reviewOpen}
         onToggle={() => setReviewOpen((value) => !value)} />
+      <NotificationCenter notifications={notifications} open={notificationsOpen}
+        error={notificationsError}
+        onToggle={() => setNotificationsOpen((value) => !value)}
+        onRead={(ref) => void readNotification(ref)}
+        onAcknowledge={(ref) => void acknowledgeAlert(ref)} />
       <div className="workspace">
         <Sidebar chats={chats} selectedId={selectedId} busy={controller.current !== null}
           open={sidebarOpen} narrow={narrow} drawerRef={drawerRef}

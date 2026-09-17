@@ -26,6 +26,7 @@ from .chats import (
     release_chat_turn,
     rename_chat,
 )
+from .monitoring.api import mount_notification_api
 from .config import AppSettings
 from .agent import encode_sse, run_chat_turn
 from .llm import ChatModel
@@ -174,5 +175,11 @@ def create_app(settings: AppSettings, model: ChatModel | None = None) -> FastAPI
     # 写请求复用同一道 WebWrite 边界，读写只走独立 approver DSN。
     mount_reviewer_api(app, settings, get_subject=get_subject,
                        require_web_write=require_web_write)
+
+    # 计划 Task 5：应用内通知中心。路由常驻、无独立 gate（每个认证主体都可能
+    # 有通知），复用同一套身份 / WebWrite / bi_app 连接依赖；owner 过滤在视图
+    # 查询里做，read/ack 的 owner 复核在 023 的两个固定函数内部重做。
+    mount_notification_api(app, get_subject=get_subject,
+                           require_web_write=require_web_write, get_conn=get_conn)
 
     return app

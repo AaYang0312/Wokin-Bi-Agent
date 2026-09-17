@@ -215,3 +215,26 @@ export async function probeReviewAccess(): Promise<ReviewAccess> {
     return 'unavailable'
   }
 }
+
+// ---------------------------------------------------------------- 库存通知 API
+// 通知中心走既有 GET 通道与 WebWrite 写边界（X-BI-Agent: web + JSON）；
+// 载荷只含后端投影的安全字段，形状校验在 NotificationCenter 的解析器里做
+// （类型声明不是信任凭据）。响应体只是已读/确认的回执，状态以重新拉取列表为准。
+
+export function listNotifications() {
+  return json<unknown[]>('/api/notifications')
+}
+
+export function markNotificationRead(notificationRef: string) {
+  return json<{ notification_ref: string; read_at: string | null }>(
+    `/api/notifications/${encodeURIComponent(notificationRef)}/read`,
+    { method: 'POST', headers: writeHeaders, body: '{}' },
+  )
+}
+
+export function acknowledgeInventoryAlert(alertRef: string) {
+  return json<{ alert_ref: string; status: string; acknowledged_at: string | null }>(
+    `/api/inventory-alerts/${encodeURIComponent(alertRef)}/acknowledge`,
+    { method: 'POST', headers: writeHeaders, body: '{}' },
+  )
+}

@@ -1170,3 +1170,314 @@ class QueryMemoryApiTests(unittest.TestCase):
             response = client.get("/api/query-memory/drafts", headers=self._read())
         self.assertEqual(response.status_code, 500)
         self._forbidden_words_absent(response.text, extra=("OperationalError", "SELECT"))
+
+
+# --- 计划 Task 5：应用内通知中心的授权 API ------------------------------------
+#
+# 与审核 API 同一协议：替身只认 owner 过滤的视图读取与两个固定 owner 复核函数，
+# 白名单之外的 SQL 显式报错。owner 过滤在 SELECT 的 WHERE 里做（响应里永远没有
+# owner subject）；read/ack 的 owner 复核在 023 函数内部重做——错 owner 与不存在
+# 都返回同一个固定 404，不泄漏任何告警/通知的存在性。
+
+_NOTIFICATION_COLUMNS = (
+    "notification_ref", "alert_ref", "event_kind", "status", "level",
+    "sku_ref", "scope_ref", "reason_code", "quantity", "threshold",
+    "unit", "data_as_of", "read_at", "created_at")
+_SAFE_PROJECTION_FIELDS = set(_NOTIFICATION_COLUMNS)
+_NOTIF_READ_AT = datetime(2026, 9, 17, 12, 30, tzinfo=timezone.utc)
+_NOTIF_ACK_AT = datetime(2026, 9, 17, 12, 35, tzinfo=timezone.utc)
+
+
+class NotificationApiConn:
+    """通知 API 替身：视图读取 + 两个固定 owner 复核函数。
+
+    ``notifications`` 按列名存行（含 owner_subject_id：SELECT 用它过滤，响应
+    投影里没有这一列）。read/ack 的幂等与状态规则按 023 函数的对外行为模拟：
+    错 owner 与不存在都抛 inventory_*_not_found；resolved/suppressed 抛
+    inventory_alert_not_acknowledgeable。白名单之外的 SQL 显式报错。
+    """
+
+    def __init__(self, *, notifications=()):
+        self.notifications = [dict(row) for row in notifications]
+        self.calls = []
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_details):
+        self.closed = True
+        return False
+
+    def close(self):
+        self.closed = True
+
+    def execute(self, sql, params=None):
+        text = " ".join(sql.split())
+        values = list(params or [])
+        self.calls.append(text)
+        if text.startswith("SELECT notification_ref, alert_ref, event_kind"):
+            # 与路由 SQL 同一排序：created_at DESC，并列按插入序（稳定排序）。
+            owned = sorted(
+                (row for row in self.notifications
+                 if row["owner_subject_id"] == values[0]),
+                key=lambda row: row["created_at"], reverse=True)
+            return Rows([[row[column] for column in _NOTIFICATION_COLUMNS]
+                         for row in owned])
+        if text.startswith("SELECT bi.mark_inventory_notification_read"):
+            ref, actor = values
+            for row in self.notifications:
+                if row["notification_ref"] == ref:
+                    if row["owner_subject_id"] != actor:
+                        break
+                    # 幂等：保留第一次已读时间。
+                    row["read_at"] = row["read_at"] or _NOTIF_READ_AT
+                    return Rows([({"notification_ref": ref,
+                                   "read_at": row["read_at"]},)])
+            raise psycopg.errors.RaiseException("inventory_notification_not_found")
+        if text.startswith("SELECT bi.acknowledge_inventory_alert"):
+            ref, actor = values
+            for row in self.notifications:
+                if row["alert_ref"] == ref:
+                    if row["owner_subject_id"] != actor:
+                        break
+                    if row["status"] == "acknowledged":
+                        return Rows([({"alert_ref": ref, "status": "acknowledged",
+                                       "acknowledged_at": _NOTIF_ACK_AT},)])
+                    if row["status"] != "open":
+                        raise psycopg.errors.RaiseException(
+                            "inventory_alert_not_acknowledgeable")
+                    row["status"] = "acknowledged"
+                    return Rows([({"alert_ref": ref, "status": "acknowledged",
+                                   "acknowledged_at": _NOTIF_ACK_AT},)])
+            raise psycopg.errors.RaiseException("inventory_alert_not_found")
+        raise AssertionError(f"未预期的SQL：{text}")
+
+
+class NotificationApiTests(unittest.TestCase):
+    """计划 Task 5 Step 1/4：跨 subject 隔离、固定错误、幂等与安全投影。"""
+
+    maxDiff = None
+
+    @staticmethod
+    def _notification(**overrides):
+        values = {
+            "notification_ref": "ntf-" + "a" * 32,
+            "alert_ref": "alert-open0001",
+            "event_kind": "triggered",
+            "status": "open",
+            "level": "physical_total",
+            "sku_ref": "ent-1a2b3c4d",
+            "scope_ref": "pl-0123456789ab|wh-0123456789ab",
+            "reason_code": "low_replenish",
+            "quantity": "10",
+            "threshold": "10",
+            "unit": "piece",
+            "data_as_of": datetime(2026, 9, 17, 11, 55, tzinfo=timezone.utc),
+            "read_at": None,
+            "created_at": datetime(2026, 9, 17, 12, tzinfo=timezone.utc),
+            "owner_subject_id": "subject-a",
+        }
+        values.update(overrides)
+        return values
+
+    @contextmanager
+    def notification_client(self, conn):
+        from bi_agent.api import create_app
+        from bi_agent.config import AppSettings
+
+        app = create_app(AppSettings(
+            app_dsn=SecretStr(_APP_DSN),
+            shop_ids=frozenset({"S1"}),
+            environment="production",
+            allowed_subjects=frozenset({"subject-a", "subject-b"}),
+            public_origin="https://bi.test",
+            auth_subject_header="X-Auth-Request-Sub",
+        ))
+
+        def connect(dsn, **kwargs):
+            self.assertEqual(dsn, _APP_DSN)
+            return conn
+
+        with patch("bi_agent.api.psycopg.connect", side_effect=connect):
+            yield TestClient(app)
+
+    @staticmethod
+    def _read(sub="subject-a"):
+        return {"X-Auth-Request-Sub": sub}
+
+    @staticmethod
+    def _write(sub="subject-a"):
+        return {"Content-Type": "application/json", "X-BI-Agent": "web",
+                "Origin": "https://bi.test", "X-Auth-Request-Sub": sub}
+
+    def test_subject_cannot_read_or_acknowledge_another_subject_alert(self):
+        conn = NotificationApiConn(notifications=[self._notification()])
+        with self.notification_client(conn) as client:
+            others = client.get("/api/notifications", headers=self._read("subject-b"))
+            self.assertEqual(others.status_code, 200, others.text)
+            self.assertEqual(others.json(), [])
+            response = client.post("/api/inventory-alerts/alert-open0001/acknowledge",
+                                   headers=self._write("subject-b"), json={})
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(response.json(),
+                             {"code": "not_found", "message": "告警不存在"})
+            self.assertEqual(conn.notifications[0]["status"], "open",
+                             "跨 owner 的确认不得改变任何状态")
+            owned = client.get("/api/notifications", headers=self._read("subject-a"))
+            self.assertEqual([row["notification_ref"] for row in owned.json()],
+                             [self._notification()["notification_ref"]])
+
+    def test_missing_notification_and_missing_alert_share_one_404(self):
+        conn = NotificationApiConn(notifications=[self._notification()])
+        with self.notification_client(conn) as client:
+            read = client.post("/api/notifications/ntf-missing/read",
+                               headers=self._write(), json={})
+            ack = client.post("/api/inventory-alerts/alert-missing/acknowledge",
+                              headers=self._write(), json={})
+        for response in (read, ack):
+            with self.subTest(url=response.url.path):
+                self.assertEqual(response.status_code, 404)
+                self.assertEqual(response.json()["code"], "not_found")
+
+    def test_reads_and_acknowledges_require_the_existing_web_write_boundary(self):
+        conn = NotificationApiConn(notifications=[self._notification()])
+        with self.notification_client(conn) as client:
+            attempts = (
+                ("no web header", client.post(
+                    "/api/notifications/ntf-x/read",
+                    headers={"Content-Type": "application/json",
+                             "Origin": "https://bi.test",
+                             "X-Auth-Request-Sub": "subject-a"}, json={})),
+                ("wrong origin", client.post(
+                    "/api/notifications/ntf-x/read",
+                    headers={"Content-Type": "application/json",
+                             "X-BI-Agent": "web", "Origin": "https://evil.test",
+                             "X-Auth-Request-Sub": "subject-a"}, json={})),
+                ("no subject", client.post(
+                    "/api/notifications/ntf-x/read",
+                    headers={"Content-Type": "application/json",
+                             "X-BI-Agent": "web",
+                             "Origin": "https://bi.test"}, json={})),
+                ("ack no web header", client.post(
+                    "/api/inventory-alerts/alert-open0001/acknowledge",
+                    headers={"X-Auth-Request-Sub": "subject-a"}, json={})),
+            )
+            for label, response in attempts:
+                with self.subTest(case=label):
+                    self.assertIn(response.status_code, (401, 403), response.text)
+        self.assertEqual([call for call in conn.calls
+                          if call.startswith("SELECT bi.")],
+                         [], "被拒的写请求不得调用任何数据库函数")
+
+    def test_already_read_and_already_acknowledged_are_idempotent_200(self):
+        conn = NotificationApiConn(notifications=[self._notification()])
+        ref = self._notification()["notification_ref"]
+        with self.notification_client(conn) as client:
+            first = client.post(f"/api/notifications/{ref}/read",
+                                headers=self._write(), json={})
+            second = client.post(f"/api/notifications/{ref}/read",
+                                 headers=self._write(), json={})
+            self.assertEqual((first.status_code, second.status_code), (200, 200))
+            self.assertEqual(first.json(), second.json())
+            self.assertEqual(set(first.json()), {"notification_ref", "read_at"})
+            self.assertIsNotNone(first.json()["read_at"])
+            ack_first = client.post("/api/inventory-alerts/alert-open0001/acknowledge",
+                                    headers=self._write(), json={})
+            ack_second = client.post("/api/inventory-alerts/alert-open0001/acknowledge",
+                                     headers=self._write(), json={})
+            self.assertEqual((ack_first.status_code, ack_second.status_code),
+                             (200, 200))
+            self.assertEqual(ack_first.json(), ack_second.json())
+            self.assertEqual(ack_first.json()["status"], "acknowledged")
+
+    def test_resolved_and_suppressed_alerts_cannot_be_acknowledged(self):
+        conn = NotificationApiConn(notifications=[
+            self._notification(notification_ref="ntf-" + "b" * 32,
+                               alert_ref="alert-resolved001",
+                               event_kind="resolved", status="resolved"),
+            self._notification(notification_ref="ntf-" + "c" * 32,
+                               alert_ref="alert-suppressed001",
+                               event_kind="triggered", status="suppressed"),
+        ])
+        with self.notification_client(conn) as client:
+            for alert_ref in ("alert-resolved001", "alert-suppressed001"):
+                with self.subTest(alert_ref=alert_ref):
+                    response = client.post(
+                        f"/api/inventory-alerts/{alert_ref}/acknowledge",
+                        headers=self._write(), json={})
+                    self.assertEqual(response.status_code, 409, response.text)
+                    self.assertEqual(response.json()["code"], "not_acknowledgeable")
+
+    def test_projection_exposes_exactly_the_safe_fields_and_no_forbidden_key(self):
+        conn = NotificationApiConn(notifications=[
+            self._notification(),
+            self._notification(notification_ref="ntf-" + "d" * 32,
+                               alert_ref="alert-open0002", status="acknowledged",
+                               read_at=_NOTIF_READ_AT, quantity=None),
+        ])
+        with self.notification_client(conn) as client:
+            response = client.get("/api/notifications", headers=self._read())
+        self.assertEqual(response.status_code, 200)
+        rows = response.json()
+        self.assertEqual([row["level"] for row in rows], ["physical_total", "physical_total"],
+                         "只有已核验层级的事件会出现在通知里")
+        self.assertNotIn("shop_sellable", response.text,
+                         "缺来源层级不得以任何卡片/键出现")
+        for row in rows:
+            self.assertEqual(set(row), _SAFE_PROJECTION_FIELDS)
+            # quantity null 与数量 0 在投影里是两回事：null 保持 null。
+            self.assertIn("quantity", row)
+        self.assertIsNone(rows[1]["quantity"])
+        self.assertEqual(rows[0]["quantity"], "10")
+        for word in ("owner_subject_id", "subject_id", "shop_id", "pool_id",
+                     "warehouse_id", "erp_sku_id", "dsn", "evidence",
+                     "scan_evidence", "payload"):
+            self.assertNotIn(word, response.text, word)
+
+    def test_rows_failing_the_safe_projection_are_skipped_fail_closed(self):
+        conn = NotificationApiConn(notifications=[
+            self._notification(),
+            self._notification(notification_ref="ntf-" + "e" * 32,
+                               event_kind="updated"),          # 非通知词表
+            self._notification(notification_ref="badref"),      # ref 形状不对
+            self._notification(notification_ref="ntf-" + "f" * 32,
+                               quantity="N/A"),                # 数量形状不对
+        ])
+        with self.notification_client(conn) as client:
+            response = client.get("/api/notifications", headers=self._read())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([row["notification_ref"] for row in response.json()],
+                         [self._notification()["notification_ref"]])
+
+    def test_client_cannot_supply_subject_sql_or_state(self):
+        conn = NotificationApiConn(notifications=[self._notification()])
+        with self.notification_client(conn) as client:
+            smuggled = client.get("/api/notifications",
+                                  headers=self._read("subject-a"),
+                                  params={"subject_id": "subject-b"})
+            self.assertEqual([row["notification_ref"] for row in smuggled.json()],
+                             [self._notification()["notification_ref"]],
+                             "查询参数里的 subject 不得覆盖认证主体")
+            body = client.post("/api/notifications/ntf-x/read",
+                               headers=self._write(), json={"status": "read"})
+            self.assertEqual(body.status_code, 422, body.text)
+            bad_ref = client.post("/api/notifications/not-a-ref/read",
+                                  headers=self._write(), json={})
+            self.assertEqual(bad_ref.status_code, 422, bad_ref.text)
+        self.assertEqual([call for call in conn.calls
+                          if call.startswith("SELECT bi.")], [])
+
+    def test_database_failure_leaks_no_dsn_or_exception_text(self):
+        class BrokenConn(NotificationApiConn):
+            def execute(self, sql, params=None):
+                raise psycopg.OperationalError(
+                    "connection to server failed dsn="
+                    f"\"{_APP_DSN}\" SELECT * FROM reporting.v_inventory_notifications")
+
+        with self.notification_client(BrokenConn()) as client:
+            response = client.get("/api/notifications", headers=self._read())
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json()["code"], "internal_error")
+        self.assertNotIn("connection to server failed", response.text)
+        self.assertNotIn("bi_app", response.text)

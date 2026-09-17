@@ -175,3 +175,42 @@ export type AnalysisPayloadView = {
   unsupported_claims: string[]
   limitations: string[]
 }
+
+/**
+ * 库存通知的事件词表：只有这三个会写 outbox / 通知中心（updated 是纯审计
+ * 事件，023 不为它写 outbox，所以它永远不会出现在 API 响应里）。
+ */
+export type InventoryEventKind = 'triggered' | 'retriggered' | 'resolved'
+
+export type InventoryAlertStatus =
+  | 'open'
+  | 'acknowledged'
+  | 'resolved'
+  | 'suppressed'
+
+export type InventoryLevel = 'physical_total' | 'shop_sellable'
+
+/**
+ * 一条应用内库存通知的后端投影（GET /api/notifications 的行）。
+ *
+ * 与后端 NotificationProjection 字段一一对应：owner subject、真实 ID、证据
+ * 与完整来源载荷在后端就被收口，类型里根本没有这些字段。`quantity` 为 null
+ * 表示本层级没读到数量——与数量 0 是两回事，也永不从另一层级取数。类型声明
+ * 不是信任凭据：渲染前仍要过 `parseNotificationList` 的逐项形状检查。
+ */
+export type InventoryNotification = {
+  notification_ref: string
+  alert_ref: string
+  event_kind: InventoryEventKind
+  status: InventoryAlertStatus
+  level: InventoryLevel
+  sku_ref: string
+  scope_ref: string
+  quantity: string | null
+  threshold: string | null
+  unit: string
+  data_as_of: string
+  reason_code: string
+  read_at: string | null
+  created_at: string
+}
