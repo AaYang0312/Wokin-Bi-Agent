@@ -300,10 +300,15 @@ def resolve_full_catalog_and_scope(runtime: InventoryRuntime) -> None:
     runtime.state = runtime.state.model_copy(
         update={"normalized_request": _normalized_request(runtime)})
     if not runtime.candidate_shop_ids:
-        _stop(runtime, kind="missing_data", code="missing_parameters", problems=[],
-              stage=InventoryNode.RESOLVE_FULL_CATALOG_AND_SCOPE,
-              message="缺少查询参数，请补充后重试。", limitations=[TEXT_SCOPE_EMPTY])
-        return
+        if (runtime.context.allowed_shop_ids
+                or "shop_sellable" in set(runtime.request.levels)):
+            _stop(runtime, kind="missing_data", code="missing_parameters", problems=[],
+                  stage=InventoryNode.RESOLVE_FULL_CATALOG_AND_SCOPE,
+                  message="缺少查询参数，请补充后重试。", limitations=[TEXT_SCOPE_EMPTY])
+            return
+        # pool-only scope (monitor empty-shop projection): no shop grants in
+        # context and shop_sellable not requested -> continue on pool grants;
+        # chat-path semantics of the stop above stay byte-identical.
     _resolve_skus(runtime)
 
 
@@ -437,6 +442,17 @@ def _pool_pairs_for_scope(runtime: InventoryRuntime) -> list[tuple[str, str]]:
     节点 2 就被排除出总量与明细。两件事分开，才不会出现"为了知道目录就读进了数"。
     """
     if runtime.scope_pairs:
+        return list(runtime.scope_pairs)
+    if not runtime.candidate_shop_ids:
+        # pool-only scope: authorized pairs derive straight from the pool
+        # grant set (no shop-join derivation); connected_pairs stays empty
+        # so no shop-side excluded_scope declarations can appear.
+        derived = repository.authorized_pool_pairs_by_ids(
+            runtime.context.conn,
+            allowed_pool_ids=sorted(runtime.context.allowed_inventory_pool_ids),
+            deadline=runtime.context.deadline)
+        runtime.scope_pairs = tuple(sorted(set(derived)))
+        runtime.connected_pairs = ()
         return list(runtime.scope_pairs)
     # 两个集合分开算，各自只服务一件事：
     #   - `authorized_pairs`：本轮真正能读的池。SKU 全集**只能**由它派生——把未获准池

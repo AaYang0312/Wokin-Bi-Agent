@@ -37,7 +37,7 @@ DEFAULT_NAMESPACE = "acct-default"
 
 __all__ = [
     "AuthorizedPools", "ChannelRow", "InventoryPool", "PhysicalRow", "ShopProfile",
-    "Threshold", "authorized_pool_pairs", "channel_snapshots",
+    "Threshold", "authorized_pool_pairs", "authorized_pool_pairs_by_ids", "channel_snapshots",
     "insert_channel_snapshot", "insert_channel_snapshot_item",
     "insert_physical_snapshot", "insert_physical_snapshot_item",
     "connected_pairs", "insert_threshold_policy", "inventory_sku_keys", "load_thresholds", "physical_snapshots",
@@ -95,6 +95,33 @@ def authorized_pool_pairs(conn, *, shop_ids: Sequence[str],
         return []
     rows = conn.execute(_POOLS_BY_SHOPS_SQL, (shops,)).fetchall()
     return [(str(row[0]), str(row[1])) for row in rows if str(row[1]) in allowed]
+
+
+_POOLS_BY_IDS_SQL = """
+SELECT namespace, pool_id
+FROM reporting.v_inventory_pools
+WHERE pool_id = ANY(%s)
+ORDER BY namespace, pool_id
+"""
+
+
+def authorized_pool_pairs_by_ids(conn, *, allowed_pool_ids: Sequence[str],
+                                 deadline: float) -> list[tuple[str, str]]:
+    """按池授权集直接派生 (账号范围, 池号)：monitor 空店铺投影的读取面。
+
+    与 `pool_connections` 同一授权面（SQL 侧 `pool_id = ANY(获准池)`），只读池
+    身份列，不读任何数量、标签或快照证据。与 `authorized_pool_pairs` 的差别只
+    在推导方向：那一版经店铺连接交集（`shop_ids` 入参），这一版由服务端已收窄
+    的池授权集直接给出——monitor 的空店铺投影下店铺侧交集恒为空。调用方仍要
+    经过 `pool_connections` 的逐池授权复核（第二道闸）。
+    """
+    allowed = sorted({str(pool) for pool in allowed_pool_ids
+                      if str(pool or "").strip()})
+    if not allowed:
+        return []
+    _check_budget(conn, deadline)
+    rows = conn.execute(_POOLS_BY_IDS_SQL, (allowed,)).fetchall()
+    return [(str(row[0]), str(row[1])) for row in rows]
 
 
 _POOL_SHOP_LINKS_SQL = """

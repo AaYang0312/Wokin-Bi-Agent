@@ -1749,6 +1749,78 @@ class InventoryGraphTests(unittest.TestCase):
                 max_age_seconds=max_age_seconds, scan_complete_supported=False,
                 production_reconciled_at=None))
 
+    # -- 5.x Task 4 的两个最小图契约（monitor 空店铺投影；聊天路径逐字不变） --
+
+    def _monitor_run(self, *, allowed: frozenset[str], pools: frozenset[str],
+                     levels: list[str], conn: object = None,
+                     thresholds: list[dict] | None = None,
+                     recorded: object = None) -> object:
+        """池轮/空店铺投影的直接图执行：不经过工具面与模型，store 只在内存。"""
+        store = MemoryQueryRunStore(
+            forbidden_values=set(self.shops.values()) | {"unused"})
+        request = _request(products="all",
+                           sku_refs=[],
+                           product_refs=[],
+                           levels=levels,
+                           thresholds=thresholds if thresholds is not None else [
+                               _threshold("low_replenish", "SKU1", "20")])
+        return inspect_inventory(request, self._context(
+            store=store, allowed=allowed, pools=pools, conn=conn or recorded))
+
+    def test_pool_only_round_continues_without_shop_grants_and_reads_pools(self):
+        """空候选店铺 + 无店铺授权 + 请求不含渠道口径 ⇒ 按池授权继续。
+
+        monitor 空店铺投影的形状：授权池对由池授权集直接派生（不经店铺连接
+        推导），渠道快照零查询，inventory_scope_empty 不出现，实物照常出数。
+        """
+        self._shared_three_shops()
+        pool_id = self.pools["a"]
+        recorded = _RecordingConn(self.conn)
+        result = self._monitor_run(
+            allowed=frozenset(), pools=frozenset({pool_id}),
+            levels=["physical_total"], conn=recorded)
+        payload = _payload_for(result)
+        self.assertEqual([row["level"] for row in _rows(payload)],
+                         ["physical_total"])
+        codes = set(inventory_limitation_codes(list(payload["limitations"])))
+        self.assertNotIn("inventory_scope_empty", codes)
+        self.assertFalse(recorded.matching("v_channel_stock"),
+                         "空店铺授权下渠道快照零查询")
+        self.assertTrue(recorded.matching("v_physical_stock"))
+        self.assertNotIn("excluded_scope", payload)
+        claims = {entry["pool_ref"] for entry in payload["inventory"]["pools"]}
+        self.assertEqual(claims, {pool_handle(DEFAULT_NAMESPACE, pool_id)})
+
+    def test_empty_scope_with_shop_grants_still_stops_scope_empty(self):
+        """聊天路径回归：授权了店铺却没有可检查的店铺 ⇒ 仍然停 scope_empty。"""
+        result = self._monitor_run(
+            allowed=frozenset({f"S{self.tag}GHOST"}), pools=frozenset(),
+            levels=["physical_total"])
+        self.assertEqual(result.status.value, "missing_data")
+        self.assertEqual(result.artifacts, [])
+
+    def test_empty_scope_with_channel_level_requested_still_stops_scope_empty(self):
+        """空店铺授权但请求含 shop_sellable ⇒ 停 scope_empty（第二个触发形状）。"""
+        self._shared_three_shops()
+        result = self._monitor_run(
+            allowed=frozenset(), pools=frozenset({self.pools["a"]}),
+            levels=["physical_total", "shop_sellable"])
+        self.assertEqual(result.status.value, "missing_data")
+        self.assertEqual(result.artifacts, [])
+
+    def test_authorized_pool_pairs_by_ids_derives_pairs_without_shop_join(self):
+        """新固定查询：按池授权集直接派生 (namespace, pool_id)，不读任何数量。"""
+        self._shop("1")
+        self._pool("a", shops=("1",))
+        self._pool("b")
+        rows = repository.authorized_pool_pairs_by_ids(
+            self.conn, allowed_pool_ids={self.pools["a"], "pool-ghost"},
+            deadline=time.monotonic() + 30)
+        self.assertEqual(sorted(rows),
+                         sorted({(DEFAULT_NAMESPACE, self.pools["a"])}))
+        self.assertEqual(repository.authorized_pool_pairs_by_ids(
+            self.conn, allowed_pool_ids=set(), deadline=time.monotonic() + 30), [])
+
     # -- 5.1 来源门禁 ------------------------------------------------------
 
     def test_missing_verified_source_reports_unsupported_for_every_level(self):

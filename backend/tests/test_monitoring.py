@@ -20,6 +20,7 @@ runner / CLI 属后续 Task。
 """
 
 import hashlib
+import io
 import json
 import pathlib
 import unittest
@@ -1445,6 +1446,1090 @@ class AlertTransitionGoldTests(unittest.TestCase):
                                  for row in scan_data["rows"]])),
             diagnostics=tuple(scan_data["diagnostics"]))
         return scan
+
+
+# --- 计划 Task 4：一次性 runner（复用 InventoryWatchGraph）与一次性 CLI --------
+
+from bi_agent.monitoring.runner import counter_total
+from bi_agent.monitoring.runner import LEVEL_UNVERIFIED_TOTAL, reset_monitor_counters
+from bi_agent.runtime.memory import MemoryQueryRunStore
+from uuid import uuid4
+from bi_agent.monitoring.repository import MonitorRepository
+from bi_agent.monitoring import runner
+THRESHOLD_POLICY_REF = "inventory-thresholds/1"
+from bi_agent.monitoring.models import (
+    MONITOR_DIAGNOSTIC_CODES, MonitorRunRequest)
+from bi_agent.inventory import repository
+from bi_agent.inventory.repository import DEFAULT_NAMESPACE
+from bi_agent.inventory.rules import (
+    INVENTORY_LIMITATION_CODES,     inventory_limitation_codes, register_inventory_source,
+    reset_inventory_sources)
+from .dbfixtures import connect_test_db
+
+import os
+from unittest.mock import patch
+
+
+def enabled_runner_settings(policy_refs=(POLICY_REF,)):
+    from pydantic import SecretStr
+
+    from bi_agent.config import MonitorSettings
+
+    return MonitorSettings(
+        enabled=True,
+        monitor_dsn=SecretStr("postgresql://bi_monitor:test@localhost/bi_agent_test"),
+        service_subject_id="inventory-monitor-service",
+        policy_refs=tuple(policy_refs))
+
+
+def disabled_runner_settings():
+    from bi_agent.config import MonitorSettings
+
+    return MonitorSettings(enabled=False)
+
+
+def policy_model(**overrides):
+    from bi_agent.monitoring.models import MonitorPolicy
+
+    values = dict(monitor_policy_dict())
+    values.update(overrides)
+    return MonitorPolicy.model_validate(values)
+
+
+RUNNER_POLICY = policy_model()
+RUNNER_NOW = MONITOR_NOW
+# 远在真实 time.monotonic() 之后：普通用例绝不误触 deadline 分支。
+RUNNER_DEADLINE = 4102444800.0
+
+
+def canonical_payload_fingerprint(payload) -> str:
+    """runner 的 source_fingerprint 公式的独立实现（canonical JSON 的 SHA-256）。"""
+    import hashlib
+
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def channel_only_alerts_payload():
+    """渠道口径的最小合法来源载荷：低配额 + 店铺作用域行。"""
+    row = {"level": "shop_sellable", "sku_ref": SKU_REF,
+           "shop_ref": _shop_ref("shop-1"), "quantity": None,
+           "channel_quantity": "0", "threshold": "5", "unit": "piece",
+           "inventory_status": "low", "snapshot_at": SNAPSHOT_ISO,
+           "batch_count": 1}
+    payload = {
+        "status": "partial",
+        "inventory": {
+            "expected_items": 1, "evaluated_items": 1, "scanned_items": 1,
+            "truncated": False, "all_safe": False, "counts": {"low": 1},
+            "levels": ["shop_sellable"], "threshold_source": "configured",
+            "pools": [],
+            "freshness_policy_seconds": 86400,
+            "rule_version": "inventory-rules/2026-09-14.1"},
+        "data": [row],
+        "filters": {"as_of": "latest", "levels": ["shop_sellable"],
+                    "products": "all",
+                    "thresholds": [{"level": "low_quota", "sku_ref": SKU_REF,
+                                    "quantity": "5", "unit": "piece"}]},
+        "limitations": [],
+        "data_as_of": SNAPSHOT_ISO,
+    }
+    from bi_agent.runtime.models import validate_artifact_payload
+
+    validate_artifact_payload(payload, "inventory_alerts")
+    return payload
+
+
+def both_registrations():
+    registrations = dict(physical_only_registrations())
+    registrations.update(channel_only_registrations())
+    return registrations
+
+
+class _RunnerGraphDouble:
+    """runner 与图之间的替身：记录请求与上下文，向内存 Store 投放来源 Artifact。"""
+
+    def __init__(self, payload=None, error=None, artifact_count=1, status=None):
+        self.calls = []
+        self.store = None
+        self.last_request = None
+        self.last_context = None
+        self.payload = payload if payload is not None else dict(alerts_payload())
+        self.error = error
+        self.artifact_count = artifact_count
+        self.status = status
+
+    def __call__(self, *, request, context, tool_call_id, arguments=None,
+                 arguments_error=None):
+        from bi_agent.runtime.models import NewArtifact, NewQueryRun
+
+        self.calls.append(tool_call_id)
+        self.last_request = request
+        self.last_context = context
+        self.store = context.store
+        if self.error is not None:
+            raise self.error
+        for index in range(self.artifact_count):
+            run_id = context.store.create_run(NewQueryRun(
+                chat_id=context.chat_id, user_message_id=context.user_message_id,
+                subject_id=context.subject_id,
+                tool_call_id=f"{tool_call_id}-{index}", domain="inventory_watch",
+                attempt_no=1 + index, normalized_request={},
+                state={"node": "resolve_full_catalog_and_scope",
+                       "status": "running", "revision": 0}))
+            payload = dict(self.payload)
+            payload.setdefault("data_as_of", SNAPSHOT_ISO)
+            if self.status is not None and index == 0:
+                payload = dict(payload)
+                payload["status"] = self.status
+            self.saved_payload = payload
+            context.store.save_artifact(run_id, NewArtifact(
+                artifact_type="inventory_alerts", payload=payload,
+                data_as_of=context.now))
+
+
+class _RunnerRepositoryDouble:
+    """runner 与 repository 之间的替身：策略读取、全历史读取与唯一提交。"""
+
+    def __init__(self, policy=RUNNER_POLICY, history=()):
+        self.policy = policy
+        self.history = tuple(history)
+        self.conn = None
+        self.load_calls = []
+        self.commit_calls = []
+        self.writes = []
+
+    def __call__(self, conn):   # runner.MonitorRepository 被替换成本实例工厂
+        self.conn = conn
+        return self
+
+    def load_policy(self, policy_ref):
+        self.load_calls.append(policy_ref)
+        return self.policy
+
+    def load_alert_history(self, policy_ref):
+        return self.history
+
+    def commit_scan(self, scan, decisions, *, now):
+        self.commit_calls.append((scan, tuple(decisions), now))
+        return ()
+
+
+def runner_seam(*, policy=RUNNER_POLICY, graph=None, repository=None,
+                directory=None):
+    """把 graph / repository / 目录枚举连接全部换成测试替身的统一入口。"""
+    from bi_agent.monitoring import runner
+
+    graph = graph if graph is not None else _RunnerGraphDouble()
+    repository = (repository if repository is not None
+                  else _RunnerRepositoryDouble(policy))
+    connect_calls = []
+
+    def fake_connect(settings):
+        connect_calls.append(settings)
+        return directory
+
+    return (patch.object(runner, "run_inventory_graph", graph),
+            patch.object(runner, "MonitorRepository", repository),
+            patch.object(runner, "_connect", fake_connect),
+            graph, repository, connect_calls)
+
+
+def run_with_seams(*, settings=None, registrations=None, now=RUNNER_NOW,
+                   deadline=RUNNER_DEADLINE, policy=RUNNER_POLICY,
+                   request=None, graph=None, repository=None, directory=None):
+    from bi_agent.monitoring import runner
+    from bi_agent.monitoring.models import MonitorRunRequest
+
+    if directory is None:
+        directory = _DirectoryConn()
+    p_graph, p_repo, p_conn, graph, repository, connect_calls = runner_seam(
+        policy=policy, graph=graph, repository=repository, directory=directory)
+    runner.reset_monitor_counters()
+    with p_graph, p_repo, p_conn:
+        result = runner.run_inventory_monitor(
+            request or MonitorRunRequest(policy_ref=POLICY_REF),
+            settings=settings if settings is not None else enabled_runner_settings(),
+            now=now, deadline=deadline, registrations=registrations)
+    return result, graph, repository, connect_calls
+
+
+class _DirectoryConn:
+    """服务端目录枚举读取的替身：只回答池与店铺清单那两条固定 SQL。"""
+
+    def __init__(self, pools=(("acct-default", "pool-main"),), shops=()):
+        self.pools = tuple(pools)
+        self.shops = tuple(shops)
+
+    def close(self) -> None:
+        return None
+
+    def execute(self, sql, params=None):
+        from tests.fakeconn import Rows
+
+        if "FROM reporting.v_inventory_pools" in sql:
+            return Rows(self.pools)
+        if "FROM reporting.v_shops" in sql:
+            return Rows(self.shops)
+        raise AssertionError(f"未预期的目录 SQL：{sql}")
+
+
+class MonitorRunnerTests(unittest.TestCase):
+    """计划 Task 4 Step 1 的焦点用例：门禁收窄、投影、fail-closed 与行过滤。"""
+
+    def test_disabled_or_unverified_exits_without_graph_or_write(self):
+        result, graph, repository, connect_calls = run_with_seams(
+            settings=disabled_runner_settings(), directory=None)
+        self.assertEqual(result, ())
+        self.assertEqual(graph.calls, [])
+        self.assertEqual(repository.writes, [])
+        self.assertEqual(repository.commit_calls, [])
+        # 关闭的门禁根本不创建连接：零 DSN 装载、零数据库。
+        self.assertEqual(connect_calls, [])
+
+        graph, repository = _RunnerGraphDouble(), _RunnerRepositoryDouble()
+        result, graph, repository, _ = run_with_seams(
+            registrations={}, graph=graph, repository=repository)
+        self.assertEqual(result, ())
+        self.assertEqual(graph.calls, [], "请求层级全部未核验：不跑图")
+        self.assertEqual(repository.commit_calls, [])
+
+    def test_graph_runs_in_memory_then_repository_commits_one_scan(self):
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations())
+        self.assertIsInstance(graph.store, MemoryQueryRunStore)
+        self.assertEqual(len(repository.commit_calls), 1, "恰好一次 commit_scan")
+        scan, decisions, now = repository.commit_calls[0]
+        self.assertEqual(scan.source_artifact_payload, graph.saved_payload,
+                         "runner 只能持久化 graph 原样载荷，不改写")
+        self.assertEqual(scan.source_fingerprint,
+                         canonical_payload_fingerprint(graph.saved_payload))
+        self.assertEqual(result, ())
+        self.assertEqual(decisions[0].event_kind, "triggered")
+        self.assertEqual(scan.complete_levels, ("physical_total",))
+        self.assertEqual(scan.policy_ref, POLICY_REF)
+
+    def test_verified_physical_only_policy_runs_but_never_fans_out_to_channel(self):
+        from bi_agent.inventory.repository import DEFAULT_NAMESPACE
+        from bi_agent.inventory.rules import pool_handle
+
+        handle = pool_handle(DEFAULT_NAMESPACE, "pool-main")
+        policy = policy_model(levels=("physical_total", "shop_sellable"),
+                              inventory_pool_refs=(handle,))
+        directory = _DirectoryConn(pools=((DEFAULT_NAMESPACE, "pool-main"),),
+                                   shops=())
+        payload = alerts_payload()
+        payload["inventory"]["pools"][0]["pool_ref"] = handle
+        payload["data"][0]["pool_ref"] = handle
+        graph = _RunnerGraphDouble(payload=payload)
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(), policy=policy,
+            directory=directory, graph=graph)
+        self.assertEqual(graph.last_request.levels, ["physical_total"])
+        self.assertEqual(graph.last_context.allowed_shop_ids, frozenset())
+        self.assertEqual(graph.last_context.shop_refs, {})
+        self.assertEqual(graph.last_context.allowed_inventory_pool_ids,
+                         frozenset({"pool-main"}))
+        self.assertEqual(repository.policy.levels,
+                         ("physical_total", "shop_sellable"))
+        scan = repository.commit_calls[0][0]
+        self.assertEqual(scan.complete_levels, ("physical_total",))
+        self.assertEqual([row.level for row in scan.rows], ["physical_total"])
+        self.assertIn("monitor_level_unverified", scan.diagnostics)
+        self.assertEqual(counter_total("inventory_monitor_level_unverified_total",
+                                       level="shop_sellable"), 1)
+
+    def test_authorization_projection_is_a_pure_function_of_verified_levels(self):
+        from bi_agent.monitoring.runner import (ContextProjection,
+                                                ResolvedScope,
+                                                context_projection_for)
+
+        resolved = ResolvedScope(shop_ids=frozenset({"shop-a-id"}),
+                                 shop_refs={"shop-a": "shop-a-id"},
+                                 pool_ids=frozenset({"pool-a-id"}))
+        self.assertEqual(
+            context_projection_for(policy=RUNNER_POLICY,
+                                   verified_levels=("physical_total",),
+                                   resolved=resolved),
+            ContextProjection(shop_ids=frozenset(), shop_refs={},
+                              pool_ids=frozenset({"pool-a-id"})))
+        self.assertEqual(
+            context_projection_for(policy=RUNNER_POLICY,
+                                   verified_levels=("shop_sellable",),
+                                   resolved=resolved),
+            ContextProjection(shop_ids=frozenset({"shop-a-id"}),
+                              shop_refs={"shop-a": "shop-a-id"},
+                              pool_ids=frozenset()))
+        self.assertEqual(
+            context_projection_for(policy=RUNNER_POLICY,
+                                   verified_levels=("physical_total",
+                                                    "shop_sellable"),
+                                   resolved=resolved),
+            ContextProjection(shop_ids=frozenset({"shop-a-id"}),
+                              shop_refs={"shop-a": "shop-a-id"},
+                              pool_ids=frozenset({"pool-a-id"})))
+        # 投影与策略存储是两回事：存储永不收窄。
+        self.assertEqual(RUNNER_POLICY.shop_refs, ("shop-a",))
+        self.assertEqual(RUNNER_POLICY.inventory_pool_refs, (POOL_REF,))
+
+    def test_no_requested_level_verified_exits_before_graph_and_before_write(self):
+        graph = _RunnerGraphDouble()
+        repository = _RunnerRepositoryDouble()
+        result, graph, repository, _ = run_with_seams(
+            registrations={}, graph=graph, repository=repository)
+        self.assertEqual(result, ())
+        self.assertEqual(graph.calls, [])
+        self.assertEqual(repository.commit_calls, [])
+        self.assertEqual(counter_total("inventory_monitor_skipped_total",
+                                       reason="monitor_source_unverified"), 1)
+
+    def test_disabled_policy_is_skipped_without_an_impossible_commit(self):
+        # 记录在案的 policy-disabled/023 张力：commit_scan 对 disabled 策略必然
+        # monitor_policy_disabled 失败。runner 按 plan 在跑图前跳过 disabled 策略，
+        # 不做注定失败的提交；残余限制如实写入验收文档。
+        policy = policy_model(enabled=False)
+        graph = _RunnerGraphDouble()
+        repository = _RunnerRepositoryDouble(policy)
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(),
+            policy=policy, graph=graph, repository=repository)
+        self.assertEqual(result, ())
+        self.assertEqual(graph.calls, [])
+        self.assertEqual(repository.commit_calls, [])
+        self.assertEqual(counter_total("inventory_monitor_skipped_total",
+                                       reason="monitor_policy_disabled"), 1)
+
+    def test_physical_pool_claim_gap_does_make_physical_incomplete(self):
+        from bi_agent.inventory.rules import INVENTORY_CODE_BY_TEXT
+
+        text = next(text for text, code in INVENTORY_CODE_BY_TEXT.items()
+                    if code == "inventory_snapshot_missing")
+        payload = alerts_payload()
+        payload["limitations"] = [text]
+        policy = policy_model(inventory_pool_refs=(POOL_REF, "pl-ffffffffffff"))
+        graph = _RunnerGraphDouble(payload=payload)
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(), policy=policy,
+            graph=graph)
+        scan = repository.commit_calls[0][0]
+        # 载荷 pools 声明缺策略在册池 → 实物层不算完整；本轮仍持久化，但零触发。
+        self.assertEqual(scan.complete_levels, ())
+        self.assertEqual(result, ())
+        self.assertEqual(len(repository.commit_calls), 1)
+
+    def test_truncated_display_projection_truncated(self):
+        from bi_agent.inventory.rules import INVENTORY_CODE_BY_TEXT
+
+        text = next(text for text, code in INVENTORY_CODE_BY_TEXT.items()
+                    if code == "inventory_display_truncated")
+        payload = alerts_payload()
+        payload["limitations"] = [text]
+        payload["inventory"] = dict(payload["inventory"])
+        payload["inventory"]["truncated"] = True
+        payload["inventory"]["expected_items"] = 500
+        payload["inventory"]["scanned_items"] = 500
+        payload["inventory"]["evaluated_items"] = 500
+        payload["inventory"]["counts"] = {"low": 1, "normal": 499}
+        graph = _RunnerGraphDouble(payload=payload)
+        history = (stored_state_alert(status="open"),
+                   stored_state_alert(alert_ref="alert-ack00001",
+                                      status="acknowledged",
+                                      level="shop_sellable",
+                                      scope_ref=CHANNEL_SCOPE,
+                                      sku_ref=SKU2_REF))
+        repository = _RunnerRepositoryDouble(history=history)
+        result, graph, repository, _ = run_with_seams(
+            registrations=both_registrations(),
+            graph=graph, repository=repository)
+        scan = repository.commit_calls[0][0]
+        self.assertEqual(scan.complete_levels, ())
+        decisions = repository.commit_calls[0][1]
+        self.assertEqual([decision.event_kind for decision in decisions],
+                         ["updated", "updated"])
+        self.assertTrue(all(not decision.notify and not decision.observed
+                            for decision in decisions))
+        self.assertEqual(result, ())
+        self.assertEqual(counter_total("inventory_monitor_skipped_total",
+                                       reason="display_projection_truncated"), 1)
+        self.assertEqual(len(repository.commit_calls), 1)
+
+    def test_physical_row_without_scope_refs_is_dropped_without_a_key(self):
+        from pydantic import ValidationError
+
+        from bi_agent.monitoring.models import MonitorAlertRow
+
+        payload = alerts_payload()
+        placeholder = dict(payload["data"][0])
+        placeholder["sku_ref"] = _sku_ref("SKU9")
+        placeholder.pop("pool_ref")
+        placeholder.pop("warehouse_ref")
+        placeholder["inventory_status"] = "unknown"
+        placeholder["quantity"] = None
+        payload["data"] = [payload["data"][0], placeholder]
+        payload["inventory"] = dict(payload["inventory"])
+        payload["inventory"]["expected_items"] = 2
+        payload["inventory"]["scanned_items"] = 2
+        payload["inventory"]["evaluated_items"] = 1
+        payload["inventory"]["counts"] = {"low": 1, "unknown": 1}
+        graph = _RunnerGraphDouble(payload=payload)
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(), graph=graph)
+        scan = repository.commit_calls[0][0]
+        self.assertNotIn(_sku_ref("SKU9"), {row.sku_ref for row in scan.rows})
+        self.assertTrue(all(row.scope_ref for row in scan.rows))
+        self.assertIn("monitor_row_scope_missing", scan.diagnostics)
+        self.assertEqual(counter_total("inventory_monitor_rows_dropped_total",
+                                       level="physical_total",
+                                       reason="monitor_row_scope_missing"), 1)
+        with self.assertRaises(ValidationError):
+            MonitorAlertRow(level="physical_total", status="unknown",
+                            sku_ref="ent-12345678", scope_ref="", quantity=None,
+                            threshold=None, unit="piece")
+        self.assertEqual([d.sku_ref for d in repository.commit_calls[0][1]],
+                         [SKU_REF])
+
+    def test_unverified_level_rows_in_payload_are_dropped_by_second_gate(self):
+        payload = alerts_payload()
+        channel_rows = dict(payload["data"][0])
+        channel_rows.update({"level": "shop_sellable",
+                            "shop_ref": _shop_ref("shop-1"),
+                            "channel_quantity": "1", "quantity": None})
+        channel_rows.pop("pool_ref", None)
+        channel_rows.pop("warehouse_ref", None)
+        payload["data"] = [payload["data"][0], channel_rows]
+        payload["inventory"] = dict(payload["inventory"])
+        payload["inventory"]["expected_items"] = 2
+        payload["inventory"]["scanned_items"] = 2
+        payload["inventory"]["evaluated_items"] = 2
+        payload["inventory"]["counts"] = {"low": 2}
+        payload["inventory"]["levels"] = ["physical_total", "shop_sellable"]
+        graph = _RunnerGraphDouble(payload=payload)
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(), graph=graph)
+        scan = repository.commit_calls[0][0]
+        self.assertEqual({row.level for row in scan.rows}, {"physical_total"})
+        self.assertIn("monitor_unverified_level_row", scan.diagnostics)
+        self.assertEqual(counter_total("inventory_monitor_rows_dropped_total",
+                                       level="shop_sellable",
+                                       reason="monitor_unverified_level_row"), 1)
+        self.assertEqual(scan.source_artifact_payload["data"], payload["data"],
+                         "第二道闸只过滤 rows，不改写已持久化载荷")
+
+    def test_failed_or_missing_artifacts_fail_closed_before_decisions(self):
+        for kwargs, reason in ((dict(artifact_count=0), "monitor_artifact_missing"),
+                               (dict(artifact_count=2), "monitor_artifact_ambiguous"),
+                               (dict(status="missing_data"),
+                                "monitor_artifact_status_not_decidable")):
+            with self.subTest(reason=reason):
+                graph = _RunnerGraphDouble(**kwargs)
+                repository = _RunnerRepositoryDouble()
+                result, graph, repository, _ = run_with_seams(
+                    registrations=physical_only_registrations(),
+                    graph=graph, repository=repository)
+                self.assertEqual(result, ())
+                self.assertEqual(repository.commit_calls, [])
+                self.assertEqual(
+                    counter_total("inventory_monitor_skipped_total", reason=reason),
+                    1)
+
+    def test_contract_errors_fail_closed_without_commit(self):
+        # 状态机拒绝（同一格两条 active：输入已坏）⇒ 固定 reason、保留告警、
+        # 零 commit 零 outbox。同格重复行本会被载荷契约挡在 Store 之前，
+        # 所以这里用"重复 active 键"触发同一条契约错误路径。
+        history = (stored_state_alert(),
+                   stored_state_alert(alert_ref="alert-open0002"))
+        graph = _RunnerGraphDouble()
+        repository = _RunnerRepositoryDouble(history=history)
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(), graph=graph,
+            repository=repository)
+        self.assertEqual(result, ())
+        self.assertEqual(repository.commit_calls, [])
+        self.assertEqual(counter_total("inventory_monitor_skipped_total",
+                                       reason="monitor_contract_error"), 1)
+
+    def test_graph_exception_and_deadline_branches_preserve_alerts(self):
+        from bi_agent.metrics import _BudgetExhausted
+
+        graph = _RunnerGraphDouble(error=_BudgetExhausted())
+        repository = _RunnerRepositoryDouble()
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(), graph=graph,
+            repository=repository)
+        self.assertEqual(result, ())
+        self.assertEqual(repository.commit_calls, [])
+        self.assertEqual(counter_total("inventory_monitor_skipped_total",
+                                       reason="monitor_deadline_exceeded"), 1)
+
+        graph = _RunnerGraphDouble(error=RuntimeError("boom"))
+        repository = _RunnerRepositoryDouble()
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(), graph=graph,
+            repository=repository)
+        self.assertEqual(result, ())
+        self.assertEqual(repository.commit_calls, [])
+        self.assertEqual(counter_total("inventory_monitor_skipped_total",
+                                       reason="monitor_graph_exception"), 1)
+
+        # deadline 先于 graph：不跑图、不提交。
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(), deadline=-1.0)
+        self.assertEqual(result, ())
+        self.assertEqual(repository.commit_calls, [])
+        # run_with_seams 每次调用前清零计数：本轮（pre-graph 的 deadline 分支）自记 1。
+        self.assertEqual(counter_total("inventory_monitor_skipped_total",
+                                       reason="monitor_deadline_exceeded"), 1)
+
+
+_CAPTURES: list = []
+
+
+class _CaptureMonitorRepository(MonitorRepository):
+    """真实 repository 的捕获壳：commit 照常落库，只是把输入留一份给断言。"""
+
+    def commit_scan(self, scan, decisions, *, now):
+        decisions = tuple(decisions)
+        transitions = super().commit_scan(scan, decisions, now=now)
+        _CAPTURES.append((scan, decisions, transitions))
+        return transitions
+
+
+class _SqlRecorder:
+    """记录经过监控连接的每条 SQL：证明渠道侧零查询是结构性的。"""
+
+    def __init__(self, conn) -> None:  # noqa: ANN001
+        self.conn = conn
+        self.sql = []
+
+    def close(self) -> None:
+        # fixture 的外层事务连接由 dbfixtures 管理：runner 的 close 在这里吞掉。
+        pass
+
+    def execute(self, sql, params=None):  # noqa: ANN001
+        self.sql.append(" ".join(str(sql).split()))
+        if params is not None:
+            return self.conn.execute(sql, params)
+        return self.conn.execute(sql)
+
+    def __getattr__(self, name):  # noqa: ANN401
+        return getattr(self.conn, name)
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class MonitorRunnerDatabaseTests(unittest.TestCase):
+    """真库上的 runner 回归：真实 graph + 真实 repository（023 提交函数）。
+
+    只连本机 *_test 库（dbfixtures 强制校验），外层事务回滚；不改任何全局
+    门禁状态。每轮证明：收窄投影下渠道侧零查询、指纹字节不变、缺声明 fail
+    closed 与两层投影形态。
+    """
+
+    def setUp(self) -> None:
+        self.conn = connect_test_db(self)
+        self.tag = uuid4().hex[:6].upper()
+        self.shops = {}
+        self.pools = {}
+        self.addCleanup(reset_inventory_sources)
+        reset_monitor_counters()
+        type(self)._Capture = None
+
+    # -- 种子 ------------------------------------------------------------
+
+    def _shop(self, key: str) -> str:
+        shop_id = f"S{self.tag}{key}"
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name, capabilities) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (shop_id) DO NOTHING",
+            (shop_id, "tb", f"监控测试店{key}", ["quantity"]))
+        self.shops[key] = shop_id
+        return shop_id
+
+    def _pool(self, key: str, shops: tuple[str, ...] = ()) -> str:
+        pool_id = f"pool-{self.tag}-{key}"
+        self.conn.execute(
+            "INSERT INTO bi.inventory_pools(pool_id, namespace, label, "
+            "connection_kind, evidence) VALUES (%s, %s, %s, %s, %s) "
+            "ON CONFLICT (namespace, pool_id) DO NOTHING",
+            (pool_id, DEFAULT_NAMESPACE, f"监控池{key}", "shared",
+             f"probe-monitor-{self.tag}-{key}"))
+        for shop in shops:
+            self.conn.execute(
+                "INSERT INTO bi.inventory_pool_shops(namespace, pool_id, shop_id) "
+                "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                (DEFAULT_NAMESPACE, pool_id, self.shops[shop]))
+        self.pools[key] = pool_id
+        return pool_id
+
+    def _sku(self, sku: str) -> str:
+        return f"{self.tag}{sku}"
+
+    def _physical(self, pool_key: str, warehouse: str, sku: str, quantity: str,
+                  *, captured_at: datetime | None = None,
+                  scan_complete: bool = True) -> None:
+        snapshot_id = f"ph-{self.tag}-{pool_key}-{warehouse}"
+        repository.insert_physical_snapshot(
+            self.conn, snapshot_id=snapshot_id, pool_id=self.pools[pool_key],
+            warehouse_id=f"{self.tag}-{warehouse}", namespace=DEFAULT_NAMESPACE,
+            source="erp", evidence=f"probe-{snapshot_id}", captured_at=captured_at,
+            scan_complete=scan_complete, scan_evidence="pages" if scan_complete else None,
+            batch_id="batch-1")
+        repository.insert_physical_snapshot_item(
+            self.conn, snapshot_id=snapshot_id, pool_id=self.pools[pool_key],
+            warehouse_id=f"{self.tag}-{warehouse}", namespace=DEFAULT_NAMESPACE,
+            erp_sku_id=self._sku(sku), available_quantity=quantity, unit="piece",
+            batch_id="batch-1", captured_at=captured_at)
+
+    def _channel(self, shop_key: str, sku: str, quantity: str, *,
+                 captured_at: datetime | None = None,
+                 scan_complete: bool = True) -> None:
+        snapshot_id = f"ch-{self.tag}-{shop_key}-{sku}"
+        repository.insert_channel_snapshot(
+            self.conn, snapshot_id=snapshot_id, shop_id=self.shops[shop_key],
+            platform="tb", namespace=DEFAULT_NAMESPACE, source="official_export",
+            evidence=f"probe-{snapshot_id}", captured_at=captured_at,
+            scan_complete=scan_complete, scan_evidence="pages" if scan_complete else None)
+        repository.insert_channel_snapshot_item(
+            self.conn, snapshot_id=snapshot_id, shop_id=self.shops[shop_key],
+            namespace=DEFAULT_NAMESPACE, listing_id="L1",
+            platform_sku_id=f"PS-{snapshot_id}", erp_sku_id=self._sku(sku),
+            sellable_quantity=quantity, unit="piece", captured_at=captured_at)
+
+    def _threshold(self, sku_key: str, level: str, quantity: str,
+                   shop_key: str | None = None) -> None:
+        repository.insert_threshold_policy(
+            self.conn, policy_id=f"pol-{self.tag}-{sku_key}-{level}",
+            policy_version=THRESHOLD_POLICY_REF, level=level,
+            erp_sku_id=self._sku(sku_key), quantity=quantity, unit="piece",
+            pool_id=None, shop_id=self.shops.get(shop_key) if shop_key else None,
+            evidence=f"probe-threshold-{self.tag}", effective_at=MONITOR_NOW.date())
+
+    def _policy(self, *, suffix: str, levels: tuple[str, ...],
+                pool_keys: tuple[str, ...] = (),
+                shop_keys: tuple[str, ...] = (), enabled: bool = True) -> str:
+        from bi_agent.inventory.rules import pool_handle
+
+        policy_ref = f"inventory-monitor/1{int(self.tag, 16)}{suffix}"
+        # 策略模型的存储形状要求 refs 排序去重：句柄是派生哈希，排序与
+        # pool key 的字典序无关，必须在入库前显式排序。
+        pool_refs = sorted({pool_handle(DEFAULT_NAMESPACE, self.pools[key])
+                            for key in pool_keys})
+        shop_refs = sorted({_shop_ref(self.shops[key]) for key in shop_keys})
+        self.conn.execute(
+            "INSERT INTO bi.inventory_monitor_policies(policy_ref, "
+            "threshold_policy_ref, owner_subject_id, shop_refs, "
+            "inventory_pool_refs, levels, cooldown_seconds, enabled) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (policy_ref, THRESHOLD_POLICY_REF, f"monitor-owner-{self.tag}",
+             shop_refs, pool_refs, list(levels), 3600, enabled))
+        return policy_ref
+
+    def _registrations(self, levels: tuple[str, ...]) -> dict:
+        """监控门禁登记表 + graph 自身注册表（同一批证据，两层各自消费）。"""
+        from bi_agent.inventory.rules import InventorySourceRegistration
+
+        registrations = {}
+        for level in levels:
+            channel = "erp" if level == "physical_total" else "official_export"
+            registrations[level] = InventorySourceRegistration(
+                level=level, channel=channel, evidence=f"probe-monitor-{self.tag}",
+                max_age_seconds=86400, scan_complete_supported=True,
+                production_reconciled_at=RECONCILED_AT)
+            register_inventory_source(registrations[level])
+        return registrations
+
+    # -- 执行 ------------------------------------------------------------
+
+    def _run(self, policy_ref: str, registrations: dict):
+        recorder = _SqlRecorder(self.conn)
+        _CAPTURES.clear()
+        settings = enabled_runner_settings(policy_refs=(policy_ref,))
+        request = MonitorRunRequest(policy_ref=policy_ref)
+        with patch.object(runner, "_connect", lambda settings: recorder), \
+                patch.object(runner, "MonitorRepository", _CaptureMonitorRepository):
+            transitions = runner.run_inventory_monitor(
+                request, settings=settings, now=MONITOR_NOW,
+                deadline=RUNNER_DEADLINE, registrations=registrations)
+        self.assertEqual(len(_CAPTURES), 1, "恰好一次 commit_scan")
+        scan, decisions, _ = _CAPTURES[0]
+        return transitions, scan, decisions, recorder
+
+    def _pool_ref(self, key: str) -> str:
+        from bi_agent.inventory.rules import pool_handle
+
+        return pool_handle(DEFAULT_NAMESPACE, self.pools[key])
+
+    # -- 用例 ------------------------------------------------------------
+
+    def test_physical_only_round_triggers_while_channel_junk_cannot_contribute(self):
+        """仅实物核验：底层渠道侧又过期又不完整还有独有 SKU，实物首发照旧，
+        渠道快照零查询、载荷与指纹无渠道贡献、渠道层零迁移零通知。"""
+        self._shop("1")
+        self._shop("2")
+        self._pool("a", shops=("1", "2"))
+        self._pool("b", shops=("1", "2"))
+        fresh = MONITOR_NOW - timedelta(minutes=20)
+        self._physical("a", "wh-a", "SKU1", "1", captured_at=fresh)
+        self._physical("b", "wh-b", "SKU1", "2", captured_at=fresh)
+        stale = MONITOR_NOW - timedelta(hours=72)
+        self._channel("1", "SKU1", "9", captured_at=stale, scan_complete=False)
+        self._channel("1", "SKU2", "9", captured_at=stale, scan_complete=False)
+        self._threshold("SKU1", "low_replenish", "2")
+        policy_ref = self._policy(suffix="0", levels=("physical_total", "shop_sellable"),
+                                  pool_keys=("a", "b"), shop_keys=("1", "2"))
+        transitions, scan, decisions, recorder = self._run(
+            policy_ref, self._registrations(("physical_total",)))
+        payload = scan.source_artifact_payload
+        rows = payload["data"]
+        self.assertEqual({row["level"] for row in rows}, {"physical_total"})
+        self.assertTrue(all("shop_ref" not in row for row in rows))
+        channel_only_ref = _sku_ref(self._sku("SKU2"))
+        self.assertNotIn(channel_only_ref, {row["sku_ref"] for row in rows})
+        claims = {entry["pool_ref"] for entry in payload["inventory"]["pools"]}
+        self.assertEqual(claims, {self._pool_ref("a"), self._pool_ref("b")})
+        codes = set(inventory_limitation_codes(list(payload["limitations"])))
+        for absent in ("inventory_channel_snapshot_missing", "inventory_scope_empty",
+                       "inventory_snapshot_missing",
+                       "inventory_channel_source_unverified"):
+            self.assertNotIn(absent, codes)
+        self.assertNotIn("excluded_scope", payload)
+        from bi_agent.inventory.graph import beijing_iso
+
+        self.assertEqual(payload["data_as_of"], beijing_iso(fresh))
+        self.assertFalse([q for q in recorder.sql if "channel_stock" in q],
+                         "空店铺投影下渠道快照零查询")
+        self.assertTrue([q for q in recorder.sql if "physical_stock" in q])
+        self.assertEqual(scan.complete_levels, ("physical_total",))
+        self.assertEqual({row.level for row in scan.rows}, {"physical_total"})
+        level_unverified_code = MONITOR_DIAGNOSTIC_CODES[1]
+        self.assertIn(level_unverified_code, scan.diagnostics)
+        self.assertEqual(counter_total(LEVEL_UNVERIFIED_TOTAL,
+                                       level="shop_sellable"), 1)
+        self.assertEqual([(t.next_status, t.event_kind) for t in transitions],
+                         [("open", "triggered"), ("open", "triggered")])
+        self.assertEqual([d.level for d in decisions if d.notify],
+                         ["physical_total", "physical_total"])
+
+    def test_channel_data_changes_cannot_enter_a_physical_round_fingerprint(self):
+        """同策略同实物下补插更多渠道快照与店铺，重跑载荷与指纹逐字节不变。"""
+        self._shop("1")
+        self._pool("a", shops=("1",))
+        fresh = MONITOR_NOW - timedelta(minutes=20)
+        self._physical("a", "wh-a", "SKU1", "1", captured_at=fresh)
+        self._channel("1", "SKU1", "9", captured_at=fresh)
+        self._threshold("SKU1", "low_replenish", "2")
+        policy_ref = self._policy(suffix="0", levels=("physical_total",),
+                                  pool_keys=("a",), shop_keys=("1",))
+        registrations = self._registrations(("physical_total",))
+        first, scan0, _, _ = self._run(policy_ref, registrations)
+        # 渠道侧"变好"：新店铺、新快照、更数——物理轮不得有任何反应。
+        self._shop("2")
+        self._pool("a", shops=("1", "2"))
+        self._channel("2", "SKU1", "7", captured_at=fresh)
+        second, scan1, _, _ = self._run(policy_ref, registrations)
+        self.assertEqual(scan0.source_artifact_payload,
+                         scan1.source_artifact_payload)
+        self.assertEqual(scan0.source_fingerprint, scan1.source_fingerprint)
+        self.assertNotIn(self.shops["2"],
+                         json.dumps(scan1.source_artifact_payload, default=str))
+        # 冷却期内重复扫描只更新 last_observed：第二轮零新首发。
+        self.assertEqual([t.event_kind for t in first], ["triggered"])
+        self.assertEqual([t.event_kind for t in second], ["updated"])
+
+    def test_channel_only_round_passes_only_shop_scope_and_never_touches_physical(self):
+        self._shop("1")
+        self._pool("a", shops=("1",))
+        fresh = MONITOR_NOW - timedelta(minutes=20)
+        self._physical("a", "wh-a", "SKU1", "1", captured_at=fresh)
+        self._channel("1", "SKU1", "0", captured_at=fresh)
+        self._threshold("SKU1", "low_quota", "5", shop_key="1")
+        policy_ref = self._policy(suffix="0", levels=("shop_sellable",),
+                                  pool_keys=("a",), shop_keys=("1",))
+        transitions, scan, _, recorder = self._run(
+            policy_ref, self._registrations(("shop_sellable",)))
+        self.assertFalse([q for q in recorder.sql if "physical_stock" in q],
+                         "池授权空集下实物快照零查询")
+        self.assertTrue([q for q in recorder.sql if "channel_stock" in q])
+        payload = scan.source_artifact_payload
+        self.assertEqual({row["level"] for row in payload["data"]},
+                         {"shop_sellable"})
+        self.assertEqual(scan.complete_levels, ("shop_sellable",))
+        self.assertEqual([(t.next_status, t.event_kind) for t in transitions],
+                         [("open", "triggered")])
+
+    def test_both_verified_round_passes_both_projections(self):
+        self._shop("1")
+        self._pool("a", shops=("1",))
+        fresh = MONITOR_NOW - timedelta(minutes=20)
+        self._physical("a", "wh-a", "SKU1", "100", captured_at=fresh)
+        self._channel("1", "SKU1", "0", captured_at=fresh)
+        self._threshold("SKU1", "low_replenish", "2")
+        self._threshold("SKU1", "low_quota", "5", shop_key="1")
+        policy_ref = self._policy(suffix="0", levels=("physical_total", "shop_sellable"),
+                                  pool_keys=("a",), shop_keys=("1",))
+        transitions, scan, _, recorder = self._run(
+            policy_ref, self._registrations(("physical_total", "shop_sellable")))
+        self.assertEqual({row["level"] for row in scan.source_artifact_payload["data"]},
+                         {"physical_total", "shop_sellable"})
+        self.assertEqual(scan.complete_levels,
+                         ("physical_total", "shop_sellable"))
+        self.assertEqual([t.next_status for t in transitions], ["open"])
+        self.assertFalse([q for q in recorder.sql if "channel_stock" in q
+                          and "physical_stock" in q])
+
+    def test_pool_claim_gap_makes_physical_incomplete_even_without_the_code(self):
+        """在册池缺 pools[] 声明 ⇒ 实物层不完整：既不首发也不解除（fail closed）。
+
+        graph 自己不知道策略在册范围（全集由快照派生），所以这一格的缺口只有
+        runner 按"判据是且只是池声明"补判；该轮照常持久化，但零迁移。
+        """
+        self._shop("1")
+        self._pool("a", shops=("1",))
+        self._pool("b", shops=("1",))
+        fresh = MONITOR_NOW - timedelta(minutes=20)
+        self._physical("a", "wh-a", "SKU1", "1", captured_at=fresh)
+        self._threshold("SKU1", "low_replenish", "2")
+        policy_ref = self._policy(suffix="0", levels=("physical_total",),
+                                  pool_keys=("a", "b"), shop_keys=("1",))
+        transitions, scan, decisions, _ = self._run(
+            policy_ref, self._registrations(("physical_total",)))
+        self.assertEqual(scan.complete_levels, ())
+        self.assertEqual(transitions, ())
+        self.assertEqual(decisions, ())
+        snapshot_missing_code = next(code for code in INVENTORY_LIMITATION_CODES
+                             if "snapshot_missing" in code
+                             and "channel" not in code)
+        self.assertIn(snapshot_missing_code, scan.diagnostics)
+
+
+# --- 计划 Task 4 Step 5：一次性 CLI -------------------------------------------
+
+
+class MonitorCliTests(unittest.TestCase):
+    """disabled 单行退出且零连接；enabled 逐策略共享 30 秒 deadline。"""
+
+    def _env(self, **overrides):
+        env = dict(valid_monitor_env())
+        env.update(overrides)
+        return env
+
+    def test_run_main_disabled_prints_one_safe_line_and_exits_zero(self):
+        from bi_agent.monitoring import cli
+
+        def explode(settings):
+            raise AssertionError("关闭的门禁不得连接任何数据库")
+
+        stdout = io.StringIO()
+        with patch.dict(os.environ, self._env(), clear=False), \
+                patch.object(cli, "_connect", explode), \
+                patch("sys.stdout", stdout):
+            code = cli.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue().strip(), "inventory_monitor disabled")
+
+    def test_run_main_enabled_runs_each_policy_once_with_shared_deadline(self):
+        import time as time_module
+
+        from bi_agent.monitoring import cli
+
+        calls = []
+
+        def fake_run(request, *, settings, now, deadline, registrations=None):
+            calls.append((request.policy_ref, deadline))
+            return ()
+
+        with patch.dict(os.environ, self._env(INVENTORY_MONITOR_ENABLED="true"),
+                        clear=False), \
+                patch.object(cli, "run_inventory_monitor", fake_run):
+            before = time_module.monotonic()
+            code = cli.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual([ref for ref, _ in calls],
+                         ["inventory-monitor/1", "inventory-monitor/1.1"])
+        self.assertEqual(len({deadline for _, deadline in calls}), 1,
+                         "一次进程共享同一个总 deadline")
+        deadline = calls[0][1]
+        self.assertGreater(deadline, before)
+        self.assertLessEqual(deadline - before, 31)
+
+    def test_run_main_enabled_policy_error_exits_one_with_fixed_code(self):
+        from bi_agent.monitoring import cli
+
+        def fake_run(request, **kwargs):
+            raise RuntimeError("monitor_commit_failed")
+
+        stdout = io.StringIO()
+        with patch.dict(os.environ, self._env(INVENTORY_MONITOR_ENABLED="true"),
+                        clear=False), \
+                patch.object(cli, "run_inventory_monitor", fake_run), \
+                patch("sys.stdout", stdout):
+            code = cli.run_main()
+        self.assertEqual(code, 1)
+        line = stdout.getvalue()
+        self.assertIn("inventory-monitor/1", line)
+        self.assertIn("monitor_commit_failed", line)
+        self.assertNotIn("postgresql://", line, "错误输出不得带 DSN")
+
+    def test_run_main_enabled_non_stable_failures_fold_into_fixed_line(self):
+        """P1 回归：per-policy 的非稳定异常（psycopg 连接失败、deadline 的
+        TimeoutError）必须折叠成固定单行——不许 traceback 逃逸、不得中断剩余
+        策略、错误原文不得进输出。计划 Step 5：“任一 policy 异常 exit 1 并只
+        输出 policy ref + fixed code”。"""
+        import psycopg
+
+        from bi_agent.monitoring import cli
+
+        cases = (
+            ("inventory-monitor/1", psycopg.errors.OperationalError(
+                "connection refused to local detail")),
+            ("inventory-monitor/1", TimeoutError("monitor_deadline_exceeded")),
+        )
+        for failed_ref, failure in cases:
+            with self.subTest(error=type(failure).__name__):
+                calls = []
+
+                def fake_run(request, **kwargs):
+                    calls.append(request.policy_ref)
+                    if request.policy_ref == failed_ref:
+                        raise failure
+                    return ()
+
+                stdout = io.StringIO()
+                with patch.dict(os.environ,
+                                self._env(INVENTORY_MONITOR_ENABLED="true"),
+                                clear=False),                         patch.object(cli, "run_inventory_monitor", fake_run),                         patch("sys.stdout", stdout):
+                    code = cli.run_main()
+                self.assertEqual(calls, ["inventory-monitor/1",
+                                         "inventory-monitor/1.1"],
+                                 "失败不得中断剩余策略")
+                self.assertEqual(code, 1)
+                lines = [line for line in stdout.getvalue().splitlines()
+                         if line.strip()]
+                self.assertEqual(len(lines), 2)
+                self.assertIn(f"policy_ref={failed_ref}", lines[0])
+                self.assertIn("monitor_run_failed", lines[0])
+                self.assertIn("policy_ref=inventory-monitor/1.1 ok", lines[1])
+                # 错误原文（含本地细节）不得进输出：只允许固定码 + 异常类型名。
+                self.assertNotIn("connection refused", stdout.getvalue())
+
+    def test_run_main_config_error_exits_one_without_connecting(self):
+        from bi_agent.monitoring import cli
+
+        def explode(settings):
+            raise AssertionError("配置错误不得连接数据库")
+
+        stdout = io.StringIO()
+        with patch.dict(os.environ,
+                        self._env(INVENTORY_MONITOR_ENABLED="true",
+                                  MONITOR_SERVICE_SUBJECT=" "),
+                        clear=False), \
+                patch.object(cli, "_connect", explode), \
+                patch("sys.stdout", stdout):
+            code = cli.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("INVENTORY_MONITOR_REQUIRES_MONITOR_SERVICE_SUBJECT",
+                      stdout.getvalue())
+
+    def test_deliver_main_disabled_and_enabled(self):
+        from bi_agent.monitoring import cli
+
+        def explode(settings):
+            raise AssertionError("关闭的门禁不得连接任何数据库")
+
+        stdout = io.StringIO()
+        with patch.dict(os.environ, self._env(), clear=False), \
+                patch.object(cli, "_connect", explode), \
+                patch("sys.stdout", stdout):
+            code = cli.deliver_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout.getvalue().strip(), "inventory_outbox disabled")
+
+        execute = []
+
+        class DeliveryConn:
+            def close(self) -> None:
+                return None
+
+            def execute(self, sql, params=None):
+                from tests.fakeconn import Rows
+
+                execute.append((sql, params))
+                return Rows([({"selected": 1, "delivered": 1, "retried": 0,
+                               "dead_lettered": 0},)])
+
+        conn = DeliveryConn()
+        with patch.dict(os.environ, self._env(INVENTORY_MONITOR_ENABLED="true"),
+                        clear=False), \
+                patch.object(cli, "_connect", lambda settings: conn):
+            code = cli.deliver_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(execute), 1)
+        self.assertIn("deliver_inventory_outbox", execute[0][0])
+
+        class BrokenConn:
+            def close(self) -> None:
+                return None
+
+            def execute(self, sql, params=None):
+                raise RuntimeError("monitor_delivery_failed")
+
+        with patch.dict(os.environ, self._env(INVENTORY_MONITOR_ENABLED="true"),
+                        clear=False), \
+                patch.object(cli, "_connect", lambda settings: BrokenConn()):
+            code = cli.deliver_main()
+        self.assertEqual(code, 1)
+
+
+class MonitorConsoleScriptTests(unittest.TestCase):
+    """Task 4 Step 5 的打包回归：声明的 console scripts 必须真实可安装。
+
+    无 [build-system] 的 uv 项目是 virtual 项目：[project.scripts] 永不安装，
+    `uv run --locked bi-inventory-monitor` 只会得到 "program not found"（已发生
+    的验收阻塞）。本回归钉住 packaging 契约的三件事：pyproject 声明（含
+    package 模式）、editable 安装的 distribution 暴露同名 entry points、以及
+    安装映射回本仓库源码树（嵌套子包可导入）。"uv run --locked" 两条命令的
+    可执行证据（单行 disabled 输出 + exit 0 + 零连接）在验收记录里另有留痕。
+    """
+
+    def test_pyproject_declares_the_two_console_scripts_in_package_mode(self):
+        import tomllib
+
+        pyproject = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        self.assertEqual(data["project"]["scripts"], {
+            "bi-inventory-monitor": "bi_agent.monitoring.cli:run_main",
+            "bi-inventory-outbox": "bi_agent.monitoring.cli:deliver_main"})
+        # virtual 项目永不安装脚本：package 模式是本打包契约的前提。
+        self.assertIs(data["tool"]["uv"]["package"], True)
+
+    def test_installed_editable_distribution_exposes_and_imports_them(self):
+        import importlib.metadata
+
+        try:
+            dist = importlib.metadata.distribution("bi-agent")
+        except importlib.metadata.PackageNotFoundError as error:
+            raise AssertionError(
+                "bi-agent 未安装为 editable distribution：console scripts 无法"
+                "生成（uv 项目须 [tool.uv] package=true 并重新 uv sync）"
+            ) from error
+        console = {entry.name: entry.value for entry in dist.entry_points
+                   if entry.group == "console_scripts"}
+        self.assertEqual(console, {
+            "bi-inventory-monitor": "bi_agent.monitoring.cli:run_main",
+            "bi-inventory-outbox": "bi_agent.monitoring.cli:deliver_main"})
+        # editable 安装必须映射回本仓库源码树，而不是拷贝进 site-packages。
+        import bi_agent
+
+        source_root = pathlib.Path(__file__).resolve().parents[1]
+        self.assertEqual(pathlib.Path(bi_agent.__file__).resolve().parents[1],
+                         source_root)
+        # 代表性嵌套子包必须经安装映射可导入（含被评审点名的两个模块）。
+        from bi_agent.inventory.graph import run_inventory_graph
+        from bi_agent.monitoring.cli import deliver_main, run_main
+
+        self.assertTrue(callable(run_inventory_graph))
+        self.assertTrue(callable(run_main))
+        self.assertTrue(callable(deliver_main))
 
 
 if __name__ == "__main__":  # pragma: no cover

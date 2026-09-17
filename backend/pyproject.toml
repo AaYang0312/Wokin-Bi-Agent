@@ -16,3 +16,13 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
 ]
+
+[project.scripts]
+bi-inventory-monitor = "bi_agent.monitoring.cli:run_main"
+bi-inventory-outbox = "bi_agent.monitoring.cli:deliver_main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+include = ["bi_agent*"]
