@@ -802,6 +802,9 @@ def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: dat
             entry = by_day.get((shop_id, day), {
                 "paid_amount": Decimal(0), "paid_orders": 0, "erp_documents": 0,
                 "refund_amount": Decimal(0), "cash_difference": Decimal(0)})
+            # 逐日客单价同样按本日的支付金额/商业订单数算，不把整段总额摊到每一天；
+            # 无单日不可除，_compute_aov 返回 None，_group_rows 只按请求指标投影。
+            entry["aov"] = _compute_aov(entry)
             if need_cohort:
                 entry["cohort_refund_rate"] = None  # 同批比率不逐日发布
             rows.append({"shop_id": shop_id, "day": day.isoformat(),
