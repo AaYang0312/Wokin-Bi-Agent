@@ -3555,7 +3555,19 @@ class QueryMemoryAgentIntegrationTests(unittest.TestCase):
         def fake_retrieve(question, *, context, deadline, explore_offered):
             retrieved["deadline"] = deadline
             retrieved["explore_offered"] = explore_offered
+            retrieved["observed_at"] = time_module.monotonic()
             return ()
+
+        # 回合入口的 monotonic 采样必须可精确观测：`agent.time_module` 与这里的
+        # `time_module` 是同一个模块对象，只在本回合内换成转发包装（真实调用仍走
+        # 保存下来的真函数），于是“deadline 的起始点”能逐字比对，而不是靠时间容差。
+        real_monotonic = time_module.monotonic
+        samples: list[float] = []
+
+        def spying_monotonic():
+            sample = real_monotonic()
+            samples.append(sample)
+            return sample
 
         model = Mock()
         model.complete.side_effect = [
@@ -3565,8 +3577,8 @@ class QueryMemoryAgentIntegrationTests(unittest.TestCase):
                                               "shop_ids": [S1_REF],
                                               "metrics": ["paid_amount"]})]),
             _reply(text="支付金额1000元")]
-        started = time_module.monotonic()
-        with patch.object(agent, "execute_business_query_tool", spying_tool), \
+        with patch.object(agent.time_module, "monotonic", spying_monotonic), \
+                patch.object(agent, "execute_business_query_tool", spying_tool), \
                 patch("bi_agent.query_memory.prompt.retrieve_routing_examples",
                       fake_retrieve), \
                 patch("bi_agent.business_query.nodes.metrics.query_business",
@@ -3577,12 +3589,16 @@ class QueryMemoryAgentIntegrationTests(unittest.TestCase):
                 conn=ShopCatalogConn(), allowed_shop_ids=frozenset({"S1"}),
                 now=self.NOW, run_store=self.run_store,
                 approved_query_memory_enabled=True)
+            returned_at = spying_monotonic()
         self.assertEqual(turn.text, "支付金额1000元")
         self.assertIs(retrieved["explore_offered"], False)
-        # 检索看到的就是回合入口那份 30 秒预算：没有重置，也没有延长。
-        self.assertLessEqual(retrieved["deadline"],
-                             started + agent.TOTAL_BUDGET_SECONDS)
-        self.assertGreater(retrieved["deadline"], time_module.monotonic())
+        # 检索看到的就是回合入口那份 30 秒预算：deadline 精确等于回合入口第一个
+        # monotonic 采样 + 30 秒。重置换算或延长都会让这个等式不成立。
+        self.assertEqual(retrieved["deadline"],
+                         samples[0] + agent.TOTAL_BUDGET_SECONDS)
+        # 仍然落在未来：检索当下与回合返回时都不能是过去/零值。
+        self.assertGreater(retrieved["deadline"], retrieved["observed_at"])
+        self.assertGreater(retrieved["deadline"], returned_at)
         # 图拿到的是同一个绝对时刻：float 相等，不是“差不多”。
         self.assertEqual(seen["graph_deadline"], retrieved["deadline"])
 
