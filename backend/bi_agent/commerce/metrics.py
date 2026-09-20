@@ -397,6 +397,8 @@ ExcludedReason = Literal[
     "source_unregistered", "capability_unavailable", "capability_ungranted",
     "coverage_time_basis_unverified", "coverage_incomplete", "data_as_of_unknown",
     "source_quality_failed", "basis_incompatible", "shop_disabled", "shop_not_synced",
+    # 分区块超过行数上限：与结果侧的 `result_too_large` 同一名称，不另造一个词。
+    "result_too_large",
 ]
 EXCLUDED_REASONS: frozenset[str] = frozenset(get_args(ExcludedReason))
 

@@ -1264,6 +1264,46 @@ class MetricInputTests(unittest.TestCase):
                                metrics=["quantity"], group_by="product")
         self.assertEqual(request.group_by, "product")
 
+    def test_partitioned_policy_only_combines_with_product_grouping(self):
+        """分区口径只在商品分组下成立：别的分组要么用 strict，要么用 separate。"""
+        from bi_agent.metrics import QueryRequest
+
+        with self.assertRaises(ValueError):
+            QueryRequest(start="2026-09-01", end="2026-09-08", shop_ids=["S1"],
+                         metrics=["paid_amount"], group_by="shop",
+                         basis_policy="partitioned")
+        request = QueryRequest(start="2026-09-01", end="2026-09-08", shop_ids=["S1"],
+                               metrics=["product_paid_amount"], group_by="product",
+                               basis_policy="partitioned")
+        self.assertEqual(request.basis_policy, "partitioned")
+
+    def test_half_month_resolves_to_the_last_fifteen_completed_days(self):
+        """「近半个月」= 最近 15 个完整自然日（含今天的窗口会把没跑完的一天算进排名）。"""
+        from bi_agent.metrics import resolve_period, resolve_period_detail
+
+        now = datetime(2026, 9, 8, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(resolve_period("近半个月", now=now),
+                         (date(2026, 8, 24), date(2026, 9, 8)))
+        self.assertEqual(resolve_period("最近半个月最好的10个商品", now=now),
+                         (date(2026, 8, 24), date(2026, 9, 8)))
+        self.assertEqual(resolve_period_detail("近半个月", now=now).kind, "half_month")
+        # 反恒真：既有词表的返回值形状与窗口不变（二元组，且今天仍算相对词）。
+        for text, expected in (
+                ("最近7天", (date(2026, 9, 1), date(2026, 9, 8))),
+                ("9月1日至7日支付金额", (date(2026, 9, 1), date(2026, 9, 8))),
+                ("那上个月呢", (date(2026, 8, 1), date(2026, 9, 1))),
+                ("今天的支付额", (date(2026, 9, 8), date(2026, 9, 9))),
+                ("照上次那样", None)):
+            with self.subTest(text=text):
+                self.assertEqual(resolve_period(text, now=now), expected)
+        # 解析种类分开报：显式日期与相对日期对窗口边界的权威程度不同。
+        self.assertEqual(resolve_period_detail("9月1日至7日支付金额", now=now).kind,
+                         "explicit_range")
+        self.assertEqual(resolve_period_detail("2026-09-01的支付额", now=now).kind,
+                         "explicit_range")
+        self.assertEqual(resolve_period_detail("那上个月呢", now=now).kind, "relative")
+        self.assertIsNone(resolve_period_detail("照上次那样", now=now))
+
     def test_spoken_dates(self):
         from bi_agent.metrics import resolve_period
 
@@ -1417,6 +1457,10 @@ class FakeWarehouse:
             return _FakeResult([self.cohort])
         if "FROM reporting.v_product_daily" in text:
             rows = self._select(self.product_rows, params)
+            # _PRODUCT_SQL：日行先按 (店铺, 商品, line_kind) 在 SQL 端聚合掉，LIMIT 只约束
+            # 最终分组数。列序与生产 SQL 逐一对应，替身不得比生产少聚合一层。
+            if "GROUP BY shop_id, product_id, line_kind" in text:
+                rows = self._aggregate_products(rows)
             return _FakeResult(rows[:params[-1]])
         if "FROM reporting.v_shop_daily" in text:
             rows = self._select(self.daily_rows, params)
@@ -1444,6 +1488,40 @@ class FakeWarehouse:
         shop_ids, start, end = params[0], params[1], params[2]
         return [row for row in rows
                 if row[0] in shop_ids and start <= row[1] < end]
+
+    @staticmethod
+    def _aggregate_products(rows):
+        """回放 _PRODUCT_SQL 的分组/求和/数组聚合语义（名称与规格按 day 排序）。"""
+        groups: dict[tuple, dict] = {}
+        for row in rows:
+            entry = groups.setdefault((row[0], row[2], row[7]), {
+                "quantity": Decimal(0), "gift_quantity": Decimal(0),
+                "product_paid_amount": Decimal(0), "allocation_verified": True,
+                "names": [], "snapshots": [], "sku_labels": []})
+            entry["quantity"] += row[3]
+            entry["gift_quantity"] += row[4]
+            entry["product_paid_amount"] += row[5]
+            entry["allocation_verified"] = bool(
+                entry["allocation_verified"] and row[6])
+            if row[8] is not None:
+                entry["names"].append((row[1], str(row[8])))
+            if row[9] is not None:
+                entry["snapshots"].append((row[1], str(row[9])))
+            entry["sku_labels"].append((row[1], row[10]))
+        output = []
+        for (shop_id, product_id, line_kind), entry in sorted(groups.items()):
+            names = [value for _, value in sorted(entry["names"], key=lambda item: item[0])]
+            snapshots = [value for _, value
+                         in sorted(entry["snapshots"], key=lambda item: item[0])]
+            sku_labels = [value for _, value
+                          in sorted(entry["sku_labels"], key=lambda item: item[0])]
+            name_day = min((day for day, _ in entry["names"]), default=None)
+            snapshot_day = min((day for day, _ in entry["snapshots"]), default=None)
+            output.append((shop_id, product_id, line_kind, entry["quantity"],
+                           entry["gift_quantity"], entry["product_paid_amount"],
+                           entry["allocation_verified"], name_day, names or None,
+                           snapshot_day, snapshots or None, sku_labels))
+        return output
 
 
 class StepClock:
@@ -1589,7 +1667,7 @@ class MetricRowCapTests(unittest.TestCase):
                                             for shop_id in shops],
                              data_as_of=self.DATA_AS_OF)
 
-    def _query(self, warehouse, *, group_by: str, metrics, shop_ids=None):
+    def _query(self, warehouse, *, group_by: str, metrics, shop_ids=None, top_n=10):
         import time as time_module
 
         from bi_agent import metrics as metrics_module
@@ -1598,7 +1676,8 @@ class MetricRowCapTests(unittest.TestCase):
             shop_ids = sorted({row[0] for row in warehouse.daily_rows})
         request = metrics_module.QueryRequest(
             start=self.START, end=self.START + timedelta(days=self.DAYS),
-            shop_ids=list(shop_ids), metrics=list(metrics), group_by=group_by)
+            shop_ids=list(shop_ids), metrics=list(metrics), group_by=group_by,
+            top_n=top_n)
         return metrics_module.query_business(
             warehouse, request, allowed_shop_ids=frozenset(shop_ids),
             now=self.DATA_AS_OF, deadline=time_module.monotonic() + 30)
@@ -1639,19 +1718,55 @@ class MetricRowCapTests(unittest.TestCase):
         self.assertEqual(result.status, "invalid_parameters")
         self.assertEqual(result.data, [])
 
-    def test_truncated_product_rows_are_unavailable_not_a_fake_top_n(self):
-        """商品分组没有预检：732 行日行只能靠 LIMIT 探测拒输出数。"""
-        from datetime import date as _date
+    def test_product_groups_over_the_cap_are_unavailable_not_a_partial_top_n(self):
+        """最终分组 >500 时仍必须 fail-closed：LIMIT 探测不能冒充 ok 的截断排名。"""
+        from bi_agent.metrics import MAX_ROWS
 
-        warehouse = self._warehouse(shops=("S1",), products=("P1", "P2"))
-        self.assertGreater(len(warehouse.product_rows), 500)
+        rows = [("S1", self.START, f"P{index:04d}", Decimal("1"), Decimal("0"),
+                 Decimal("10"), True, "sale") for index in range(MAX_ROWS + 1)]
+        warehouse = FakeWarehouse(product_rows=rows, shops=[("S1", True, "CNY")],
+                                  shop_profiles=[("S1", "fxg", "档案店S1")],
+                                  data_as_of=self.DATA_AS_OF)
         result = self._query(warehouse, group_by="product",
-                             metrics=["product_paid_amount", "quantity"])
+                             metrics=["product_paid_amount"], shop_ids=["S1"])
 
         self.assertEqual(result.status, "unavailable")
         self.assertEqual(result.data, [])
         self.assertTrue(any("上限" in item for item in result.limitations),
                         result.limitations)
+
+    def test_product_rows_aggregate_daily_rows_in_sql_before_the_cap(self):
+        """>500 行日行但最终分组 <500：必须先在 SQL 端聚合再排名，不得误报超限。"""
+        from bi_agent.metrics import MAX_ROWS
+
+        amounts = {"P1": Decimal("2"), "P2": Decimal("3"), "P3": Decimal("5")}
+        rows = []
+        for offset in range(self.DAYS):
+            day = date.fromordinal(self.START.toordinal() + offset)
+            for product_id, amount in amounts.items():
+                rows.append(("S1", day, product_id, Decimal("1"), Decimal("0"),
+                             amount, True, "sale"))
+        warehouse = FakeWarehouse(product_rows=rows, shops=[("S1", True, "CNY")],
+                                  shop_profiles=[("S1", "fxg", "档案店S1")],
+                                  data_as_of=self.DATA_AS_OF)
+        self.assertGreater(len(warehouse.product_rows), MAX_ROWS)
+
+        result = self._query(warehouse, group_by="product", shop_ids=["S1"],
+                             metrics=["product_paid_amount"], top_n=2)
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        ranked = [row for row in result.data if "product_id" in row]
+        self.assertEqual([row["product_id"] for row in ranked], ["P3", "P2"])
+        self.assertEqual([Decimal(str(row["product_paid_amount"])) for row in ranked],
+                         [amounts["P3"] * self.DAYS, amounts["P2"] * self.DAYS])
+        self.assertEqual([row for row in result.data if "notice" in row],
+                         [{"notice": "仅返回Top 2，共3个商品"}])
+        # 反恒真：SQL 必须自己聚合日行，而不是把 1098 行日行 LIMIT 掉后靠 Python 拼。
+        statements = [statement for statement, _ in warehouse.fetches("v_product_daily")]
+        self.assertTrue(any("GROUP BY shop_id, product_id, line_kind" in statement
+                            for statement in statements), statements)
+        self.assertFalse(any("ORDER BY day, shop_id, product_id" in statement
+                             for statement in statements), statements)
 
     def test_more_shops_than_the_cap_is_unavailable_not_a_partial_sum(self):
         shop_ids = tuple(f"S{index}" for index in range(501))
@@ -1672,6 +1787,297 @@ class MetricRowCapTests(unittest.TestCase):
         limits = [params[-1] for sql, params in warehouse.fetches("v_shop_daily")
                   if "GROUP BY shop_id" in sql]
         self.assertEqual(limits, [MAX_ROWS + 1])
+
+
+class PartitionedProductRankingTests(unittest.TestCase):
+    """多店商品排行按完整指标签名分区：各出各自 Top-N，缺证据的分区只排除自己。
+
+    这批用例钉住的是“一次查询、服务端分组”，不是“让模型多试几次”：
+    认证组正常出榜、未认证组只能当可观测样本、实测不成立的口径不出一行，
+    且任何跨分区合计/排名/静默截断都不会出现。
+    """
+
+    TZ = ZoneInfo("Asia/Shanghai")
+    START = date(2026, 9, 1)
+    END = date(2026, 9, 8)
+    DATA_AS_OF = datetime(2026, 9, 8, 0, 0, tzinfo=TZ)
+    PRODUCT_CAPS = ("product_paid_amount", "quantity")
+
+    def _shop(self, shop_id, platform, capabilities=PRODUCT_CAPS):
+        # v_shops 五列：店、开关、币种、平台、能力标签。
+        return (shop_id, True, "CNY", platform, list(capabilities))
+
+    def _products(self, shop_id, amounts, *, day=None):
+        return [(shop_id, day or self.START, product_id, Decimal("1"), Decimal("0"),
+                 Decimal(amount), True, "sale")
+                for product_id, amount in amounts.items()]
+
+    def _warehouse(self, shops, product_rows, *, unverified_payments=(0, 0, 0, 0)):
+        return FakeWarehouse(
+            product_rows=list(product_rows), shops=list(shops),
+            shop_profiles=[(row[0], row[3], f"档案店{row[0]}") for row in shops],
+            data_as_of=self.DATA_AS_OF, unverified_payments=unverified_payments)
+
+    def _query(self, warehouse, shop_ids, *, metrics=("product_paid_amount",),
+               basis_policy="partitioned", top_n=10):
+        import time as time_module
+
+        from bi_agent import metrics as metrics_module
+
+        request = metrics_module.QueryRequest(
+            start=self.START, end=self.END, shop_ids=list(shop_ids),
+            metrics=list(metrics), group_by="product", basis_policy=basis_policy,
+            top_n=top_n)
+        return metrics_module.query_business(
+            warehouse, request, allowed_shop_ids=frozenset(shop_ids),
+            now=self.DATA_AS_OF, deadline=time_module.monotonic() + 30)
+
+    @staticmethod
+    def _rows_by_group(result):
+        grouped: dict[str, list[dict]] = {}
+        for row in result.data:
+            if "product_id" in row:
+                grouped.setdefault(str(row["rank_group"]), []).append(row)
+        return grouped
+
+    def test_partitioned_ranking_splits_certified_and_unmeasured_cohorts(self):
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("JD1", "jd")],
+            self._products("FX1", {"P1": "300", "P2": "200"})
+            + self._products("JD1", {"P9": "500"}))
+
+        result = self._query(warehouse, ["FX1", "JD1"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual([group["group"] for group in result.rank_groups], ["g1", "g2"])
+        self.assertEqual([group["status"] for group in result.rank_groups],
+                         ["certified", "observable_sample"])
+        self.assertEqual([group["shop_ids"] for group in result.rank_groups],
+                         [["FX1"], ["JD1"]])
+        self.assertEqual(result.rank_exclusions, [])
+        self.assertEqual(result.coverage.status, "complete")
+        self.assertIn("1 家店铺的结果来自未认证付款时间口径，按可观测样本披露",
+                      result.limitations)
+        self.assertIn("本次结果按口径分为 2 个分区，分区之间不得汇总、比较或排名",
+                      result.limitations)
+        self.assertEqual({group: [row["rank"] for row in rows]
+                          for group, rows in self._rows_by_group(result).items()},
+                         {"g1": [1, 2], "g2": [1]})
+
+    def test_partitioned_ranking_discloses_unverified_payments_like_strict(self):
+        """分区路径对同一指标必须照搬 strict 的未认证支付披露，不能因多店而吞掉。"""
+        from bi_agent.business_query.nodes import _limitation_codes
+
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("JD1", "jd")],
+            self._products("FX1", {"P1": "300"})
+            + self._products("JD1", {"P9": "500"}),
+            unverified_payments=(3, 1, 2, Decimal("500")))
+
+        result = self._query(warehouse, ["FX1", "JD1"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertIn("未认证支付3笔（金额未定1笔），已知原始金额500元（2笔）",
+                      result.limitations)
+        self.assertIn("unverified_payments", _limitation_codes(result.limitations))
+
+        # 正向控制：诊断为零时不得凭空多出这句话。
+        clean = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("JD1", "jd")],
+            self._products("FX1", {"P1": "300"})
+            + self._products("JD1", {"P9": "500"}))
+        clean_result = self._query(clean, ["FX1", "JD1"])
+        self.assertFalse(any(item.startswith("未认证支付")
+                             for item in clean_result.limitations))
+
+    def test_disproved_cohort_publishes_no_rows_and_is_excluded(self):
+        """实测不成立的付款时间口径：一行都不出，且原因是口径未认证而不是“指标冲突”。"""
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("TB1", "tb")],
+            self._products("FX1", {"P1": "300"})
+            + self._products("TB1", {"P9": "999"}))
+
+        result = self._query(warehouse, ["FX1", "TB1"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual([row["shop_id"] for row in result.data], ["FX1"])
+        self.assertEqual([row["rank"] for row in result.data], [1])
+        self.assertEqual(result.rank_exclusions,
+                         [{"shop_id": "TB1",
+                           "reason": "coverage_time_basis_unverified"}])
+        self.assertIn("1 家店铺的付款时间口径未经认证（实测不成立），未列入本次排行",
+                      result.limitations)
+        self.assertEqual(result.coverage.status, "partial")
+        # 反恒真：不得把口径缺口说成“指标互不兼容”，也不得建议换个指标再试。
+        self.assertFalse(any("互不兼容" in item for item in result.limitations))
+        self.assertFalse(any("quantity" in item for item in result.limitations))
+
+        # 公开投影只带引用与分区陈述：真实店铺主键不得经新字段泄出去。
+        from bi_agent.business_query.tool import to_model_result
+        from bi_agent.catalog import build_catalog
+        from tests.fakeconn import ShopCatalogConn
+
+        catalog = build_catalog(
+            ShopCatalogConn([("FX1", "店铺A"), ("TB1", "店铺B")]), result,
+            allowed_shop_ids=frozenset({"FX1", "TB1"}))
+        model_payload = to_model_result(result, catalog)
+        rendered = json.dumps(model_payload, ensure_ascii=False)
+        self.assertNotIn("FX1", rendered)
+        self.assertNotIn("TB1", rendered)
+        self.assertEqual(model_payload["excluded_scope"],
+                         [{"shop_ref": catalog.shop_ref("TB1"),
+                           "reason": "coverage_time_basis_unverified"}])
+        self.assertEqual([group["shop_refs"] for group in model_payload["rank_groups"]],
+                         [[catalog.shop_ref("FX1")]])
+
+    def test_unsupported_cohort_is_excluded_not_a_whole_request_refusal(self):
+        """能力/来源缺口只缩到分区粒度：一家店答不了不得打死整次排行。"""
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("PD1", "pdd")],
+            self._products("FX1", {"P1": "300"}))
+
+        result = self._query(warehouse, ["FX1", "PD1"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual([row["shop_id"] for row in result.data], ["FX1"])
+        self.assertEqual(result.rank_exclusions,
+                         [{"shop_id": "PD1", "reason": "capability_unavailable"}])
+        self.assertIn("1 家店铺缺少 product_paid_amount 的已核验能力，未列入本次排行",
+                      result.limitations)
+        self.assertEqual(result.coverage.status, "partial")
+
+    def test_cohort_over_the_final_group_cap_is_excluded_while_others_publish(self):
+        """分区内最终分组 >500：该分区拒输出数，其他分区照常发布，绝不静默截断。"""
+        from bi_agent.metrics import MAX_ROWS
+
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("JD1", "jd")],
+            self._products("FX1", {f"P{index:04d}": "10"
+                                    for index in range(MAX_ROWS + 1)})
+            + self._products("JD1", {"P9": "500"}))
+
+        result = self._query(warehouse, ["FX1", "JD1"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(result.rank_exclusions,
+                         [{"shop_id": "FX1", "reason": "result_too_large"}])
+        self.assertIn("1 家店铺的商品分组数超过 500 上限，未列入本次排行",
+                      result.limitations)
+        self.assertEqual([row["shop_id"] for row in self.data_rows(result)], ["JD1"])
+
+    @staticmethod
+    def data_rows(result):
+        return [row for row in result.data if "product_id" in row]
+
+    def test_composite_output_cap_refuses_without_publishing_a_prefix(self):
+        """组合输出上限：超限时一行都不发（发布前几个分区就是静默截断）。"""
+        wide = {f"P{index:03d}": "10" for index in range(300)}
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("JD1", "jd")],
+            self._products("FX1", wide) + self._products("JD1", wide))
+
+        refused = self._query(warehouse, ["FX1", "JD1"], top_n=300)
+
+        self.assertEqual(refused.status, "invalid_parameters", refused.limitations)
+        self.assertEqual(refused.data, [])
+        self.assertEqual(refused.rank_groups, [])
+        self.assertIn("分区结果共需 600 行，超过 500 行上限；请缩小 top_n 后重试",
+                      refused.limitations)
+
+        # 正向控制：把 top_n 缩到上限以内，两个分区都能发布（各带一条截断提醒行）。
+        control = self._query(warehouse, ["FX1", "JD1"], top_n=200)
+        self.assertEqual(control.status, "ok", control.limitations)
+        self.assertEqual([group["truncated"] for group in control.rank_groups],
+                         [True, True])
+        self.assertEqual(len(control.data), 402)
+
+    def test_partitioned_ranking_never_merges_ranks_across_cohorts(self):
+        """反恒真：名次只在分区内计数；两个分区不能共享一个全局计数器。"""
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("JD1", "jd")],
+            self._products("FX1", {"P1": "300", "P2": "200"})
+            + self._products("JD1", {"P9": "500", "P10": "100"}))
+
+        grouped = self._rows_by_group(self._query(warehouse, ["FX1", "JD1"]))
+
+        self.assertEqual(sorted(grouped), ["g1", "g2"])
+        self.assertEqual([row["rank"] for row in grouped["g1"]], [1, 2])
+        self.assertEqual([row["rank"] for row in grouped["g2"]], [1, 2])
+        # 未认证分区的第一名金额高于认证分区的第二名：全局计数器会把它记成 rank 3。
+        self.assertLess(Decimal(str(grouped["g1"][1]["product_paid_amount"])),
+                        Decimal(str(grouped["g2"][0]["product_paid_amount"])))
+
+    def test_strict_multi_basis_product_ranking_still_refuses_and_names_the_policy(self):
+        """显式 strict 行为不变，只是补一句告诉我们怎么改成分区排行。"""
+        from bi_agent.business_query.nodes import _limitation_codes
+
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("TB1", "tb")],
+            self._products("FX1", {"P1": "300"})
+            + self._products("TB1", {"P9": "999"}))
+
+        result = self._query(warehouse, ["FX1", "TB1"], basis_policy="strict")
+
+        self.assertEqual(result.status, "invalid_parameters")
+        self.assertEqual(result.data, [])
+        self.assertEqual(_limitation_codes(result.limitations),
+                         ["basis_incompatible"])
+        self.assertTrue(any("basis_policy=partitioned" in item
+                            for item in result.limitations), result.limitations)
+
+    def test_product_metric_signatures_stay_within_the_partition_bound(self):
+        """分区数由注册表决定而不是由店铺数决定：这条不变量要能被钉住。"""
+        from bi_agent.metrics import MAX_RANK_GROUPS, PRODUCT_METRICS
+        from bi_agent.sources import (METRIC_CAPABILITIES, ShopRecord, _REGISTRATIONS,
+                                      binding_signature, resolve_metric_dependencies)
+
+        signatures = set()
+        for platform in _REGISTRATIONS:
+            record = ShopRecord(shop_id="S1", platform=platform,
+                                capabilities=frozenset(METRIC_CAPABILITIES))
+            signatures.add(tuple(sorted(
+                (metric, binding_signature(resolve_metric_dependencies(record, metric)))
+                for metric in sorted(PRODUCT_METRICS))))
+
+        self.assertLessEqual(len(signatures), MAX_RANK_GROUPS)
+
+    def test_partitioned_queries_are_bounded_by_cohorts_not_shops(self):
+        """查询次数上界是分区数：不得按店铺或商品逐项发查询（N+1）。"""
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("FX2", "fxg"),
+             self._shop("JD1", "jd")],
+            self._products("FX1", {"P1": "300"})
+            + self._products("FX2", {"P2": "200"})
+            + self._products("JD1", {"P9": "500"}))
+
+        result = self._query(warehouse, ["FX1", "FX2", "JD1"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        fetches = warehouse.fetches("v_product_daily")
+        # 商品分组查询（而不是归属披露等读同一视图的其他语句）每分区恰好一次。
+        product_fetches = [(sql, params) for sql, params in fetches
+                           if "GROUP BY shop_id, product_id, line_kind" in sql]
+        self.assertEqual(len(product_fetches), len(result.rank_groups))
+        self.assertEqual({tuple(params[0]) for _sql, params in product_fetches},
+                         {("FX1", "FX2"), ("JD1",)})
+
+    def test_partitioned_ranking_with_empty_published_cohorts_is_partial(self):
+        """已评估但确实没有商品也是结果：它不能被读成契约违规。"""
+        from bi_agent.business_query.nodes import _classify
+        from bi_agent.runtime.models import DomainStatus
+
+        warehouse = self._warehouse(
+            [self._shop("FX1", "fxg"), self._shop("TB1", "tb")], [])
+
+        result = self._query(warehouse, ["FX1", "TB1"])
+
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(result.data, [])
+        self.assertEqual(result.coverage.status, "partial")
+        self.assertEqual(result.rank_groups[0]["groups_total"], 0)
+        target_status, error = _classify(result)
+        self.assertEqual(target_status, DomainStatus.PARTIAL)
+        self.assertIsNone(error)
 
 
 class ModelTests(unittest.TestCase):
@@ -2086,6 +2492,8 @@ class PromotionTests(unittest.TestCase):
                    | models.INVENTORY_WAREHOUSE_REF_RESULT_COLUMNS
                    | models.INVENTORY_UNIT_RESULT_COLUMNS
                    | models.INVENTORY_INT_RESULT_COLUMNS
+                   | models._METRIC_INT_RESULT_COLUMNS
+                   | frozenset(models._METRIC_LABEL_PATTERN_RESULT_COLUMNS)
                    | frozenset(models._LABEL_RESULT_VALUES)
                    | models._REF_RESULT_COLUMNS | models._TEXT_RESULT_COLUMNS)
         self.assertEqual(covered, models.ARTIFACT_RESULT_COLUMNS)
@@ -2425,6 +2833,162 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len({run["user_message_id"] for run in runs}), 1)
         self.assertEqual(len(turn.results), 1)
         self.assertEqual(model.complete.call_count, 3)
+
+    def _basis_incompatible_result(self):
+        """确定性引擎对跨口径范围的真实拒答：schema 合法、已执行、已可落盘。"""
+        return ToolResult(
+            status="invalid_parameters", data=[],
+            coverage=Coverage(status="complete", start=date(2026, 9, 1),
+                              end=date(2026, 9, 8)),
+            filters={"start": "2026-09-01", "end": "2026-09-08",
+                     "shop_ids": ["S1"], "metrics": ["product_paid_amount"],
+                     "group_by": "product", "compare": "none", "currency": "CNY",
+                     "basis_policy": "strict"},
+            data_as_of=self.NOW,
+            limitations=["这些指标在本次范围内口径互不兼容：product_paid_amount；"
+                         "请按店铺分列后逐组查看，不能汇总或比较"],
+            basis=[{"shop_id": "S1", "metric": "product_paid_amount",
+                    "basis": "verified_payment/1", "time_basis": "pay_time",
+                    "metric_version": "1"}])
+
+    def test_basis_incompatible_result_is_delivered_not_retried_as_arguments(self):
+        """basis_incompatible 是确定性结果，不是模型参数非法：不得消耗修正名额。"""
+        from bi_agent.agent import SessionState, answer
+
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[self._call(metrics=["product_paid_amount"],
+                                     group_by="product")]),
+            _reply(text="两组口径不兼容，不能汇总或排名，请按店铺分列后再查。"),
+        ]
+        with patch("bi_agent.metrics.query_business",
+                   return_value=self._basis_incompatible_result()) as query:
+            turn = answer("近半月最好的10个商品", SessionState(subject="u1"),
+                          model=model, conn=self._conn(),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+            query.assert_called_once()
+
+        # 结果与 Artifact 被交付（bug 下两者都为空，且模型只收到修正消息）。
+        self.assertEqual(len(turn.results), 1)
+        self.assertEqual(turn.results[0].status, "invalid_parameters")
+        self.assertEqual(len(turn.artifacts), 1)
+        self.assertEqual(turn.artifacts[0]["status"], "invalid_parameters")
+        self.assertEqual(model.complete.call_count, 2)
+        self.assertNotIn("参数两次非法", turn.text or "")
+        tool_messages = [m for m in turn.state.turns if m.role == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+        content = tool_messages[-1].content or ""
+        self.assertIn("口径互不兼容", content)
+        self.assertIn("按店铺分列", content)
+        self.assertNotIn('"error"', content, "不得退化成 invalid_parameters 修正通道")
+        # 确定性兜底链也要能复述已交付的拒答，而不是只说“换一种问法”。
+        from bi_agent.agent import _deterministic_summary
+        summary = _deterministic_summary(list(turn.results))
+        self.assertIsNotNone(summary)
+        self.assertIn("口径互不兼容", summary)
+
+    def test_malformed_arguments_still_get_one_correction_then_stop(self):
+        """反恒真：真正的模型参数非法仍只给一次修正，第二次就停。"""
+        from bi_agent.agent import SessionState, answer
+        from bi_agent.llm import ToolCall
+
+        bad = ToolCall(id="call_1", name="query_business", arguments=None,
+                       arguments_error="invalid_json")
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[bad]),
+            _reply(calls=[ToolCall(id="call_2", name="query_business",
+                                   arguments=None, arguments_error="invalid_json")]),
+        ]
+        with patch("bi_agent.metrics.query_business") as query:
+            turn = answer("查一下", SessionState(subject="u1"), model=model,
+                          conn=self._conn(), allowed_shop_ids=frozenset({"S1"}),
+                          now=self.NOW, run_store=self.run_store)
+            query.assert_not_called()
+
+        self.assertEqual(turn.results, [])
+        self.assertEqual(turn.artifacts, [])
+        self.assertEqual(model.complete.call_count, 2)
+        self.assertIn("参数两次非法", turn.text or "")
+
+    def test_partitioned_product_ranking_result_is_delivered_in_one_call(self):
+        """复现句「近半月最好的10个商品」：一次调用拿到分区榜，不再四次试错到预算耗尽。"""
+        from bi_agent.agent import SessionState, answer
+
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[self._call(metrics=["product_paid_amount"],
+                                     group_by="product",
+                                     basis_policy="partitioned",
+                                     start="2026-09-01", end="2026-09-19")]),
+            _reply(text="已认证口径的 Top 2 见结果。"),
+        ]
+        with patch("bi_agent.metrics.query_business",
+                   return_value=self._partitioned_result()) as query:
+            turn = answer("近半月最好的10个商品", SessionState(subject="u1"),
+                          model=model, conn=self._conn(),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+            query.assert_called_once()
+        request = query.call_args.args[1]
+        self.assertEqual(request.basis_policy, "partitioned")
+        # 模型给的 09-19 是没跑完的一天：确定性解析器把两侧边界都改成最近15个完整日。
+        self.assertEqual(request.start, date(2026, 8, 24))
+        self.assertEqual(request.end, date(2026, 9, 8))
+        self.assertEqual(model.complete.call_count, 2)
+        tool_messages = [m for m in turn.state.turns if m.role == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+        content = tool_messages[-1].content or ""
+        self.assertIn("rank_groups", content)
+        self.assertIn("rank_group", content)
+        self.assertNotIn("budget_exhausted", content)
+        self.assertEqual(len(turn.results), 1)
+        self.assertEqual(turn.results[0].status, "ok")
+        self.assertEqual(len(turn.artifacts), 1)
+
+    def test_system_prompt_and_tool_doc_direct_partitioned_product_ranking(self):
+        """路由不靠运气：提示与工具说明必须直接让模型选对政策与指标。"""
+        from bi_agent import agent
+
+        prompt = agent._SYSTEM_PROMPT
+        self.assertIn("basis_policy=partitioned", prompt)
+        self.assertIn("rank_group", prompt)
+        self.assertIn("不能跨分区汇总、比较或排名", prompt)
+        description = next(item["function"]["description"] for item
+                           in agent._tool_schemas()
+                           if item["function"]["name"] == "query_business")
+        self.assertIn("partitioned", description)
+        enum = agent._tool_schemas()[0]["function"]["parameters"]["properties"][
+            "basis_policy"]["enum"]
+        self.assertEqual(sorted(enum), ["partitioned", "separate", "strict"])
+
+    def _partitioned_result(self):
+        """生产形状的分区结果：两个分区各自 Top-N，未认证分区按样本披露。"""
+        return ToolResult(
+            status="ok",
+            data=[{"shop_id": "S1", "product_id": "P1", "line_kind": "sale",
+                   "product_paid_amount": "300", "rank_group": "g1", "rank": 1},
+                  {"shop_id": "S1", "product_id": "P2", "line_kind": "sale",
+                   "product_paid_amount": "200", "rank_group": "g1", "rank": 2}],
+            metric_definition={"product_paid_amount":
+                               "已核验的非赠品父项行级分摊支付金额（按line_kind标注）"},
+            filters={"start": "2026-08-24", "end": "2026-09-08", "shop_ids": ["S1"],
+                     "metrics": ["product_paid_amount"], "group_by": "product",
+                     "compare": "none", "currency": "CNY",
+                     "basis_policy": "partitioned"},
+            data_as_of=self.NOW,
+            coverage=Coverage(status="partial", start=date(2026, 8, 24),
+                              end=date(2026, 9, 8)),
+            limitations=["本次结果按口径分为 1 个分区，分区之间不得汇总、比较或排名"],
+            rank_groups=[{"group": "g1", "status": "certified", "shop_ids": ["S1"],
+                          "basis": [{"metric": "product_paid_amount",
+                                     "basis": "platform_payment/v1",
+                                     "time_basis": "pay_time",
+                                     "time_certification": "certified"}],
+                          "groups_published": 2, "groups_total": 2,
+                          "truncated": False}],
+            rank_exclusions=[])
 
     def test_batch_of_five_executes_four(self):
         from bi_agent.agent import SessionState, answer

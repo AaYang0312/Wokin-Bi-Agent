@@ -396,6 +396,104 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
                 self.assertNotIn("shop_ids", runtime.state.normalized_request)
                 query_business.assert_not_called()
 
+    def test_basis_policy_enters_the_audited_normalized_request(self):
+        """basis_policy 决定兼容性判定：它必须进规范化请求（审计身份），不能被丢掉。"""
+        runtime = self._runtime(
+            question="查询店铺",
+            arguments={
+                "shop_ids": [S1_REF],
+                "start": "2026-09-01",
+                "end": "2026-09-02",
+                "metrics": ["paid_amount"],
+                "group_by": "shop",
+                "basis_policy": "separate",
+            },
+        )
+
+        resolve_parameters(runtime)
+        validate_parameters(runtime)
+
+        self.assertEqual(runtime.state.normalized_request["basis_policy"], "separate")
+
+    def test_half_month_window_overrides_a_model_end_that_reaches_today(self):
+        """「近半个月」对两侧边界都是权威的：模型给的当天/未来结束日不得留下。"""
+        runtime = self._runtime(
+            question="近半月最好的10个商品",
+            arguments={
+                "shop_ids": [S1_REF],
+                "start": "2026-09-01",
+                "end": "2026-09-19",
+                "metrics": ["product_paid_amount"],
+                "group_by": "product",
+                "basis_policy": "partitioned",
+            },
+        )
+
+        resolve_parameters(runtime)
+        validate_parameters(runtime)
+
+        # now 是 2026-09-10（北京）：最近 15 个完整日为 [2026-08-26, 2026-09-10)。
+        self.assertEqual(runtime.request.start, date(2026, 8, 26))
+        self.assertEqual(runtime.request.end, date(2026, 9, 10))
+        self.assertEqual(runtime.state.normalized_request["start"], "2026-08-26")
+        self.assertEqual(runtime.state.normalized_request["end"], "2026-09-10")
+        self.assertEqual(runtime.state.normalized_request["basis_policy"], "partitioned")
+
+    def test_half_month_window_overrides_a_narrower_model_window(self):
+        """更窄的模型窗口同样是残缺窗口：它会把后 8 天静默排在榜外。"""
+        runtime = self._runtime(
+            question="近半个月销量最好的商品",
+            arguments={
+                "shop_ids": [S1_REF],
+                "start": "2026-09-03",
+                "end": "2026-09-10",
+                "metrics": ["quantity"],
+                "group_by": "product",
+            },
+        )
+
+        resolve_parameters(runtime)
+        validate_parameters(runtime)
+
+        self.assertEqual(runtime.request.start, date(2026, 8, 26))
+        self.assertEqual(runtime.request.end, date(2026, 9, 10))
+
+    def test_explicit_range_in_the_question_wins_over_model_args_and_relative_words(self):
+        """问题里写明的日期范围优先：既盖过模型给的边界，也盖过句中的相对词。"""
+        runtime = self._runtime(
+            question="9月1日至7日的商品支付金额，最近7天也行",
+            arguments={
+                "shop_ids": [S1_REF],
+                "start": "2026-08-01",
+                "end": "2026-08-31",
+                "metrics": ["product_paid_amount"],
+                "group_by": "product",
+            },
+        )
+
+        resolve_parameters(runtime)
+        validate_parameters(runtime)
+
+        self.assertEqual(runtime.request.start, date(2026, 9, 1))
+        self.assertEqual(runtime.request.end, date(2026, 9, 8))
+
+    def test_relative_calendar_words_keep_todays_setdefault_behaviour(self):
+        """反恒真：未被授权的相对词仍只做缺省填充，不覆盖模型给的边界。"""
+        runtime = self._runtime(
+            question="那上个月呢",
+            arguments={
+                "shop_ids": [S1_REF],
+                "start": "2026-09-03",
+                "end": "2026-09-06",
+                "metrics": ["paid_amount"],
+            },
+        )
+
+        resolve_parameters(runtime)
+
+        self.assertEqual(runtime.resolved_args["start"], "2026-09-03")
+        self.assertEqual(runtime.resolved_args["end"], "2026-09-06")
+
     def test_only_authorized_runtime_reaches_execute_node(self):
         runtime = self._runtime(
             question="查询店铺",
@@ -508,6 +606,8 @@ class BusinessQueryExecutionTests(unittest.TestCase):
                 "compare": "none",
                 "top_n": 10,
                 "currency": "CNY",
+                # 兼容性判据的一半：口径策略是审计身份的一部分，不能丢。
+                "basis_policy": "strict",
             },
         )
         self.assertEqual(

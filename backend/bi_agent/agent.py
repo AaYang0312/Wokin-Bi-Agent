@@ -56,6 +56,12 @@ _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%
 只能使用六个工具：
 - query_business：按已确认口径查询经营指标，日期end排他；shop_ids 只能填 ent- 形式的店铺引用，
   可用引用：{ref_doc}。引用与真实店名的对应关系你看不到，也不要猜。
+  多店商品排行（如「近半个月最好的10个商品」）用 group_by=product、
+  metrics=["product_paid_amount"]（可选再加 quantity）、basis_policy=partitioned：服务端按
+  口径分区，每个分区各出一份 Top-N，行上带 rank_group。已认证分区正常转述；未认证分区
+  只能作为可观测样本；未发布的分区按 excluded_scope 与限制里的原因逐条说明。
+  **不能跨分区汇总、比较或排名**，也不能建议换一个指标来让被排除的分区出数——那是
+  来源、能力或付款时间口径的缺口，不是指标选错了。
 - analyze_product_performance：查**一个指定商品**在获准店铺内的跨店经营报告与七日趋势；
   product 只能填 ent- 商品引用或一段商品文字，范围用 scope（all_authorized 或显式引用/平台）。
   商品文字只用于找候选：命中多个候选时工具返 needs_input 并附候选引用，必须把候选问回用户，
@@ -477,7 +483,9 @@ def _tool_schemas() -> list[dict[str, object]]:
         {"type": "function", "function": {
             "name": "query_business",
             "description": "按已确认口径查询经营指标，日期end排他；shop_ids 只填 ent- 店铺引用；"
-                           "跨口径范围要分列时用 basis_policy=separate 且 group_by=shop",
+                           "跨口径范围要分列时用 basis_policy=separate 且 group_by=shop；"
+                           "多店商品排行用 basis_policy=partitioned 且 group_by=product，"
+                           "服务端按口径分区各自出 Top-N，分区之间不得汇总、比较或排名",
             "parameters": QueryRequest.model_json_schema()}},
         {"type": "function", "function": {
             "name": "analyze_product_performance",
@@ -537,12 +545,17 @@ NO_TEXT_WITHOUT_RESULTS = "本轮没能给出回答，请重试或换个问法�
 
 
 def _deterministic_summary(results: list[object]) -> str | None:
-    """从已持久化的领域结果生成兜底文本；没有任何成功结果时返回 None。"""
+    """从已持久化的领域结果生成兜底文本；没有任何成功结果时返回 None。
+
+    交付的确定性拒答（如 basis_incompatible 的 invalid_parameters）也在这里复述：
+    它已经落盘为 Artifact，不是“没拿到结果”，不能退化成“请重试或换个问法”。
+    """
     from .response_summary import render_result_summary
 
     for outcome in reversed(results):
         domain_result = getattr(outcome, "domain_result", outcome)
-        if getattr(domain_result, "status", None) not in ("success", "missing_data"):
+        if getattr(domain_result, "status", None) not in (
+                "success", "missing_data", "invalid_parameters"):
             continue
         text = render_result_summary(domain_result)
         if text:
@@ -743,7 +756,12 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     conn,
                     run_store,
                 )
-                if execution.domain_result.status.value == "needs_input":
+                # needs_input 里有两种截然不同的东西：真正的模型参数非法（没有确定性
+                # 结果）才允许修正一次；而 schema 已通过、图已执行并落盘的语义性拒答
+                # （如 basis_incompatible）是确定性结果，必须原样交付，不能当成参数
+                # 非法去重试——那会把已算好的“为什么不兼容”丢掉，只回一句“两次非法”。
+                if (execution.domain_result.status.value == "needs_input"
+                        and execution.tool_result is None):
                     if correction_used:
                         last_error = "参数两次非法，已停止本次回答"
                         stop_after_batch = True

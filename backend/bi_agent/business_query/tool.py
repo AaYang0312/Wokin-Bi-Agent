@@ -174,6 +174,52 @@ def safe_result_body(
     raw_diagnostics = payload.get("diagnostics")
     diagnostics = raw_diagnostics if isinstance(raw_diagnostics, dict) else {}
 
+    # 分区榜身份：内部带真实 shop_id（分区是按签名分组的店集），公开形状只留引用，
+    # 与行上的 rank_group 同名同值，否则名次就无法解释。
+    rank_groups: list[dict[str, object]] = []
+    raw_groups = payload.get("rank_groups")
+    if isinstance(raw_groups, list):
+        for item in raw_groups:
+            if not isinstance(item, dict):
+                continue
+            entry: dict[str, object] = {
+                "group": item.get("group"),
+                "status": item.get("status"),
+                "shop_refs": [catalog.shop_ref(str(shop_id))
+                              for shop_id in (item.get("shop_ids") or [])],
+                "basis": [{"metric": basis_item.get("metric"),
+                           "basis": basis_item.get("basis"),
+                           "time_basis": basis_item.get("time_basis"),
+                           "time_certification": basis_item.get("time_certification")}
+                          for basis_item in (item.get("basis") or [])
+                          if isinstance(basis_item, dict)],
+                "groups_published": item.get("groups_published"),
+                "groups_total": item.get("groups_total"),
+                "truncated": item.get("truncated"),
+            }
+            data_as_of = item.get("data_as_of")
+            if data_as_of is not None:
+                entry["data_as_of"] = (data_as_of.isoformat()
+                                       if hasattr(data_as_of, "isoformat")
+                                       else data_as_of)
+            rank_groups.append(entry)
+
+    # 被排除的店铺：形状与对比报告的 excluded_scope 同一套（引用 + 稳定原因码）。
+    excluded_scope: list[dict[str, object]] = []
+    raw_exclusions = payload.get("rank_exclusions")
+    if isinstance(raw_exclusions, list):
+        for item in raw_exclusions:
+            if not isinstance(item, dict) or item.get("shop_id") is None:
+                continue
+            exclusion: dict[str, object] = {
+                "shop_ref": catalog.shop_ref(str(item["shop_id"])),
+                "reason": item.get("reason"),
+            }
+            windows = item.get("windows")
+            if windows:
+                exclusion["windows"] = [str(window) for window in windows]
+            excluded_scope.append(exclusion)
+
     body: dict[str, object] = {
         "status": payload.get("status"),
         "metric_definition": payload.get("metric_definition"),
@@ -188,4 +234,9 @@ def safe_result_body(
     if not model_view:
         body["entities"] = catalog.entities_payload()
         body["catalog_version"] = catalog.catalog_version
+    # 只在非空时出现：非分区调用的载荷保持逐字节与以前相同。
+    if rank_groups:
+        body["rank_groups"] = rank_groups
+    if excluded_scope:
+        body["excluded_scope"] = excluded_scope
     return body

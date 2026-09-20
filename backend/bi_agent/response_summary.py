@@ -16,8 +16,11 @@ def render_result_summary(domain_result: Any) -> str:
     """把一次已完成的领域结果复述成纯文本兜底回答。"""
     if domain_result is None:
         return _MISSING
-    payload = getattr(domain_result, "model_payload", None)
-    if not isinstance(payload, dict) or payload.get("status") not in ("ok", "missing_data"):
+    payload = _payload_of(domain_result)
+    # invalid_parameters 也在这里：口径不兼容这类确定性拒答已被交付（有 Artifact），
+    # 兜底摘要同样要把“为什么不兼容、要怎么改范围”说给用户，而不是只说“请重试”。
+    if not isinstance(payload, dict) or payload.get("status") not in (
+            "ok", "missing_data", "invalid_parameters"):
         return _MISSING
 
     filters = payload.get("filters") if isinstance(payload.get("filters"), dict) else {}
@@ -54,10 +57,46 @@ def render_result_summary(domain_result: Any) -> str:
             f"{item.get('metric')}＝{item.get('basis')}（时间归属 {item.get('time_basis')}）"
             for item in basis))
 
+    groups = [item for item in (payload.get("rank_groups") or [])
+              if isinstance(item, dict)]
+    if groups:
+        # 分区榜有好几份名次：不写出来，兜底摘要就会把几个分区读成一个全局榜单。
+        lines.append("分区（各自出榜，不跨区比较）：" + "；".join(
+            f"{item.get('group')} "
+            + ("认证口径" if item.get("status") == "certified"
+               else "未认证口径，按可观测样本")
+            + f"，已出{item.get('groups_published')}/共{item.get('groups_total')}个商品"
+            for item in groups))
+
     limitations = [str(item) for item in (payload.get("limitations") or [])]
     if limitations:
         lines.append("限制：" + "；".join(limitations) + "。")
     return "\n".join(lines)
+
+
+def _payload_of(domain_result: Any) -> dict[str, Any] | None:
+    """取领域结果给模型的那份载荷；没有 model_payload 时按 ToolResult 形状读。
+
+    Agent 主层把已交付的确定性结果按 ToolResult 收集（不是 DomainResult），
+    兜底摘要要能直接复述它，而不是因为拿不到 model_payload 就退化成占位文案。
+    """
+    payload = getattr(domain_result, "model_payload", None)
+    if isinstance(payload, dict):
+        return payload
+    if not hasattr(domain_result, "status"):
+        return None
+    coverage = getattr(domain_result, "coverage", None)
+    return {
+        "status": getattr(domain_result, "status", None),
+        "metric_definition": getattr(domain_result, "metric_definition", None),
+        "coverage": (coverage.model_dump(mode="json")
+                     if hasattr(coverage, "model_dump") else coverage),
+        "filters": getattr(domain_result, "filters", None),
+        "data": getattr(domain_result, "data", None),
+        "data_as_of": getattr(domain_result, "data_as_of", None),
+        "limitations": getattr(domain_result, "limitations", None),
+        "basis": getattr(domain_result, "basis", None),
+    }
 
 
 def _render_rows(rows: list[dict[str, Any]]) -> str:

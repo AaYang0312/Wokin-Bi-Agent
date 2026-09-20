@@ -704,6 +704,140 @@ class QuantifiedLimitationContractTests(unittest.TestCase):
                     validate_artifact_payload(self._payload(bad))
 
 
+class PartitionedRankingContractTests(unittest.TestCase):
+    """分区榜单是新增载荷块：新列与新块都要在白名单处声明类型与取值。"""
+
+    PRODUCT_REF = "ent-0a1b2c3d"
+    GROUP = {
+        "group": "g1", "status": "certified", "shop_refs": [S1_REF],
+        "basis": [{"metric": "product_paid_amount",
+                   "basis": "platform_payment/v1", "time_basis": "pay_time",
+                   "time_certification": "certified"}],
+        "groups_published": 2, "groups_total": 3, "truncated": True,
+    }
+    ROWS = [
+        {"shop_ref": S1_REF, "product_ref": PRODUCT_REF, "line_kind": "sale",
+         "product_paid_amount": "300", "rank_group": "g1", "rank": 1},
+        {"shop_ref": S1_REF, "notice": "仅返回Top 2，共3个商品",
+         "rank_group": "g1"},
+    ]
+
+    def _payload(self, **overrides):
+        payload = {
+            "status": "ok",
+            "metric_definition": {
+                "product_paid_amount":
+                    "已核验的非赠品父项行级分摊支付金额（按line_kind标注）"},
+            "coverage": {"status": "complete", "start": "2026-09-01",
+                         "end": "2026-09-08", "gaps": []},
+            "limitations": [], "data_as_of": None, "filters": {},
+            "data": list(self.ROWS), "rank_groups": [dict(self.GROUP)],
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_well_formed_partitioned_payload_is_accepted(self):
+        from bi_agent.runtime.models import (validate_artifact_payload,
+                                             validate_model_payload)
+
+        payload = self._payload()
+        validate_artifact_payload(payload)
+        validate_model_payload(payload)
+
+    def test_rank_group_block_and_row_columns_are_type_validated(self):
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        cases = (
+            ("unknown_block_key", {"rank_groups": [{**self.GROUP, "total": 3}]}),
+            ("bad_label", {"rank_groups": [{**self.GROUP, "group": "1"}]}),
+            ("duplicate_group", {"rank_groups": [dict(self.GROUP), dict(self.GROUP)]}),
+            ("status_without_certified_basis", {
+                "rank_groups": [{**self.GROUP, "status": "observable_sample"}]}),
+            ("published_above_total", {
+                "rank_groups": [{**self.GROUP, "groups_published": 4}]}),
+            ("truncated_inconsistent", {
+                "rank_groups": [{**self.GROUP, "truncated": False}]}),
+            ("rank_as_decimal_string", {
+                "data": [{**self.ROWS[0], "rank": "1.0"}]}),
+            ("rank_below_one", {
+                "data": [{**self.ROWS[0], "rank": 0}]}),
+            ("unregistered_row_group", {
+                "data": [{**self.ROWS[0], "rank_group": "g2"}]}),
+            ("raw_shop_id_in_group", {
+                "rank_groups": [{**self.GROUP, "shop_ids": ["S1"]}]}),
+            ("unknown_basis_field", {
+                "rank_groups": [{**self.GROUP, "basis": [
+                    {**self.GROUP["basis"][0], "time_certification": "maybe"}]}]}),
+        )
+        for name, overrides in cases:
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    validate_artifact_payload(self._payload(**overrides))
+
+    def test_rows_carrying_a_rank_group_require_the_block(self):
+        """带分区标签的行不能没有分区块：否则那个 g1 没有任何人解释。"""
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        with self.assertRaises(ValueError):
+            validate_artifact_payload(self._payload(rank_groups=[]))
+
+
+class PartitionedLimitationContractTests(unittest.TestCase):
+    """分区披露同样是参数化文本：家数与指标名可变，句式与码固定。"""
+
+    CODES = {
+        "2 家店铺缺少 product_paid_amount 的已核验能力，未列入本次排行":
+            "capability_unavailable",
+        "2 家店铺的来源尚未开通（未授权或未同步），未列入本次排行":
+            "source_not_onboarded",
+        "12 家店铺的付款时间口径未经认证（实测不成立），未列入本次排行":
+            "coverage_time_basis_unverified",
+        "3 家店铺的数据覆盖不足或截止未知，未列入本次排行":
+            "coverage_incomplete",
+        "1 家店铺的来源质量核验未通过，未列入本次排行": "source_quality_failed",
+        "1 家店铺的商品分组数超过 500 上限，未列入本次排行": "result_too_large",
+        "分区结果共需 600 行，超过 500 行上限；请缩小 top_n 后重试":
+            "result_too_large",
+        "本次结果按口径分为 2 个分区，分区之间不得汇总、比较或排名":
+            "basis_incompatible",
+        "多店商品排行请改用 basis_policy=partitioned 重新发起 group_by=product 查询，"
+        "服务端按口径分区各自出Top-N": "basis_incompatible",
+    }
+
+    def _payload(self, limitation):
+        return {
+            "status": "ok", "metric_definition": {},
+            "coverage": {"status": "complete", "start": "2026-09-01",
+                         "end": "2026-09-08", "gaps": []},
+            "limitations": [limitation], "data_as_of": None,
+            "filters": {}, "data": [],
+        }
+
+    def test_each_partitioned_disclosure_is_accepted_and_carries_a_stable_code(self):
+        from bi_agent.business_query.nodes import _limitation_codes
+        from bi_agent.runtime.models import (validate_artifact_payload,
+                                             validate_model_payload)
+
+        for text, code in self.CODES.items():
+            with self.subTest(text=text[:22]):
+                validate_artifact_payload(self._payload(text))
+                validate_model_payload(self._payload(text))
+                self.assertEqual(_limitation_codes([text]), [code])
+
+    def test_invented_partitioned_variants_are_rejected(self):
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        for bad in (
+            "2 家店铺缺少 product_paid_amount 的已核验能力，未列入本次排行（店铺166754）",
+            "2 家店铺缺少 的已核验能力，未列入本次排行",
+            "2 家店铺的付款时间口径未经认证，未列入本次排行吧",
+            "分区结果共需 600 行，超过 500 行上限",
+        ):
+            with self.subTest(bad=bad[:24]):
+                with self.assertRaises(ValueError):
+                    validate_artifact_payload(self._payload(bad))
+
+
 class MemoryQueryRunStoreTests(unittest.TestCase):
     def setUp(self):
         self.store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})

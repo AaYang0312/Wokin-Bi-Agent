@@ -43,7 +43,7 @@ from bi_agent.listing_audit.rules import (
     LISTING_NUMERIC_RESULT_COLUMNS, LISTING_PUBLIC_LIMITATIONS,
     LISTING_REF_RE, LISTING_REF_RESULT_COLUMNS,
     LISTING_RESULT_COLUMNS, LISTING_SOURCE_KINDS, MAX_ROSTER_ITEMS, PRICE_BASES)  # noqa: E501
-from bi_agent.metrics import Coverage, METRIC_DEFINITIONS
+from bi_agent.metrics import BASIS_POLICIES, Coverage, METRIC_DEFINITIONS
 from bi_agent.presentation.charts import (
     CHART_BASELINES, CHART_KINDS, CHART_NULL_HANDLES, CHART_PAYLOAD_KEYS,
     CHART_REQUIRED_PAYLOAD_KEYS, CHART_SERIES_COLUMNS, CHART_SPEC_NAME,
@@ -215,6 +215,9 @@ _PUBLIC_LIMITATIONS = frozenset({
     "上期覆盖不足，无法比较，仅返回绝对值",
     "比较仅支持total/shop分组",
     "同批支付额为0或无支付，同批退款率不可计算",
+    # 多店商品排行的正确出口：固定一句话，不多不少。
+    "多店商品排行请改用 basis_policy=partitioned 重新发起 group_by=product 查询，"
+    "服务端按口径分区各自出Top-N",
 }) | PROMOTION_PUBLIC_LIMITATIONS | COMMERCE_PUBLIC_LIMITATIONS \
     | LISTING_PUBLIC_LIMITATIONS | INVENTORY_PUBLIC_LIMITATIONS
 _PUBLIC_LIMITATION_PATTERNS = (
@@ -241,6 +244,15 @@ _PUBLIC_LIMITATION_PATTERNS = (
     # 付款时间口径未认证：家数可变，两种后果（拒答 / 披露）各一句固定文本。
     re.compile(r"^[0-9]+ 家店铺的付款时间口径未经认证，未执行金额查询$"),
     re.compile(r"^[0-9]+ 家店铺的结果来自未认证付款时间口径，按可观测样本披露$"),
+    # 分区商品排行的排除披露：家数（有的还带指标名与上限数）可变，句式固定。
+    re.compile(r"^[0-9]+ 家店铺的来源尚未开通（未授权或未同步），未列入本次排行$"),
+    re.compile(r"^[0-9]+ 家店铺缺少 [a-z_、]+ 的已核验能力，未列入本次排行$"),
+    re.compile(r"^[0-9]+ 家店铺的付款时间口径未经认证（实测不成立），未列入本次排行$"),
+    re.compile(r"^[0-9]+ 家店铺的数据覆盖不足或截止未知，未列入本次排行$"),
+    re.compile(r"^[0-9]+ 家店铺的来源质量核验未通过，未列入本次排行$"),
+    re.compile(r"^[0-9]+ 家店铺的商品分组数超过 [0-9]+ 上限，未列入本次排行$"),
+    re.compile(r"^分区结果共需 [0-9]+ 行，超过 [0-9]+ 行上限；请缩小 top_n 后重试$"),
+    re.compile(r"^本次结果按口径分为 [0-9]+ 个分区，分区之间不得汇总、比较或排名$"),
     # 商品归属披露：四个分项必现（缺项就是给猜测留空间），金额形式与 _DECIMAL_RE 同源。
     re.compile(
         r"^支付额中" + _MONEY + r"元未计入商品维度"
@@ -286,6 +298,8 @@ _ARTIFACT_KEYS = frozenset({
     "audit",
     # 库存预警（Task 10）：期望项与扫描事实分列，池声明与阈值来源随行可核对。
     "inventory",
+    # 分区商品排行：每个已发布分区的身份与口径陈述（行上的 rank_group 靠它解释）。
+    "rank_groups",
 })
 
 # ---------------------------------------------------------------------------
@@ -315,6 +329,8 @@ _DIAGNOSIS_KEYS = frozenset({
     "erp_document_coverage",
     # 对比报告请求了几个分组、发布了几家：让“缺了哪几个”能机器核对。
     "comparison_groups",
+    # 分区商品排行发布/排除了几个分区与几家店：不是每家店都能上榜这件事可机器核对。
+    "product_ranking",
 })
 _DIAGNOSIS_FIELDS = {
     "unmatched_refunds": frozenset({
@@ -326,6 +342,9 @@ _DIAGNOSIS_FIELDS = {
         "documents", "documents_with_gross_profit", "publishable"}),
     "comparison_groups": frozenset({
         "groups_requested", "groups_published", "publishable"}),
+    "product_ranking": frozenset({
+        "groups_published", "shops_published", "shops_excluded", "rows_published",
+        "row_cap"}),
 }
 # 名称只在授权展示层出现：模型载荷带上这两项就是契约违规。
 _PUBLIC_ONLY_ARTIFACT_KEYS = frozenset({"entities", "catalog_version"})
@@ -351,6 +370,9 @@ _INVENTORY_UNITS: frozenset[str] = INVENTORY_UNIT_RESULT_COLUMNS
 _INVENTORY_QUANTITIES: frozenset[str] = INVENTORY_QUANTITY_RESULT_COLUMNS
 _INVENTORY_INTS: frozenset[str] = INVENTORY_INT_RESULT_COLUMNS
 _PRICE_BASES = frozenset(PRICE_BASES)
+# 口径政策词表由 `bi_agent.metrics` 持有（它同时是唯一构造入口），这里只引用：
+# 两边各拄一份，就会出现“载荷里能写 partitioned、引擎却不认识”的漂移。
+_BASIS_POLICIES = frozenset(BASIS_POLICIES)
 _AUDIT_STATUSES = frozenset(AUDIT_STATUSES)
 # 库存预警同一做派：列名、类别与取值集都由 `inventory.rules` 持有并自校。
 _POOL_RE = POOL_REF_RE
@@ -365,7 +387,14 @@ _METRIC_RESULT_COLUMNS = frozenset({
     "day", "shop_ref", "product_ref", "line_kind", "currency",
     "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
     "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount", "notice",
+    # 分区商品排行：名次只在分区内计数，所以名次必须与分区标签一起出现。
+    "rank", "rank_group",
 })
+# 分区名次是**计数**不是金额：它不是 _DECIMAL_RE 能表达的列，必须在数值分支之前接住。
+_METRIC_INT_RESULT_COLUMNS = frozenset({"rank"})
+# 分区标签是 `g1..gN` 的封闭形式（与 rank_groups[].group 同一规则），不是自由文本。
+_METRIC_LABEL_PATTERN_RESULT_COLUMNS: dict[str, re.Pattern[str]] = {
+    "rank_group": re.compile(r"^g[1-9][0-9]?$")}
 _REF_RESULT_COLUMNS = (frozenset({"shop_ref", "product_ref"})
                        | LISTING_REF_RESULT_COLUMNS | INVENTORY_REF_RESULT_COLUMNS)
 # 文本列只有上限、转义与长数字主键三道限制；不放开成“任意字符串都收”。
@@ -392,6 +421,8 @@ _NUMERIC_RESULT_COLUMNS = ((_RESULT_COLUMNS - _REF_RESULT_COLUMNS - _DATE_RESULT
                             - _TEXT_RESULT_COLUMNS - _DATETIME_RESULT_COLUMNS
                             - _LISTING_REF_RESULT_COLUMNS - LISTING_RESULT_COLUMNS
                             - INVENTORY_RESULT_COLUMNS - INVENTORY_INT_RESULT_COLUMNS
+                            - _METRIC_INT_RESULT_COLUMNS
+                            - frozenset(_METRIC_LABEL_PATTERN_RESULT_COLUMNS)
                             - frozenset(_LABEL_RESULT_VALUES))
                            | LISTING_NUMERIC_RESULT_COLUMNS
                            | INVENTORY_QUANTITY_RESULT_COLUMNS)
@@ -1164,6 +1195,13 @@ def _result_rows(value: object, *, public: bool) -> None:
             # 是固定指标的列名），走那一支就会把裸 JSON 整数当成合法数量收下来。
             if key in INVENTORY_QUANTITY_RESULT_COLUMNS:
                 _quantity_or_null(result_value)
+            elif key in _METRIC_INT_RESULT_COLUMNS:
+                _positive_int(result_value)
+            elif key in _METRIC_LABEL_PATTERN_RESULT_COLUMNS:
+                pattern = _METRIC_LABEL_PATTERN_RESULT_COLUMNS[key]
+                if not (isinstance(result_value, str)
+                        and pattern.fullmatch(result_value)):
+                    _unsafe_payload()
             elif key in _NUMERIC_RESULT_COLUMNS:
                 _numeric_result(result_value)
             elif key in _DATE_RESULT_COLUMNS:
@@ -1213,6 +1251,8 @@ def _filters(value: object, *, public: bool) -> None:
             _unsafe_payload()
     if "currency" in filters and filters["currency"] != "CNY":
         _unsafe_payload()
+    if "basis_policy" in filters:
+        _string_in(filters["basis_policy"], _BASIS_POLICIES)
     if "mode" in filters:
         _string_in(filters["mode"], PROMOTION_MODE_VALUES)
     if "platforms" in filters:
@@ -1293,6 +1333,8 @@ def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
         _group_statuses(payload["group_statuses"])
     if "ranking" in payload:
         _ranking(payload["ranking"])
+    if "rank_groups" in payload:
+        _rank_groups(payload["rank_groups"], data=payload.get("data"))
     if "trend_window" in payload:
         _date_pair(payload["trend_window"])
     if "resolved_product" in payload:
@@ -1360,6 +1402,78 @@ def _diagnostics(value: object) -> None:
         for item in fields.values():
             if not _diagnosis_value_ok(item):
                 raise ValueError("diagnostics_invalid")
+
+
+_RANK_GROUP_KEYS = frozenset({
+    "group", "status", "shop_refs", "basis", "groups_published", "groups_total",
+    "truncated", "data_as_of",
+})
+_RANK_GROUP_REQUIRED = frozenset({
+    "group", "status", "shop_refs", "basis", "groups_published", "groups_total",
+    "truncated",
+})
+_RANK_GROUP_STATUSES = frozenset({"certified", "observable_sample"})
+_RANK_BASIS_KEYS = frozenset({"metric", "basis", "time_basis", "time_certification"})
+_TIME_CERTIFICATIONS = frozenset({"certified", "unmeasured", "disproved"})
+
+
+def _rank_groups(value: object, *, data: object) -> None:
+    """分区榜身份：标签、状态、参加口径与行数互相自证，不许出现无法解释的名次。
+
+    三条硬约束：标签唯一且形状封闭；状态必须与逐指标认证状态一致（把样本说成
+    认证就是拿可观测窗口冒充完整窗口）；名次行必须能在这一块里找到自己的分区。
+    """
+    if not isinstance(value, list) or not value:
+        _unsafe_payload()
+    seen: set[str] = set()
+    for item in value:
+        entry = _mapping(item, allowed=_RANK_GROUP_KEYS, required=_RANK_GROUP_REQUIRED)
+        label = entry["group"]
+        if not isinstance(label, str) or not _RANK_GROUP_LABEL_RE.fullmatch(label):
+            _unsafe_payload()
+        if label in seen:
+            _unsafe_payload()      # 两个分区共用一个标签，行上的名次就说不清属于谁
+        seen.add(label)
+        _string_in(entry["status"], _RANK_GROUP_STATUSES)
+        _string_list(entry["shop_refs"], _ref)
+        basis = entry["basis"]
+        if not isinstance(basis, list) or not basis:
+            _unsafe_payload()
+        certifications: set[str] = set()
+        for item_value in basis:
+            row = _mapping(item_value, allowed=_RANK_BASIS_KEYS,
+                           required=_RANK_BASIS_KEYS)
+            if row["metric"] not in _METRIC_DEFINITION_TEXTS:
+                _unsafe_payload()
+            for key in ("basis", "time_basis"):
+                if not (isinstance(row[key], str)
+                        and _BASIS_NAME_RE.fullmatch(row[key])):
+                    _unsafe_payload()
+            _string_in(row["time_certification"], _TIME_CERTIFICATIONS)
+            certifications.add(str(row["time_certification"]))
+        published = entry["groups_published"]
+        total = entry["groups_total"]
+        _non_negative_int(published)
+        _non_negative_int(total)
+        if published > total:
+            _unsafe_payload()
+        truncated = entry["truncated"]
+        if not isinstance(truncated, bool) or truncated != (published < total):
+            # 截断与否只能由行数自己说：两者不一致就一定有一边是错的。
+            _unsafe_payload()
+        certified = certifications == {"certified"}
+        if certified != (entry["status"] == "certified"):
+            _unsafe_payload()
+        if "data_as_of" in entry and entry["data_as_of"] is not None:
+            _datetime_string(entry["data_as_of"])
+    labelled = {str(row.get("rank_group"))
+                for row in (data or []) if isinstance(row, dict) and "rank_group" in row}
+    missing = sorted(labelled - seen)
+    if missing:
+        _unsafe_payload()      # 带分区标签却没有分区块：那个标签没有任何解释
+
+
+_RANK_GROUP_LABEL_RE = re.compile(r"^g[1-9][0-9]?$")
 
 
 _INVENTORY_SUMMARY_KEYS = frozenset({

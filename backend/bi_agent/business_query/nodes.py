@@ -11,7 +11,14 @@ from pydantic import ValidationError
 
 from bi_agent import metrics
 from bi_agent.catalog import CatalogUnauthorized, build_catalog
-from bi_agent.metrics import Coverage, METRIC_DEFINITIONS, QueryRequest, ToolResult, resolve_period
+from bi_agent.metrics import (
+    BASIS_POLICIES,
+    Coverage,
+    METRIC_DEFINITIONS,
+    QueryRequest,
+    ToolResult,
+    resolve_period_detail,
+)
 from bi_agent.runtime.models import (
     ArtifactPersistenceError,
     DomainStatus,
@@ -28,6 +35,9 @@ from .tool import to_public_artifact
 
 _GROUP_BY = frozenset({"total", "day", "shop", "product"})
 _COMPARE = frozenset({"none", "previous_period"})
+# 政策词表只从 metrics 引用：两边各拄一份，“能写进载荷但图里判不出来”的取值
+# 迟早会出现（与 _GROUP_BY 同一条理由）。
+_BASIS_POLICIES = BASIS_POLICIES
 _SHOP_IDS_SOURCE = "_shop_ids_source"
 _REF_SHOPS = "refs"
 _PREVIOUS_FILTER_SHOPS = "previous_filters"
@@ -41,6 +51,7 @@ _VALIDATION_PROBLEMS = {
     "compare": "invalid_compare",
     "top_n": "invalid_top_n",
     "shop_ids": "invalid_shop",
+    "basis_policy": "invalid_parameters",
 }
 _ProblemCode = Literal[
     "missing_parameters",
@@ -70,17 +81,22 @@ def resolve_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
     shop_refs, shop_source = _resolve_shops(args, runtime, ref_reverse)
     args[_SHOP_IDS_SOURCE] = shop_source
 
-    if "start" not in args or "end" not in args:
-        period = resolve_period(runtime.context.question, now=runtime.context.now)
+    # 问题里写明的日期范围、以及“近半个月”这类已识别相对词，对窗口两侧都是权威的：
+    # 模型给的结束日可能落在没跑完的今天/未来，也可能是个更窄的残缺窗口。
+    # 权威窗口直接写进 args；其余相对/日历词仍只做缺省填充（行为不变）。
+    period = resolve_period_detail(runtime.context.question, now=runtime.context.now)
+    if period is not None and period.kind != "relative":
+        args["start"] = period.start.isoformat()
+        args["end"] = period.end.isoformat()
+    elif "start" not in args or "end" not in args:
         previous_start = runtime.context.previous_filters.get("start")
         previous_end = runtime.context.previous_filters.get("end")
         if period is not None:
-            args.setdefault("start", period[0].isoformat())
-            args.setdefault("end", period[1].isoformat())
+            args.setdefault("start", period.start.isoformat())
+            args.setdefault("end", period.end.isoformat())
         elif previous_start and previous_end:
             args.setdefault("start", previous_start)
             args.setdefault("end", previous_end)
-
     if "metrics" not in args or not args.get("metrics"):
         previous_metrics = runtime.context.previous_filters.get("metrics")
         args["metrics"] = (
@@ -137,6 +153,9 @@ def validate_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
         "compare": request.compare,
         "top_n": request.top_n,
         "currency": request.currency,
+        # 兼容性判据的一半：同一份指标范围，basis_policy 不同就是两个问题，
+        # 指纹与审计必须区分（strict 拒答、separate 才是显式分列）。
+        "basis_policy": request.basis_policy,
     }
     if isinstance(refs, list):
         normalized_request["shop_refs"] = refs
@@ -185,8 +204,7 @@ def authorize_scope(
 
 
 _LIMITATION_CODES = {
-    "覆盖未完成，拒绝部分汇总；缺口见coverage.gaps": "coverage_incomplete",
-    "数据截止未知（回填未完成）": "data_as_of_unknown",
+    "覆盖未完成，拒绝部分汇总；缺口见coverage.gaps": "coverage_incomplete",    "数据截止未知（回填未完成）": "data_as_of_unknown",
     "来源质量核验未通过，拒绝出数": "source_quality_failed",
     "来源质量未核验（尚无对账记录）": "source_quality_unverified",
     "店铺尚未同步，无法查询": "shop_not_synced",
@@ -446,8 +464,9 @@ def _classify(result: ToolResult) -> tuple[DomainStatus, ErrorEnvelope | None]:
     if (
         result.status == "ok"
         and result.coverage.status == "partial"
-        and bool(result.data)
     ):
+        # 分区榜可以“已评估但确实没有商品”：范围不完整不等于契约违规。
+        # 非分区路径不会产生 ok+partial（覆盖不完成在 metrics 里先降级成 missing_data）。
         return DomainStatus.PARTIAL, None
     if result.status == "missing_data":
         return DomainStatus.MISSING_DATA, None
@@ -521,10 +540,26 @@ def _limitation_codes(limitations: list[str]) -> list[str]:
             # 时间口径未认证与缺覆盖是两类缺口：前者等回填不会自己好。
             code = "coverage_time_basis_unverified"
         if (code is None and " 家店铺缺少 " in limitation
-                and "的已核验能力，未执行金额查询" in limitation):
+                and ("的已核验能力，未执行金额查询" in limitation
+                     or "的已核验能力，未列入本次排行" in limitation)):
             # 指标能力未开通与缺覆盖是两回事：前者缩小日期范围永远拿不到数，
             # 所以恢复策略归到缺口类（一次不追加），不能当成可重试的临时失败。
             code = "capability_unavailable"
+        if code is None and " 家店铺的数据覆盖不足或截止未知，未列入本次排行" in limitation:
+            code = "coverage_incomplete"
+        if code is None and " 家店铺的来源质量核验未通过，未列入本次排行" in limitation:
+            code = "source_quality_failed"
+        if (code is None and limitation.startswith("分区结果共需 ")
+                and limitation.endswith("请缩小 top_n 后重试")):
+            # 组合输出超限与行数超限同一归因：都是“范围太大”，不是数据异常。
+            code = "result_too_large"
+        if (code is None and " 家店铺的商品分组数超过 " in limitation
+                and "未列入本次排行" in limitation):
+            code = "result_too_large"
+        if code is None and "本次结果按口径分为" in limitation and "分区之间不得汇总、比较或排名" in limitation:            # 分区榜只是一份带范围说明的结果：跨分区汇总/比较/排名仍然被拒。
+            code = "basis_incompatible"
+        if code is None and limitation.startswith("多店商品排行请改用"):
+            code = "basis_incompatible"
         if code is not None and code not in codes:
             codes.append(code)
     return codes
@@ -662,6 +697,9 @@ def _normalized_request(
         normalized["top_n"] = top_n
     if args.get("currency") == "CNY":
         normalized["currency"] = "CNY"
+    basis_policy = args.get("basis_policy")
+    if isinstance(basis_policy, str) and basis_policy in _BASIS_POLICIES:
+        normalized["basis_policy"] = basis_policy
     return normalized
 
 
