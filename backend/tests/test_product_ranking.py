@@ -227,6 +227,56 @@ class ProductRankingPartitionDatabaseTests(unittest.TestCase):
         self.assertEqual(sorted({item["shop_id"] for item in result.basis}),
                          ["JD1", "S1"])
 
+    def test_gap_then_equal_length_prior_window_publishes_eligible_partitions(self):
+        """The real test DB has rows before a tail gap; shifting may recover them.
+
+        A disproved outstock source must stay excluded even after the shift.
+        """
+        from bi_agent.agent import _prior_window_from_exclusions
+        from bi_agent.metrics import QueryRequest, query_business
+        from bi_agent.sources import OUTSTOCK_SOURCE, TRADE_LIST_SOURCE
+
+        self._seed_trade("S1", {"P_A": "300"}, source=TRADE_LIST_SOURCE)
+        self._seed_trade("JD1", {"P_C": "500"}, source=TRADE_LIST_SOURCE)
+        self._seed_trade("TB1", {"P_D": "900"}, source=OUTSTOCK_SOURCE)
+        for shop_id, source in (("S1", TRADE_LIST_SOURCE),
+                                ("JD1", TRADE_LIST_SOURCE),
+                                ("TB1", OUTSTOCK_SOURCE)):
+            self._seed_coverage(shop_id, source=source)
+        for shop_id in ("S1", "JD1"):
+            self.conn.execute(
+                "UPDATE bi.sync_state SET covered = "
+                "tstzmultirange(tstzrange('2026-08-24','2026-09-08','[)')) "
+                "WHERE source=%s AND entity='orders' AND shop_id=%s",
+                (TRADE_LIST_SOURCE, shop_id))
+
+        now = datetime(2026, 9, 16, tzinfo=BEIJING)
+        request = QueryRequest(start=date(2026, 9, 1), end=date(2026, 9, 16),
+                               shop_ids=["S1", "JD1", "TB1"],
+                               metrics=["product_paid_amount"], group_by="product",
+                               basis_policy="partitioned")
+        initial = query_business(
+            self.conn, request, allowed_shop_ids=frozenset(request.shop_ids),
+            now=now, deadline=time_module.monotonic() + 30)
+        self.assertEqual(initial.status, "missing_data")
+        self.assertEqual(_prior_window_from_exclusions(
+            "近半个月的商品排行，遇到数据缺口就把时间段向前移动", now, initial),
+            ("2026-08-24", "2026-09-08"))
+
+        prior = request.model_copy(update={"start": date(2026, 8, 24),
+                                           "end": date(2026, 9, 8)})
+        recovered = query_business(
+            self.conn, prior, allowed_shop_ids=frozenset(prior.shop_ids),
+            now=now, deadline=time_module.monotonic() + 30)
+        self.assertEqual(recovered.status, "ok", recovered.limitations)
+        self.assertEqual([(group["status"], group["shop_ids"])
+                          for group in recovered.rank_groups],
+                         [("certified", ["S1"]),
+                          ("observable_sample", ["JD1"])])
+        self.assertEqual(recovered.rank_exclusions,
+                         [{"shop_id": "TB1", "reason": "coverage_time_basis_unverified"}])
+        self.assertEqual(len([row for row in recovered.data if "product_id" in row]), 2)
+
     def test_partitioned_ranking_keeps_the_final_group_cap_per_cohort(self):
         from bi_agent.metrics import MAX_ROWS
         from bi_agent.sources import TRADE_LIST_SOURCE

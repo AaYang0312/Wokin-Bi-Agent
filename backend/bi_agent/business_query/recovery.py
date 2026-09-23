@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Literal
 
 RecoveryAction = Literal[
@@ -40,6 +41,25 @@ TERMINAL_REASONS = frozenset({
 # 临时故障重试需要的最小剩余预算：低于它重试只会把整轮拖死。
 TRANSIENT_RETRY_MIN_SECONDS = 3.0
 PARAMETER_RETRY_MIN_SECONDS = 2.0
+
+
+def user_authorized_prior_window(question: str) -> bool:
+    """Only an affirmative instruction about a data gap permits an earlier window.
+
+    This authorizes a bounded server-chosen retry, not an arbitrary date supplied by
+    the model. A negated instruction must not accidentally opt the user in.
+    """
+    # 提问、回顾过去及本轮否定都不是对额外查询的授权；宁可不前移。
+    if re.search(r"[?？]|要不要|能否|是否|可否|能不能", question):
+        return False
+    if re.search(r"不要|别|禁止|不准|无需|不用|不必|暂不|不能|不允许", question):
+        return False
+    if re.search(r"(?:上次|此前|曾经|之前|以前).{0,24}(?:前移|往前|向前)", question):
+        return False
+    return bool(re.search(
+        r"(?:缺口|缺数|缺数据|覆盖不足)[^。！？?]{0,24}"
+        r"(?:就|则|请|把|需要|要)[^。！？?]{0,12}(?:前移|往前|向前|更早)",
+        question))
 
 
 @dataclass(frozen=True)

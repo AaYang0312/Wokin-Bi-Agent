@@ -458,6 +458,47 @@ class BusinessQueryInputNodeTests(unittest.TestCase):
         self.assertEqual(runtime.request.start, date(2026, 8, 26))
         self.assertEqual(runtime.request.end, date(2026, 9, 10))
 
+    def test_user_authorized_prior_window_survives_half_month_normalization(self):
+        """Only a trusted fallback after a gap may shift the user's half-month window."""
+        runtime = self._runtime(
+            question="近半个月最好的商品，遇到数据缺口就把时间段向前移动",
+            arguments={"shop_ids": [S1_REF], "start": "2026-08-21",
+                       "end": "2026-09-05", "metrics": ["product_paid_amount"],
+                       "group_by": "product", "basis_policy": "partitioned"},
+        )
+        runtime.context.trusted_window_override = ("2026-08-21", "2026-09-05")
+        resolve_parameters(runtime)
+        validate_parameters(runtime)
+        self.assertEqual((runtime.request.start, runtime.request.end),
+                         (date(2026, 8, 21), date(2026, 9, 5)))
+        self.assertEqual(runtime.state.normalized_request["start"], "2026-08-21")
+
+    def test_full_gap_allows_one_whole_prior_half_month(self):
+        runtime = self._runtime(
+            question="近半个月最好的商品，遇到数据缺口就把时间段向前移动",
+            arguments={"shop_ids": [S1_REF], "start": "2026-08-11",
+                       "end": "2026-08-26", "metrics": ["product_paid_amount"],
+                       "group_by": "product", "basis_policy": "partitioned"},
+        )
+        runtime.context.trusted_window_override = ("2026-08-11", "2026-08-26")
+        resolve_parameters(runtime)
+        validate_parameters(runtime)
+        self.assertEqual((runtime.request.start, runtime.request.end),
+                         (date(2026, 8, 11), date(2026, 8, 26)))
+
+    def test_unapproved_prior_window_is_still_overridden(self):
+        runtime = self._runtime(
+            question="近半个月最好的商品",
+            arguments={"shop_ids": [S1_REF], "start": "2026-08-21",
+                       "end": "2026-09-05", "metrics": ["product_paid_amount"],
+                       "group_by": "product", "basis_policy": "partitioned"},
+        )
+        runtime.context.trusted_window_override = ("2026-08-21", "2026-09-05")
+        resolve_parameters(runtime)
+        validate_parameters(runtime)
+        self.assertEqual((runtime.request.start, runtime.request.end),
+                         (date(2026, 8, 26), date(2026, 9, 10)))
+
     def test_explicit_range_in_the_question_wins_over_model_args_and_relative_words(self):
         """问题里写明的日期范围优先：既盖过模型给的边界，也盖过句中的相对词。"""
         runtime = self._runtime(

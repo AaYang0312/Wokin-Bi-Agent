@@ -29,6 +29,7 @@ from bi_agent.runtime.models import (
 )
 
 from .graph import transition_state
+from .recovery import user_authorized_prior_window
 from .state import BusinessQueryNode, BusinessQueryRuntime
 from .tool import to_public_artifact
 
@@ -81,11 +82,23 @@ def resolve_parameters(runtime: BusinessQueryRuntime) -> BusinessQueryRuntime:
     shop_refs, shop_source = _resolve_shops(args, runtime, ref_reverse)
     args[_SHOP_IDS_SOURCE] = shop_source
 
-    # 问题里写明的日期范围、以及“近半个月”这类已识别相对词，对窗口两侧都是权威的：
-    # 模型给的结束日可能落在没跑完的今天/未来，也可能是个更窄的残缺窗口。
-    # 权威窗口直接写进 args；其余相对/日历词仍只做缺省填充（行为不变）。
+    # 原始明确日期/近半个月仍是权威窗口。唯一例外：用户本轮明示缺口可前移，
+    # 且服务端已经观察到缺口并给出了等长、更早的可信窗口。模型参数自身无权开启例外。
     period = resolve_period_detail(runtime.context.question, now=runtime.context.now)
-    if period is not None and period.kind != "relative":
+    trusted = runtime.context.trusted_window_override
+    approved = False
+    if (period is not None and period.kind == "half_month" and trusted is not None
+            and user_authorized_prior_window(runtime.context.question)):
+        try:
+            shifted_start, shifted_end = (date.fromisoformat(item) for item in trusted)
+            approved = (shifted_end - shifted_start == period.end - period.start
+                        and shifted_start < period.start
+                        and period.start <= shifted_end < period.end)
+        except (TypeError, ValueError):
+            approved = False
+    if approved:
+        args["start"], args["end"] = trusted
+    elif period is not None and period.kind != "relative":
         args["start"] = period.start.isoformat()
         args["end"] = period.end.isoformat()
     elif "start" not in args or "end" not in args:

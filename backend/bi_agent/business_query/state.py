@@ -110,6 +110,9 @@ class BusinessQueryContext:
     now: datetime
     deadline: float
     attempt_no: int
+    # Only the server may set this after observing a real coverage gap. It never
+    # enters the model schema or the persisted graph state.
+    trusted_window_override: tuple[str, str] | None = None
 
 
 @dataclass

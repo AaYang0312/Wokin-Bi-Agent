@@ -25,6 +25,7 @@ from .business_query.tool import (
     to_public_artifact as _to_public_artifact,
 )
 from .business_query import BusinessQueryContext
+from .business_query.recovery import user_authorized_prior_window
 from .commerce.models import DomainContext
 from .commerce.tool import (
     commerce_request_schema, comparison_request_schema, execute_commerce_tool)
@@ -40,7 +41,7 @@ from .inventory.tool import (
     execute_inventory_tool, inventory_request_schema)
 from .listing_audit.tool import (
     execute_listing_audit_tool, listing_audit_request_schema)
-from .metrics import QueryRequest, ToolResult, resolve_period
+from .metrics import QueryRequest, ToolResult, resolve_period, resolve_period_detail
 from .data_quality import SHOP_PLATFORMS_SQL
 from .sources import DOCUMENT_BASIS, OUTSTOCK_SOURCE, registration
 from .promotion import PromotionRequest, evaluate_promotion
@@ -61,7 +62,9 @@ _SYSTEM_PROMPT = """你是内部电商经营助手。当前北京时间：{now:%
   口径分区，每个分区各出一份 Top-N，行上带 rank_group。已认证分区正常转述；未认证分区
   只能作为可观测样本；未发布的分区按 excluded_scope 与限制里的原因逐条说明。
   **不能跨分区汇总、比较或排名**，也不能建议换一个指标来让被排除的分区出数——那是
-  来源、能力或付款时间口径的缺口，不是指标选错了。
+  来源、能力或付款时间口径的缺口，不是指标选错了。用户明确要求遇到缺口前移时，
+  服务端会依据实际覆盖缺口额外尝试一次等长窗口；只转述返回的实际窗口，不能声称
+  尝试过未出现在结果中的日期，也不要重复发同一窗口。
 - analyze_product_performance：查**一个指定商品**在获准店铺内的跨店经营报告与七日趋势；
   product 只能填 ent- 商品引用或一段商品文字，范围用 scope（all_authorized 或显式引用/平台）。
   商品文字只用于找候选：命中多个候选时工具返 needs_input 并附候选引用，必须把候选问回用户，
@@ -563,6 +566,66 @@ def _deterministic_summary(results: list[object]) -> str | None:
     return None
 
 
+def _rank_request_key(question: str, now: datetime,
+                      arguments: dict[str, object] | None) -> str | None:
+    """Turn-local identity for an authorized ranking; dates are server-owned.
+
+    Only identical model inputs apart from dates can reuse a delivered result.
+    A different scope, metric, or policy must execute its own authorized graph.
+    """
+    period = resolve_period_detail(question, now=now)
+    if (not user_authorized_prior_window(question) or period is None
+            or period.kind != "half_month" or not isinstance(arguments, dict)
+            or arguments.get("group_by") != "product"
+            or arguments.get("basis_policy") != "partitioned"):
+        return None
+    try:
+        return json.dumps({key: value for key, value in arguments.items()
+                           if key not in {"start", "end"}},
+                          sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return None
+
+
+def _prior_window_from_exclusions(question: str, now: datetime,
+                                  result: ToolResult) -> tuple[str, str] | None:
+    """Pick one nearest, equal-length retry from server-reported coverage gaps.
+
+    A gap from one eligible partition can justify an earlier attempt; a time-basis
+    refusal, unknown cutoff, or a model-supplied date cannot. The retry still goes
+    through the complete graph and may itself fail closed.
+    """
+    period = resolve_period_detail(question, now=now)
+    if (not user_authorized_prior_window(question) or period is None
+            or period.kind != "half_month" or result.status != "missing_data"
+            or result.filters.get("group_by") != "product"
+            or result.filters.get("basis_policy") != "partitioned"
+            or result.filters.get("start") != period.start.isoformat()
+            or result.filters.get("end") != period.end.isoformat()):
+        return None
+    gap_starts: list[date] = []
+    for exclusion in result.rank_exclusions:
+        if exclusion.get("reason") != "coverage_incomplete":
+            continue
+        for window in exclusion.get("windows", []):
+            if not isinstance(window, str):
+                continue
+            start_text, separator, end_text = window.partition("~")
+            if not separator:
+                continue
+            try:
+                gap_start, gap_end = date.fromisoformat(start_text), date.fromisoformat(end_text)
+            except ValueError:
+                continue
+            if period.start <= gap_start < gap_end <= period.end:
+                gap_starts.append(gap_start)
+    if not gap_starts:
+        return None
+    shifted_end = min(gap_starts)
+    shifted_start = shifted_end - (period.end - period.start)
+    return shifted_start.isoformat(), shifted_end.isoformat()
+
+
 def _final_text_answer(model: ChatModel, messages: list[Message],
                        deadline: float) -> str | None:
     """补一次不挂工具的文本回合，让模型用已拿到的确定性结果作答。
@@ -693,8 +756,13 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
     messages.extend(state.turns)
     messages.append(Message(role="user",
                             content=_anonymize_question(question, shops, state.shop_refs)))
+    turn_messages_start = len(messages)
     results: list[ToolResult] = []
     artifacts: list[dict[str, object]] = []
+    # Keep the last delivered ranking payload separate from unrelated business tools.
+    ranking_summary_artifact: dict[str, object] | None = None
+    # Only this answer invocation owns the cache: never reuse across messages/users.
+    business_result_cache: dict[str, dict[str, object]] = {}
     calls_used = 0
     correction_used = False
     text_answer: str | None = None
@@ -737,6 +805,13 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                 stop_after_batch = True
                 continue
             if call.name == "query_business":
+                rank_key = _rank_request_key(question, now, call.arguments)
+                if rank_key is not None and rank_key in business_result_cache:
+                    messages.append(Message(
+                        role="tool", tool_call_id=call.id,
+                        content=json.dumps(business_result_cache[rank_key],
+                                           ensure_ascii=False)))
+                    continue
                 business_attempt_no += 1
                 execution = execute_business_query_tool(
                     call,
@@ -781,20 +856,73 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     error_code = execution.domain_result.error.code
                     results.clear()
                     artifacts.clear()
+                    ranking_summary_artifact = None
                     filters = dict(state.filters)
                     stop_after_batch = True
                     break
                 if execution.tool_result is not None:
                     calls_used += 1
                     results.append(execution.tool_result)
-                    # 图内已按同一目录投出公开载荷：展示层只补上 Artifact 自身引用，
-                    # 不做二次投影（补引用是为了让图表能按 dataset_ref 找到数据集）。
-                    artifacts.extend(
-                        artifact_event_payload(artifact)
-                        for artifact in execution.domain_result.artifacts
-                    )
+                    # 图内已按同一目录投出公开载荷：展示层只补上 Artifact 自身引用。
+                    delivered = [artifact_event_payload(artifact)
+                                 for artifact in execution.domain_result.artifacts]
+                    artifacts.extend(delivered)
+                    if (delivered and execution.tool_result.filters.get("group_by") == "product"
+                            and execution.tool_result.filters.get("basis_policy") == "partitioned"):
+                        ranking_summary_artifact = delivered[-1]
                     if execution.session_filters:
                         filters.update(execution.session_filters)
+
+                    # 用户明确允许“缺口前移”时，服务端从已交付的逐店覆盖缺口
+                    # 确定最近的等长候选，只额外跑一次完整图。模型不得自行改窗口，
+                    # 也不得靠重复同一窗口冒充已经前移。
+                    candidate = _prior_window_from_exclusions(
+                        question, now, execution.tool_result)
+                    if (candidate is not None and calls_used < MAX_TOOL_CALLS
+                            and deadline - time_module.monotonic() > 2
+                            and call.arguments is not None):
+                        business_attempt_no += 1
+                        fallback_call = call.model_copy(update={
+                            "arguments": {**call.arguments,
+                                          "start": candidate[0], "end": candidate[1]}})
+                        fallback = execute_business_query_tool(
+                            fallback_call, state,
+                            BusinessQueryContext(
+                                chat_id=turn_context.chat_id,
+                                user_message_id=turn_context.user_message_id,
+                                subject_id=turn_context.subject_id,
+                                question=question, previous_filters=filters,
+                                shop_refs=state.shop_refs,
+                                allowed_shop_ids=allowed_shop_ids, now=now,
+                                deadline=deadline, attempt_no=business_attempt_no,
+                                trusted_window_override=candidate),
+                            conn, run_store)
+                        if (fallback.domain_result.error is not None
+                                and fallback.domain_result.error.code in {
+                                    "artifact_persistence_failed",
+                                    "result_contract_violation"}):
+                            last_error = fallback.domain_result.error.public_message
+                            error_code = fallback.domain_result.error.code
+                            results.clear()
+                            artifacts.clear()
+                            ranking_summary_artifact = None
+                            filters = dict(state.filters)
+                            stop_after_batch = True
+                            break
+                        if fallback.tool_result is not None:
+                            calls_used += 1
+                            results.append(fallback.tool_result)
+                            delivered = [artifact_event_payload(artifact)
+                                         for artifact in fallback.domain_result.artifacts]
+                            artifacts.extend(delivered)
+                            if (delivered and fallback.tool_result.filters.get("group_by") == "product"
+                                    and fallback.tool_result.filters.get("basis_policy") == "partitioned"):
+                                ranking_summary_artifact = delivered[-1]
+                            if fallback.session_filters:
+                                filters.update(fallback.session_filters)
+                            execution = fallback
+                if rank_key is not None and execution.tool_result is not None:
+                    business_result_cache[rank_key] = execution.domain_result.model_payload
                 messages.append(Message(
                     role="tool", tool_call_id=call.id,
                     content=json.dumps(execution.domain_result.model_payload,
@@ -1076,6 +1204,28 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                        or _deterministic_summary(results)
                        or (NO_TEXT_WITH_RESULTS if (results or artifacts)
                            else NO_TEXT_WITHOUT_RESULTS))
+
+    # 对显式授权前移的商品查询，正文只从实际落盘的结果生成；模型的自由文本
+    # 不能再杜撰“试过三个窗口”。不改写任一 Artifact，也不把被排除店铺当成零。
+    if user_authorized_prior_window(question) and ranking_summary_artifact is not None:
+        observed = [result for result in results
+                    if result.filters.get("group_by") == "product"
+                    and result.filters.get("basis_policy") == "partitioned"
+                    and result.filters.get("start") and result.filters.get("end")]
+        if observed:
+            from .response_summary import render_result_summary
+
+            windows = "；".join(
+                f"{result.filters['start']} ~ {result.filters['end']}：{result.status}"
+                for result in observed)
+            text_answer = (f"本轮实际取得结果的窗口（北京时间、结束日排他）：{windows}。\n"
+                           + render_result_summary(ranking_summary_artifact))
+            # 下一轮的会话记忆也不能保留本轮模型杜撰的尝试记录。
+            for index in range(turn_messages_start, len(messages)):
+                message = messages[index]
+                if message.role == "assistant" and message.content:
+                    messages[index] = message.model_copy(update={
+                        "content": None if message.tool_calls else text_answer})
 
     new_state = state.model_copy(update={
         "filters": filters,

@@ -84,6 +84,7 @@ def execute_business_query_tool(
         now=context.now,
         deadline=context.deadline,
         attempt_no=context.attempt_no,
+        trusted_window_override=context.trusted_window_override,
     )
     return _execute_business_query_graph(
         conn,

@@ -38,7 +38,14 @@ def render_result_summary(domain_result: Any) -> str:
             f"{name}＝{definitions[name]}" if name in definitions else name
             for name in metrics))
     data_as_of = payload.get("data_as_of")
-    lines.append(f"数据截止 {data_as_of}。" if data_as_of else "数据截止未知（回填未完成）。")
+    no_partition = (filters.get("group_by") == "product"
+                    and filters.get("basis_policy") == "partitioned"
+                    and not rows and bool(payload.get("excluded_scope")))
+    if no_partition:
+        lines.append("没有可发布的分区；整体截止不适用，逐店原因见限制和排除范围。")
+    else:
+        lines.append(f"数据截止 {data_as_of}。" if data_as_of
+                     else "数据截止未知（回填未完成）。")
 
     coverage = payload.get("coverage") if isinstance(payload.get("coverage"), dict) else {}
     gaps = [str(item) for item in (coverage.get("gaps") or [])]
@@ -80,6 +87,8 @@ def _payload_of(domain_result: Any) -> dict[str, Any] | None:
     Agent 主层把已交付的确定性结果按 ToolResult 收集（不是 DomainResult），
     兜底摘要要能直接复述它，而不是因为拿不到 model_payload 就退化成占位文案。
     """
+    if isinstance(domain_result, dict):
+        return domain_result
     payload = getattr(domain_result, "model_payload", None)
     if isinstance(payload, dict):
         return payload

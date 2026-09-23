@@ -2947,6 +2947,181 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(turn.results[0].status, "ok")
         self.assertEqual(len(turn.artifacts), 1)
 
+    def test_authorized_gap_moves_the_real_query_window_and_rejects_fictional_attempts(self):
+        """The graph must execute the fallback, not merely let prose claim it did."""
+        from bi_agent.agent import SessionState, answer
+
+        first = ToolResult(
+            status="missing_data",
+            filters={"start": "2026-08-24", "end": "2026-09-08",
+                     "shop_ids": ["S1"], "metrics": ["product_paid_amount"],
+                     "group_by": "product", "basis_policy": "partitioned"},
+            coverage=Coverage(status="missing", start=None, end=None),
+            rank_exclusions=[{"shop_id": "S1", "reason": "coverage_incomplete",
+                              "windows": ["2026-09-05~2026-09-08"]}],
+        )
+        second = self._partitioned_result().model_copy(update={
+            "filters": {**self._partitioned_result().filters,
+                        "start": "2026-08-21", "end": "2026-09-05"},
+            "coverage": Coverage(status="complete", start=date(2026, 8, 21),
+                                 end=date(2026, 9, 5)),
+        })
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[self._call(metrics=["product_paid_amount"],
+                                     group_by="product", basis_policy="partitioned")]),
+            _reply(text="我试了 2026-08-01 到 2026-08-16，还是无数据。"),
+        ]
+        with patch("bi_agent.metrics.query_business", side_effect=[first, second]) as query:
+            turn = answer("近半个月最好的10个商品，遇到数据缺口就把时间段向前移动",
+                          SessionState(subject="u1"), model=model, conn=self._conn(),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+        self.assertEqual(query.call_count, 2)
+        self.assertEqual([(call.args[1].start, call.args[1].end)
+                          for call in query.call_args_list],
+                         [(date(2026, 8, 24), date(2026, 9, 8)),
+                          (date(2026, 8, 21), date(2026, 9, 5))])
+        self.assertEqual(len(self.run_store.runs), 2)
+        self.assertEqual(len(turn.artifacts), 2)
+        self.assertIn("2026-08-21", turn.text)
+        self.assertNotIn("2026-08-01", turn.text)
+        self.assertNotIn("2026-08-01", " ".join(
+            message.content or "" for message in turn.state.turns))
+
+    def test_repeating_original_window_reuses_persisted_fallback_result(self):
+        """A model repeating the same half-month request must not rerun its SQL."""
+        from bi_agent.agent import SessionState, answer
+
+        first = ToolResult(
+            status="missing_data",
+            filters={"start": "2026-08-24", "end": "2026-09-08",
+                     "shop_ids": ["S1"], "metrics": ["product_paid_amount"],
+                     "group_by": "product", "basis_policy": "partitioned"},
+            coverage=Coverage(status="missing", start=None, end=None),
+            rank_exclusions=[{"shop_id": "S1", "reason": "coverage_incomplete",
+                              "windows": ["2026-09-05~2026-09-08"]}])
+        second = self._partitioned_result().model_copy(update={
+            "filters": {**self._partitioned_result().filters,
+                        "start": "2026-08-21", "end": "2026-09-05"}})
+        original_call = self._call(metrics=["product_paid_amount"],
+                                   group_by="product", basis_policy="partitioned")
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[original_call]),
+            _reply(calls=[original_call.model_copy(update={"id": "call_again"})]),
+            _reply(text="已完成。"),
+        ]
+
+        def fake_query(_conn, request, **_kwargs):
+            return first if request.start == date(2026, 8, 24) else second
+
+        with patch("bi_agent.metrics.query_business", side_effect=fake_query) as query:
+            turn = answer("近半个月最好的10个商品，遇到数据缺口就把时间段向前移动",
+                          SessionState(subject="u1"), model=model, conn=self._conn(),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+        self.assertEqual(query.call_count, 2)
+        self.assertEqual(len(self.run_store.runs), 2)
+        self.assertEqual(len(turn.artifacts), 2)
+        self.assertIn("2026-08-21", turn.text)
+
+    def test_prior_window_summary_uses_ranking_not_later_shop_query(self):
+        """The ranking windows must not be paired with another dataset's summary."""
+        from bi_agent.agent import SessionState, answer
+
+        first = ToolResult(
+            status="missing_data",
+            filters={"start": "2026-08-24", "end": "2026-09-08",
+                     "shop_ids": ["S1"], "metrics": ["product_paid_amount"],
+                     "group_by": "product", "basis_policy": "partitioned"},
+            coverage=Coverage(status="missing", start=None, end=None),
+            rank_exclusions=[{"shop_id": "S1", "reason": "coverage_incomplete",
+                              "windows": ["2026-09-05~2026-09-08"]}],
+        )
+        second = self._partitioned_result().model_copy(update={
+            "filters": {**self._partitioned_result().filters,
+                        "start": "2026-08-21", "end": "2026-09-05"},
+        })
+        shop_result = ToolResult(
+            status="ok", data=[{"shop_id": "S1", "paid_amount": "999"}],
+            filters={"start": "2026-08-24", "end": "2026-09-08",
+                     "shop_ids": ["S1"], "metrics": ["paid_amount"],
+                     "group_by": "shop", "basis_policy": "strict"},
+            coverage=Coverage(status="complete", start=date(2026, 8, 24),
+                              end=date(2026, 9, 8)),
+            data_as_of=self.NOW,
+        )
+        model = Mock()
+        model.complete.side_effect = [
+            _reply(calls=[self._call(metrics=["product_paid_amount"],
+                                     group_by="product", basis_policy="partitioned"),
+                          self._call(metrics=["paid_amount"], group_by="shop",
+                                     basis_policy="strict").model_copy(update={"id": "other"})]),
+            _reply(text="我试过没有证据的窗口"),
+        ]
+        with patch("bi_agent.metrics.query_business",
+                   side_effect=[first, second, shop_result]) as query:
+            turn = answer("近半个月最好的10个商品，遇到数据缺口就把时间段向前移动",
+                          SessionState(subject="u1"), model=model, conn=self._conn(),
+                          allowed_shop_ids=frozenset({"S1"}), now=self.NOW,
+                          run_store=self.run_store)
+        self.assertEqual(query.call_count, 3)
+        self.assertEqual(len(turn.results), 3)
+        self.assertIn("分区（各自出榜", turn.text)
+        self.assertIn("口径：product_paid_amount", turn.text)
+        self.assertNotIn("口径：paid_amount", turn.text)
+        self.assertNotIn("999", turn.text)
+
+    def test_prior_window_reuse_key_never_crosses_scope_metric_or_authorization(self):
+        from bi_agent.agent import _rank_request_key
+
+        question = "近半个月最好的10个商品，遇到数据缺口就把时间段向前移动"
+        args = {"shop_ids": [S1_REF], "metrics": ["product_paid_amount"],
+                "group_by": "product", "basis_policy": "partitioned",
+                "start": "2026-08-24", "end": "2026-09-08"}
+        key = _rank_request_key(question, self.NOW, args)
+        self.assertIsNotNone(key)
+        self.assertEqual(key, _rank_request_key(
+            question, self.NOW, {**args, "start": "2026-08-21", "end": "2026-09-05"}))
+        self.assertNotEqual(key, _rank_request_key(
+            question, self.NOW, {**args, "metrics": ["quantity"]}))
+        self.assertNotEqual(key, _rank_request_key(
+            question, self.NOW, {**args, "shop_ids": ["ent-other"]}))
+        self.assertIsNone(_rank_request_key("近半个月最好的商品", self.NOW, args))
+
+    def test_prior_window_requires_an_affirmative_instruction_and_real_gap(self):
+        from bi_agent.agent import _prior_window_from_exclusions
+        from bi_agent.business_query.recovery import user_authorized_prior_window
+
+        missing = ToolResult(
+            status="missing_data", coverage=Coverage(status="missing", start=None,
+                                                      end=None),
+            filters={"start": "2026-08-24", "end": "2026-09-08",
+                     "group_by": "product", "basis_policy": "partitioned"},
+            rank_exclusions=[{"shop_id": "S1", "reason": "coverage_incomplete",
+                              "windows": ["2026-09-05~2026-09-08"]}])
+        self.assertFalse(user_authorized_prior_window("近半个月，缺口就不要向前移动"))
+        self.assertFalse(user_authorized_prior_window("近半个月有缺口也暂不前移"))
+        self.assertFalse(user_authorized_prior_window("上次缺口你们前移过，这次不要"))
+        self.assertFalse(user_authorized_prior_window("缺口前移能行吗？"))
+        self.assertFalse(user_authorized_prior_window("有缺口要不要前移？"))
+        self.assertTrue(user_authorized_prior_window("有缺口就请前移时间段"))
+        self.assertIsNone(_prior_window_from_exclusions(
+            "近半个月，缺口就不要向前移动", self.NOW, missing))
+        self.assertIsNone(_prior_window_from_exclusions(
+            "近半个月，遇到缺口就往前移", self.NOW,
+            missing.model_copy(update={"rank_exclusions": []})))
+        self.assertIsNone(_prior_window_from_exclusions(
+            "近半个月，遇到缺口就往前移", self.NOW,
+            missing.model_copy(update={"status": "unavailable"})))
+        full_gap = missing.model_copy(update={
+            "rank_exclusions": [{"shop_id": "S1", "reason": "coverage_incomplete",
+                                 "windows": ["2026-08-24~2026-09-08"]}]})
+        self.assertEqual(_prior_window_from_exclusions(
+            "近半个月，遇到缺口就往前移", self.NOW, full_gap),
+            ("2026-08-09", "2026-08-24"))
+
     def test_system_prompt_and_tool_doc_direct_partitioned_product_ranking(self):
         """路由不靠运气：提示与工具说明必须直接让模型选对政策与指标。"""
         from bi_agent import agent
