@@ -55,6 +55,15 @@ React/Vite 前端 → /api 代理 → FastAPI → 受限 Agent
 - 默认关闭：`ISOLATED_ANALYSIS_ENABLED=false`（`.env.example` 就是该值）。关闭时不注册分析 Tool、不读取任何 Artifact、聊天与 Task 11 基线逐字相同；回滚 = 把开关保持/改回 `false`。迁移 `022` 只扩 domain/artifact 两份 CHECK，不建事实表。
 - 目前只完成本地开发与本地验收（[验收记录](docs/superpowers/research/2026-09-14-isolated-analysis-acceptance.md)）：不证明真实模型下的叙述质量，也不改变 Task 11 统一发布门禁的状态（第 4–7 项仍 open）。HTTP 生产启用与受控探索一样被刻意延后。启用前置与回退见[运行手册](docs/runbook.md)，观测口径见[指标口径](docs/metrics.md)。
 
+## 持续库存通知（默认关闭）
+
+`backend/bi_agent/monitoring/` 是 Task 11 后置子项目 E：部署主机周期性调用一次性 CLI（`bi-inventory-monitor` → `bi-inventory-outbox`），复用 `InventoryWatchGraph` 与稳定去重状态机生成**应用内**库存通知；首版渠道只有 PostgreSQL outbox + 应用内通知中心，没有邮件、短信、IM、webhook 或自动采购动作。调度只由部署主机的计划任务反复调用两条一次性命令；不在 API 进程建循环，也没有 Codex automation。
+
+- 来源门禁**按层级判定**（所有者 2026-09-17 Option A）：`physical_total` 已核验而 `shop_sellable` 缺已核验登记时，实物层仍可触发/更新/解除；缺登记的层级是一等 `data_missing`/unknown——永不补零、永不从实物层复制扇出、永不触发、永不解除、也不向用户周期性播报“无法判断”，只记固定诊断 `monitor_level_unverified` 与固定计数。策略请求的层级一个都没有核验时该策略以 disabled 退出。
+- 边界不变：缺数量不是零；曾核验的来源退场只走 `suppressed`、永不 `resolved`；`erp` 不是渠道层合法来源，拼多多通道永久排除；来源 Artifact 只是 ≤20 行的展示投影，期望项超过 20 的策略作用域本轮不会出告警（这是显式局限，不是已解决问题）；模型不参与调度、状态迁移、文案或投递。
+- 默认关闭：`INVENTORY_MONITOR_ENABLED=false`（`.env.example` 就是该值）。启用还需独立的 `BI_MONITOR_DSN`（`bi_monitor` 最小权限身份，不得与 app/writer/approver 共用）、`MONITOR_SERVICE_SUBJECT` 与 `MONITOR_POLICY_REFS` 三件套。迁移 `023` 只在本机 `*_test` 库执行过，未碰生产/预发布。
+- 目前只完成本地开发与本地/离线验收（[验收记录](docs/superpowers/research/2026-09-25-continuous-inventory-notifications-acceptance.md)）：库存来源验收仍为 **FAIL**（`physical` 四维 NOT MET、`channel` 一等 `data_missing`），Task 11 统一发布门禁第 4–7 项仍 open——**生产监控保持 disabled，本计划不解除任一门禁**，也不构成来源验收通过、生产就绪或通知已启用。调度配置与回滚见[运行手册](docs/runbook.md)，定名指标与观测口径见[指标口径](docs/metrics.md)。
+
 ## 本地启动
 
 需要 Python 3.11、Node.js 22、PostgreSQL 17。复制 `.env.example` 为 `.env.app`，只填写 API 所需的 `BI_APP_DSN`、店铺范围和一个模型 provider 配置；不要在其中放同步 DSN 或快麦凭证。
@@ -114,7 +123,7 @@ uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
 ```powershell
 Set-Location backend
 uv run python -m unittest tests.test_core -v
-uv run --env-file ../.env.test python -m unittest tests.test_db tests.test_api -v
+uv run --env-file ../.env.test python -m unittest tests.test_db tests.test_api tests.test_monitoring -v
 uv run --env-file ../.env.test python -m tests.acceptance --offline
 Set-Location ../frontend
 npm test

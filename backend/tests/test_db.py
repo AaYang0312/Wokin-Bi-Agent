@@ -3557,6 +3557,405 @@ class InventoryMonitorConcurrencyTests(unittest.TestCase):
             first.close()
             locker.close()
 
+    # -- 计划 Task 6 Step 1：进程级并发/崩溃重启/登记退场/跨策略矩阵 ----------
+    #
+    # 与上面的 advisory-lock 探针同一协议：只依赖已提交到本机测试库的 023，
+    # 全部写入走显式提交的独立连接，并在用例内清理到只剩 023 自身的结构。
+    # 判定一律由真实状态机（decide_alert_transitions）对**从存储重读的全生命
+    # 周期历史**算出，再经真实 MonitorRepository 提交给真实 023 提交函数；
+    # 图与 runner 的集成证据在 tests.test_monitoring.MonitorRunnerDatabaseTests，
+    # 这里补的是跨连接（=跨进程）的持久化语义。“重启” = 全新连接重新装载；
+    # “两进程” = 两个独立连接在 ThreadPoolExecutor 里并发提交——线程只用于
+    # 制造被断言的竞争本身，所有等待都有界（连接 5s、语句 15s、锁 10s、
+    # future 30s）。
+
+    RACE_TIMEOUT_SECONDS = 30
+
+    def _fixture(self) -> InventoryMonitorMigrationTests:
+        return self.MIGRATION_TESTS(
+            "test_023_is_the_next_numbered_migration_after_022")
+
+    @staticmethod
+    def _shop_ref(tag: str) -> str:
+        from bi_agent.catalog import ref_for_key
+
+        return ref_for_key("shop", tag)
+
+    def _committed_conn(self) -> psycopg.Connection:
+        """显式提交的独立连接：模拟一个独立的 monitor 进程，等待全部有界。"""
+        conn = psycopg.connect(self.dsn, autocommit=True, connect_timeout=5)
+        conn.execute("SET statement_timeout = '15s'")
+        conn.execute("SET lock_timeout = '10s'")
+        self.addCleanup(conn.close)
+        return conn
+
+    def _monitor_policy(self, fixture: InventoryMonitorMigrationTests,
+                        policy_ref: str, levels: tuple[str, ...]):
+        from bi_agent.monitoring.models import MonitorPolicy
+
+        return MonitorPolicy(
+            policy_ref=policy_ref,
+            threshold_policy_ref="inventory-thresholds/1",
+            owner_subject_id="owner-subject",
+            shop_refs=("shop-a",) if "shop_sellable" in levels else (),
+            inventory_pool_refs=(fixture.POOL_REF,),
+            levels=levels, cooldown_seconds=3600, enabled=True)
+
+    def _seed_policy(self, conn: psycopg.Connection,
+                     fixture: InventoryMonitorMigrationTests,
+                     policy_ref: str, levels: tuple[str, ...]) -> None:
+        conn.execute(
+            """INSERT INTO bi.inventory_monitor_policies (
+                   policy_ref, threshold_policy_ref, owner_subject_id, shop_refs,
+                   inventory_pool_refs, levels, cooldown_seconds, enabled)
+               VALUES (%s, 'inventory-thresholds/1', 'owner-subject', %s,
+                       ARRAY[%s], %s, 3600, true)""",
+            (policy_ref,
+             list(("shop-a",) if "shop_sellable" in levels else ()),
+             fixture.POOL_REF, list(levels)))
+
+    @staticmethod
+    def _fingerprint(payload: dict) -> str:
+        """runner 的同一公式：canonical JSON 的 SHA-256（载荷不变则键不变）。"""
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _scan(self, fixture: InventoryMonitorMigrationTests, policy_ref: str,
+              payload: dict, *, complete: tuple[str, ...], rows: tuple,
+              now: datetime):
+        from bi_agent.monitoring.models import MonitorScan
+
+        return MonitorScan(
+            policy_ref=policy_ref, source_artifact_payload=payload,
+            source_fingerprint=self._fingerprint(payload), data_as_of=now,
+            fresh=True, complete_levels=tuple(sorted(set(complete))),
+            rows=rows, diagnostics=())
+
+    def _physical_row(self, fixture: InventoryMonitorMigrationTests, *,
+                      status: str, quantity: str):
+        from bi_agent.monitoring.models import MonitorAlertRow
+
+        return MonitorAlertRow(level="physical_total", status=status,
+                               sku_ref=fixture._sku_ref("SKU1"),
+                               scope_ref=fixture.SCOPE_REF, quantity=quantity,
+                               threshold="10", unit="piece")
+
+    def _channel_row(self, fixture: InventoryMonitorMigrationTests, *,
+                     status: str, quantity: str):
+        from bi_agent.monitoring.models import MonitorAlertRow
+
+        return MonitorAlertRow(level="shop_sellable", status=status,
+                               sku_ref=fixture._sku_ref("SKU1"),
+                               scope_ref=self._shop_ref("shop-a"),
+                               quantity=quantity, threshold="5", unit="piece")
+
+    def _both_verified_payload(
+            self, fixture: InventoryMonitorMigrationTests, *,
+            physical_status: str, channel_status: str) -> dict:
+        """两层都核验轮的来源载荷：在册池有声明，实物/渠道各一行同 SKU。"""
+        snapshot = (fixture.OBSERVED - timedelta(minutes=5)).isoformat()
+        payload = fixture._alerts_payload()
+        row = payload["data"][0]
+        row["inventory_status"] = physical_status
+        if physical_status == "normal":
+            row["quantity"] = "100"
+        # 两行 = 两个期望项：行数、分母与逐状态计数必须互相一致，否则契约拒绝。
+        payload["inventory"]["expected_items"] = 2
+        payload["inventory"]["evaluated_items"] = 2
+        payload["inventory"]["scanned_items"] = 2
+        lows = sum(1 for item in ((physical_status,), (channel_status,))
+                   if item[0] == "low")
+        payload["inventory"]["counts"] = {"low": lows, "normal": 2 - lows}
+        payload["data"].append({
+            "level": "shop_sellable", "sku_ref": fixture._sku_ref("SKU1"),
+            "shop_ref": self._shop_ref("shop-a"), "quantity": None,
+            "channel_quantity": "0" if channel_status == "low" else "9",
+            "threshold": "5", "unit": "piece",
+            "inventory_status": channel_status, "snapshot_at": snapshot,
+            "batch_count": 1})
+        payload["inventory"]["levels"] = ["physical_total", "shop_sellable"]
+        payload["filters"]["levels"] = ["physical_total", "shop_sellable"]
+        payload["filters"]["thresholds"].append(
+            {"level": "low_quota", "sku_ref": fixture._sku_ref("SKU1"),
+             "quantity": "5", "unit": "piece"})
+        return payload
+
+    def _decide(self, policy, scan, history, verified, now):
+        from bi_agent.monitoring.state_machine import decide_alert_transitions
+
+        return decide_alert_transitions(scan, policy=policy, active=history,
+                                        verified_levels=tuple(verified), now=now)
+
+    def _commit(self, conn: psycopg.Connection, scan, decisions, *, now):
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        return MonitorRepository(conn).commit_scan(scan, decisions, now=now)
+
+    def _history(self, conn: psycopg.Connection, policy_ref: str):
+        from bi_agent.monitoring.repository import MonitorRepository
+
+        return MonitorRepository(conn).load_alert_history(policy_ref)
+
+    def _key(self, fixture: InventoryMonitorMigrationTests, policy_ref: str,
+             level: str) -> str:
+        from bi_agent.inventory.rules import THRESHOLD_LEVEL_BY_LEVEL
+        from bi_agent.monitoring.state_machine import dedupe_key
+
+        return dedupe_key(
+            policy_version=policy_ref, level=level,
+            sku_ref=fixture._sku_ref("SKU1"),
+            scope_ref=fixture.SCOPE_REF if level == "physical_total"
+            else self._shop_ref("shop-a"),
+            rule_code=THRESHOLD_LEVEL_BY_LEVEL[level])
+
+    def _register_cleanup(self, conn: psycopg.Connection, *, keys, fingerprints,
+                          policy_refs) -> None:
+        """把本用例提交的行清到只剩 023 自身结构（与上方用例同一语句序）。"""
+        statements = []
+        for key in keys:
+            statements.extend([
+                ("DELETE FROM bi.notification_outbox o USING "
+                 "bi.inventory_alert_instances a WHERE o.alert_ref = a.alert_ref "
+                 "AND a.dedupe_key = %s", (key,)),
+                ("DELETE FROM bi.inventory_alert_events e USING "
+                 "bi.inventory_alert_instances a WHERE e.alert_ref = a.alert_ref "
+                 "AND a.dedupe_key = %s", (key,)),
+                ("DELETE FROM bi.inventory_alert_instances WHERE dedupe_key = %s",
+                 (key,))])
+        for fingerprint in fingerprints:
+            statements.extend([
+                ("DELETE FROM bi.query_artifacts WHERE run_id IN (SELECT id FROM "
+                 "bi.query_runs WHERE request_fingerprint = %s)", (fingerprint,)),
+                ("DELETE FROM bi.query_runs WHERE request_fingerprint = %s",
+                 (fingerprint,))])
+        for policy_ref in policy_refs:
+            statements.append(
+                ("DELETE FROM bi.inventory_monitor_policies "
+                 "WHERE policy_ref = %s", (policy_ref,)))
+        self.addCleanup(self._run_cleanup, conn, statements)
+
+    @staticmethod
+    def _run_cleanup(conn: psycopg.Connection, statements) -> None:
+        for statement, params in statements:
+            conn.execute(statement, params)
+
+    def _alert_state(self, conn: psycopg.Connection, key: str):
+        row = conn.execute(
+            "SELECT status, last_observed_at FROM bi.inventory_alert_instances "
+            "WHERE dedupe_key = %s", (key,)).fetchone()
+        self.assertIsNotNone(row, "被断言的去重键应有持久化告警")
+        return row
+
+    def _event_kinds(self, conn: psycopg.Connection, key: str) -> list[str]:
+        return [row[0] for row in conn.execute(
+            "SELECT e.event_kind FROM bi.inventory_alert_events e "
+            "JOIN bi.inventory_alert_instances a ON a.alert_ref = e.alert_ref "
+            "WHERE a.dedupe_key = %s ORDER BY e.event_kind", (key,)).fetchall()]
+
+    def _outbox_kinds(self, conn: psycopg.Connection, key: str) -> list[str]:
+        return [row[0] for row in conn.execute(
+            "SELECT e.event_kind FROM bi.notification_outbox o "
+            "JOIN bi.inventory_alert_events e ON e.id = o.event_id "
+            "JOIN bi.inventory_alert_instances a ON a.alert_ref = o.alert_ref "
+            "WHERE a.dedupe_key = %s ORDER BY e.event_kind", (key,)).fetchall()]
+
+    def _race(self, jobs) -> list:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futures = [pool.submit(job) for job in jobs]
+            return [future.result(timeout=self.RACE_TIMEOUT_SECONDS)
+                    for future in futures]
+
+    def test_two_monitor_processes_create_one_active_alert_and_one_trigger(self):
+        """两进程同刻提交同一份低扫描：键级 advisory 锁串行化 + 事件幂等键把
+        并发重放折叠成一次首发——恰一个 active、一个 triggered、一行 outbox。"""
+        fixture = self._fixture()
+        policy_ref = "inventory-monitor/1"
+        key = self._key(fixture, policy_ref, "physical_total")
+        conn = self._committed_conn()
+        self._seed_policy(conn, fixture, policy_ref,
+                          ("physical_total", "shop_sellable"))
+        payload = fixture._alerts_payload()
+        scan = self._scan(fixture, policy_ref, payload,
+                          complete=("physical_total",),
+                          rows=(self._physical_row(fixture, status="low",
+                                                   quantity="10"),),
+                          now=fixture.OBSERVED)
+        policy = self._monitor_policy(fixture, policy_ref,
+                                      ("physical_total", "shop_sellable"))
+        decisions = self._decide(policy, scan, (), ("physical_total",),
+                                 fixture.OBSERVED)
+        self.assertEqual([d.event_kind for d in decisions], ["triggered"])
+        self._register_cleanup(conn, keys=[key],
+                               fingerprints=[scan.source_fingerprint],
+                               policy_refs=[policy_ref])
+        first = self._committed_conn()
+        second = self._committed_conn()
+        results = self._race([
+            lambda: self._commit(first, scan, decisions, now=fixture.OBSERVED),
+            lambda: self._commit(second, scan, decisions, now=fixture.OBSERVED)])
+        triggered = sum(1 for transitions in results for transition in transitions
+                        if transition.event_kind == "triggered")
+        self.assertEqual(triggered, 1, "两进程竞争后只允许一次首发")
+        self.assertEqual(self._alert_state(conn, key), ("open", fixture.OBSERVED))
+        self.assertEqual(self._event_kinds(conn, key), ["triggered"])
+        self.assertEqual(self._outbox_kinds(conn, key), ["triggered"])
+
+    def test_incomplete_scan_after_open_preserves_open_across_restart(self):
+        """首发后的不完整轮跨“重启”（全新连接重读存储）保留 open：不推进观测、
+        零 resolved、零新 outbox；同一格的 normal 行因 complete_levels 为空
+        不得参与解除。"""
+        fixture = self._fixture()
+        policy_ref = "inventory-monitor/1"
+        key = self._key(fixture, policy_ref, "physical_total")
+        both_levels = ("physical_total", "shop_sellable")
+        conn = self._committed_conn()
+        self._seed_policy(conn, fixture, policy_ref, both_levels)
+        policy = self._monitor_policy(fixture, policy_ref, both_levels)
+        low_payload = fixture._alerts_payload()
+        low_scan = self._scan(fixture, policy_ref, low_payload,
+                              complete=("physical_total",),
+                              rows=(self._physical_row(fixture, status="low",
+                                                       quantity="10"),),
+                              now=fixture.OBSERVED)
+        kept_payload = fixture._alerts_payload()
+        kept_payload["data"][0]["inventory_status"] = "normal"
+        kept_payload["data"][0]["quantity"] = "100"
+        kept_scan = self._scan(fixture, policy_ref, kept_payload, complete=(),
+                               rows=(self._physical_row(fixture, status="normal",
+                                                        quantity="100"),),
+                               now=fixture.LATER)
+        self._register_cleanup(conn, keys=[key],
+                               fingerprints=[low_scan.source_fingerprint,
+                                             kept_scan.source_fingerprint],
+                               policy_refs=[policy_ref])
+        self._commit(conn, low_scan,
+                     self._decide(policy, low_scan, (), ("physical_total",),
+                                  fixture.OBSERVED), now=fixture.OBSERVED)
+        # 重启：全新连接，历史只从存储装载。
+        restarted = self._committed_conn()
+        history = self._history(restarted, policy_ref)
+        self.assertEqual([(alert.dedupe_key, alert.status) for alert in history],
+                         [(key, "open")])
+        decisions = self._decide(policy, kept_scan, history, ("physical_total",),
+                                 fixture.LATER)
+        self.assertEqual([(d.event_kind, d.next_status, d.observed)
+                          for d in decisions], [("updated", "open", False)])
+        self._commit(restarted, kept_scan, decisions, now=fixture.LATER)
+        self.assertEqual(self._alert_state(conn, key), ("open", fixture.OBSERVED),
+                         "缺扫描不推进 last_observed_at")
+        self.assertEqual(self._event_kinds(conn, key), ["triggered", "updated"])
+        self.assertEqual(self._outbox_kinds(conn, key), ["triggered"])
+
+    def test_channel_source_withdrawal_suppresses_and_never_resolves_across_restart(
+            self):
+        """渠道登记退场后的首轮（新连接、只剩实物已核验）：渠道 active 走
+        suppressed 审计（updated、零通知、零 resolved outbox），永不 resolved；
+        实物层同轮照常首发，不受退场牵连。"""
+        fixture = self._fixture()
+        policy_ref = "inventory-monitor/1"
+        channel_key = self._key(fixture, policy_ref, "shop_sellable")
+        physical_key = self._key(fixture, policy_ref, "physical_total")
+        both_levels = ("physical_total", "shop_sellable")
+        conn = self._committed_conn()
+        self._seed_policy(conn, fixture, policy_ref, both_levels)
+        policy = self._monitor_policy(fixture, policy_ref, both_levels)
+        first_payload = self._both_verified_payload(fixture,
+                                                    physical_status="normal",
+                                                    channel_status="low")
+        first_scan = self._scan(fixture, policy_ref, first_payload,
+                                complete=both_levels,
+                                rows=(self._physical_row(fixture, status="normal",
+                                                         quantity="100"),
+                                      self._channel_row(fixture, status="low",
+                                                        quantity="0")),
+                                now=fixture.OBSERVED)
+        second_scan = self._scan(fixture, policy_ref, fixture._alerts_payload(),
+                                 complete=("physical_total",),
+                                 rows=(self._physical_row(fixture, status="low",
+                                                          quantity="10"),),
+                                 now=fixture.LATER)
+        self._register_cleanup(conn, keys=[channel_key, physical_key],
+                               fingerprints=[first_scan.source_fingerprint,
+                                             second_scan.source_fingerprint],
+                               policy_refs=[policy_ref])
+        self._commit(conn, first_scan,
+                     self._decide(policy, first_scan, (), both_levels,
+                                  fixture.OBSERVED), now=fixture.OBSERVED)
+        self.assertEqual(self._alert_state(conn, channel_key)[0], "open")
+        # 重启：渠道登记已撤，gate 只剩实物层。
+        restarted = self._committed_conn()
+        history = self._history(restarted, policy_ref)
+        decisions = self._decide(policy, second_scan, history,
+                                 ("physical_total",), fixture.LATER)
+        self.assertEqual([(d.level, d.event_kind, d.next_status, d.notify)
+                          for d in decisions],
+                         [("physical_total", "triggered", "open", True),
+                          ("shop_sellable", "updated", "suppressed", False)])
+        self._commit(restarted, second_scan, decisions, now=fixture.LATER)
+        self.assertEqual(self._alert_state(conn, channel_key)[0], "suppressed")
+        self.assertEqual(self._event_kinds(conn, channel_key),
+                         ["triggered", "updated"], "退场只落 updated 审计")
+        self.assertEqual(self._outbox_kinds(conn, channel_key), ["triggered"],
+                         "退场不写任何 outbox 行，更没有 resolved 通知")
+        self.assertEqual(self._alert_state(conn, physical_key),
+                         ("open", fixture.LATER), "实物层不受退场牵连")
+        self.assertEqual(self._event_kinds(conn, physical_key), ["triggered"])
+        for key in (channel_key, physical_key):
+            self.assertNotIn("resolved", self._event_kinds(conn, key))
+
+    def test_physical_only_and_both_level_policies_do_not_cross_feed(self):
+        """仅实物与两层策略并发扫描同一池：各策略实物键恰一个 active 首发、
+        全库零 shop_sellable 告警——实物数量不跨层级、不跨策略扇出。"""
+        fixture = self._fixture()
+        both_ref, physical_ref = "inventory-monitor/1", "inventory-monitor/2"
+        both_key = self._key(fixture, both_ref, "physical_total")
+        physical_key = self._key(fixture, physical_ref, "physical_total")
+        both_levels = ("physical_total", "shop_sellable")
+        conn = self._committed_conn()
+        self._seed_policy(conn, fixture, both_ref, both_levels)
+        self._seed_policy(conn, fixture, physical_ref, ("physical_total",))
+        payload = fixture._alerts_payload()
+        scans = {
+            ref: self._scan(fixture, ref, payload, complete=("physical_total",),
+                            rows=(self._physical_row(fixture, status="low",
+                                                     quantity="10"),),
+                            now=fixture.OBSERVED)
+            for ref in (both_ref, physical_ref)}
+        self._register_cleanup(conn, keys=[both_key, physical_key],
+                               fingerprints=[scans[both_ref].source_fingerprint,
+                                             scans[physical_ref]
+                                             .source_fingerprint],
+                               policy_refs=[both_ref, physical_ref])
+
+        def run_for(policy_ref: str):
+            process = self._committed_conn()
+            policy = self._monitor_policy(
+                fixture, policy_ref,
+                both_levels if policy_ref == both_ref else ("physical_total",))
+            decisions = self._decide(policy, scans[policy_ref],
+                                     self._history(process, policy_ref),
+                                     ("physical_total",), fixture.OBSERVED)
+            return self._commit(process, scans[policy_ref], decisions,
+                                now=fixture.OBSERVED)
+
+        results = self._race([lambda: run_for(both_ref),
+                              lambda: run_for(physical_ref)])
+        for transitions in results:
+            self.assertEqual([(t.next_status, t.event_kind) for t in transitions],
+                             [("open", "triggered")])
+        self.assertEqual(self._alert_state(conn, both_key)[0], "open")
+        self.assertEqual(self._alert_state(conn, physical_key)[0], "open")
+        total = conn.execute(
+            "SELECT count(*) FROM bi.inventory_alert_instances").fetchone()[0]
+        self.assertEqual(total, 2, "每个策略的实物键恰一个 active，无合并无翻倍")
+        sellable = conn.execute(
+            "SELECT count(*) FROM bi.inventory_alert_instances "
+            "WHERE level = 'shop_sellable'").fetchone()[0]
+        self.assertEqual(sellable, 0, "实物低库存不得跨层级产生渠道告警")
+
 
 if __name__ == "__main__":
     unittest.main()

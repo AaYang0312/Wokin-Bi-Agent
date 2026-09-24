@@ -429,4 +429,13 @@ describe('库存通知 API 调用与错误', () => {
     expect((caught as ApiError).status).toBe(404)
     expect((caught as ApiError).message).toBe('告警不存在')
   })
+
+  it('surfaces the list channel auth failure as an ApiError (Task 6 pin)', async () => {
+    stubFetch(() => jsonResponse(401, { code: 'unauthenticated', message: '请先登录' }))
+    const caught = await listNotifications()
+      .then(() => null, (error: unknown) => error)
+    expect(caught).toBeInstanceOf(ApiError)
+    expect((caught as ApiError).status).toBe(401)
+    expect((caught as ApiError).message).toBe('请先登录')
+  })
 })

@@ -453,6 +453,91 @@ uv run --locked --env-file ../.env.test python -m tests.acceptance --offline
 - 模型叙述失败（超时、超 token、格式不合法、模型异常）不丢数：确定性 findings 照常发布，限制里记 `narrative_unavailable`；剩余 deadline 不足 2 秒整段跳过模型调用。持久化失败才是硬失败：状态 failed、零 Artifact、模型侧拿不到任何 findings。
 - 前端对 `analysis_result` 载荷整体验形后才渲染：验不过整卡拒绝（“未通过展示侧校验”），不猜形状、不补数字；“查看来源数据”按钮只在同一条消息里找到唯一匹配的数据集 Artifact 时可用。
 
+## 持续库存通知（默认关闭）
+
+`backend/bi_agent/monitoring/` 是 Task 11 后置子项目 E：部署主机周期性调用一次性 CLI（`bi-inventory-monitor` 生成告警与 outbox 行，`bi-inventory-outbox` 幂等投递到应用内通知中心），复用 `InventoryWatchGraph` 与确定性问题状态机；模型与工具路径零参与。来源门禁**按层级判定**：只核验实物时渠道层是一等 `data_missing`/unknown——不补零、不替位、不触发、不解除、不发“无法判断”通知。
+
+### 当前状态（先读这一段）
+
+**默认关闭、未部署、未注册调度。** `INVENTORY_MONITOR_ENABLED=false` 是仓库与文档的默认值；本轮没有在任何机器注册计划任务，没有创建 systemd timer / Windows 任务，没有部署。启用前置是逐层库存来源验收（[验收记录](superpowers/research/2026-09-14-inventory-source-acceptance.md)，仍为 FAIL：`physical` 四维 NOT MET、`channel` 一等 `data_missing`）与 Task 11 统一发布门禁第 4–7 项（仍 open）——两者都未满足前，本节调度与回滚只是文档，不是操作记录。迁移 `023` 只在本机 `*_test` 库执行过；`bi_monitor` 是 NOLOGIN 最小权限身份，生产启用前必须另建独立登录与服务主体。
+
+### 门禁与变量
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `INVENTORY_MONITOR_ENABLED` | `false` | 总开关；关闭时两条 CLI 打印一行安全文案、退出 0、不连任何数据库、不装载任何秘密 |
+| `BI_MONITOR_DSN` | 空 | `bi_monitor` 身份的独立连接串；开启时必填，且不得等于 app/writer/approver 任一 DSN（`MONITOR_DSN_MUST_BE_SEPARATE`） |
+| `MONITOR_SERVICE_SUBJECT` | 空 | 服务主体；开启时必填 |
+| `MONITOR_POLICY_REFS` | 空 | 逗号分隔的已批准策略引用；开启时必填、去重、至多 100 条 |
+
+策略本身存于 `bi.inventory_monitor_policies`（默认无行，`enabled=false` 起步）；批准一条策略时的显式检查：其作用域内期望项必须 ≤20——来源 Artifact 只是 top-20 展示投影，超过 20 的作用域本轮永远零告警。
+
+### 部署主机调度（仅文档；本轮未注册）
+
+两种受控配置，调度器只反复调用两条一次性命令，命令不接受任何参数；**不创建 Codex automation**，不在 API 进程建循环：
+
+- **Windows Task Scheduler**（每 15 分钟，工作目录 `backend\`，非交互服务账号，单实例，30 秒超时，失败退出码告警）：
+
+```powershell
+# 注册模板（本轮未执行；仅当启用前置全部满足后由所有者决定使用）
+# run-inventory-monitor.ps1 依次执行 monitor、outbox，并把任一非零退出码交给既有告警通道。
+schtasks /Create /TN bi-inventory-monitor /SC MINUTE /MO 15 /RU <SERVICE_ACCOUNT> /RP * ^
+  /TR "powershell.exe -NoProfile -NonInteractive -File D:\bi-agent\run-inventory-monitor.ps1"
+# schtasks.exe 不能设置下列两项；注册后必须通过受控 XML 或 Task Scheduler 设置并复核：
+#   MultipleInstancesPolicy = IgnoreNew（单实例，不重叠）
+#   ExecutionTimeLimit = PT30S（30 秒超时）
+# 任务还必须设置为“无论用户是否登录都运行”；不得使用 /IT（它只允许交互登录会话）。
+# 服务账号密码只在受控注册提示中输入，不写入脚本、命令记录或仓库。
+```
+
+- **systemd timer**（同两条 ExecStart，`OnCalendar=*:0/15`，单实例由 `flock` 保证，`TimeoutStartSec=30s`，专用系统用户，失败进 `OnFailure` 告警单元，`WorkingDirectory` 指向 `backend/`）：
+
+```ini
+# bi-inventory-monitor.service（模板；本轮未安装）
+[Service]
+Type=oneshot
+User=bi-monitor
+WorkingDirectory=/opt/bi-agent/backend
+ExecStart=/usr/bin/flock -n /run/bi-inventory-monitor.lock uv run --locked bi-inventory-monitor
+ExecStartPost=/usr/bin/flock -n /run/bi-inventory-monitor.lock uv run --locked bi-inventory-outbox
+TimeoutStartSec=30s
+EnvironmentFile=/etc/bi-agent/monitor.env
+# environment 文件由运维以受控权限维护；仓库内不放任何真实值
+
+# bi-inventory-monitor.timer
+[Timer]
+OnCalendar=*:0/15
+Persistent=false
+[Install]
+WantedBy=timers.target
+```
+
+每轮 30 秒总 deadline 在进程内强制（逐策略共享）；调度器超时只是同一约束的第二道闸。日志只有 policy ref、run ref、固定状态码与计数——不含 DSN、证据原文、数量或真实 ID。
+
+### 零告警不等于安全（三类合法原因）
+
+运维**不得**把“没告警”读成“库存安全”。至少三类本轮合法的零告警，只能靠固定诊断码与固定计数区分：
+
+1. **请求层级未核验**：策略请求的层级缺已核验登记时，该层根本不会被发给 graph——无行、无去重键、不撑 expected_items，信号只有固定码 `monitor_level_unverified` 与计数 `inventory_monitor_level_unverified_total{level}`。只核验实物时**不存在**任何渠道侧信号：空店铺授权投影下 graph 结构上不读渠道快照，运维不会在物理轮看到 `inventory_channel_source_unverified`，也不该看到 `inventory_channel_snapshot_missing` 或未同步店铺一类店铺侧信号——载荷里出现即投影契约违约（按聚合码 fail closed，本轮去掉全部已核验层级并照常持久化）；两层都核验的运行里，`shop_not_synced` 伴随的 `inventory_snapshot_missing` 只去掉 `shop_sellable`，不要去查实物层。
+2. **展示投影截断**：来源 Artifact 只是 ≤20 行的展示投影；`inventory.truncated=true` 或出现 `inventory_display_truncated` 的轮次，所有已核验层级都不算完整——零首发、零解除，保持原状态。这不是“没出现的那几百格都安全”。
+3. **缺作用域引用的行被丢弃**：缺 `pool_ref`/`warehouse_ref`（实物）或 `shop_ref`（渠道）的格子不成为告警，只记 `monitor_row_scope_missing` 与 `inventory_monitor_rows_dropped_total{level,reason}`；不借另一层级引用、不拼默认作用域、不补零。
+
+对应计数：`inventory_monitor_skipped_total{reason}`（reason 是闭集固定码）、`inventory_monitor_level_unverified_total{level}`、`inventory_monitor_rows_dropped_total{level,reason}`；口径见[指标口径](metrics.md) §4.9。
+
+### 回滚
+
+顺序固定：① 把 `INVENTORY_MONITOR_ENABLED` 置回 `false`（或移除该变量）并停止调度任务（`schtasks /End` + `/Change /DISABLE`，或 `systemctl disable --now bi-inventory-monitor.timer`）；② 确认两条 CLI 在 disabled 下打印单行安全文案退出 0；③ **历史表全部保留审计**——`bi.inventory_alert_instances` / `bi.inventory_alert_events` / `bi.notification_outbox` / `bi.in_app_notifications` 不清空、不删除 open 告警、不伪造 `resolved`。迁移 `023` 不回滚：表结构与权限收窄保留，已有行仍可审计；重新启用只是把开关改回 `true`。来源被撤销或策略失效后的存量 open/acknowledged 告警由 runner 置 `suppressed`（永不 resolved）。
+
+### 本地回归
+
+```powershell
+Set-Location backend
+uv run --locked --env-file ../.env.test python -m unittest tests.test_monitoring -v
+uv run --locked --env-file ../.env.test python -m unittest tests.test_db tests.test_runtime_db tests.test_monitoring -v
+```
+
+共享库套件请逐条顺序跑（同一 `bi_agent_test`，外层回滚但 advisory 锁与共享表是全局态）。
+
 ## 同源部署
 
 发布 `frontend/dist` 静态文件。反向代理将 `/api/*` 转发到 `127.0.0.1:8000`，其余路径提供 SPA 回退；关闭 SSE 路径的响应缓冲。FastAPI 仅运行于回环地址且使用单 worker：
@@ -476,6 +561,9 @@ uv run --locked --env-file ../.env.test python -m unittest tests.test_exploratio
 # approved 查询学习记忆（后置子项目 C：契约与生命周期、授权/版本过滤检索与撤销时效、
 # 路由接入与无自动写入；真库用例在 test_db / test_runtime_db / test_api 内）
 uv run --locked --env-file ../.env.test python -m unittest tests.test_query_memory -v
+# 持续库存通知（后置子项目 E：契约与逐层门禁、状态机与 gold、runner 投影收窄、
+# CLI/投递；真库并发/崩溃矩阵在 test_db，通知 API 在 test_api）
+uv run --locked --env-file ../.env.test python -m unittest tests.test_monitoring -v
 # 底座回归
 uv run python -m unittest tests.test_core -v
 uv run --env-file ../.env.test python -m unittest tests.test_db tests.test_api tests.test_runtime_db -v

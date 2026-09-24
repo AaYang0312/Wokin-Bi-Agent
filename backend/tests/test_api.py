@@ -1328,6 +1328,18 @@ class NotificationApiTests(unittest.TestCase):
             self.assertEqual([row["notification_ref"] for row in owned.json()],
                              [self._notification()["notification_ref"]])
 
+    def test_read_channel_without_subject_is_unauthenticated_before_any_read(self):
+        """计划 Task 6：读通道与写通道同一认证闸——缺 subject 401，且在认证前
+        不触发任何视图读取（轮询的 GET 与 POST 走同一 get_subject 依赖）。"""
+        conn = NotificationApiConn(notifications=[self._notification()])
+        with self.notification_client(conn) as client:
+            response = client.get("/api/notifications")
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json(),
+                         {"code": "unauthenticated", "message": "请先登录"})
+        self.assertEqual([call for call in conn.calls
+                          if call.startswith("SELECT notification")], [])
+
     def test_missing_notification_and_missing_alert_share_one_404(self):
         conn = NotificationApiConn(notifications=[self._notification()])
         with self.notification_client(conn) as client:

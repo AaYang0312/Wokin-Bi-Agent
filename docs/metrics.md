@@ -432,6 +432,46 @@ SELECT count(*) FROM reporting.v_approved_query_examples;
 - 分析不创造新数据能力：它只能消费当前用户已被授权读取的既有 Artifact，来源失权后下一次分析即拒绝。
 - HTTP 生产启用被刻意延后（与 `CONTROLLED_SQL_ENABLED` 先例一致），Task 11 统一发布门禁第 4–7 项仍 open。
 
+## 4.9 持续库存通知的观测口径（`backend/bi_agent/monitoring/`，计划 Task 11 后置子项目 E）
+
+本功能默认关闭（`INVENTORY_MONITOR_ENABLED=false`），且仓库没有指标后端：以下是八个定名指标的**真实现状**与观测口径，不虚构未接入的计数器。所有 label 都是闭集固定枚举，**不含 policy ref、SKU、subject 或任何真实 ID**；缺来源层级、缺证据与投影截断信息只能以这类指标与固定诊断码出现，**不得以用户通知出现**。
+
+### 八个定名指标
+
+| 名称 | 现状 | 含义与 label 词表 |
+| --- | --- | --- |
+| `inventory_monitor_runs_total{status}` | **目标插桩，当前只能部分派生**：已提交的监控轮在 `bi.query_runs`（`domain='inventory_watch'`）留有行，可按终态计数；但被跳过/失败的轮（门禁 disabled、策略不存在或停用、deadline、图异常）不落任何行——完整按 status 出数必须新增请求级插桩 | 衡量监控轮的量与结果分布 |
+| `inventory_alert_transitions_total{event_kind}` | **可派生**：`SELECT event_kind, count(*) FROM bi.inventory_alert_events GROUP BY event_kind`；`event_kind` 闭集 `triggered` / `retriggered` / `updated` / `resolved` | 衡量状态迁移分布；`suppressed` 退场只落 `updated` 审计，永不产生 `resolved` |
+| `inventory_monitor_skipped_total{reason}` | **进程内计数器**（`monitoring/runner.py` 的 `_COUNTERS`，进程重启即归零） | 整轮被跳过的闭集固定码：`monitor_source_unverified`、`display_projection_truncated`、`monitor_policy_disabled`、`monitor_deadline_exceeded`、`monitor_graph_exception`、`monitor_artifact_missing`、`monitor_artifact_ambiguous`、`monitor_artifact_status_not_decidable`、`monitor_artifact_payload_invalid`、`monitor_contract_error`、`monitor_projection_contract_violation`、`monitor_aggregate_limitation_code`、`monitor_unknown_limitation_code`（计划文本只点名前两枚；实现闭集还包含其余 fail-closed 固定码，不得自行扩充） |
+| `notification_outbox_pending` | **可派生**：`SELECT count(*) FROM bi.notification_outbox WHERE delivered_at IS NULL` | 待投递存量；投递是 at-least-once、幂等键去重、批量上限 100、attempts ≤ 20 指数退避 |
+| `notification_delivery_attempts_total{status}` | **目标插桩，当前无计数器**：总量与重试分布可从 outbox 行（`attempts`、`delivered_at`、attempts=20 且未投递即死信）派生，按 status 细分需接入插桩 | 衡量投递成功/重试/死信 |
+| `inventory_alerts_active{status}` | **可派生**：`SELECT status, count(*) FROM bi.inventory_alert_instances GROUP BY status`；唯一部分索引保证每个去重键至多一条 open/acknowledged | 活跃告警存量；`resolved` / `suppressed` 行是历史审计，不算 active |
+| `inventory_monitor_level_unverified_total{level}` | **进程内计数器**（同上）；`level` 只取 `physical_total` / `shop_sellable` 两个枚举值 | 缺已核验登记的层级计数。该层被 runner 从 graph 请求里剔除，所以它的信号只有这个计数与 `monitor_level_unverified` 固定码，**不是** graph 的 `*_source_unverified`（那属于聊天路径） |
+| `inventory_monitor_rows_dropped_total{level,reason}` | **进程内计数器**（同上）；`reason` 只取 `monitor_row_scope_missing`、`monitor_unverified_level_row` | 被 runner 丢弃的行：缺本层级作用域引用，或载荷里出现未核验层级的行（第二道闸）。丢弃行不进状态机输入、不生成去重键、零事件零 outbox |
+
+两个进程内计数器只在所属进程内有效；一次性 CLI 每轮即退，所以生产观测它们必须由指标后端在进程退出前抓取或改接远端后端——在那之前，数据库侧可派生的四个指标是唯一可持续观测面。
+
+### 数据库侧只读观测
+
+用受管只读身份；输出只有状态、事件种类与计数，不查 payload 列：
+
+```sql
+-- 活跃告警存量（每键至多一条 open/acknowledged）
+SELECT status, count(*) FROM bi.inventory_alert_instances GROUP BY status ORDER BY status;
+-- 状态迁移分布（suppressed 退场只落 updated 审计）
+SELECT event_kind, count(*) FROM bi.inventory_alert_events GROUP BY event_kind ORDER BY event_kind;
+-- 待投递存量
+SELECT count(*) FROM bi.notification_outbox WHERE delivered_at IS NULL;
+-- 已提交监控轮（被跳过的轮不留行，见上表现状列）
+SELECT count(*) FROM bi.query_runs WHERE domain = 'inventory_watch';
+```
+
+### 不得从本功能读出的结论
+
+- 来源门禁按层级判定（所有者 2026-09-17 Option A）：`inventory_monitor_level_unverified_total` 的计数**永远不是零可用**的证据，更不是某层数量；缺层是一等 `data_missing`/unknown，不补零、不替位。
+- 来源 Artifact 是 graph 的 top-20 展示投影，本计划未实现全量决策投影；期望项超过 20 的策略作用域本轮不会出告警——`inventory_alerts_active` 为零不得读成“库存都安全”。
+- 本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [持续库存通知本地验收记录](superpowers/research/2026-09-25-continuous-inventory-notifications-acceptance.md)；生产监控保持 disabled（库存来源验收仍 FAIL，Task 11 门禁第 4–7 项仍 open），调度未注册，本节口径不构成启用许可。
+
 ## 5. 真实对账结果摘要
 
 ### 合成基准（已通过，冻结时刻 2026-09-08 09:00+08）

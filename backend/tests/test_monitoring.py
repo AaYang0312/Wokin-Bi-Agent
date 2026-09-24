@@ -1821,6 +1821,48 @@ class MonitorRunnerTests(unittest.TestCase):
         self.assertEqual(result, ())
         self.assertEqual(len(repository.commit_calls), 1)
 
+    def test_shop_side_code_only_removes_shop_sellable_when_it_runs(self):
+        """两层都核验时渠道侧限制码只去掉 shop_sellable：实物层完整性不受
+        一个它自己的证据没问题的层级牵连（计划 Task 4 Step 4 归属规则）。"""
+        from bi_agent.inventory.rules import INVENTORY_CODE_BY_TEXT
+
+        text = next(text for text, code in INVENTORY_CODE_BY_TEXT.items()
+                    if code == "inventory_channel_snapshot_missing")
+        payload = alerts_payload()
+        payload["limitations"] = [text]
+        graph = _RunnerGraphDouble(payload=payload)
+        result, graph, repository, _ = run_with_seams(
+            registrations=both_registrations(), graph=graph)
+        scan = repository.commit_calls[0][0]
+        # 渠道侧码只说店铺：本轮不完整的是渠道层；实物层照常完整并可首发。
+        self.assertEqual(scan.complete_levels, ("physical_total",))
+        self.assertEqual([decision.event_kind for decision in
+                          repository.commit_calls[0][1]], ["triggered"])
+        self.assertEqual(counter_total("inventory_monitor_skipped_total",
+                                       reason="monitor_projection_contract_violation"),
+                         0)
+
+    def test_channel_code_in_a_physical_only_round_is_a_contract_violation(self):
+        """物理轮（空店铺投影）里渠道侧码结构上不可产生：出现即投影契约违约，
+        当聚合码 fail closed——本轮去掉全部已核验层级并照常持久化，零迁移。
+        运维不得把它读成“实物不完整”，也不得据此改宽请求或投影。"""
+        from bi_agent.inventory.rules import INVENTORY_CODE_BY_TEXT
+
+        text = next(text for text, code in INVENTORY_CODE_BY_TEXT.items()
+                    if code == "inventory_channel_snapshot_missing")
+        payload = alerts_payload()
+        payload["limitations"] = [text]
+        graph = _RunnerGraphDouble(payload=payload)
+        result, graph, repository, _ = run_with_seams(
+            registrations=physical_only_registrations(), graph=graph)
+        scan = repository.commit_calls[0][0]
+        self.assertEqual(scan.complete_levels, ())
+        self.assertEqual(result, ())
+        self.assertEqual(counter_total("inventory_monitor_skipped_total",
+                                       reason="monitor_projection_contract_violation"),
+                         1)
+        self.assertEqual(len(repository.commit_calls), 1)
+
     def test_truncated_display_projection_truncated(self):
         from bi_agent.inventory.rules import INVENTORY_CODE_BY_TEXT
 
