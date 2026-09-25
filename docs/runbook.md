@@ -48,6 +48,7 @@ psql -d bi_agent -f backend/sql/022_isolated_analysis_artifacts.sql
 - 新增一个来源必须先拿齐方法名、权限、时间语义与金额对账证据，再写进注册表；数据库里不维护第二套可自由配置的来源表。
 - 先跑 `shops` 刷店铺档案再跑订单命令，缺档案的店会直接报错（防假覆盖）。
 - 淘系口径为 **ERP 出库非敏感字段**，非平台账单口径；收件人/买家昵称/手机号等 PII 字段在规范化入口即丢弃并有守护用例，不得扩列。详见 `docs/superpowers/research/2026-09-12-taoxi-onboarding.md`。
+- 淘系（tb/tm）支付窗口回填/replay/reconcile 自 2026-09-25（S2 取证）起改走**宽出库窗 + 本地 payTime 过滤**：按 `timeType=consign_time` 请求 `[start-15d, end+15d)`，**逐日切片（≤1 天/片，官方建议跨度）且每片先在线（cursor/hasNext）后归档（total 证据）双通道**，任何一片分页不完整即整窗失败；本地只保留 `payTime ∈ [start, end)` 的行后入库，覆盖区间仍是请求窗口本身（宽窗只是取数范围，永远不写成覆盖）。代价是查询放大：每个 1 天支付窗口的宽窗取数为 31 个日切片 × 2 通道 = 每支付日至少 62 次 stream start（切片超 200 行另有分页请求；原 pay_time 路径每支付日仅 2 次 stream start），调度预算由运维控制；未发货的已付单在该路径不可见（出库人群上限，来源口径已披露），由 upd_time 增量与后续发货后的重放补齐。其余平台（fxg/jd/kuaishou/wxsph/wsxc/pdd）支付窗口仍按 API `pay_time` 过滤。
 
 分别启动后端和前端：
 
@@ -227,10 +228,12 @@ uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
 - 覆盖、截止与质量按 `(店铺 × 来源 × 实体)` 取**交集**判定（计划 Task 5.2b）：
   `covered_windows` 与 `suggested_window` 都是“每家、每个依赖都齐”的区间，不再拿各店
   已覆盖段的并集当建议窗口；缺口按实体、店铺与具体来源归因，旧通道残留的状态行不再参与。
-- 付款时间口径未认证（Task 5.2c）分两档：`disproved`（销售出库接口实测按自身时间裁剪）
-  不得给支付窗口类结果，返回 `coverage_time_basis_unverified`；`unmeasured`（同通道但未
-  逐店对照）可出数但必须披露为可观测样本。`erp_documents` 是单据计数、不是支付窗口主张，
-  两档都只披露不拒答。等回填不会改变这个结论，要的是与后台账单/业务日期的对照登记。
+- 付款时间口径未认证（Task 5.2c）分三档：`disproved`（销售出库接口实测按自身时间裁剪）与
+  `local_filter`（S2 取证后淘系同步改宽出库窗+本地 payTime 过滤，窗口归属已按构造精确，
+  但出库人群上限与 S3 口径决策未落地前仍不开放「完整支付窗口」主张）都不得给支付窗口类
+  结果，返回 `coverage_time_basis_unverified`；`unmeasured`（同通道但未逐店对照）可出数但
+  必须披露为可观测样本。`erp_documents` 是单据计数、不是支付窗口主张，各档都只披露不拒答。
+  等回填不会改变这个结论，要的是与后台账单/业务日期的对照登记。
 
 - 历史遗留的“从未核验”统一是 `unknown`，仍可出数但会带「来源质量未核验」说明；不得直接当数据有错。
 - 对账发现归属未确认的平台成功退款时，**不再**把来源降为 `failed`：它是一道可量化限制，

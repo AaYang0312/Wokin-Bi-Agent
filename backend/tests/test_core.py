@@ -1019,10 +1019,10 @@ class PageCompletionEvidenceTests(unittest.TestCase):
         source = inspect.getsource(sync)
 
         self.assertIn("C-6", source)
-        # 宽容位只允许给两处**归档通道**（orders 的 pay_time 与 orders_consign 的
-        # consign_time，都是 queryType=1 的同一接口家族、同一实测行为）：
-        # 在线通道永远严格。
-        self.assertEqual(source.count("allow_omitted_list=True"), 2,
+        # 宽容位只允许给**归档通道**（orders 的 pay_time、orders_consign 的
+        # consign_time、S2 本地过滤支付窗口的宽窗 consign_time——都是 queryType=1
+        # 的同一接口家族、同一实测行为）：在线通道永远严格。
+        self.assertEqual(source.count("allow_omitted_list=True"), 3,
                          "宽容位不得扩散到在线通道或其他调用点")
         for block in source.split("def ")[1:]:
             if "allow_omitted_list=True" in block:
@@ -3602,7 +3602,9 @@ class SalesBasisClarificationTests(unittest.TestCase):
                               ("P1", "pdd")])
         self.assertIn("tb：erp_outstock_payment/v1", text)
         self.assertIn("非平台账单 GMV", text)
-        self.assertIn("实测不成立", text)
+        # S2 取证后：淘系窗口由本地过滤建立，但完整支付窗口仍不宣称。
+        self.assertIn("本地 payTime 过滤", text)
+        self.assertIn("完整支付窗口仍不宣称", text)
         self.assertIn("jd", text)
         self.assertIn("未逐店对照", text)
         # 顺序只由平台码决定：同一个授权集两次问不能给出两份文案，否则模型会把
@@ -3869,6 +3871,154 @@ class OutstockSourceTests(unittest.TestCase):
         ])
         with self.assertRaises(KuaimaiError):
             list(fetch_consign_window(client, shop_id="166520", window=window))
+
+    def test_payment_window_fetch_uses_wide_consign_window_with_local_filter(self):
+        """S2 本地过滤支付窗口：按 ≤1 天切片请求宽出库窗（consign_time，±15 天），
+        只放行 payTime 真实落在请求窗口内的行——窗口归属不再依赖 API 的
+        pay_time 过滤语义（实测会漂移，83/8367 行越窗）。"""
+        from bi_agent.sources import (
+            OUTSTOCK_SOURCE, PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        from bi_agent.sync import Window, fetch_window
+        window = Window(datetime(2026, 9, 1, tzinfo=self.TZ),
+                        datetime(2026, 9, 2, tzinfo=self.TZ))
+        wide_page = {"success": True, "total": 3, "hasNext": False, "list": [
+            self._raw(sid=1, userId=166520,
+                      payTime=self._ms(datetime(2026, 9, 1, 10, tzinfo=self.TZ)),
+                      consignTime=self._ms(datetime(2026, 9, 3, 10, tzinfo=self.TZ))),
+            self._raw(sid=2, userId=166520,
+                      payTime=self._ms(datetime(2026, 9, 5, 10, tzinfo=self.TZ)),
+                      consignTime=self._ms(datetime(2026, 9, 6, 10, tzinfo=self.TZ))),
+            self._raw(sid=3, userId=166520,
+                      payTime=self._ms(datetime(2000, 1, 1, tzinfo=self.TZ)),
+                      consignTime=self._ms(datetime(2026, 9, 3, 10, tzinfo=self.TZ))),
+        ]}
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, dict(params)))
+                if (params.get("queryType") == "0" and "cursor" not in params
+                        and params["startTime"] == "2026-08-17 00:00:00"):
+                    # 宽窗第一切片的在线通道：窗内支付 / 窗外支付 / 占位支付各一单。
+                    return wide_page
+                return {"success": True, "total": 0}
+
+        client = Client()
+        rows = list(fetch_window(client, entity="orders", shop_id="166520",
+                                 window=window, mode="backfill",
+                                 order_source=OUTSTOCK_SOURCE,
+                                 payment_fetch=PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER))
+        self.assertEqual([row["sid"] for row in rows], [1],
+                         "只放行 payTime ∈ [start,end) 的行；窗外与占位支付一律拦下")
+        self.assertEqual({m for m, _ in client.calls}, {OUTSTOCK_SOURCE})
+        self.assertEqual({p["timeType"] for _, p in client.calls}, {"consign_time"},
+                         "宽窗按发货时间取数，不用 API 的 pay_time 过滤")
+        # 逐字断言：宽窗 [start-15d, end+15d) = [08-17, 09-17) 必须= 31 个 ≤1 天日切片，
+        # 每片先在线（queryType=0）后归档（queryType=1）；多日单流会被服务端静默截断，
+        # 且分页完成证据无法发现，因此这里钉死每个切片的精确边界与通道顺序。
+        expected_calls = []
+        for offset in range(31):
+            slice_start = datetime(2026, 8, 17, tzinfo=self.TZ) + timedelta(days=offset)
+            slice_end = slice_start + timedelta(days=1)
+            bounds = (slice_start.strftime("%Y-%m-%d %H:%M:%S"),
+                      slice_end.strftime("%Y-%m-%d %H:%M:%S"))
+            expected_calls.append(("0",) + bounds)
+            expected_calls.append(("1",) + bounds)
+        actual_calls = [(p["queryType"], p["startTime"], p["endTime"])
+                        for _, p in client.calls]
+        self.assertEqual(actual_calls, expected_calls,
+                         "宽窗必须逐日切片（≤1 天/片，官方建议跨度），且每片先在线后归档双通道")
+
+    def test_payment_window_fetch_fail_closed_on_incomplete_pagination(self):
+        """宽窗分页完整性破坏：KuaimaiError 上抛，半窗数据永不外流。"""
+        from bi_agent.kuaimai import KuaimaiError
+        from bi_agent.sources import (
+            OUTSTOCK_SOURCE, PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        from bi_agent.sync import Window, fetch_window
+        window = Window(datetime(2026, 9, 1, tzinfo=self.TZ),
+                        datetime(2026, 9, 2, tzinfo=self.TZ))
+
+        class Client:
+            def call(self, method, params):
+                return {"success": True, "list": [{"sid": "E1"}],
+                        "hasNext": True, "cursor": "c1"}
+
+        with self.assertRaises(KuaimaiError):
+            list(fetch_window(Client(), entity="orders", shop_id="S1",
+                              window=window, mode="backfill",
+                              order_source=OUTSTOCK_SOURCE,
+                              payment_fetch=PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER))
+
+    def test_payment_fetch_style_must_pair_with_outstock_source(self):
+        """宽出库窗+本地过滤只配出库通道订单源；配错在任何 API 调用前拒绝。"""
+        from bi_agent.sources import (
+            PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER, TRADE_LIST_SOURCE)
+        from bi_agent.sync import Window, fetch_window
+        window = Window(datetime(2026, 9, 1, tzinfo=self.TZ),
+                        datetime(2026, 9, 2, tzinfo=self.TZ))
+
+        class Client:
+            def call(self, method, params):
+                raise AssertionError("配对错误不得走到 API 调用")
+
+        with self.assertRaises(ValueError):
+            list(fetch_window(Client(), entity="orders", shop_id="S1",
+                              window=window, mode="backfill",
+                              order_source=TRADE_LIST_SOURCE,
+                              payment_fetch=PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER))
+
+    def test_shop_payment_fetch_routes_by_platform(self):
+        """支付窗口取数方式按 bi.shops.platform 路由：tb/tm 走宽出库窗，
+        交易通道平台与 pdd 仍走 API pay_time；未登记/缺档案 fail closed。"""
+        from bi_agent.sources import (
+            PAYMENT_FETCH_API_PAY_TIME, PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        from bi_agent.sync import _shop_payment_fetch
+
+        class Conn:
+            def __init__(self, row):
+                self.row = row
+
+            def execute(self, sql, parameters=None):
+                row = self.row
+
+                class Result:
+                    def fetchone(self):
+                        return row
+
+                return Result()
+
+        self.assertEqual(_shop_payment_fetch(Conn(("tb",)), "1"),
+                         PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        self.assertEqual(_shop_payment_fetch(Conn(("tm",)), "1"),
+                         PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        for platform in ("fxg", "jd", "kuaishou", "wxsph", "wsxc", "pdd"):
+            self.assertEqual(_shop_payment_fetch(Conn((platform,)), "1"),
+                             PAYMENT_FETCH_API_PAY_TIME, platform)
+        with self.assertRaises(SystemExit):
+            _shop_payment_fetch(Conn(("1688",)), "1")
+        with self.assertRaises(SystemExit):
+            _shop_payment_fetch(Conn(None), "1")
+
+    def test_tb_tm_payment_windows_are_local_filter_certified(self):
+        """S2 取证（2026-09-25）：tb/tm 时间口径标记 local_filter——出库通道
+        pay_time 参数语义漂移由本地过滤修正；完整支付窗口主张仍未认证。"""
+        from bi_agent.sources import (
+            OUTSTOCK_SOURCE, PAYMENT_FETCH_API_PAY_TIME,
+            PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER, payment_window_fetch,
+            registration)
+        for platform in ("tb", "tm"):
+            reg = registration(platform)
+            self.assertEqual(reg.order_source, OUTSTOCK_SOURCE)
+            self.assertEqual(reg.time_certified, "local_filter", platform)
+            self.assertEqual(payment_window_fetch(platform),
+                             PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER, platform)
+        for platform in ("fxg", "jd", "kuaishou", "wxsph", "wsxc", "pdd"):
+            self.assertEqual(payment_window_fetch(platform),
+                             PAYMENT_FETCH_API_PAY_TIME, platform)
+        self.assertIsNone(payment_window_fetch("1688"),
+                          "未登记平台没有取数方式，fail closed")
 
     def test_normalised_key_set_frozen(self):
         from bi_agent.sync import normalise_aftersale

@@ -378,11 +378,10 @@ class CapabilityGateDatabaseTests(unittest.TestCase):
         self.assertEqual(money.status, "missing_data", money.limitations)
         self.assertEqual(money.data, [])
 
-    def test_disproved_pay_time_channel_refuses_a_payment_window_result(self):
-        """出库接口实测按自身时间裁剪（83/8367 行越界）：它给不出完整支付窗口。
-
-        数据齐、覆盖全也不能出数——把可观测样本当完整窗口，就是拿偏小的数字冒充总额。
-        """
+    def test_disproved_or_local_filter_channel_refuses_a_payment_window_result(self):
+        """出库来源不能宣称完整支付窗口：S2 前 pay_time 参数实测漂移（83/8367 行
+        越窗），S2 后同步改宽出库窗+本地过滤，但出库人群结构上限与 S3 口径决策
+        未落地前，完整支付窗口主张仍 fail closed——数据齐、覆盖全也不能出数。"""
         self._grant("{paid_amount}", platform="tb")
         result = self._query(["paid_amount"])
         self.assertEqual(result.status, "missing_data", result.limitations)

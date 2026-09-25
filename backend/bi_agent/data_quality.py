@@ -615,7 +615,11 @@ def assess_query_coverage(conn, request) -> CoverageAssessment:
         certification = binding.time_certification
         if certification == "certified":
             continue
-        if certification == "disproved" and shop_id in window_shops:
+        # disproved：通道 pay_time 过滤语义实测不成立；local_filter：S2 取证后
+        # 淘系同步改宽出库窗+本地 payTime 过滤，窗口归属已按构造精确，但出库
+        # 人群上限（未发货单不可见）与 S3 关闭单口径决策未落地前，「完整支付
+        # 窗口」主张仍然 fail closed（见 2026-09-25-s2-acceptance.md）。
+        if certification in ("disproved", "local_filter") and shop_id in window_shops:
             blocking.add(shop_id)
         else:
             disclosure.add(shop_id)

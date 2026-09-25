@@ -28,8 +28,9 @@ from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
 from .metrics import _BudgetExhausted, _set_query_budget
 from .sources import (
     AFTERSALE_SOURCE, CONSIGN_ORDERS_ENTITY, OUTSTOCK_SOURCE, ShopRecord,
-    TRADE_LIST_SOURCE, capabilities_from_evidence, platform_order_sources,
-    resolve_consign_source, resolve_order_source)
+    TRADE_LIST_SOURCE, capabilities_from_evidence, payment_window_fetch,
+    platform_order_sources, resolve_consign_source, resolve_order_source,
+    PAYMENT_FETCH_API_PAY_TIME, PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
 
 logger = logging.getLogger(__name__)
 
@@ -950,12 +951,16 @@ def _fetch_aftersales_paged(client: KuaimaiClient, *, shop_id: str, window: Wind
 
 def fetch_window(client: KuaimaiClient, *, entity: str, shop_id: str,
                  window: Window, mode: str,
-                 order_source: str = ORDER_SOURCE) -> Iterator[dict[str, Any]]:
+                 order_source: str = ORDER_SOURCE,
+                 payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME) -> Iterator[dict[str, Any]]:
     """拉取一个窗口；结束前必须证明分页完整，否则抛KuaimaiError。
 
     初始订单回填按pay_time建立支付业务覆盖；归档边界附近分别核对
     queryType=0/1，使用两通道覆盖且依主键幂等去重。
     order_source 决定订单实体请求的接口方法（淘系走出库通道）；售后不分平台。
+    payment_fetch 决定订单实体的业务时间窗口取数方式（见 sources.payment_window_fetch）：
+    淘系（wide_consign_local_filter）改走宽出库窗+本地 payTime 过滤，其余平台
+    维持 API pay_time 过滤；增量/扫描（upd_time）与售后不受影响。
     """
     if entity == "orders":
         if mode in ("incremental", "scan"):
@@ -963,6 +968,14 @@ def fetch_window(client: KuaimaiClient, *, entity: str, shop_id: str,
                                             time_type="upd_time", query_type="0",
                                             method=order_source)
         elif mode in ("backfill", "replay", "reconcile", "probe"):
+            if payment_fetch == PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER:
+                if order_source != OUTSTOCK_SOURCE:
+                    raise ValueError(
+                        "宽出库窗+本地过滤只适用于出库通道订单源，"
+                        f"收到 {order_source!r}")
+                yield from fetch_payment_window(client, shop_id=shop_id,
+                                                window=window, method=order_source)
+                return
             yield from _fetch_orders_cursor(client, shop_id=shop_id, window=window,
                                             time_type="pay_time", query_type="0",
                                             method=order_source)
@@ -1102,7 +1115,8 @@ def record_failure(conn, *, source: str, entity: str, shop_id: str, code: str) -
 
 def sync_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
                 window: Window, mode: str,
-                order_source: str = ORDER_SOURCE) -> int:
+                order_source: str = ORDER_SOURCE,
+                payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME) -> int:
     """单个窗口事务：拉取、规范化、入库、去重；成功后推进状态。成功返回写入记录数。"""
     batch_id = uuid.uuid4().hex
     source = order_source if entity == "orders" else AFTERSALE_SOURCE
@@ -1111,7 +1125,8 @@ def sync_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
     touched_commercials: set[str] = set()
     with conn.transaction():
         for raw in fetch_window(client, entity=entity, shop_id=shop_id, window=window,
-                                mode=mode, order_source=order_source):
+                                mode=mode, order_source=order_source,
+                                payment_fetch=payment_fetch):
             if entity == "orders":
                 trade = normalise_trade(raw, source=order_source)
                 if trade["normalization_status"] == "invalid":
@@ -1163,6 +1178,53 @@ def fetch_consign_window(client: KuaimaiClient, *, shop_id: str,
                                    time_type="consign_time", query_type="1",
                                    method=OUTSTOCK_SOURCE,
                                    allow_omitted_list=True)
+
+
+# S2 取证（2026-09-25，两店半月窗口、A/B 对称差集 100% 归因于「未发货单」，
+# 见 docs/superpowers/research/2026-09-25-s2-acceptance.md）：出库通道的
+# pay_time 参数语义随渠道漂移，淘系支付窗口改由宽出库窗 + 本地 payTime 过滤
+# 建立；±15 天保证实测全部差集类别都在解释闭集内。
+PAYMENT_WINDOW_PAD = timedelta(days=15)
+
+
+def _pay_time_in_window(raw: dict[str, Any], start: datetime,
+                        end: datetime) -> bool:
+    """本地支付窗口过滤：payTime 必须是真实业务时间且落在 [start, end)。
+
+    与 `parse_business_timestamp` 同一语义：2000-01-01 一类占位/缺失支付时间
+    绝不当作窗口内支付——这正是对出库通道 pay_time 参数语义漂移的本地修正。
+    """
+    pay = parse_business_timestamp(raw.get("payTime"))
+    return pay is not None and start <= pay < end
+
+
+def fetch_payment_window(client: KuaimaiClient, *, shop_id: str, window: Window,
+                         method: str = OUTSTOCK_SOURCE) -> Iterator[dict[str, Any]]:
+    """S2 淘系支付窗口取数：宽出库窗（consign_time，±PAYMENT_WINDOW_PAD）
+    + 本地 `payTime ∈ [start, end)` 过滤。
+
+    宽窗必须**逐日切片**（官方「跨度建议不超过一天」；多日单流会被服务端
+    静默截断，而分页完成证据只覆盖服务端实际返回的内容，发现不了截断）：
+    每个日切片各走在线（cursor/hasNext）与归档（total 证据 + 宽容空位）双通道，
+    与订单/出库通道同一套分页终止证据；任何一片不完整就抛 KuaimaiError——
+    半窗数据永远不离开生成器，调用方窗口事务整体回滚。日切片按 consignTime
+    互斥，同一单每通道只出现一片；产出行是本地过滤后的严格
+    `payTime ∈ [start, end)` 子集：窗口覆盖的准确性不再依赖 API 的 pay_time
+    过滤语义。出库人群上限（未发货单不可见）由来源口径披露，不在本函数补偿。
+    """
+    wide_start = window.start - PAYMENT_WINDOW_PAD
+    wide_end = window.end + PAYMENT_WINDOW_PAD
+    for slice_ in day_windows(wide_start, wide_end):
+        for raw in _fetch_orders_cursor(client, shop_id=shop_id, window=slice_,
+                                        time_type="consign_time", query_type="0",
+                                        method=method):
+            if _pay_time_in_window(raw, window.start, window.end):
+                yield raw
+        for raw in _fetch_orders_paged(client, shop_id=shop_id, window=slice_,
+                                       time_type="consign_time", query_type="1",
+                                       method=method, allow_omitted_list=True):
+            if _pay_time_in_window(raw, window.start, window.end):
+                yield raw
 
 
 def _refresh_allocation_flags(conn, shop_id: str,
@@ -1577,12 +1639,29 @@ def _shop_error(exc: BaseException) -> str:
     return str(exc) or exc.__class__.__name__
 
 
+def _shop_payment_fetch(conn, shop_id: str) -> str:
+    """按 bi.shops.platform 路由支付窗口取数方式；未登记/缺档案直接停机。
+
+    与 `_shop_order_source` 同一纪律：宁可停机，不回退默认方式——否则淘系店会
+    沿用实测漂移的 pay_time 参数过滤，把错误窗口归属写成完整覆盖。
+    """
+    row = conn.execute(
+        "SELECT platform FROM bi.shops WHERE shop_id=%s", (shop_id,)).fetchone()
+    style = payment_window_fetch(str(row[0]) if row else None)
+    if style is None:
+        raise SystemExit(f"店铺 {shop_id} 的平台未在 sources 注册表登记，"
+                         "支付窗口取数方式不可解析")
+    return style
+
+
 def _run_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
                 window: Window, mode: str,
-                order_source: str = ORDER_SOURCE) -> int:
+                order_source: str = ORDER_SOURCE,
+                payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME) -> int:
     try:
         return sync_window(conn, client, entity=entity, shop_id=shop_id,
-                           window=window, mode=mode, order_source=order_source)
+                           window=window, mode=mode, order_source=order_source,
+                           payment_fetch=payment_fetch)
     except KuaimaiError as exc:
         record_failure(conn,
                        source=order_source if entity == "orders" else AFTERSALE_SOURCE,
@@ -1598,6 +1677,7 @@ def _beijing_now() -> datetime:
 
 def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
                    t0: datetime, order_source: str = ORDER_SOURCE,
+                   payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME,
                    now: Callable[[], datetime] = _beijing_now) -> dict[str, int]:
     """回填最近N天并补拉[t0,t1)；t1 是回填完成瞬间，补齐后才发布data_as_of。
 
@@ -1612,7 +1692,8 @@ def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
     for window in day_windows(start, t0):
         stats["orders"] += _run_window(conn, client, entity="orders", shop_id=shop_id,
                                        window=window, mode="backfill",
-                                       order_source=order_source)
+                                       order_source=order_source,
+                                       payment_fetch=payment_fetch)
     for window in day_windows(start, t0):
         stats["aftersales_occurrence"] += _run_window(
             conn, client, entity="aftersales_occurrence", shop_id=shop_id,
@@ -1669,7 +1750,8 @@ def _incremental_shop(conn, client: KuaimaiClient, *, shop_id: str,
 
 def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
                     run_end: datetime,
-                    order_source: str = ORDER_SOURCE) -> dict[str, object]:
+                    order_source: str = ORDER_SOURCE,
+                    payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME) -> dict[str, object]:
     """按支付日/退款完成日重核最近N天，刷新cohort覆盖与data_as_of，并按凭证推进质量状态。"""
     if days > MAX_QUERY_DAYS:
         raise SystemExit(f"重核跨度最多{MAX_QUERY_DAYS}天")
@@ -1678,7 +1760,8 @@ def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
     for window in day_windows(start, run_end):
         stats["orders"] += _run_window(conn, client, entity="orders", shop_id=shop_id,
                                        window=window, mode="reconcile",
-                                       order_source=order_source)
+                                       order_source=order_source,
+                                       payment_fetch=payment_fetch)
         stats["aftersales_occurrence"] += _run_window(
             conn, client, entity="aftersales_occurrence", shop_id=shop_id,
             window=window, mode="reconcile")
@@ -1701,14 +1784,16 @@ def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
 
 def _replay_entity(conn, client: KuaimaiClient, *, shop_id: str, entity: str,
                    start: datetime, end: datetime,
-                   order_source: str = ORDER_SOURCE) -> int:
+                   order_source: str = ORDER_SOURCE,
+                   payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME) -> int:
     """历史范围replay：业务时间窗口重跑并加入覆盖。"""
     count = 0
     if entity == "orders":
         for window in day_windows(start, end):
             count += _run_window(conn, client, entity="orders", shop_id=shop_id,
                                  window=window, mode="replay",
-                                 order_source=order_source)
+                                 order_source=order_source,
+                                 payment_fetch=payment_fetch)
     elif entity == "aftersales_occurrence":
         for window in day_windows(start, end):
             count += _run_window(conn, client, entity="aftersales_occurrence",
@@ -1722,7 +1807,8 @@ def _replay_entity(conn, client: KuaimaiClient, *, shop_id: str, entity: str,
 
 
 def _probe(client: KuaimaiClient, *, shop_id: str, start: datetime,
-           end: datetime, order_source: str = ORDER_SOURCE) -> dict[str, object]:
+           end: datetime, order_source: str = ORDER_SOURCE,
+           payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME) -> dict[str, object]:
     """拉全页但只输出数量、金额字段覆盖和质量统计，不输出客户/订单号。"""
     window = Window(start, end)
     pay_total = Decimal(0)
@@ -1733,7 +1819,8 @@ def _probe(client: KuaimaiClient, *, shop_id: str, start: datetime,
     tid_counts: dict[str, int] = {}
     for raw in fetch_window(client, entity="orders", shop_id=shop_id,
                             window=window, mode="probe",
-                            order_source=order_source):
+                            order_source=order_source,
+                            payment_fetch=payment_fetch):
         order_count += 1
         amount = to_decimal(raw.get("payAmount"))
         if amount is not None:
@@ -1984,7 +2071,8 @@ def main(argv: list[str] | None = None) -> int:
                 shop_id = _require_single_shop(settings)
                 summary = _probe(client, shop_id=shop_id,
                                  start=_parse_date(args.start), end=_parse_date(args.end),
-                                 order_source=_shop_order_source(conn, shop_id))
+                                 order_source=_shop_order_source(conn, shop_id),
+                                 payment_fetch=_shop_payment_fetch(conn, shop_id))
                 print(json.dumps(summary, ensure_ascii=False))
             elif args.command == "backfill":
                 t0 = datetime.now(BEIJING)  # 回填开始前记录T0；完成后在_backfill_shop内补拉[T0,T1)
@@ -1992,9 +2080,11 @@ def main(argv: list[str] | None = None) -> int:
                     before = GUARD_STATS.payment_downgrade_blocked
                     try:
                         order_source = _shop_order_source(conn, shop_id)
+                        payment_fetch = _shop_payment_fetch(conn, shop_id)
                         stats = _backfill_shop(conn, client, shop_id=shop_id,
                                                days=args.days, t0=t0,
-                                               order_source=order_source)
+                                               order_source=order_source,
+                                               payment_fetch=payment_fetch)
                     except (KuaimaiError, SystemExit) as exc:
                         print(json.dumps({"action": "backfill", "shop_id": shop_id,
                                           "error": _shop_error(exc)}, ensure_ascii=False))
@@ -2071,9 +2161,11 @@ def main(argv: list[str] | None = None) -> int:
                     before = GUARD_STATS.payment_downgrade_blocked
                     try:
                         order_source = _shop_order_source(conn, shop_id)
+                        payment_fetch = _shop_payment_fetch(conn, shop_id)
                         stats = _reconcile_shop(conn, client, shop_id=shop_id,
                                                 days=args.days, run_end=run_end,
-                                                order_source=order_source)
+                                                order_source=order_source,
+                                                payment_fetch=payment_fetch)
                     except (KuaimaiError, SystemExit) as exc:
                         print(json.dumps({"action": "reconcile", "shop_id": shop_id,
                                           "error": _shop_error(exc)}, ensure_ascii=False))
@@ -2091,9 +2183,11 @@ def main(argv: list[str] | None = None) -> int:
                     before = GUARD_STATS.payment_downgrade_blocked
                     try:
                         order_source = _shop_order_source(conn, shop_id)
+                        payment_fetch = _shop_payment_fetch(conn, shop_id)
                         count = _replay_entity(conn, client, shop_id=shop_id,
                                                entity=args.entity, start=start, end=end,
-                                               order_source=order_source)
+                                               order_source=order_source,
+                                               payment_fetch=payment_fetch)
                     except (KuaimaiError, SystemExit) as exc:
                         print(json.dumps({"action": "replay", "shop_id": shop_id,
                                           "error": _shop_error(exc)}, ensure_ascii=False))

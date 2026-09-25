@@ -4135,6 +4135,184 @@ class ConsignTimeSyncTests(unittest.TestCase):
             (OUTSTOCK_SOURCE,)).fetchone()
         self.assertEqual(str(state2[0]), str(state[0]), "覆盖区间合并后不变")
 
+    def test_payment_window_backfill_records_exact_pay_coverage(self):
+        """S2 宽出库窗+本地过滤：窗外/占位支付行被本地过滤拦下，覆盖只写请求的
+        支付窗口——宽窗是取数范围，永远不是覆盖范围。"""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.sources import (
+            OUTSTOCK_SOURCE, PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        from bi_agent.sync import Window, sync_window
+        beijing = ZoneInfo("Asia/Shanghai")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('PW1', 'tb', '本地过滤店') ON CONFLICT (shop_id) DO NOTHING")
+        window = Window(datetime(2026, 9, 1, tzinfo=beijing),
+                        datetime(2026, 9, 4, tzinfo=beijing))
+        pay_ms = 1788321600000        # 2026-09-02 12:00 北京（窗内）
+        outside_pay_ms = 1790308800000  # 2026-09-25 12:00 北京（窗外）
+        consign_ms = 1788408000000    # 2026-09-03 12:00 北京（宽窗内）
+
+        def doc(sid, pay_time_ms):
+            return {"sid": sid, "userId": "PW1", "tid": "C-" + sid,
+                    "payAmount": "100", "payTime": pay_time_ms,
+                    "updTime": pay_time_ms, "consignTime": consign_ms,
+                    "orders": [{"oid": sid + "-1", "tid": "C-" + sid,
+                                "num": "1", "itemSysId": "P_PW",
+                                "payAmount": "100"}]}
+
+        class Client:
+            def __init__(self):
+                self.calls = 0
+
+            def call(self, method, params):
+                self.calls += 1
+                if (params.get("queryType") == "0" and "cursor" not in params
+                        and params["startTime"] == "2026-08-17 00:00:00"):
+                    return {"success": True, "hasNext": False, "total": 3,
+                            "list": [doc("E1", pay_ms), doc("E2", outside_pay_ms),
+                                     doc("E3", 946684800000)]}
+                return {"success": True, "total": 0}
+
+        client = Client()
+        accepted = sync_window(self.conn, client, entity="orders", shop_id="PW1",
+                               window=window, mode="backfill",
+                               order_source=OUTSTOCK_SOURCE,
+                               payment_fetch=PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        self.assertEqual(accepted, 1,
+                         "窗外支付与占位支付行都被本地过滤拦下，只收窗内一单")
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.orders WHERE shop_id='PW1'").fetchone()[0], 1)
+        order = self.conn.execute(
+            "SELECT erp_id, paid_at, consigned_at FROM bi.orders "
+            "WHERE shop_id='PW1'").fetchone()
+        self.assertEqual(order[0], "E1")
+        self.assertIsNotNone(order[1])
+        self.assertIsNotNone(order[2])
+        state = self.conn.execute(
+            "SELECT covered FROM bi.sync_state WHERE source=%s AND entity='orders' "
+            "AND shop_id='PW1'", (OUTSTOCK_SOURCE,)).fetchone()
+        covered = str(state[0])
+        self.assertIn("2026-09-01", covered)
+        self.assertIn("2026-09-04", covered)
+        self.assertNotIn("2026-08-17", covered, "宽窗下界不是覆盖")
+        self.assertNotIn("2026-09-18", covered, "宽窗上界不是覆盖")
+        # 幂等：同一窗口重跑，事实与覆盖都不变。
+        client2 = Client()
+        accepted2 = sync_window(self.conn, client2, entity="orders", shop_id="PW1",
+                                window=window, mode="backfill",
+                                order_source=OUTSTOCK_SOURCE,
+                                payment_fetch=PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        self.assertEqual(accepted2, 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.orders WHERE shop_id='PW1'").fetchone()[0], 1)
+        state2 = self.conn.execute(
+            "SELECT covered FROM bi.sync_state WHERE source=%s AND entity='orders' "
+            "AND shop_id='PW1'", (OUTSTOCK_SOURCE,)).fetchone()
+        self.assertEqual(str(state2[0]), covered)
+
+    def test_payment_window_backfill_fail_closed_on_incomplete_wide_scan(self):
+        """宽窗分页不完整：KuaimaiError 上抛，覆盖分毫不写、无半窗数据。"""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.kuaimai import KuaimaiError
+        from bi_agent.sources import (
+            OUTSTOCK_SOURCE, PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        from bi_agent.sync import Window, _run_window
+        beijing = ZoneInfo("Asia/Shanghai")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('PW2', 'tm', '本地过滤店二') ON CONFLICT (shop_id) DO NOTHING")
+        window = Window(datetime(2026, 9, 1, tzinfo=beijing),
+                        datetime(2026, 9, 2, tzinfo=beijing))
+
+        class Client:
+            def call(self, method, params):
+                return {"success": True, "list": [{"sid": "E9", "userId": "PW2",
+                                                  "payAmount": "10"}],
+                        "hasNext": True, "cursor": "c1"}
+
+        with self.assertRaises(KuaimaiError):
+            _run_window(self.conn, Client(), entity="orders", shop_id="PW2",
+                        window=window, mode="backfill",
+                        order_source=OUTSTOCK_SOURCE,
+                        payment_fetch=PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.orders WHERE shop_id='PW2'").fetchone()[0], 0)
+        state = self.conn.execute(
+            "SELECT covered, last_error_code FROM bi.sync_state "
+            "WHERE source=%s AND entity='orders' AND shop_id='PW2'",
+            (OUTSTOCK_SOURCE,)).fetchone()
+        self.assertIsNotNone(state, "fail-closed 凭证必须在场")
+        self.assertEqual(str(state[0]), "{}", "半窗数据不得写成覆盖")
+        self.assertEqual(state[1], "invalid_response")
+
+    def test_payment_window_backfill_rolls_back_on_late_slice_failure(self):
+        """宽窗**后续**日切片分页破坏：先前行已入事务也必须整体回滚，覆盖不推进。
+
+        逐日切片后任何一片无结束证据都抛 KuaimaiError；窗口事务回滚
+        意味着早先切片的行同样不得存活，请求窗口覆盖分毫不写。
+        """
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.kuaimai import KuaimaiError
+        from bi_agent.sources import (
+            OUTSTOCK_SOURCE, PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        from bi_agent.sync import Window, _run_window
+        beijing = ZoneInfo("Asia/Shanghai")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('PW3', 'tm', '本地过滤店三') ON CONFLICT (shop_id) DO NOTHING")
+        window = Window(datetime(2026, 9, 1, tzinfo=beijing),
+                        datetime(2026, 9, 2, tzinfo=beijing))
+        pay_ms = 1788235200000  # 2026-09-01 12:00 北京（窗内，若不被回滚即会入库）
+
+        def good_doc(sid):
+            return {"sid": sid, "userId": "PW3", "tid": "C-" + sid,
+                    "payAmount": "100", "payTime": pay_ms, "updTime": pay_ms,
+                    "consignTime": pay_ms + 86400000,
+                    "orders": [{"oid": sid + "-1", "tid": "C-" + sid,
+                                "num": "1", "itemSysId": "P_PW3",
+                                "payAmount": "100"}]}
+
+        late_slice_start = (datetime(2026, 8, 17, tzinfo=beijing)
+                            + timedelta(days=9)).strftime("%Y-%m-%d %H:%M:%S")
+
+        class Client:
+            def call(self, method, params):
+                if (params.get("queryType") == "0"
+                        and params.get("startTime") == late_slice_start):
+                    # 第 10 个日切片的在线通道：游标不前进（c1 原样返回）→ 无结束证据。
+                    return {"success": True, "list": [{"sid": "E-LATE",
+                                                       "userId": "PW3",
+                                                       "payAmount": "10"}],
+                            "hasNext": True, "cursor": "c1"}
+                if (params.get("queryType") == "0" and "cursor" not in params
+                        and params["startTime"] == "2026-08-17 00:00:00"):
+                    # 第一个切片正常返回窗内支付行：若回滚缺失它就会留在库里。
+                    return {"success": True, "list": [good_doc("E-EARLY")],
+                            "hasNext": False, "total": 1}
+                return {"success": True, "total": 0}
+
+        with self.assertRaises(KuaimaiError):
+            _run_window(self.conn, Client(), entity="orders", shop_id="PW3",
+                        window=window, mode="backfill",
+                        order_source=OUTSTOCK_SOURCE,
+                        payment_fetch=PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.orders WHERE shop_id='PW3'").fetchone()[0], 0,
+            "后续切片失败时早先切片的行必须随事务回滚")
+        state = self.conn.execute(
+            "SELECT covered, last_error_code FROM bi.sync_state "
+            "WHERE source=%s AND entity='orders' AND shop_id='PW3'",
+            (OUTSTOCK_SOURCE,)).fetchone()
+        self.assertIsNotNone(state, "fail-closed 凭证必须在场")
+        self.assertEqual(str(state[0]), "{}", "请求窗口覆盖不得推进")
+        self.assertEqual(state[1], "invalid_response")
+
     def test_consign_scan_blocks_coverage_on_unconsigned_document(self):
         """缺发货时间的单据 → 整窗回滚 + fail-closed 凭证，覆盖不推进。"""
         from datetime import datetime

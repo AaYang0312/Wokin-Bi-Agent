@@ -16,16 +16,21 @@
 2. **未知平台 fail closed**。没有登记就没有来源，更不允许「回退到交易源」之后把空响应
    标成完整覆盖。
 
-时间口径分三态，因为“没测过”和“测了不成立”不能混为一谈：
+时间口径分四态，因为“没测过”、“测了不成立”和“本地过滤已修正”不能混为一谈：
 
 - `certified`：拿到「业务时间窗口完整」的对照证据（抖音交易通道实测 0/9414 行越界）。
 - `unmeasured`：通道语义按文档成立，但这家店/这个平台没有逐店对照证据。仍可出数，
   但必须披露为可观测样本，不能宣称完整支付窗口。
 - `disproved`：实测不成立。销售出库接口按自身时间字段裁剪（83/8367 行 `paid_at`
-  早于窗口起点，最早早 42 天），所以它的 `pay_time` 覆盖永远给不出完整支付窗口。
+  早于窗口起点，最早早 42 天），所以它的原始 `pay_time` 参数过滤永远给不出完整支付窗口。
+- `local_filter`：S2 取证（2026-09-25，两店半月窗口、对称差集 100% 归因，见
+  `docs/superpowers/research/2026-09-25-s2-acceptance.md`）后，淘系支付窗口改由
+  **宽出库窗 + 本地 payTime 过滤**建立：窗口归属不再依赖 API 的 pay_time 参数语义，
+  覆盖区间内的行按构造真在窗内。但它仍是出库人群（未发货单不可见），且只对样本窗口
+  做过对照——「完整支付窗口」主张依旧不开放，与 `disproved` 同属拒绝层。
 
-三态判断只看通道语义；**金额口径与逐指标能力仍是逐店取证**（5.1 的 capabilities
-只能由对账证据开通），不把抖音的结论复制给别的平台。
+三态（现四态）判断只看通道语义；**金额口径与逐指标能力仍是逐店取证**（5.1 的
+capabilities 只能由对账证据开通），不把抖音的结论复制给别的平台。
 """
 
 from __future__ import annotations
@@ -98,8 +103,16 @@ ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
 }
 
 TimeBasis = Literal["pay_time", "outstock_time", "aftersale_completion_time"]
-# 业务时间窗口的认证状态：见模块开头的三态说明。
-TimeCertification = Literal["certified", "unmeasured", "disproved"]
+# 业务时间窗口的认证状态：见模块开头的四态说明。
+TimeCertification = Literal["certified", "unmeasured", "disproved", "local_filter"]
+
+# 支付窗口（业务时间回填/replay/reconcile/probe）的两种取数方式。
+# 名字即契约：同步路由与用例遍历共用同一拼名，不得各写一份字符串。
+# - `api_pay_time`：直接按 API `timeType=pay_time` 过滤（交易通道平台；fxg 实测严格）。
+# - `wide_consign_local_filter`：宽出库窗（consign_time，±15 天，见
+#   sync.PAYMENT_WINDOW_PAD）+ 本地 payTime ∈ 窗口过滤（S2 取证后淘系的取数方式）。
+PAYMENT_FETCH_API_PAY_TIME = "api_pay_time"
+PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER = "wide_consign_local_filter"
 
 
 @dataclass(frozen=True)
@@ -138,11 +151,13 @@ _REGISTRATIONS: dict[str, PlatformRegistration] = {
                                   PAYMENT_BASIS, "unmeasured", METRIC_CAPABILITIES),
     "wsxc": PlatformRegistration("wsxc", TRADE_LIST_SOURCE, "pay_time",
                                  PAYMENT_BASIS, "unmeasured", METRIC_CAPABILITIES),
-    # 淘系唯一非敏感订单通道是销售出库；它按自身时间字段裁剪，不承诺支付窗口完整。
+    # 淘系唯一非敏感订单通道是销售出库；它的 pay_time 参数按自身时间字段裁剪，
+    # 不承诺支付窗口完整。S2 取证后同步改宽出库窗+本地过滤（local_filter），
+    # 但出库人群上限与 S3 口径决策未落地前，完整支付窗口主张仍不开放。
     "tb": PlatformRegistration("tb", OUTSTOCK_SOURCE, "outstock_time", OUTSTOCK_BASIS,
-                               "disproved", METRIC_CAPABILITIES),
+                               "local_filter", METRIC_CAPABILITIES),
     "tm": PlatformRegistration("tm", OUTSTOCK_SOURCE, "outstock_time", OUTSTOCK_BASIS,
-                               "disproved", METRIC_CAPABILITIES),
+                               "local_filter", METRIC_CAPABILITIES),
     # 拼多多：2026-09-12 决定不接入支付。单据口径保留，支付族永久解析不通。
     # 订单源只能给出库通道——官方 `erp.trade.list.query` 明确排除淘系与拼多多，
     # 拿交易源去同步会被空响应伪造成“完整覆盖”（设计 §3 禁止的正是这个回退）。
@@ -217,6 +232,22 @@ def platform_order_sources() -> dict[str, str]:
     """平台→订单源快照：同步路由与用例遍历共用，不在两处各抄一份。"""
     return {platform: item.order_source
             for platform, item in sorted(_REGISTRATIONS.items())}
+
+
+def payment_window_fetch(platform: object) -> str | None:
+    """支付窗口回填（业务时间模式）的取数方式；未登记平台 None，fail closed。
+
+    - 出库口径支付来源（tb/tm）：S2 取证后走宽出库窗 + 本地 payTime 过滤——
+      出库通道的 pay_time 参数语义实测漂移，窗口归属改由行内 payTime 精确判定。
+    - 交易通道平台（fxg/jd/kuaishou/wxsph/wsxc）与 pdd：维持 API pay_time 过滤。
+      pdd 虽走订单出库通道，但没有支付口径，窗口仍按现状取数（仅单据语义）。
+    """
+    reg = registration(platform)
+    if reg is None:
+        return None
+    if reg.payment_basis == OUTSTOCK_BASIS:
+        return PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER
+    return PAYMENT_FETCH_API_PAY_TIME
 
 
 def registration(platform: object) -> PlatformRegistration | None:
