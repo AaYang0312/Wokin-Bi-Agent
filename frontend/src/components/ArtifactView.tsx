@@ -1,4 +1,5 @@
 import type { Artifact, DisplayEntity, DrilldownIntent } from '../types'
+import { caliberLabel } from '../types'
 import { AnalysisArtifact } from './AnalysisArtifact'
 import { ChartArtifact } from './ChartArtifact'
 import { ClockIcon, GaugeIcon, TableIcon } from './icons'
@@ -463,6 +464,9 @@ export function ArtifactView({
   const basisLabels = [...new Set(basis.map((item) => (
     `${text(item.metric)}＝${text(item.basis)}（${text(item.time_basis)}）`)))]
   const mixedBasis = basisKeys.size > 1
+  // 对比口径徽标（S1）：数据集载荷的 filters.caliber 是唯一来源；缺失就不挂徽标，
+  // 不从行值反推口径（展示层不做任何口径判断，更不做财务重算）。
+  const caliber = caliberLabel(filters?.caliber)
   const rangeStart = typeof filters?.start === 'string' ? filters.start : null
   const rangeEnd = typeof filters?.end === 'string' ? filters.end : null
   const asOf = typeof artifact.data_as_of === 'string' ? artifact.data_as_of : null
@@ -494,6 +498,7 @@ export function ArtifactView({
     <section className="artifact" aria-label="经营数据结果">
       <header className="artifact-head">
         <span className="artifact-title"><TableIcon size={15} />查询结果</span>
+        {caliber && <span className="pill caliber-pill" data-caliber={String(filters?.caliber)}>{caliber}</span>}
         {dataRows.length > 0 && <span className="pill">{dataRows.length} 行</span>}
       </header>
       {basisLabels.length > 0 && (
@@ -545,6 +550,7 @@ export function ArtifactView({
         </div>
       )}
       <div className="artifact-meta">
+        {caliber && <span>口径：{caliber}</span>}
         {rangeStart && rangeEnd && <span>期间：{rangeStart} 至 {rangeEnd}</span>}
         {shopRefs.length > 0 && <span>范围：{shopRefs.map((ref) => cellText(ref, entities)).join('、')}</span>}
         {asOf && <span><ClockIcon size={13} />数据截止：{asOf}</span>}

@@ -152,6 +152,30 @@ class ComparisonRequestContractTests(unittest.TestCase):
                 with self.assertRaises(Exception):
                     _request(**bad)
 
+    def test_caliber_defaults_to_erp_outstock_and_pairs_with_sales_basis(self):
+        """双口径契约（S1）：口径与事实集合一对一配对，交叉组合不存在。"""
+        minimal = {"start": "2026-09-01", "end": "2026-09-08",
+                   "group_by": "platform", "metrics": ["sales_amount"]}
+        default = PerformanceComparisonRequest.model_validate(minimal)
+        self.assertEqual(default.caliber, "erp_outstock")
+        self.assertEqual(default.sales_basis, "erp_effective_parent")
+        self.assertEqual(default.normalized()["caliber"], "erp_outstock",
+                         "口径参与指纹：换口径就是另一个问题")
+        # 单给一边：另一边由配对规则推出，不猜也不留旧值。
+        payment = PerformanceComparisonRequest.model_validate(
+            {**minimal, "caliber": "platform_payment"})
+        self.assertEqual(payment.sales_basis, "verified_payment")
+        outstock = PerformanceComparisonRequest.model_validate(
+            {**minimal, "sales_basis": "verified_payment"})
+        self.assertEqual(outstock.caliber, "platform_payment")
+        # 两边都给且矛盾：拒绝，不静默取其一。
+        with self.assertRaises(Exception):
+            _request(caliber="erp_outstock", sales_basis="verified_payment")
+        with self.assertRaises(Exception):
+            _request(caliber="platform_payment", sales_basis="erp_effective_parent")
+        with self.assertRaises(Exception):
+            PerformanceComparisonRequest.model_validate({**minimal, "caliber": "gmv"})
+
     def test_trend_window_is_its_own_seven_days(self):
         request = _request(start="2026-09-06", end="2026-09-08")
         self.assertEqual(request.trend_window, (date(2026, 9, 1), date(2026, 9, 8)),
@@ -293,41 +317,67 @@ class ComparisonGraphTests(unittest.TestCase):
         return shop_id
 
     def _cover(self, shop_key: str, start: datetime, end: datetime,
-               source: str = "erp.trade.list.query") -> None:
-        self.conn.execute(
-            "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
-            "data_as_of, quality_status, quality_rule) "
-            "VALUES (%s, 'orders', %s, %s, tstzmultirange(tstzrange(%s, %s, '[)')), %s, "
-            "'passed', %s) ON CONFLICT (source, entity, shop_id) DO UPDATE SET "
-            "covered = bi.sync_state.covered + EXCLUDED.covered, "
-            "data_as_of = greatest(coalesce(bi.sync_state.data_as_of, "
-            "  '-infinity'), EXCLUDED.data_as_of), "
-            "quality_status = EXCLUDED.quality_status, "
-            "quality_rule = EXCLUDED.quality_rule",
-            (source, self.shops[shop_key], end, start, end, end, QUALITY_RULE))
-        self.conn.execute(
-            "INSERT INTO bi.sync_batches(source, entity, shop_id, batch_id, "
-            "business_window, window_kind, mode, row_count, business_end) "
-            "VALUES (%s, 'orders', %s, %s, tstzrange(%s, %s, '[)'), 'business', "
-            "'backfill', 1, %s) ON CONFLICT (source, entity, shop_id, batch_id) "
-            "DO UPDATE SET business_window = EXCLUDED.business_window",
-            (source, self.shops[shop_key],
-             f"t8-{source}-{start:%m%d}-{end:%m%d}", start, end, end))
+               source: str = "erp.trade.list.query", consign: bool | None = None
+               ) -> None:
+        """写覆盖凭证；出库通道额外写 orders_consign（发货时间扫描的覆盖）。
+
+        `consign=None` 表示跟随通道：只有出库通道（timeType=consign_time 扫描）
+        才有发货时间覆盖凭证；pay_time 通道永远没有，覆盖不可借用。
+        """
+        entities = [(source, "orders")]
+        if consign is True or (consign is None
+                               and source == "erp.trade.outstock.simple.query"):
+            # orders_consign 凭证永远记在**出库专项通道**名下（timeType=consign_time
+            # 扫描），与各平台的支付来源绑定无关。
+            entities.append(("erp.trade.outstock.simple.query", "orders_consign"))
+        for row_source, entity in entities:
+            self.conn.execute(
+                "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, "
+                "covered, data_as_of, quality_status, quality_rule) "
+                "VALUES (%s, %s, %s, %s, tstzmultirange(tstzrange(%s, %s, '[)')), %s, "
+                "'passed', %s) ON CONFLICT (source, entity, shop_id) DO UPDATE SET "
+                "covered = bi.sync_state.covered + EXCLUDED.covered, "
+                "data_as_of = greatest(coalesce(bi.sync_state.data_as_of, "
+                "  '-infinity'), EXCLUDED.data_as_of), "
+                "quality_status = EXCLUDED.quality_status, "
+                "quality_rule = EXCLUDED.quality_rule",
+                (row_source, entity, self.shops[shop_key], end, start, end, end,
+                 QUALITY_RULE))
+            self.conn.execute(
+                "INSERT INTO bi.sync_batches(source, entity, shop_id, batch_id, "
+                "business_window, window_kind, mode, row_count, business_end) "
+                "VALUES (%s, %s, %s, %s, tstzrange(%s, %s, '[)'), 'business', "
+                "'backfill', 1, %s) ON CONFLICT (source, entity, shop_id, batch_id) "
+                "DO UPDATE SET business_window = EXCLUDED.business_window",
+                (row_source, entity, self.shops[shop_key],
+                 f"t8-{row_source}-{entity}-{start:%m%d}-{end:%m%d}", start, end,
+                 end))
 
     def _sale(self, shop_key: str, erp_id: str, *, day: date, quantity: str,
               amount: str, cost: str | None = None, product: str = "P8",
               line_kind: str = "sale", verified: bool = True,
               document_profit: str | None = None,
-              source: str = "erp.trade.list.query") -> None:
-        """一张 ERP 单据 + 一行商品父行：与 Task 7 同一形状，只是商品号无关紧要。"""
+              source: str = "erp.trade.list.query",
+              consigned_day: date | None = None,
+              consigned: bool = True) -> None:
+        """一张 ERP 单据 + 一行商品父行：与 Task 7 同一形状，只是商品号无关紧要。
+
+        `consigned`/`consigned_day` 控制发货时间（consigned_at）：默认与付款同日
+        （新规范化总会写 consignTime）；`consigned=False` 造出 pay-time-only 单据。
+        """
         shop_id = self.shops[shop_key]
         paid_at = datetime(day.year, day.month, day.day, 12, tzinfo=BEIJING)
+        consign_day = consigned_day or day
+        consigned_at = (datetime(consign_day.year, consign_day.month,
+                                 consign_day.day, 12, tzinfo=BEIJING)
+                        if consigned else None)
         self.conn.execute(
             "INSERT INTO bi.orders(shop_id, erp_id, commercial_ids, source, "
-            "source_updated_at, paid_at, raw_gross_profit, active, batch_id) "
-            "VALUES (%s, %s, %s, %s, now(), %s, %s, true, 't8-seed') "
+            "source_updated_at, paid_at, consigned_at, raw_gross_profit, active, "
+            "batch_id) VALUES (%s, %s, %s, %s, now(), %s, %s, %s, true, 't8-seed') "
             "ON CONFLICT (shop_id, erp_id) DO NOTHING",
-            (shop_id, erp_id, [f"C{erp_id}"], source, paid_at, document_profit))
+            (shop_id, erp_id, [f"C{erp_id}"], source, paid_at, consigned_at,
+             document_profit))
         self.conn.execute(
             "INSERT INTO bi.order_items(shop_id, erp_id, line_id, commercial_id, "
             "product_id, sku_id, paid_at, quantity, raw_unit_cost, "
@@ -359,13 +409,19 @@ class ComparisonGraphTests(unittest.TestCase):
                                                  conn=conn))
 
     def _five_platforms(self, missing: str = "pdd") -> None:
-        """四个可比平台 + 一个回答不了支付口径的平台。"""
-        for index, platform in enumerate(COMPARABLE_PLATFORMS):
+        """出库口径可答的两个平台（tb/tm，发货时间扫描）+ 两个不可答平台 + 一个缺口。
+
+        出库口径（S1 修正后）只聚合出库通道平台：jd/kuaishou 的覆盖是付款时间
+        扫描，借不来，因此它们进 missing 格；pdd 走既有能力边界。
+        """
+        for index, platform in enumerate(("tb", "tb", "tm", "tm")):
             key = str(index + 1)
             self._shop(key, platform=platform)
-            self._cover(key, WINDOW_START, WINDOW_END)
+            self._cover(key, WINDOW_START, WINDOW_END,
+                        source="erp.trade.outstock.simple.query")
             self._sale(key, f"E{index}", day=date(2026, 9, 2),
-                       quantity=str(index + 1), amount=str(100 * (index + 1)))
+                       quantity=str(index + 1), amount=str(100 * (index + 1)),
+                       source="erp.trade.outstock.simple.query")
         self._shop("5", platform=missing,
                    capabilities=PDD_CAPABILITIES if missing == "pdd"
                    else ALL_CAPABILITIES)
@@ -377,17 +433,18 @@ class ComparisonGraphTests(unittest.TestCase):
     # -- 1. 五平台含一缺失 -------------------------------------------------
 
     def test_five_platform_overview_publishes_only_complete_comparable_groups(self):
+        """出库口径总览：只有发货时间扫描覆盖的平台出数，其余格子留场带原因。"""
         self._five_platforms()
         result = self._run()
         payload = result.model_payload
         self.assertEqual(result.status.value, "partial", payload.get("limitations"))
         table = _payload_for(result, "comparison_table")
         rows = {row["platform"]: row for row in _group_rows(table)}
-        self.assertEqual(sorted(rows), sorted(COMPARABLE_PLATFORMS),
+        self.assertEqual(sorted(rows), ["tb", "tm"],
                          "回答不了本口径的平台整组不发布，不给它一个 0")
-        self.assertEqual(rows["jd"]["sold_quantity"], "1")
-        self.assertEqual(rows["wsxc"]["sold_quantity"], "4")
-        self.assertEqual(rows["wsxc"]["sales_amount"], "400")
+        self.assertEqual(rows["tb"]["sold_quantity"], "3")
+        self.assertEqual(rows["tm"]["sold_quantity"], "7")
+        self.assertEqual(rows["tm"]["sales_amount"], "700")
         # 均价从合并后的总额重算：(100+200+300+400)/(1+2+3+4)=100，不是四个均价的平均。
         total = [row for row in table["data"]
                  if "platform" not in row and "shop_ref" not in row]
@@ -405,8 +462,7 @@ class ComparisonGraphTests(unittest.TestCase):
                   if "platform" in item}
         self.assertEqual(groups["pdd"]["status"], "partial")
         self.assertEqual(groups["pdd"]["shops_evaluated"], 0)
-        self.assertEqual(payload["evaluated_scope"]["platforms"],
-                         sorted(COMPARABLE_PLATFORMS),
+        self.assertEqual(payload["evaluated_scope"]["platforms"], ["tb", "tm"],
                          "已发布完整分组按平台码定序：与 rows 的分组顺序同一规则")
         self.assertNotIn(self.shops["5"], json.dumps(payload, ensure_ascii=False),
                          "被排除店铺的引用不进 evaluated 侧的任何清单")
@@ -418,26 +474,304 @@ class ComparisonGraphTests(unittest.TestCase):
         sales = blocks["sales_amount"]
         self.assertEqual(sales["status"], "complete")
         self.assertEqual(sales["ranking_scope"], "evaluated_only")
-        self.assertEqual(sales["basis"], "platform_payment/v1")
+        # 出库口径的排名块携带口径与真实绑定口径签名（consignTime 发货时间）。
+        self.assertEqual(sales["caliber"], "erp_outstock")
+        self.assertEqual(sales["basis"], "erp_document/v1")
+        self.assertEqual(sales["time_basis"], "outstock_time")
         self.assertEqual([(row["rank"], row["platform"], row["value"])
                           for row in sales["rows"]],
-                         [(1, "wsxc", "400"), (2, "wxsph", "300"),
-                          (3, "kuaishou", "200"), (4, "jd", "100")],
+                         [(1, "tm", "700"), (2, "tb", "300")],
                          "名次只给同口径且有值的分组，缺值不占位也不当 0 排")
         self.assertNotIn("pdd", json.dumps(sales, ensure_ascii=False),
                          "缺失分组不进排名集合，它在 excluded_scope 与 group_statuses 里")
 
-    def test_incomplete_platform_group_publishes_no_group_number(self):
-        """一个平台三家店、一家缺覆盖：整组不发布，缺的那家店仍按原因列出。"""
-        for key in ("1", "2", "3"):
-            self._shop(key, platform="jd")
-            self._cover(key, WINDOW_START, WINDOW_END)
+    # -- 0. 双口径契约（S1） ----------------------------------------------
+
+    def test_default_response_carries_the_outstock_caliber_badge(self):
+        """默认排名/图表是 ERP 出库口径，载荷必须显式带着口径说话。"""
+        self._five_platforms()
+        result = self._run()
+        payload = result.model_payload
+        self.assertEqual(payload["filters"]["caliber"], "erp_outstock")
+        self.assertTrue(
+            all(block.get("caliber") == "erp_outstock"
+                for block in payload["ranking"]),
+            payload["ranking"])
+        for chart in _charts(result):
+            self.assertEqual(chart.get("caliber"), "erp_outstock", chart["y"])
+        self.assertTrue(any("ERP出库口径" in text and "consignTime" in text
+                            for text in payload["limitations"]),
+                        payload["limitations"])
+        self.assertTrue(any("orders_consign" in text
+                            for text in payload["limitations"]),
+                        payload["limitations"])
+        # 出库口径的口径签名是真实绑定：不写支付口径，也不再写 document_time 简称。
+        ranking_text = json.dumps(payload["ranking"], ensure_ascii=False)
+        self.assertNotIn("platform_payment/v1", ranking_text)
+        self.assertNotIn("document_time", ranking_text)
+        self.assertIn("outstock_time", ranking_text)
+
+    def test_outstock_caliber_uses_consign_time_not_pay_time(self):
+        """P1 修正的核心：出库口径按 consignTime 归窗归日，payTime 不是它的归属。"""
+        self._shop("1", platform="tb")
+        self._shop("2", platform="tb")
+        for key in ("1", "2"):
+            self._cover(key, WINDOW_START, WINDOW_END,
+                        source="erp.trade.outstock.simple.query")
+        # 店1：付款 9-02、发货 9-05；店2：付款与发货都是 9-02。
+        self._sale("1", "E1", day=date(2026, 9, 2), quantity="3", amount="300",
+                   source="erp.trade.outstock.simple.query",
+                   consigned_day=date(2026, 9, 5))
+        self._sale("2", "E2", day=date(2026, 9, 2), quantity="1", amount="100",
+                   source="erp.trade.outstock.simple.query")
+
+        scope = {"mode": "all_authorized", "platforms": ["tb"]}
+        early = self._run(group_by="shop", scope=scope, start="2026-09-01",
+                          end="2026-09-04",
+                          metrics=["sold_quantity", "sales_amount"])
+        early_table = _payload_for(early, "comparison_table")
+        rows = {row["shop_ref"]: row for row in _group_rows(early_table)}
+        self.assertEqual(rows[ref_for_key("shop", self.shops["2"])]["sold_quantity"],
+                         "1", "发货在窗口内的单照常计入")
+        self.assertEqual(rows[ref_for_key("shop", self.shops["1"])]["sold_quantity"],
+                         "0", "发货 9-05 在 [9/1,9/4) 窗口外：付款在窗内也不计入")
+        late = self._run(group_by="shop", scope=scope, start="2026-09-04",
+                         end="2026-09-08",
+                         metrics=["sold_quantity", "sales_amount"])
+        late_table = _payload_for(late, "comparison_table")
+        late_rows = {row["shop_ref"]: row for row in _group_rows(late_table)}
+        self.assertEqual(late_rows[ref_for_key("shop", self.shops["1"])]["sales_amount"],
+                         "300", "窗口按发货时间移动后，这笔出库在 [9/4,9/8) 出现")
+        self.assertEqual(late_rows[ref_for_key("shop", self.shops["2"])]["sold_quantity"],
+                         "0", "发货 9-02 不进 [9/4,9/8)：出库口径没有双重归属")
+        block = {item["metric"]: item
+                 for item in late.model_payload["ranking"]}["sales_amount"]
+        self.assertEqual(block["status"], "complete")
+        self.assertEqual(block["time_basis"], "outstock_time")
+        self.assertEqual(late.status.value, "success")
+
+    def test_pay_time_only_document_cannot_enter_outstock_results(self):
+        """缺发货时间的单据无法证明窗口归属：该店 fail closed，不补零不借用 paid_at。"""
+        self._shop("1", platform="tb")
+        self._shop("2", platform="tb")
+        for key in ("1", "2"):
+            self._cover(key, WINDOW_START, WINDOW_END,
+                        source="erp.trade.outstock.simple.query")
+        self._sale("1", "E1", day=date(2026, 9, 2), quantity="9", amount="900",
+                   source="erp.trade.outstock.simple.query", consigned=False)
+        self._sale("2", "E2", day=date(2026, 9, 2), quantity="1", amount="100",
+                   source="erp.trade.outstock.simple.query")
+
+        result = self._run(group_by="shop",
+                           scope={"mode": "all_authorized", "platforms": ["tb"]},
+                           metrics=["sold_quantity", "sales_amount"])
+        payload = result.model_payload
+        self.assertEqual(result.status.value, "partial", payload)
+        table = _payload_for(result, "comparison_table")
+        rows = {row["shop_ref"]: row["sales_amount"]
+                for row in _group_rows(table)}
+        self.assertEqual(rows, {ref_for_key("shop", self.shops["2"]): "100"},
+                         "缺发货时间的店不发任何出库数字：900 不得借道出现")
+        self.assertEqual([row["sales_amount"] for row in table["data"]
+                          if "shop_ref" not in row and "platform" not in row],
+                         ["100"], "合计只加能按发货时间归属的店")
+        self.assertTrue(any("缺少发货时间consignTime" in text
+                            for text in payload["limitations"]), payload["limitations"])
+        self.assertEqual({item["shop_ref"]: item["reason"]
+                          for item in payload["excluded_scope"]},
+                         {ref_for_key("shop", self.shops["1"]): "coverage_incomplete"})
+
+    def test_outstock_caliber_never_borrows_pay_time_coverage(self):
+        """发货时间覆盖不可借用：付时覆盖再完整，没有 consign 扫描就是 data_missing。"""
+        # tb 店只有付款时间扫描覆盖（没有 orders_consign 凭证）→ 覆盖缺口 fail closed。
+        self._shop("1", platform="tb")
+        self._cover("1", WINDOW_START, WINDOW_END,
+                    source="erp.trade.outstock.simple.query", consign=False)
+        self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100",
+                   source="erp.trade.outstock.simple.query")
+        result = self._run(metrics=["sold_quantity", "sales_amount"])
+        payload = result.model_payload
+        # 任一范围内的店缺发货时间覆盖 = 共同截止未知：整个请求 fail closed，
+        # 绝不拿付款时间窗口顶替（与固定指标的覆盖纪律同一形状）。
+        self.assertEqual(result.status.value, "missing_data", payload)
+        self.assertEqual(result.artifacts, [],
+                         "没有发货时间覆盖就不发任何出库数字")
+        self.assertTrue(any("数据截止未知" in text
+                            for text in payload["limitations"]),
+                        payload["limitations"])
+
+    def test_consign_scan_admits_paytime_channel_platforms(self):
+        """专项扫描（orders_consign 凭证）完成后，fxg/jd/kuaishou 进默认出库排名。
+
+        它们的支付来源是付款时间通道——出库路径与支付绑定相互独立：出库通道
+        erp.trade.outstock.simple.query + timeType=consign_time 的覆盖凭证一旦在
+        （合成扫描写入），这些平台照常出数、合计与排名；凭证缺失时仍 fail closed
+        （见 never_borrows 用例）。
+        """
+        shops = (("1", "fxg", "100"), ("2", "jd", "200"),
+                 ("3", "kuaishou", "300"), ("4", "tm", "400"))
+        for index, (key, platform, amount) in enumerate(shops):
+            self._shop(key, platform=platform)
+            # 付款通道店：覆盖来自出库专项扫描（consign=True 强制写 orders_consign）。
+            self._cover(key, WINDOW_START, WINDOW_END, consign=True)
+            self._sale(key, f"E{index}", day=date(2026, 9, 2), quantity="1",
+                       amount=amount)
+
+        result = self._run(metrics=["sold_quantity", "sales_amount"])
+        payload = result.model_payload
+        self.assertEqual(result.status.value, "success", payload)
+        table = _payload_for(result, "comparison_table")
+        rows = {row["platform"]: row["sales_amount"] for row in _group_rows(table)}
+        self.assertEqual(rows, {"fxg": "100", "jd": "200", "kuaishou": "300",
+                                "tm": "400"},
+                         "出库口径对全部非 PDD 平台结构可用：扫描完成即可出数")
+        total = [row for row in table["data"] if "platform" not in row][0]
+        self.assertEqual(total["sales_amount"], "1000")
+        block = {item["metric"]: item for item in payload["ranking"]}["sales_amount"]
+        self.assertEqual(block["status"], "complete")
+        self.assertEqual(block["time_basis"], "outstock_time")
+        # 载荷凭证不携带方法名（安全投影）；专用通道本身由 resolve_consign_source
+        # 的单元断言与 consign 扫描测试钉住，这里钉口径/时间归属。
+        labels = {(str(item["basis"]), str(item["time_basis"]))
+                  for item in table["basis"]}
+        self.assertEqual(labels, {("erp_document/v1", "outstock_time")},
+                         "出库口径的凭证就是发货时间绑定，不写支付口径")
+
+    def test_pdd_stays_out_of_the_outstock_ranking_via_existing_boundary(self):
+        """PDD 不进任何口径的排名：出库口径下仍走既有 excluded_scope 边界。"""
+        self._five_platforms()
+        payload = self._run(metrics=["sold_quantity", "sales_amount"]).model_payload
+        groups = {item["platform"]: item for item in payload["group_statuses"]
+                  if "platform" in item}
+        self.assertEqual(groups["pdd"]["shops_evaluated"], 0)
+        self.assertNotEqual(groups["pdd"]["status"], "complete")
+        self.assertEqual(
+            {item["shop_ref"]: item["reason"] for item in payload["excluded_scope"]},
+            {ref_for_key("shop", self.shops["5"]): "coverage_time_basis_unverified"})
+        published_platforms = {row["platform"] for row in _group_rows(
+            _payload_for(self._run(metrics=["sold_quantity"]),
+                         "comparison_table"))}
+        self.assertEqual(published_platforms, {"tb", "tm"},
+                         "出库口径只发出库通道平台：pdd 不得借道出现")
+
+    def test_payment_caliber_publishes_only_certified_platform_groups(self):
+        """支付口径 tab：只聚合已认证平台；未认证平台格子 data_missing 留在场。"""
+        self._shop("1", platform="fxg")
+        self._shop("2", platform="jd")
+        self._shop("3", platform="tb")
+        for key, source in (("1", "erp.trade.list.query"),
+                            ("2", "erp.trade.list.query"),
+                            ("3", "erp.trade.outstock.simple.query")):
+            self._cover(key, WINDOW_START, WINDOW_END, source=source)
             self._sale(key, f"E{key}", day=date(2026, 9, 2), quantity="1",
-                       amount="100")
+                       amount="100", source=source)
+        for key, commercial in (("1", "C_E1"), ("2", "C_E2")):
+            self.conn.execute(
+                "INSERT INTO bi.order_payments(shop_id, commercial_id, paid_at, "
+                "amount, currency, basis, verified) "
+                "VALUES (%s, %s, %s, '100', 'CNY', 'items', true)",
+                (self.shops[key], commercial,
+                 datetime(2026, 9, 2, 12, tzinfo=BEIJING)))
+
+        result = self._run(caliber="platform_payment", sales_basis="verified_payment",
+                  metrics=["sales_amount"])
+        payload = result.model_payload
+        self.assertEqual(payload["filters"]["caliber"], "platform_payment")
+        table = _payload_for(result, "comparison_table")
+        rows = {row["platform"]: row for row in _group_rows(table)}
+        self.assertEqual(sorted(rows), ["fxg"], "只发已认证平台的分组行")
+        self.assertEqual(rows["fxg"]["paid_amount"], "100")
+        total = [row for row in table["data"] if "platform" not in row][0]
+        self.assertEqual(total["paid_amount"], "100",
+                         "合计只覆盖已认证平台：它不是全平台支付额")
+        # 未认证平台的格子以 data_missing 留在场：带稳定原因码，不补零、不缺席。
+        cells = {(item.get("platform"), item["metric"]): item
+                 for item in payload["metric_statuses"] if "platform" in item}
+        for platform in ("jd", "tb"):
+            for metric in ("sales_amount", "paid_amount"):
+                self.assertEqual(cells[(platform, metric)]["status"], "missing",
+                                 cells[(platform, metric)])
+                self.assertEqual(cells[(platform, metric)]["reason"],
+                                 "coverage_time_basis_unverified")
+        block = {item["metric"]: item for item in payload["ranking"]}["sales_amount"]
+        self.assertEqual(block["caliber"], "platform_payment")
+        self.assertIn({"platform": "jd", "reason": "coverage_time_basis_unverified"},
+                      block["missing"])
+        self.assertIn({"platform": "tb", "reason": "coverage_time_basis_unverified"},
+                      block["missing"])
+        self.assertTrue(any("未经认证" in text and "data_missing" in text
+                            for text in payload["limitations"]),
+                        payload["limitations"])
+        self.assertEqual(_charts(result), [],
+                         "支付列没有登记单位契约，支付口径不出默认排名图")
+
+    def test_payment_caliber_never_borrows_outstock_values_and_names_pdd(self):
+        """出库金额不得顶替支付额；PDD 只以显式缺失出现（S1 负边界）。"""
+        self._shop("1", platform="fxg")
+        self._shop("2", platform="tb")
+        self._shop("3", platform="pdd", capabilities=PDD_CAPABILITIES)
+        for key, source in (("1", "erp.trade.list.query"),
+                            ("2", "erp.trade.outstock.simple.query"),
+                            ("3", "erp.trade.outstock.simple.query")):
+            self._cover(key, WINDOW_START, WINDOW_END, source=source)
+            self._sale(key, f"E{key}", day=date(2026, 9, 2), quantity="9",
+                       amount="900", source=source)
+        self.conn.execute(
+            "INSERT INTO bi.order_payments(shop_id, commercial_id, paid_at, "
+            "amount, currency, basis, verified) "
+            "VALUES (%s, 'C_E1', %s, '100', 'CNY', 'items', true)",
+            (self.shops["1"], datetime(2026, 9, 2, 12, tzinfo=BEIJING)))
+
+        result = self._run(caliber="platform_payment", sales_basis="verified_payment",
+                  metrics=["sales_amount"])
+        payload = result.model_payload
+        table = _payload_for(result, "comparison_table")
+        rows = {row["platform"]: row for row in _group_rows(table)}
+        self.assertEqual(sorted(rows), ["fxg"])
+        self.assertEqual(rows["fxg"]["paid_amount"], "100",
+                         "支付口径只发支付事实：出库 900 不顶替任何一列")
+        published = [row["paid_amount"] for artifact in result.artifacts
+                     if artifact.ref.type in ("comparison_table", "trend_series")
+                     for row in artifact.public_payload["data"]
+                     if "paid_amount" in row]
+        self.assertNotIn("900", published, "出库金额不得借支付口径的列出场")
+        excluded = {item["shop_ref"]: item["reason"]
+                    for item in payload["excluded_scope"]}
+        self.assertEqual(excluded[ref_for_key("shop", self.shops["3"])],
+                         "coverage_time_basis_unverified",
+                         "PDD 的支付缺口按注册表归因：不接入、非延后")
+        self.assertNotIn(ref_for_key("shop", self.shops["3"]),
+                         json.dumps(payload["evaluated_scope"],
+                                    ensure_ascii=False))
+
+    def test_fingerprint_separates_the_two_calibers(self):
+        self._shop("1", platform="tb")
+        self._cover("1", WINDOW_START, WINDOW_END,
+                    source="erp.trade.outstock.simple.query")
+        self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100",
+                   source="erp.trade.outstock.simple.query")
+        first = MemoryQueryRunStore(forbidden_values=set(self.shops.values()))
+        second = MemoryQueryRunStore(forbidden_values=set(self.shops.values()))
+        self._run(store=first, metrics=["sales_amount"])
+        self._run(store=second, metrics=["sales_amount"], caliber="platform_payment",
+                  sales_basis="verified_payment")
+        fingerprints = {store.runs[list(store.runs)[0]]["request_fingerprint"]
+                        for store in (first, second)}
+        self.assertEqual(len(fingerprints), 2,
+                         "同参数换口径不是同一个问题：旧结果不许命中")
+
+    def test_incomplete_platform_group_publishes_no_group_number(self):
+        """一个平台三家店、一家缺发货时间覆盖：整组不发布，缺的那家店仍按原因列出。"""
+        for key in ("1", "2", "3"):
+            self._shop(key, platform="tb")
+            self._cover(key, WINDOW_START, WINDOW_END,
+                        source="erp.trade.outstock.simple.query")
+            self._sale(key, f"E{key}", day=date(2026, 9, 2), quantity="1",
+                       amount="100", source="erp.trade.outstock.simple.query")
         self.conn.execute(
             "UPDATE bi.sync_state SET covered = "
             "tstzmultirange(tstzrange('2026-08-28 00:00+08','2026-09-02 00:00+08','[)'))"
-            " WHERE shop_id = %s AND entity = 'orders'",
+            " WHERE shop_id = %s AND entity = 'orders_consign'",
             (self.shops["3"],))
 
         result = self._run(metrics=["sales_amount"])
@@ -445,14 +779,14 @@ class ComparisonGraphTests(unittest.TestCase):
         self.assertEqual(result.status.value, "missing_data", payload)
         self.assertEqual(result.artifacts, [],
                          "组内缺一家就不发这个平台的数：两家的和被读成整个平台是错话")
-        self.assertTrue(any("不发布该分组数字：jd" in text
+        self.assertTrue(any("不发布该分组数字：tb" in text
                             for text in payload["limitations"]), payload["limitations"])
         self.assertTrue(any("未列入本次合计" in text
                             for text in payload["limitations"]), payload["limitations"],
                         )
         # 下钻到店铺粒度：已评估的两家店照给，缺的那家照缺。
         drilled = self._run(group_by="shop", metrics=["sales_amount"],
-                            scope={"mode": "all_authorized", "platforms": ["jd"]})
+                            scope={"mode": "all_authorized", "platforms": ["tb"]})
         rows = {row["shop_ref"] for row in _group_rows(
             _payload_for(drilled, "comparison_table"))}
         self.assertEqual(rows, {ref_for_key("shop", self.shops["1"]),
@@ -463,8 +797,8 @@ class ComparisonGraphTests(unittest.TestCase):
 
     # -- 2. 一口径不一致 ---------------------------------------------------
 
-    def test_mixed_basis_groups_stay_visible_but_share_no_total_or_ranking(self):
-        """抖音（已认证支付窗口）与未逐店对照的平台同名不同认证：不给合计也不排名。"""
+    def test_mixed_certification_platforms_share_no_payment_total_or_ranking(self):
+        """支付口径下认证差异是缺席边界：已认证平台出数，其余 data_missing。"""
         for index, platform in enumerate(COMPARABLE_PLATFORMS):
             key = str(index + 1)
             self._shop(key, platform=platform)
@@ -475,21 +809,22 @@ class ComparisonGraphTests(unittest.TestCase):
         self._cover("9", WINDOW_START, WINDOW_END)
         self._sale("9", "E9", day=date(2026, 9, 2), quantity="5", amount="900")
 
-        result = self._run(metrics=["sales_amount"])
+        result = self._run(caliber="platform_payment", sales_basis="verified_payment",
+                  metrics=["sales_amount"])
         payload = result.model_payload
         table = _payload_for(result, "comparison_table")
         rows = {row["platform"]: row for row in _group_rows(table)}
-        self.assertEqual(sorted(rows), sorted([*COMPARABLE_PLATFORMS, "fxg"]))
-        self.assertEqual(rows["fxg"]["sales_amount"], "900",
-                         "单组自己的数字照发：不可比抹掉的是汇总与排名，不是各行")
+        self.assertEqual(sorted(rows), ["fxg"],
+                         "支付口径只发已认证平台的行；未认证平台的格子留在状态里")
         total = [row for row in table["data"] if "platform" not in row][0]
-        self.assertIsNone(total["sales_amount"], "混口径的集合没有合计")
-        block = {item["metric"]: item for item in payload["ranking"]}["sales_amount"]
-        self.assertEqual(block["status"], "incomparable")
-        self.assertEqual(block["reason"], "basis_incompatible")
-        self.assertTrue(all(row["rank"] is None for row in block["rows"]))
-        self.assertNotIn("basis", block, "不可比时不再贴一个口径名，那会把多口径说成一口径")
-        self.assertTrue(any("口径互不兼容" in text
+        self.assertIsNone(total["sales_amount"],
+                         "报告指标在支付口径下没有事实：合计不发数")
+        cells = {(item.get("platform"), item["metric"]): item
+                 for item in payload["metric_statuses"] if "platform" in item}
+        self.assertEqual(cells[("jd", "paid_amount")]["reason"],
+                         "coverage_time_basis_unverified",
+                         "未逐店对照过的平台在支付口径下是 data_missing，不是样本披露")
+        self.assertTrue(any("未经认证" in text and "data_missing" in text
                             for text in payload["limitations"]), payload["limitations"])
         self.assertEqual(result.status.value, "partial")
 
@@ -521,19 +856,22 @@ class ComparisonGraphTests(unittest.TestCase):
     # -- 3. 平台下钻：单平台多店 ------------------------------------------
 
     def test_one_platform_shop_drilldown_keeps_window_and_basis(self):
-        self._shop("1", platform="fxg")
-        self._shop("2", platform="fxg")
+        self._shop("1", platform="tb")
+        self._shop("2", platform="tb")
         self._shop("3", platform="jd")
-        for key in ("1", "2", "3"):
-            self._cover(key, WINDOW_START, WINDOW_END)
+        self._cover("1", WINDOW_START, WINDOW_END,
+                    source="erp.trade.outstock.simple.query")
+        self._cover("2", WINDOW_START, WINDOW_END,
+                    source="erp.trade.outstock.simple.query")
+        self._cover("3", WINDOW_START, WINDOW_END)
         self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100",
-                   cost="40")
+                   cost="40", source="erp.trade.outstock.simple.query")
         self._sale("2", "E2", day=date(2026, 9, 3), quantity="9", amount="450",
-                   cost="30")
+                   cost="30", source="erp.trade.outstock.simple.query")
         self._sale("3", "E3", day=date(2026, 9, 2), quantity="8", amount="800")
 
         result = self._run(
-            group_by="shop", scope={"mode": "all_authorized", "platforms": ["fxg"]},
+            group_by="shop", scope={"mode": "all_authorized", "platforms": ["tb"]},
             start="2026-09-01", end="2026-09-05",
             metrics=["sold_quantity", "sales_amount", "weighted_avg_paid_price"])
         payload = result.model_payload
@@ -548,23 +886,27 @@ class ComparisonGraphTests(unittest.TestCase):
         self.assertEqual(payload["filters"]["sales_basis"], "erp_effective_parent")
         self.assertEqual(payload["filters"]["group_by"], "shop")
         self.assertEqual(payload["requested_scope"], {"mode": "all_authorized",
-                                                     "platforms": ["fxg"]})
+                                                     "platforms": ["tb"]})
         total = [row for row in table["data"] if "shop_ref" not in row][0]
         self.assertEqual(total["weighted_avg_paid_price"], "55",
                          "两店均价 100/50 不能被平均成 75")
 
     def test_drilldown_rereads_authorization_and_refuses_out_of_scope(self):
-        self._shop("1", platform="fxg")
-        other = self._shop("2", platform="fxg")
-        self._cover("1", WINDOW_START, WINDOW_END)
-        self._cover("2", WINDOW_START, WINDOW_END)
-        self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100")
-        self._sale("2", "E2", day=date(2026, 9, 2), quantity="2", amount="200")
+        self._shop("1", platform="tb")
+        other = self._shop("2", platform="tb")
+        self._cover("1", WINDOW_START, WINDOW_END,
+                    source="erp.trade.outstock.simple.query")
+        self._cover("2", WINDOW_START, WINDOW_END,
+                    source="erp.trade.outstock.simple.query")
+        self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100",
+                   source="erp.trade.outstock.simple.query")
+        self._sale("2", "E2", day=date(2026, 9, 2), quantity="2", amount="200",
+                   source="erp.trade.outstock.simple.query")
 
         allowed = frozenset({self.shops["1"]})
         result = compare_performance(
             _request(group_by="shop", scope={"mode": "all_authorized",
-                                             "platforms": ["fxg"]}),
+                                             "platforms": ["tb"]}),
             self._context(allowed=allowed))
         payload = result.model_payload
         self.assertEqual([row["shop_ref"] for row in _group_rows(_payload_for(
@@ -591,28 +933,35 @@ class ComparisonGraphTests(unittest.TestCase):
                                      self._context(conn=counting, store=store))
         self.assertIn(single.status.value, {"success", "partial"},
                       single.model_payload.get("limitations"))
-        group_queries = [sql for sql in counting.sql if "v_product_cost_daily" in sql]
+        group_queries = [sql for sql in counting.sql if "v_outstock_daily" in sql]
         self.assertEqual(len(group_queries), 1,
-                         f"分组面必须只有一条集合查询：{group_queries}")
+                         f"出库分组面必须只有一条集合查询：{group_queries}")
         self.assertIn("GROUP BY shop_id, day, line_kind", group_queries[0])
         self.assertIn("shop_id = ANY(", group_queries[0],
                       "店铺集合只能作为一条数组参数进去，不能逐店拼 SQL")
+        completeness = [sql for sql in counting.sql if "v_order_consign" in sql]
+        self.assertLessEqual(len(completeness), 1,
+                             f"发货时间完整性必须是一次集合查询：{completeness}")
 
     # -- 4. 趋势缺口与图表 -------------------------------------------------
 
     def test_trend_null_gaps_break_the_line_and_zero_days_stay_real(self):
-        self._shop("1", platform="jd")
-        self._shop("2", platform="kuaishou")
+        self._shop("1", platform="tb")
+        self._shop("2", platform="tm")
         for key in ("1", "2"):
-            self._cover(key, WINDOW_START, WINDOW_END)
-        self._sale("1", "E1", day=date(2026, 9, 6), quantity="1", amount="100")
-        self._sale("2", "E2", day=date(2026, 9, 6), quantity="2", amount="200")
+            self._cover(key, WINDOW_START, WINDOW_END,
+                        source="erp.trade.outstock.simple.query")
+        self._sale("1", "E1", day=date(2026, 9, 6), quantity="1", amount="100",
+                   source="erp.trade.outstock.simple.query")
+        self._sale("2", "E2", day=date(2026, 9, 6), quantity="2", amount="200",
+                   source="erp.trade.outstock.simple.query")
         # 只在趋势窗口内、主期间外挖一个洞：主期间仍完整，缺的那天必须留 null。
+        # 洞挖在 orders_consign 上：出库口径只认发货时间覆盖。
         self.conn.execute(
             "UPDATE bi.sync_state SET covered = "
             "tstzmultirange(tstzrange('2026-08-28 00:00+08','2026-09-04 00:00+08','[)'),"
             " tstzrange('2026-09-05 00:00+08','2026-09-12 00:00+08','[)')) "
-            "WHERE shop_id = %s AND entity = 'orders'",
+            "WHERE shop_id = %s AND entity = 'orders_consign'",
             (self.shops["2"],))
 
         result = self._run(start="2026-09-05", end="2026-09-08",
@@ -621,16 +970,16 @@ class ComparisonGraphTests(unittest.TestCase):
         rows = {(row["platform"], row["day"]): row for row in trend["data"]}
         self.assertEqual(trend["coverage"]["status"], "partial")
         self.assertIn("2026-09-04~2026-09-05", trend["coverage"]["gaps"])
-        self.assertIsNone(rows[("kuaishou", "2026-09-04")]["sold_quantity"],
+        self.assertIsNone(rows[("tm", "2026-09-04")]["sold_quantity"],
                           "覆盖缺的一天必须是 null：给 0 就等于说那天没卖")
-        self.assertEqual(rows[("jd", "2026-09-04")]["sold_quantity"], "0",
+        self.assertEqual(rows[("tb", "2026-09-04")]["sold_quantity"], "0",
                          "覆盖成立而当天无成交：那是真实 0")
-        self.assertEqual(rows[("jd", "2026-09-06")]["sold_quantity"], "1")
+        self.assertEqual(rows[("tb", "2026-09-06")]["sold_quantity"], "1")
         self.assertTrue(any("缺失日按 null" in text for text in trend["limitations"]),
                         trend["limitations"])
         # 行必须按"逐分组 × 逐日"发：前端按 series 分列画多条线，靠的就是这一形状。
         self.assertEqual([row["platform"] for row in trend["data"]],
-                         ["jd"] * 7 + ["kuaishou"] * 7)
+                         ["tb"] * 7 + ["tm"] * 7)
         self.assertEqual({row["day"] for row in trend["data"]},
                          {f"2026-09-0{day}" for day in range(1, 8)})
         line = [chart for chart in _charts(result) if chart["kind"] == "line"]
@@ -756,12 +1105,14 @@ class ComparisonGraphTests(unittest.TestCase):
 
     def test_pdd_stays_an_explicit_missing_group_without_any_payment_number(self):
         """拼多多：本轮不接入支付，它只作为显式缺失组出现，也不给任何支付数字。"""
-        self._shop("1", platform="jd")
+        self._shop("1", platform="tb")
         self._shop("2", platform="pdd", capabilities=PDD_CAPABILITIES)
-        self._cover("1", WINDOW_START, WINDOW_END)
+        self._cover("1", WINDOW_START, WINDOW_END,
+                    source="erp.trade.outstock.simple.query")
         self._cover("2", WINDOW_START, WINDOW_END,
                     source="erp.trade.outstock.simple.query")
-        self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100")
+        self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100",
+                   source="erp.trade.outstock.simple.query")
         self._sale("2", "E2", day=date(2026, 9, 2), quantity="9", amount="900",
                    source="erp.trade.outstock.simple.query")
 
@@ -777,7 +1128,7 @@ class ComparisonGraphTests(unittest.TestCase):
         # 也可能假绿），所以它与 test_operator_workflows.py 里同形的那几处一起改掉。
         table = _payload_for(result, "comparison_table")
         self.assertEqual([(row["platform"], row["sales_amount"])
-                          for row in _group_rows(table)], [("jd", "100")],
+                          for row in _group_rows(table)], [("tb", "100")],
                          "被排除的平台不发分组行，也不顶替已评估平台那一行")
         self.assertEqual([row["sales_amount"] for row in table["data"]
                           if "platform" not in row and "shop_ref" not in row],
@@ -796,14 +1147,17 @@ class ComparisonGraphTests(unittest.TestCase):
         这正是"多指标能力独立判断"在对比面上的形状：不能答单据毛利的平台仍然
         回答销量，而合计与排名不会因为一个空单元格就说成整套都有数。
         """
-        self._shop("1", platform="jd")
-        self._shop("2", platform="kuaishou",
+        self._shop("1", platform="tb")
+        self._shop("2", platform="tm",
                    capabilities=("quantity", "product_paid_amount"))
-        self._cover("1", WINDOW_START, WINDOW_END)
-        self._cover("2", WINDOW_START, WINDOW_END)
+        self._cover("1", WINDOW_START, WINDOW_END,
+                    source="erp.trade.outstock.simple.query")
+        self._cover("2", WINDOW_START, WINDOW_END,
+                    source="erp.trade.outstock.simple.query")
         self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100",
-                   document_profit="30")
-        self._sale("2", "E2", day=date(2026, 9, 2), quantity="5", amount="500")
+                   document_profit="30", source="erp.trade.outstock.simple.query")
+        self._sale("2", "E2", day=date(2026, 9, 2), quantity="5", amount="500",
+                   source="erp.trade.outstock.simple.query")
 
         result = self._run(metrics=["sold_quantity", "erp_gross_profit_reference"],
                            profit_basis="existing_fields")
@@ -812,16 +1166,16 @@ class ComparisonGraphTests(unittest.TestCase):
                          "有别的指标可答就不整店退出：多指标独立判定")
         table = _payload_for(result, "comparison_table")
         rows = {row["platform"]: row for row in _group_rows(table)}
-        self.assertEqual([rows[key]["sold_quantity"] for key in ("jd", "kuaishou")],
+        self.assertEqual([rows[key]["sold_quantity"] for key in ("tb", "tm")],
                          ["1", "5"])
-        self.assertEqual(rows["jd"]["erp_gross_profit_reference"], "30")
-        self.assertIsNone(rows["kuaishou"]["erp_gross_profit_reference"],
+        self.assertEqual(rows["tb"]["erp_gross_profit_reference"], "30")
+        self.assertIsNone(rows["tm"]["erp_gross_profit_reference"],
                           "缺能力的分组不给 0：那一格就是没算出来")
         statuses = {(item.get("platform"), item["metric"]): item["status"]
                     for item in payload["metric_statuses"]}
-        self.assertEqual(statuses[("kuaishou", "erp_gross_profit_reference")],
+        self.assertEqual(statuses[("tm", "erp_gross_profit_reference")],
                          "unsupported")
-        self.assertEqual(statuses[("kuaishou", "sold_quantity")], "available")
+        self.assertEqual(statuses[("tm", "sold_quantity")], "available")
         blocks = {block["metric"]: block for block in payload["ranking"]}
         self.assertEqual(blocks["sold_quantity"]["status"], "complete")
         self.assertEqual(blocks["erp_gross_profit_reference"]["status"], "incomplete")
@@ -859,37 +1213,38 @@ class ComparisonGraphTests(unittest.TestCase):
 
         两个原因指向完全不同的下一步：一个要回去补单据毛利字段，一个只是那天确实没卖。
         """
-        self._shop("1", platform="jd")
-        self._shop("2", platform="kuaishou")
+        self._shop("1", platform="tb")
+        self._shop("2", platform="tm")
         for key in ("1", "2"):
-            self._cover(key, WINDOW_START, WINDOW_END)
+            self._cover(key, WINDOW_START, WINDOW_END,
+                        source="erp.trade.outstock.simple.query")
         self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100",
-                   document_profit=None)
+                   document_profit=None, source="erp.trade.outstock.simple.query")
         self._sale("1", "E2", day=date(2026, 9, 3), quantity="1", amount="100",
-                   document_profit="30")
+                   document_profit="30", source="erp.trade.outstock.simple.query")
         self._sale("2", "E3", day=date(2026, 9, 2), quantity="1", amount="100",
-                   document_profit="40")
+                   document_profit="40", source="erp.trade.outstock.simple.query")
 
         result = self._run(metrics=["sold_quantity", "erp_gross_profit_reference"],
                            profit_basis="existing_fields")
         payload = result.model_payload
         table = _payload_for(result, "comparison_table")
         rows = {row["platform"]: row for row in _group_rows(table)}
-        self.assertIsNone(rows["jd"]["erp_gross_profit_reference"],
+        self.assertIsNone(rows["tb"]["erp_gross_profit_reference"],
                           "两张单据只有一张带毛利字段：不给这一组的毛利")
-        self.assertEqual(rows["kuaishou"]["erp_gross_profit_reference"], "40")
-        self.assertEqual(rows["jd"]["erp_documents"], 2, "两份计数照常给，缺口自己可数")
-        self.assertEqual(rows["jd"]["erp_documents_with_gross_profit"], 1)
+        self.assertEqual(rows["tm"]["erp_gross_profit_reference"], "40")
+        self.assertEqual(rows["tb"]["erp_documents"], 2, "两份计数照常给，缺口自己可数")
+        self.assertEqual(rows["tb"]["erp_documents_with_gross_profit"], 1)
         statuses = {(item.get("platform"), item["metric"]): item
                     for item in payload["metric_statuses"] if "platform" in item}
-        jd = statuses[("jd", "erp_gross_profit_reference")]
+        jd = statuses[("tb", "erp_gross_profit_reference")]
         self.assertEqual(jd["status"], "missing")
         self.assertEqual(jd["reason"], "erp_document_coverage_incomplete",
                          "原因要指回该补的取数字段，而不是笼统说没有事实")
         block = {item["metric"]: item for item in payload["ranking"]}
         self.assertEqual(block["erp_gross_profit_reference"]["status"], "incomplete")
         self.assertEqual(block["erp_gross_profit_reference"]["missing"],
-                         [{"platform": "jd", "reason": "erp_document_coverage_incomplete"}])
+                         [{"platform": "tb", "reason": "erp_document_coverage_incomplete"}])
         self.assertTrue(all(row["rank"] is None
                             for row in block["erp_gross_profit_reference"]["rows"]))
         total = [row for row in table["data"] if "platform" not in row][0]
@@ -907,8 +1262,8 @@ class ComparisonGraphTests(unittest.TestCase):
         那一列，等于用另一个事实集合顶替同一个名字（spec §5.2）。因此本轮：支付面
         按自己的列发布，请求的指标一律标 `incomparable`，也不出图。
         """
-        self._shop("1", platform="jd")
-        self._shop("2", platform="kuaishou")
+        self._shop("1", platform="fxg")
+        self._shop("2", platform="fxg")
         for key in ("1", "2"):
             self._cover(key, WINDOW_START, WINDOW_END)
         self._sale("1", "E1", day=date(2026, 9, 2), quantity="1", amount="100")
@@ -920,8 +1275,11 @@ class ComparisonGraphTests(unittest.TestCase):
                 (self.shops[key], commercial, datetime(2026, 9, 2, 12, tzinfo=BEIJING),
                  amount))
 
+        # sales_basis 单给一边时由配对规则推出支付口径：fxg 是唯一已认证平台。
         result = self._run(sales_basis="verified_payment", metrics=["sales_amount"])
         payload = result.model_payload
+        self.assertEqual(payload["filters"]["caliber"], "platform_payment",
+                         "verified_payment 就是支付口径：两个拼写必须指向同一个选择")
         statuses = {(item.get("shop_ref"), item["metric"]): item["status"]
                     for item in payload["metric_statuses"]}
         self.assertEqual(set(statuses.values()), {"incomparable"},
@@ -932,8 +1290,8 @@ class ComparisonGraphTests(unittest.TestCase):
         table = _payload_for(result, "comparison_table")
         payments = {row["platform"]: row.get("paid_amount") for row in _group_rows(table)
                     if "paid_amount" in row}
-        self.assertEqual(payments, {"jd": "100", "kuaishou": "200"},
-                         "支付面单独一列，列名自己说清口径")
+        self.assertEqual(payments, {"fxg": "300"},
+                         "支付面单独一列，列名自己说清口径；两家已认证店铺可合计")
         self.assertEqual(_charts(result), [],
                          "支付面没有登记过单位契约，不进图表轴")
         self.assertTrue(any("本轮没有可画的指标" in text

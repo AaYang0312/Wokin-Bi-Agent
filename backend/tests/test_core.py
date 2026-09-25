@@ -701,6 +701,7 @@ class SyncSchemaTests(unittest.TestCase):
 
         assert_sync_schema(Connection([
             ("orders", "unified_status"), ("orders", "system_status"),
+            ("orders", "consigned_at"),
             ("order_items", "source_type"),
             ("products", "title"), ("products", "source_modified_at"),
         ]))
@@ -711,6 +712,13 @@ class SyncSchemaTests(unittest.TestCase):
             assert_sync_schema(Connection([
                 ("orders", "unified_status"), ("orders", "system_status"),
                 ("order_items", "source_type"),
+            ]))
+        # 025 未执行（缺 consigned_at）时出库扫描同样必须整体拒写。
+        with self.assertRaisesRegex(KuaimaiError, "schema_outdated"):
+            assert_sync_schema(Connection([
+                ("orders", "unified_status"), ("orders", "system_status"),
+                ("order_items", "source_type"),
+                ("products", "title"), ("products", "source_modified_at"),
             ]))
 
 
@@ -1011,8 +1019,15 @@ class PageCompletionEvidenceTests(unittest.TestCase):
         source = inspect.getsource(sync)
 
         self.assertIn("C-6", source)
-        self.assertEqual(source.count("allow_omitted_list=True"), 1,
-                         "宽容位不得扩散到其他调用点")
+        # 宽容位只允许给两处**归档通道**（orders 的 pay_time 与 orders_consign 的
+        # consign_time，都是 queryType=1 的同一接口家族、同一实测行为）：
+        # 在线通道永远严格。
+        self.assertEqual(source.count("allow_omitted_list=True"), 2,
+                         "宽容位不得扩散到在线通道或其他调用点")
+        for block in source.split("def ")[1:]:
+            if "allow_omitted_list=True" in block:
+                self.assertIn('query_type="1"', block,
+                              "宽容位只随归档通道（queryType=1）出现")
         cursor_calls = [line for line in source.splitlines()
                         if "_fetch_orders_cursor(" in line or "time_type=\"pay_time\"" in line]
         self.assertTrue(any("query_type=\"0\"" in line for line in cursor_calls),
@@ -3805,12 +3820,63 @@ class OutstockSourceTests(unittest.TestCase):
                           order_source=OUTSTOCK_SOURCE))
         self.assertEqual([m for m, _ in client.calls], ["erp.aftersale.list.query"])
 
+    def test_fetch_consign_window_requests_consign_time_exactly(self):
+        """出库专项扫描：方法/时间参数逐字钉死，分页形状与订单通道同一套。"""
+        from bi_agent.sync import OUTSTOCK_SOURCE, Window, fetch_consign_window
+        window = Window(datetime(2026, 8, 16, tzinfo=self.TZ),
+                        datetime(2026, 8, 17, tzinfo=self.TZ))
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, dict(params)))
+                return {"success": True, "list": [], "total": 0}
+
+        client = Client()
+        list(fetch_consign_window(client, shop_id="166520", window=window))
+        self.assertEqual({m for m, _ in client.calls}, {OUTSTOCK_SOURCE},
+                         "只走出库专项通道，与支付来源无关")
+        self.assertEqual([p["queryType"] for _, p in client.calls], ["0", "1"])
+        self.assertEqual({p["timeType"] for _, p in client.calls}, {"consign_time"})
+        self.assertEqual(client.calls[0][1]["startTime"], "2026-08-16 00:00:00")
+        self.assertEqual(client.calls[0][1]["endTime"], "2026-08-17 00:00:00")
+        self.assertEqual(client.calls[0][1]["userIds"], "166520")
+
+    def test_fetch_consign_window_refuses_incomplete_pagination(self):
+        """游标不前进=无结束证据：抛 KuaimaiError，半窗数据不外流。"""
+        from bi_agent.kuaimai import KuaimaiError
+        from bi_agent.sync import Window, fetch_consign_window
+        window = Window(datetime(2026, 8, 16, tzinfo=self.TZ),
+                        datetime(2026, 8, 17, tzinfo=self.TZ))
+
+        class Client:
+            def __init__(self, pages):
+                self.pages = list(pages)
+
+            def call(self, method, params):
+                page = self.pages.pop(0)
+                if isinstance(page, Exception):
+                    raise page
+                return page
+
+        client = Client([
+            {"success": True, "list": [{"sid": "E1"}], "hasNext": True,
+             "cursor": "c1"},
+            {"success": True, "list": [{"sid": "E2"}], "hasNext": True,
+             "cursor": "c1"},
+        ])
+        with self.assertRaises(KuaimaiError):
+            list(fetch_consign_window(client, shop_id="166520", window=window))
+
     def test_normalised_key_set_frozen(self):
         from bi_agent.sync import normalise_aftersale
         trade = self._normalised_trade()
         self.assertEqual(set(trade), {
             "shop_id", "erp_id", "commercial_ids", "split_parent_id", "source",
-            "source_updated_at", "platform_modified_at", "paid_at", "raw_pay_amount",
+            "source_updated_at", "platform_modified_at", "paid_at", "consigned_at",
+            "raw_pay_amount",
             "raw_payment", "raw_platform_payment", "raw_cost", "raw_gross_profit",
             "unified_status", "system_status",
             "active", "normalization_status", "items_present", "items"})
@@ -3856,7 +3922,8 @@ class OutstockSourceTests(unittest.TestCase):
         columns = {part.strip() for part in _ORDER_COLUMNS.split(",")}
         self.assertEqual(columns, {
             "shop_id", "erp_id", "commercial_ids", "split_parent_id", "source",
-            "source_updated_at", "platform_modified_at", "paid_at", "raw_pay_amount",
+            "source_updated_at", "platform_modified_at", "paid_at", "consigned_at",
+            "raw_pay_amount",
             "raw_payment", "raw_platform_payment", "raw_cost", "raw_gross_profit",
             "unified_status", "system_status",
             "active", "normalization_status", "batch_id"})

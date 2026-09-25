@@ -1,3 +1,22 @@
+/**
+ * 平台对比的双口径词表（S1 契约，与后端 `commerce.metrics` 同名同值）。
+ * 同名指标的值在不同口径下不可比：展示层必须把口径徽标挂在图与表上，
+ * 不靠读图人自己分辨。文案是徽标的唯一来源，后端不再另发一份。
+ */
+export type ComparisonCaliber = 'erp_outstock' | 'platform_payment'
+
+export const CALIBER_LABELS: Record<ComparisonCaliber, string> = {
+  erp_outstock: 'ERP出库口径（默认排名）',
+  platform_payment: '平台支付口径（仅已认证平台）',
+}
+
+export function caliberLabel(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  return value === 'erp_outstock' || value === 'platform_payment'
+    ? CALIBER_LABELS[value]
+    : null
+}
+
 export type ChatSummary = {
   id: string
   title: string

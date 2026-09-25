@@ -3957,5 +3957,384 @@ class InventoryMonitorConcurrencyTests(unittest.TestCase):
         self.assertEqual(sellable, 0, "实物低库存不得跨层级产生渠道告警")
 
 
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ConsignTimeSyncTests(unittest.TestCase):
+    """025：发货时间（consignTime）独立入列，与付款时间（payTime）永不互替。"""
+
+    def setUp(self):
+        from tests.dbfixtures import connect_test_db
+
+        self.conn = connect_test_db(self)
+
+    def _normalise_outstock(self, *, pay_day: str, consign_day: str | None,
+                            source: str):
+        from bi_agent.sync import normalise_trade
+
+        raw: dict[str, object] = {
+            "sid": "E-CT1", "userId": "CT1", "tid": "C-CT1",
+            "payAmount": "100", "payTime": 1788000000000 + int(pay_day),
+            "updTime": 1788000000000,
+            "orders": [{"oid": "E-CT1-1", "tid": "C-CT1", "num": "1",
+                        "itemSysId": "P_CT", "payAmount": "100"}],
+        }
+        if consign_day is not None:
+            raw["consignTime"] = 1788000000000 + int(consign_day)
+        return normalise_trade(raw, source=source)
+
+    def test_normalise_trade_keeps_paytime_and_consigntime_apart(self):
+        from tests.dbfixtures import connect_test_db  # noqa: F401
+
+        record = self._normalise_outstock(pay_day="1", consign_day="2",
+                                          source="erp.trade.outstock.simple.query")
+        self.assertEqual(record["normalization_status"], "normal")
+        self.assertIsNotNone(record["paid_at"])
+        self.assertIsNotNone(record["consigned_at"])
+        self.assertNotEqual(record["paid_at"], record["consigned_at"],
+                            "两个字段可以不同：它们是两个事实，不得互替")
+
+    def test_consigned_at_stays_null_when_the_field_is_absent(self):
+        record = self._normalise_outstock(pay_day="1", consign_day=None,
+                                          source="erp.trade.outstock.simple.query")
+        self.assertIsNotNone(record["paid_at"])
+        self.assertIsNone(record["consigned_at"],
+                          "没有 consignTime 就是没有发货时间：出库口径不得借用 paid_at")
+
+    def test_apply_trade_persists_consigned_at(self):
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('CT1', 'tb', '发货时间测试店') ON CONFLICT (shop_id) DO NOTHING")
+        record = normalise_trade({
+            "sid": "E-CT9", "userId": "CT1", "tid": "C-CT9", "payAmount": "100",
+            "payTime": 1788000000000, "consignTime": 1788100000000,
+            "updTime": 1788000000000,
+            "orders": [{"oid": "E-CT9-1", "tid": "C-CT9", "num": "1",
+                        "itemSysId": "P_CT", "payAmount": "100"}],
+        }, source="erp.trade.outstock.simple.query")
+        self.assertTrue(apply_trade(self.conn, record, batch_id="ct-1"))
+        row = self.conn.execute(
+            "SELECT paid_at, consigned_at FROM bi.orders "
+            "WHERE shop_id='CT1' AND erp_id='E-CT9'").fetchone()
+        self.assertIsNotNone(row[0])
+        self.assertIsNotNone(row[1])
+        self.assertNotEqual(row[0], row[1])
+
+    def _consign_client(self, pages):
+        class Client:
+            def __init__(self, pages):
+                self.pages = list(pages)
+                self.calls = []
+
+            def call(self, method, params):
+                self.calls.append((method, dict(params)))
+                page = self.pages.pop(0)
+                if isinstance(page, Exception):
+                    raise page
+                return page
+
+        return Client(pages)
+
+    def _consign_doc(self, *, shop_id: str, consigned_ms: int | None,
+                     commercial: str = "C-8"):
+        pay_ms = 1788321600000  # 2026-09-02 12:00 北京时间（固定，避免依赖时钟）
+        doc = {"sid": "E-CT9", "userId": shop_id, "tid": commercial,
+               "payAmount": "100", "payTime": pay_ms, "updTime": pay_ms,
+               "orders": [{"oid": "E-CT9-1", "tid": commercial, "num": "1",
+                           "itemSysId": "P_CT", "payAmount": "100"}]}
+        if consigned_ms is not None:
+            doc["consignTime"] = consigned_ms
+        return doc
+
+    def test_consign_source_covers_every_non_pdd_platform_independently(self):
+        """出库专项来源绑定全部非 PDD 平台，且与支付来源绑定相互独立。"""
+        from bi_agent.sources import (
+            CONSIGN_ORDERS_ENTITY, OUTSTOCK_SOURCE, TRADE_LIST_SOURCE,
+            ShopRecord, resolve_consign_source, resolve_order_source)
+
+        for platform in ("fxg", "jd", "kuaishou", "wxsph", "wsxc", "tb", "tm"):
+            record = ShopRecord.from_row("X", platform, ())
+            self.assertEqual(resolve_consign_source(record),
+                             (OUTSTOCK_SOURCE, CONSIGN_ORDERS_ENTITY),
+                             platform)
+            if platform in ("fxg", "jd", "kuaishou", "wxsph", "wsxc"):
+                # 支付来源仍是各自登记的付款时间通道：两条路径互不影响。
+                self.assertEqual(resolve_order_source(record), TRADE_LIST_SOURCE,
+                                 platform)
+        self.assertIsNone(resolve_consign_source(
+            ShopRecord.from_row("X", "pdd", ())), "pdd 永久排除")
+        self.assertIsNone(resolve_consign_source(
+            ShopRecord.from_row("X", "taobao", ())), "未登记平台 fail closed")
+
+    def test_consign_scan_writes_coverage_and_spares_payments(self):
+        """完整扫描才写 orders_consign 覆盖；支付事实原样；写入幂等。"""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.sync import OUTSTOCK_SOURCE, Window, sync_consign_window
+        beijing = ZoneInfo("Asia/Shanghai")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('CT1', 'fxg', '出库扫描店') ON CONFLICT (shop_id) DO NOTHING")
+        # 一条已验证支付事实（与扫描单据不同商业单）：扫描不得碰它。
+        self.conn.execute(
+            "INSERT INTO bi.order_payments(shop_id, commercial_id, paid_at, amount,"
+            " currency, basis, verified) VALUES ('CT1', 'C-9', %s, '55', 'CNY',"
+            " 'head', true)",
+            (datetime(2026, 9, 2, 12, tzinfo=beijing),))
+        window = Window(datetime(2026, 9, 1, tzinfo=beijing),
+                        datetime(2026, 9, 4, tzinfo=beijing))
+        consigned_ms = 1788408000000  # 2026-09-03 12:00 北京时间
+        client = self._consign_client([
+            {"success": True, "list": [self._consign_doc(shop_id="CT1", consigned_ms=consigned_ms)],
+             "hasNext": False},
+            {"success": True},
+        ])
+        stats = sync_consign_window(self.conn, client, shop_id="CT1",
+                                    window=window, mode="backfill")
+        self.assertEqual(stats["accepted"], 1)
+        order = self.conn.execute(
+            "SELECT paid_at, consigned_at FROM bi.orders "
+            "WHERE shop_id='CT1' AND erp_id='E-CT9'").fetchone()
+        self.assertIsNotNone(order[0])
+        self.assertIsNotNone(order[1])
+        self.assertNotEqual(order[0], order[1])
+        state = self.conn.execute(
+            "SELECT covered, last_error_code FROM bi.sync_state "
+            "WHERE source=%s AND entity='orders_consign' AND shop_id='CT1'",
+            (OUTSTOCK_SOURCE,)).fetchone()
+        self.assertIsNotNone(state, "完整扫描后覆盖必须推进")
+        self.assertIn("2026-09-01", str(state[0]))
+        self.assertIsNone(state[1])
+        batch = self.conn.execute(
+            "SELECT window_kind FROM bi.sync_batches WHERE source=%s "
+            "AND entity='orders_consign' AND shop_id='CT1'",
+            (OUTSTOCK_SOURCE,)).fetchone()
+        self.assertEqual(batch[0], "business")
+        payments = self.conn.execute(
+            "SELECT commercial_id, amount, verified FROM bi.order_payments "
+            "WHERE shop_id='CT1' ORDER BY commercial_id").fetchall()
+        self.assertEqual([(r[0], str(r[1]), r[2]) for r in payments],
+                         [("C-9", "55.000000", True)],
+                         "扫描只补单据/行事实：不重建、不新建任何支付事实")
+        # 幂等：同一窗口再扫一遍，事实不重复、覆盖不回退。
+        client = self._consign_client([
+            {"success": True, "list": [self._consign_doc(shop_id="CT1", consigned_ms=consigned_ms)],
+             "hasNext": False},
+            {"success": True},
+        ])
+        sync_consign_window(self.conn, client, shop_id="CT1", window=window,
+                            mode="backfill")
+        count = self.conn.execute(
+            "SELECT count(*) FROM bi.orders WHERE shop_id='CT1'").fetchone()[0]
+        self.assertEqual(count, 1, "按主键幂等：重复扫描不产生第二份单据")
+        state2 = self.conn.execute(
+            "SELECT covered FROM bi.sync_state WHERE source=%s "
+            "AND entity='orders_consign' AND shop_id='CT1'",
+            (OUTSTOCK_SOURCE,)).fetchone()
+        self.assertEqual(str(state2[0]), str(state[0]), "覆盖区间合并后不变")
+
+    def test_consign_scan_blocks_coverage_on_unconsigned_document(self):
+        """缺发货时间的单据 → 整窗回滚 + fail-closed 凭证，覆盖不推进。"""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.sync import OUTSTOCK_SOURCE, Window, sync_consign_window
+        beijing = ZoneInfo("Asia/Shanghai")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('CT1', 'fxg', '出库扫描店') ON CONFLICT (shop_id) DO NOTHING")
+        window = Window(datetime(2026, 9, 1, tzinfo=beijing),
+                        datetime(2026, 9, 4, tzinfo=beijing))
+        client = self._consign_client([
+            {"success": True, "list": [self._consign_doc(shop_id="CT1", consigned_ms=None)],
+             "hasNext": False},
+            {"success": True},
+        ])
+        with self.assertRaises(Exception) as caught:
+            sync_consign_window(self.conn, client, shop_id="CT1", window=window)
+        self.assertIn("consign_scan_incomplete", str(caught.exception))
+        orders = self.conn.execute(
+            "SELECT count(*) FROM bi.orders WHERE shop_id='CT1'").fetchone()[0]
+        self.assertEqual(orders, 0, "事务回滚：问题单据不入库")
+        state = self.conn.execute(
+            "SELECT covered, last_error_code FROM bi.sync_state "
+            "WHERE source=%s AND entity='orders_consign' AND shop_id='CT1'",
+            (OUTSTOCK_SOURCE,)).fetchone()
+        self.assertIsNotNone(state)
+        self.assertEqual(state[1], "consign_scan_incomplete",
+                         "fail-closed 凭证在场，覆盖区间不得出现")
+        self.assertEqual(str(state[0]), "{}", "覆盖分毫未写")
+
+    def test_consign_scan_blocks_coverage_on_pagination_failure(self):
+        """分页完整性破坏 → KuaimaiError 上抛，覆盖不推进、无半窗数据。"""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.kuaimai import KuaimaiError
+        from bi_agent.sync import OUTSTOCK_SOURCE, Window, sync_consign_window
+        beijing = ZoneInfo("Asia/Shanghai")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('CT1', 'fxg', '出库扫描店') ON CONFLICT (shop_id) DO NOTHING")
+        window = Window(datetime(2026, 9, 1, tzinfo=beijing),
+                        datetime(2026, 9, 4, tzinfo=beijing))
+        client = self._consign_client([
+            {"success": True, "list": [self._consign_doc(shop_id="CT1", consigned_ms=1788408000000)],
+             "hasNext": True, "cursor": "c1"},
+            KuaimaiError("upstream"),
+        ])
+        with self.assertRaises(KuaimaiError):
+            sync_consign_window(self.conn, client, shop_id="CT1", window=window)
+        state = self.conn.execute(
+            "SELECT covered, last_error_code FROM bi.sync_state "
+            "WHERE source=%s AND entity='orders_consign' AND shop_id='CT1'",
+            (OUTSTOCK_SOURCE,)).fetchone()
+        self.assertIsNotNone(state)
+        self.assertEqual(str(state[0]), "{}", "半窗数据不得写成覆盖")
+        orders = self.conn.execute(
+            "SELECT count(*) FROM bi.orders WHERE shop_id='CT1'").fetchone()[0]
+        self.assertEqual(orders, 0)
+
+    def test_consign_scan_honors_query_budget(self):
+        """预算耗尽：不发出任何请求、不写任何状态（与查询侧同一份预算机器）。"""
+        import time as time_module
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.sync import OUTSTOCK_SOURCE, Window, sync_consign_window
+        beijing = ZoneInfo("Asia/Shanghai")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('CT1', 'fxg', '出库扫描店') ON CONFLICT (shop_id) DO NOTHING")
+        window = Window(datetime(2026, 9, 1, tzinfo=beijing),
+                        datetime(2026, 9, 4, tzinfo=beijing))
+        client = self._consign_client([])
+        with self.assertRaises(Exception):
+            sync_consign_window(self.conn, client, shop_id="CT1", window=window,
+                                deadline=time_module.monotonic() - 1)
+        self.assertEqual(client.calls, [], "预算耗尽时不发任何 API 请求")
+        state = self.conn.execute(
+            "SELECT count(*) FROM bi.sync_state WHERE source=%s "
+            "AND entity='orders_consign' AND shop_id='CT1'",
+            (OUTSTOCK_SOURCE,)).fetchone()[0]
+        self.assertEqual(state, 0)
+
+    def test_consign_replay_preserves_verified_allocation_and_payment(self):
+        """等时间戳 consign 回放：已验证支付的同商业单行核验不得被无声降级。"""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.sync import Window, sync_consign_window
+        beijing = ZoneInfo("Asia/Shanghai")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('CT2', 'fxg', '分摊核验店') ON CONFLICT (shop_id) DO NOTHING")
+        pay_ts = datetime(2026, 9, 2, 12, tzinfo=beijing)
+        # 已验证支付事实：商业单 C-8。
+        self.conn.execute(
+            "INSERT INTO bi.order_payments(shop_id, commercial_id, paid_at, amount,"
+            " currency, basis, verified, source_updated_at) "
+            "VALUES ('CT2', 'C-8', %s, '100', 'CNY', 'head', true, %s)",
+            (pay_ts, pay_ts))
+        window = Window(datetime(2026, 9, 1, tzinfo=beijing),
+                        datetime(2026, 9, 4, tzinfo=beijing))
+
+        def doc_client():
+            return self._consign_client([
+                {"success": True,
+                 "list": [self._consign_doc(shop_id="CT2",
+                                            consigned_ms=1788408000000,
+                                            commercial="C-8")],
+                 "hasNext": False},
+                {"success": True},
+            ])
+
+        payment_fields = ("SELECT commercial_id, paid_at, amount, currency, basis, "
+                          "verified, source_updated_at FROM bi.order_payments "
+                          "WHERE shop_id='CT2' AND commercial_id='C-8'")
+        item_flag = ("SELECT allocation_verified FROM bi.order_items "
+                     "WHERE shop_id='CT2' AND commercial_id='C-8'")
+
+        # 首扫建立单据与行：修复后行核验按既有已验证支付提升为 true。
+        sync_consign_window(self.conn, doc_client(), shop_id="CT2", window=window,
+                            mode="backfill")
+        self.assertEqual(
+            self.conn.execute(item_flag).fetchone()[0], True,
+            "同商业单已有已验证支付：首扫即应恢复行核验标记")
+        before = self.conn.execute(payment_fields).fetchone()
+
+        # 等时间戳（source_updated_at 相同）强制回放：这正是降级缺陷的触发路径。
+        sync_consign_window(self.conn, doc_client(), shop_id="CT2", window=window,
+                            mode="replay")
+        after = self.conn.execute(payment_fields).fetchone()
+        self.assertEqual(after, before,
+                         "支付行相关字段逐字不变：paid_at/amount/basis/verified/"
+                         "source_updated_at 都不得被出库扫描改写")
+        self.assertEqual(self.conn.execute(item_flag).fetchone()[0], True,
+                         "回放重写行之后，核验标记必须被确定性重导回 true")
+        outstock = self.conn.execute(
+            "SELECT sales_amount FROM reporting.v_outstock_daily "
+            "WHERE shop_id='CT2' AND day >= '2026-09-01' "
+            "AND day < '2026-09-04'").fetchall()
+        self.assertEqual([str(r[0]) for r in outstock], ["100.000000"],
+                         "出库金额保持可发布：未被 withhold")
+
+        # 重复回放幂等：三处状态全部稳定。
+        sync_consign_window(self.conn, doc_client(), shop_id="CT2", window=window,
+                            mode="replay")
+        self.assertEqual(self.conn.execute(item_flag).fetchone()[0], True)
+        self.assertEqual(self.conn.execute(payment_fields).fetchone(), after)
+        self.assertEqual([str(r[0]) for r in self.conn.execute(
+            "SELECT sales_amount FROM reporting.v_outstock_daily "
+            "WHERE shop_id='CT2' AND day >= '2026-09-01' "
+            "AND day < '2026-09-04'").fetchall()], ["100.000000"])
+
+    def test_consign_replay_never_promotes_without_verified_payment(self):
+        """没有已验证支付就没有提升：行核验保持 false，也不新建支付行。"""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from bi_agent.sync import Window, sync_consign_window
+        beijing = ZoneInfo("Asia/Shanghai")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('CT3', 'jd', '无支付店') ON CONFLICT (shop_id) DO NOTHING")
+        window = Window(datetime(2026, 9, 1, tzinfo=beijing),
+                        datetime(2026, 9, 4, tzinfo=beijing))
+        client = self._consign_client([
+            {"success": True,
+             "list": [self._consign_doc(shop_id="CT3", consigned_ms=1788408000000,
+                                        commercial="C-7")],
+             "hasNext": False},
+            {"success": True},
+        ])
+        sync_consign_window(self.conn, client, shop_id="CT3", window=window,
+                            mode="backfill")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT allocation_verified FROM bi.order_items "
+                "WHERE shop_id='CT3' AND commercial_id='C-7'").fetchone()[0],
+            False, "无已验证支付：分摊核验不得被提升")
+        sync_consign_window(self.conn, self._consign_client([
+            {"success": True,
+             "list": [self._consign_doc(shop_id="CT3", consigned_ms=1788408000000,
+                                        commercial="C-7")],
+             "hasNext": False},
+            {"success": True},
+        ]), shop_id="CT3", window=window, mode="replay")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT allocation_verified FROM bi.order_items "
+                "WHERE shop_id='CT3' AND commercial_id='C-7'").fetchone()[0],
+            False, "回放同样不得提升")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT count(*) FROM bi.order_payments "
+                "WHERE shop_id='CT3' AND commercial_id='C-7'").fetchone()[0],
+            0, "出库扫描不得新建支付行")
+
+
 if __name__ == "__main__":
     unittest.main()

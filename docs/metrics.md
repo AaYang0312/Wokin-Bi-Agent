@@ -168,11 +168,32 @@ deadline 全部来自服务端 `DomainContext`。旧 `query_business` 不变，�
 一次对比 = 一次图执行 = **一条**整店集合查询（`shop_id = ANY(%s)`）：查询条数不随店铺数增长，
 主期间、分组行与七日序列共用同一个 REPEATABLE READ 只读快照。
 
-仍不得因代码存在就宣称的能力：京东、快手、视频号、微购相册的支付窗口都还没有逐店账单对照
-证据（`unmeasured`），抖音是 `certified`、淘系是 `disproved`，所以按现行可比性规则**跨平台**的
-`sales_amount` 往往判为 `incomparable` —— 此时报告只分行给出各分组自己的数，合计与排名留空。
-五平台总览里唯一能拿到完整总览的是"同为未认证支付口径"的那一组，其余一律按缺口披露；
-拼多多继续作为显式缺失组出现（`excluded_scope`，不接入支付）。
+### 4.3.1 双口径契约（S1，2026-09-25 起；P1 修正后按发货时间归属）
+
+自 S1 起，`compare_performance` 的请求与每一份响应/Artifact 都带显式 `caliber` 维度
+（`erp_outstock` | `platform_payment`）；同名指标的值不携带口径就不能同列比较。
+
+| 契约 | 规则 | 不能是什么 |
+| --- | --- | --- |
+| 口径 ↔ 事实集合 | `erp_outstock` ⇔ `sales_basis=erp_effective_parent`；`platform_payment` ⇔ `sales_basis=verified_payment`。缺一边由另一边推出，两边都给且矛盾按 `invalid_parameters` 拒绝 | 不存在"出库口径配支付事实"的组合；口径与 `sales_basis` 是同一选择的两个名字，不各说各话 |
+| `caliber=erp_outstock`（**默认**） | 出库金额/出库销量/单据数复用既有 ERP 单据事实的**值语义**（行级分摊金额、件数、单据计数），但**归属时间必须是发货时间**：`bi.orders.consigned_at`（迁移 025 新增，同步规范化写入快麦响应字段 `consignTime`/发货时间，与 `paid_at`=`payTime` 付款时间是两个事实、永不互替）。读取面为 025 的 `reporting.v_outstock_daily` / `v_outstock_document_daily`（与原视图同纳入条件、同列形，按 consigned_at 归日，缺发货时间的单据不出现）。**覆盖只认 `bi.sync_state(entity='orders_consign')` 凭证**——即按 `erp.trade.outstock.simple.query` 请求参数 `timeType=consign_time` 建立的扫描；付款时间（`timeType=pay_time`）扫描建立的 covered 区间不得顶替。口径签名即真实绑定：`erp_document/v1｜outstock_time（=consignTime）`。**成员资格与支付来源绑定无关**：`resolve_consign_source` 把全部已登记非 PDD 平台（fxg/jd/kuaishou/wxsph/wsxc/tb/tm）都绑定到出库专项通道。因此**扫描前（不存在 `orders_consign` 凭证）所有平台 fail closed**（`data_missing` / `data_as_of_unknown` / `coverage_incomplete`，即使个别行带发货时间字段也不改变覆盖结论）；**`consign-scan` 完成后，任一拥有完整 `orders_consign` 证据的已登记非 PDD 平台都可回答该口径**并进入默认排名。存在缺 `consigned_at` 的出库通道单据时整范围 fail closed（`coverage_incomplete`），绝不补零、绝不按付款时间归属。默认排名与图表必须携带口径徽标（载荷 `filters.caliber`、排名块 `caliber`、图表 `caliber`） | 不把单据事实说成支付额/GMV；不把 payTime 事实改名为出库口径；出库与支付两口径不得同图合计或排名；拼多多不进出库口径（仍走 `excluded_scope` + `coverage_time_basis_unverified` 边界） |
+| `caliber=platform_payment` | 只聚合注册表 `time_certified=certified` 的平台组（当前仅 fxg）；未认证平台（jd/kuaishou/wxsph/wsxc/tb/tm）的支付格**在场**：`metric_statuses` 中逐格 `missing` + 稳定原因码 `coverage_time_basis_unverified`，排名块 `missing` 逐组点名，`group_statuses` 保留分母，并有逐组点名的披露文本 | 未认证支付格不补零、不替位、不静默缺席；不拿出库金额顶替支付列；`paid_amount/paid_orders` 没有登记图表单位，支付口径不出默认排名图 |
+| 口径指纹 | `caliber` 进入 `normalized_request` 与请求指纹；换口径即另一个问题，旧 Artifact 按旧口径标签原样可读 | 同一问题不许因口径不同命中同一份缓存结果 |
+
+采集路径（S1 P1 修正后已具备）：`bi_agent.sync` 提供 `consign-scan` 子命令——逐店、按
+≤1 天窗口调用 `erp.trade.outstock.simple.query`（`timeType=consign_time`），分页完整性与
+行预算复用订单通道同一套机器；单据入库**不重建支付事实**；只有窗口扫描完整且全部单据
+带窗口内发货时间，才写 `bi.sync_state(source='erp.trade.outstock.simple.query',
+entity='orders_consign')` 的覆盖凭证与批次，否则整窗回滚并留
+`consign_scan_incomplete` 等失败凭证（fail closed）。拼多多店铺自动跳过。命令与运维
+语义见 `docs/runbook.md`「平台对比的双口径」。
+
+仍不得因代码存在就宣称的能力：**出库口径当前整体 NOT MET**——`consign-scan` 尚未在真实
+店铺上执行，测试库中的 `orders_consign` 凭证全部是合成验收数据；真实扫描、对账认证完成
+之前，出库口径对全部平台 fail closed（`data_missing` / `coverage_incomplete`）。这是有意
+的 fail-closed，不是缺陷；代码路径就绪（DONE）不等于真实扫描证据就绪（FAIL）。`platform_payment` 口径下 jd/kuaishou/wxsph/wsxc 的逐店账单对照
+证据仍是 `unmeasured`，一律 `data_missing`。出库口径不宣称支付窗口完整；淘系 `disproved`
+的付款时间口径结论不变。
 
 回归命令（`backend/`）：
 

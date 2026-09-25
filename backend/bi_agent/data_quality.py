@@ -24,7 +24,7 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 # 指标→实体依赖定义在 sources 注册表（来源与能力的唯一真源）；本模块继续向外转发，
 # 不养第二份，否则覆盖门禁与指标层会各自演化出口径。
 from bi_agent.sources import (
-    ENTITY_REQUIREMENTS, ORDERS_ENTITY, PAYMENT_WINDOW_METRICS, PAY_TIME_METRICS,
+    ENTITY_REQUIREMENTS, ORDERS_ENTITY, PAYMENT_WINDOW_METRICS, PAY_TIME_METRICS, resolve_consign_source,
     ShopRecord, SourceBinding, resolve_metric_dependencies, resolve_order_source)
 
 # 默认来源名：只给 `reconcile_source_quality` 在调用方没显式传 source 时兜底。
@@ -448,6 +448,98 @@ def _unconfigured_shops(conn, shop_ids: Sequence[str], entities: Sequence[str]) 
         if resolve_order_source(record) is None:
             unconfigured.append(str(shop_id))
     return tuple(sorted(unconfigured))
+
+
+@dataclass(frozen=True)
+class ConsignCoverage:
+    """出库口径（发货时间）的就绪结论：只认 `orders_consign` 覆盖凭证。
+
+    它不是 CoverageAssessment 的别名：发货时间的覆盖**不可能**从 pay_time 扫描的
+    covered 区间借来，所以这一份结论只由 `assess_consign_coverage` 产出，
+    而那个函数只查 `entity='orders_consign'` 的覆盖行。
+    """
+
+    status: CoverageStatus
+    requested_window: Window
+    missing_windows: tuple[Window, ...]
+    data_as_of: datetime | None
+    quality_status: QualityStatus
+    source_batches: tuple[str, ...]
+    gaps: tuple[CoverageGap, ...]
+    # 没有发货时间扫描来源的店铺（pay_time 通道）：它们不是“缺覆盖”，
+    # 而是从一开始就答不了出库口径，调用方按 capability/时间口径缺口归因。
+    shops_without_consign_source: tuple[str, ...] = ()
+
+
+def assess_consign_coverage(conn, shop_records, *, start, end) -> ConsignCoverage:
+    """出库口径的覆盖判定：逐店只读 `(来源, orders_consign)` 的覆盖凭证。
+
+    `shop_records` 是 [(shop_id, ShopRecord)]。没有发货时间扫描来源的店铺记入
+    `shops_without_consign_source`；有来源的店铺，覆盖=请求窗口 ∩ 它的
+    orders_consign covered 区间——**绝不**读取 `orders` 实体的任何区间。
+    """
+    start_ts = datetime(start.year, start.month, start.day, tzinfo=BEIJING)
+    end_ts = datetime(end.year, end.month, end.day, tzinfo=BEIJING)
+    requested: Window = (start.isoformat(), end.isoformat())
+    common: list[Span] = [(start, end)]
+    gaps: list[CoverageGap] = []
+    cutoffs: list[datetime] = []
+    qualities: list[QualityStatus] = []
+    batches: list[str] = []
+    without_source: list[str] = []
+    checked = 0
+    for shop_id, record in sorted(shop_records):
+        resolved = resolve_consign_source(record)
+        if resolved is None:
+            without_source.append(str(shop_id))
+            continue
+        checked += 1
+        source, entity = resolved
+        rows = conn.execute(_COVERAGE_SQL, (start_ts, end_ts, start_ts, end_ts,
+                                            source, entity, [shop_id])).fetchall()
+        if not rows:
+            # 没有覆盖行就是从未按发货时间扫描过：未知，不是“确实没有出库”。
+            qualities.append("unknown")
+            gaps.append(CoverageGap(entity=entity, shop_id=str(shop_id),
+                                    start=start, end=end, source=source))
+            common = []
+            continue
+        row = rows[0]
+        qualities.append(_effective_quality(row[4], row[5]))
+        if row[3] is not None:
+            cutoffs.append(row[3])
+        clipped = _spans(row[1])
+        common = intersect_spans(common, clipped)
+        gaps.extend(
+            CoverageGap(entity=entity, shop_id=str(shop_id), start=gap[0],
+                        end=gap[1], source=source)
+            for gap in subtract_spans([(start, end)], clipped))
+        batches.extend(str(item[0]) for item in conn.execute(
+            _BATCHES_SQL, (source, entity, [shop_id], end_ts, start_ts)).fetchall())
+    missing = subtract_spans([(start, end)], common) if checked else [(start, end)]
+    if not checked:
+        # 一家能按发货时间回答的店都没有：覆盖整体未知，不能拼出“完整”。
+        qualities = qualities or ["unknown"]
+        common = []
+        missing = [(start, end)]
+    if "failed" in qualities:
+        quality: QualityStatus = "failed"
+    elif qualities and all(item == "passed" for item in qualities):
+        quality = "passed"
+    else:
+        quality = "unknown"
+    missing_windows = _windows(missing)
+    status: CoverageStatus = ("complete" if not missing_windows
+                              else "partial" if checked and common else "missing")
+    return ConsignCoverage(
+        status=status,
+        requested_window=requested,
+        missing_windows=_windows(missing),
+        data_as_of=(min(cutoffs) if cutoffs and len(cutoffs) == checked else None),
+        quality_status=quality,
+        source_batches=tuple(sorted(set(batches))),
+        gaps=tuple(gaps),
+        shops_without_consign_source=tuple(sorted(without_source)))
 
 
 def assess_query_coverage(conn, request) -> CoverageAssessment:

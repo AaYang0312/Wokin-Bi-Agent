@@ -221,6 +221,54 @@ describe('图表卡片：只渲染已落库数据集', () => {
 })
 
 
+describe('双口径徽标（S1）', () => {
+  const outstockBar: Artifact = Object.assign({}, barSpec, {
+    caliber: 'erp_outstock',
+    metric_basis: 'sales_amount|erp_document/v1|outstock_time',
+  })
+
+  it('默认排名图带 ERP 出库口径徽标：语义挂在载荷字段上，不靠读图人猜', () => {
+    const markup = chart(outstockBar, [dataset, outstockBar])
+    expect(markup).toContain('caliber-pill')
+    expect(markup).toContain('data-caliber="erp_outstock"')
+    expect(markup).toContain('ERP出库口径（默认排名）')
+  })
+
+  it('支付口径图写已认证平台语义：两个口径的徽标永远不同', () => {
+    const paymentBar: Artifact = Object.assign({}, outstockBar, {
+      caliber: 'platform_payment',
+    })
+    const markup = chart(paymentBar, [dataset, paymentBar])
+    expect(markup).toContain('data-caliber="platform_payment"')
+    expect(markup).toContain('平台支付口径（仅已认证平台）')
+    expect(markup).not.toContain('ERP出库口径')
+  })
+
+  it('载荷没有 caliber（旧 Artifact）就不挂徽标：不猜口径', () => {
+    const markup = chart()
+    expect(markup).not.toContain('caliber-pill')
+  })
+
+  it('数据集表格也带口径徽标：filters.caliber 是唯一来源', () => {
+    const paidDataset: Artifact = Object.assign({}, dataset, {
+      filters: Object.assign({}, dataset.filters, { caliber: 'platform_payment',
+        sales_basis: 'verified_payment' }),
+    })
+    const markup = renderToStaticMarkup(<ArtifactView artifact={paidDataset} />)
+    expect(markup).toContain('caliber-pill')
+    expect(markup).toContain('平台支付口径（仅已认证平台）')
+    expect(markup).toContain('口径：平台支付口径（仅已认证平台）')
+  })
+
+  it('词表之外的 caliber 原样不挂徽标，不猜一个近似文案', () => {
+    const bad: Artifact = Object.assign({}, dataset, {
+      filters: Object.assign({}, dataset.filters, { caliber: 'gmv' }),
+    })
+    const markup = renderToStaticMarkup(<ArtifactView artifact={bad} />)
+    expect(markup).not.toContain('caliber-pill')
+  })
+})
+
 describe('多系列趋势与轴的两端', () => {
   const trendTwo: Artifact = {
     artifact_id: '7b1f2b3c-4d5e-4f60-8a71-8293a4b5c6d7',

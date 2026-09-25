@@ -41,8 +41,9 @@ from bi_agent.catalog import build_catalog
 from bi_agent.catalog.models import ref_for_key
 from bi_agent.catalog.resolver import ProductResolution, Selector, resolve_product
 from bi_agent.data_quality import (
-    QUALITY_RULE, CoverageAssessment, assess_query_coverage, attribution_gap,
-    describe_attribution_gap, money_text, switched_sources_between, unverified_payments)
+    QUALITY_RULE, CoverageAssessment, assess_consign_coverage,
+    assess_query_coverage, attribution_gap, describe_attribution_gap, money_text,
+    switched_sources_between, unverified_payments)
 from bi_agent.metrics import (
     Coverage, MAX_ROWS, METRIC_DEFINITIONS, QueryRequest, ToolResult,
     _BudgetExhausted, _RowsTruncated, _capability_gap, _window_range,
@@ -64,9 +65,10 @@ from bi_agent.runtime.models import (
 )
 from bi_agent.presentation.charts import PersistedDataset, build_chart_spec
 from bi_agent.sources import (
-    AFTERSALE_COHORT_ENTITY, AFTERSALE_ENTITY, ORDERS_ENTITY, PAYMENT_WINDOW_METRICS,
-    ShopRecord, binding_signature, registration, resolve_metric_dependencies,
-    unsupported_reason)
+    AFTERSALE_COHORT_ENTITY, AFTERSALE_ENTITY, CONSIGN_ORDERS_ENTITY, DOCUMENT_BASIS,
+    ORDERS_ENTITY, PAYMENT_WINDOW_METRICS, ShopRecord, SourceBinding,
+    binding_signature, registration, resolve_consign_source,
+    resolve_metric_dependencies, unsupported_reason)
 
 from . import repository
 from .metrics import (
@@ -84,8 +86,10 @@ from .metrics import (
     COMPARISON_TREND_PLATFORM_ROWS,
     COMPARISON_TREND_SHOP_ROWS,
     DOCUMENT_ROWS,
+    ERP_OUTSTOCK_CALIBER_TEXT,
     METRIC_FACET,
     PAYMENT_CAPABILITY_COLUMNS,
+    PAYMENT_CALIBER_TEXT,
     PAYMENT_ROWS,
     PLATFORM_GROUP_RULE,
     PRODUCT_FACET_METRICS,
@@ -136,7 +140,14 @@ CELL_WITHHELD_TEXT = (
 COST_SEMANTIC_UNVERIFIED_KINDS = frozenset({"suite", "combination", "processing"})
 # 覆盖缺口按业务实体归因；`entity == 指标名` 的那一类是"这个平台的来源拿不到该口径"，
 # 属于能力缺口，已由能力门禁处理，不能再算成缺覆盖。
-_REAL_ENTITIES = frozenset({ORDERS_ENTITY, AFTERSALE_ENTITY, AFTERSALE_COHORT_ENTITY})
+_REAL_ENTITIES = frozenset({ORDERS_ENTITY, CONSIGN_ORDERS_ENTITY, AFTERSALE_ENTITY,
+                            AFTERSALE_COHORT_ENTITY})
+# 出库口径（S1）的两条固定披露：成员边界（无发货时间扫描来源）与完整性边界
+# （存在缺 consigned_at 的单据）。文本进公开白名单，码映射见 _COMMERCE_CODE_BY_FRAGMENT。
+CONSIGN_SOURCE_TEXT = ("{count} {unit}的订单来源不提供发货时间consignTime扫描，"
+                       "出库口径下为data_missing：{groups}")
+CONSIGN_COMPLETENESS_TEXT = ("{count} 家店铺存在缺少发货时间consignTime的单据，"
+                             "出库口径不能按完整窗口出数：{groups}")
 # 能力标签 → 覆盖判定所用的分组形态（商品标签与固定指标的 product 分组共用依赖）。
 _TAG_GROUP_BY = {"quantity": "product", "product_paid_amount": "product"}
 
@@ -211,6 +222,9 @@ class QueryPlan:
     payment_facet: bool
     # 对比报告读的是同一张视图的另一粒度（整店汇总），不是“再跑一次商品面查询”。
     group_facet: bool = False
+    # 出库口径（S1）：group/document 两面改读发货时间归日的出库视图
+    # （v_outstock_daily / v_outstock_document_daily），值语义不变、时间归属换轨。
+    outstock: bool = False
 
 
 @dataclass
@@ -223,6 +237,8 @@ class ChartPlan:
     y: str
     series: tuple[str, ...]
     basis_entry: Mapping[str, str]
+    # 对比图表携带口径徽标（S1）：默认排名图的 ERP 出库口径语义必须可见。
+    caliber: str | None = None
 
 
 @dataclass
@@ -302,6 +318,13 @@ class CommerceRuntime:
     group_statuses: list[dict[str, Any]] = field(default_factory=list)
     ranking: list[dict[str, Any]] = field(default_factory=list)
     chart_plans: list[ChartPlan] = field(default_factory=list)
+    # 双口径契约（S1）：把「整组答不了本口径」的分组键与原因收在这里（支付口径=
+    # 未认证平台；出库口径=不提供发货时间扫描的平台），让它们的格子以 data_missing
+    # 留在场——不补零也不缺席。
+    missing_groups: dict[str, str] = field(default_factory=dict)
+    # 出库口径（S1）的发货时间覆盖评估按窗口缓存：主窗口与趋势窗口各评一次，
+    # 全部是集合查询，不逐店往返。
+    consign_assessments: dict[tuple[date, date], Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -372,9 +395,10 @@ def _filters(runtime: CommerceRuntime) -> dict[str, Any]:
         "sales_share_basis": "evaluated_only",
     }
     if isinstance(request, PerformanceComparisonRequest):
-        # 分组维度是合计与排名能不能做的直接依据：商品报告不带这个键
-        # （它的分行由行性质决定）。
+        # 分组维度与口径是合计与排名能不能做的直接依据：商品报告不带这两个键
+        # （它的分行由行性质决定，口径固定为 ERP 有效销售父项）。
         filters["group_by"] = request.group_by
+        filters["caliber"] = request.caliber
     if request.scope.platforms:
         filters["platforms"] = list(request.scope.platforms)
     if runtime.erp_product_id is not None:
@@ -414,6 +438,9 @@ _FIXED_LIMITATION_CODES = {
     "覆盖未完成，拒绝部分汇总；缺口见coverage.gaps": "coverage_incomplete",
 }
 _FIXED_CODE_BY_FRAGMENT = (
+    # 出库口径（S1）的成员/完整性边界：归因沿用既有的覆盖与时间口径词表。
+    ("不提供发货时间consignTime扫描", "coverage_time_basis_unverified"),
+    ("缺少发货时间consignTime的单据", "coverage_incomplete"),
     (" 家店铺的来源尚未开通", "source_not_onboarded"),
     (" 家店铺缺少 ", "capability_unavailable"),
     (" 家店铺的付款时间口径未经认证", "coverage_time_basis_unverified"),
@@ -425,6 +452,9 @@ _FIXED_CODE_BY_FRAGMENT = (
     ("结果行数达到", "result_too_large"),
 )
 _COMMERCE_CODE_BY_FRAGMENT = (
+    ("按发货时间consignTime归属", "comparison_caliber_erp_outstock"),
+    ("支付口径下为data_missing", "comparison_caliber_payment_uncertified"),
+    ("发货时间口径未经逐店对照认证", "comparison_caliber_erp_outstock"),
     ("未列入本次合计", "commerce_scope_excluded"),
     ("已评估店铺集合的合计", "commerce_scope_excluded"),
     ("已发布分组的合计", "commerce_scope_excluded"),
@@ -861,10 +891,25 @@ def resolve_metric_basis(runtime: CommerceRuntime) -> None:
     if request.sales_basis == "verified_payment":
         tags.update({"paid_amount", "paid_orders"})
     runtime.tags = tuple(sorted(tags))
+    # 出库口径（S1）：三个出库指标读的是**发货时间（consignTime）**事实面，取数
+    # 依赖是 (出库通道, orders_consign)；没有发货时间扫描来源的通道（pay_time 通道）
+    # 解析为空，由出库口径的成员门禁排除。凭证就是真实绑定：erp_document/v1 +
+    # outstock_time（快麦 consignTime），不另造口径名。
+    outstock_caliber = (runtime.report_kind == "comparison"
+                        and getattr(request, "caliber", None) == "erp_outstock")
     for shop in runtime.candidate_shop_ids:
         record = _record_of(runtime, shop)
         for metric in request.metrics:
-            bindings = tuple(_dependencies(record, str(metric), request.sales_basis))
+            if outstock_caliber:
+                resolved = resolve_consign_source(record)
+                bindings = (SourceBinding(
+                    shop_id=shop, platform=record.platform,
+                    entity=CONSIGN_ORDERS_ENTITY, source=resolved[0],
+                    basis=DOCUMENT_BASIS, time_basis="outstock_time",
+                    time_certification="unmeasured"),) if resolved else ()
+            else:
+                bindings = tuple(_dependencies(record, str(metric),
+                                               request.sales_basis))
             runtime.bindings[(shop, str(metric))] = bindings
             if not bindings:
                 continue
@@ -876,6 +921,8 @@ def resolve_metric_basis(runtime: CommerceRuntime) -> None:
                 "time_basis": bindings[0].time_basis,
                 "metric_version": COMMERCE_METRIC_VERSION,
             })
+    if outstock_caliber:
+        runtime.limitations.append(ERP_OUTSTOCK_CALIBER_TEXT)
 
 
 def _dependencies(record: ShopRecord, metric: str, sales_basis: str) -> tuple:
@@ -953,11 +1000,116 @@ def check_capabilities_and_coverage(runtime: CommerceRuntime) -> None:
               or [_capability_gap_text(request)])
         return
 
-    # 2) 主窗口覆盖：一家店有缺口就整店退出合计，不拿已覆盖段冒充全量汇总。
+    # 2) 口径成员门（S1）：每个口径只聚合它的事实来源真正覆盖的平台组；整组
+    #    答不了的分组键与原因留在 runtime 上，格子以 data_missing 留在场
+    #    （metric_statuses / 排名缺失清单），不补零也不缺席。
+    caliber = getattr(request, "caliber", None)
+    if runtime.report_kind == "comparison" and caliber == "platform_payment":
+        missing: dict[str, str] = {}
+        for key, shops in runtime.requested_groups.items():
+            drops = [shop for shop in shops
+                     if (registration(_record_of(runtime, shop).platform) is None
+                         or registration(_record_of(runtime, shop).platform)
+                         .time_certified != "certified")]
+            if drops:
+                missing[key] = "coverage_time_basis_unverified"
+        runtime.missing_groups = missing
+        for key, shops in runtime.requested_groups.items():
+            if key in missing:
+                for shop in shops:
+                    if shop in runtime.candidate_shop_ids:
+                        _exclude(runtime, shop, "coverage_time_basis_unverified")
+        if missing:
+            unit = "个平台" if runtime.group_column == "platform" else "家店铺"
+            uncertified_text = (
+                f"{len(missing)} {unit}的支付时间口径未经认证，"
+                "支付口径下为data_missing："
+                + "、".join(sorted(_group_label(runtime, key) for key in missing)))
+            runtime.limitations.append(uncertified_text)
+            runtime.limitations.append(PAYMENT_CALIBER_TEXT)
+        if not runtime.candidate_shop_ids:
+            # 整个范围都没认证平台：不是能力没开通，而是认证边界挡住——按口径归因。
+            _stop(runtime, kind="missing_data", code="coverage_time_basis_unverified",
+                  problems=[], stage=CommerceNode.CHECK_CAPABILITIES_AND_COVERAGE,
+                  message="支付口径只有已认证平台能出数，本轮范围内没有已认证平台。",
+                  limitations=([uncertified_text, PAYMENT_CALIBER_TEXT]
+                               if missing else [PAYMENT_CALIBER_TEXT]))
+            return
+    if runtime.report_kind == "comparison" and caliber == "erp_outstock":
+        # 出库口径按**发货时间（consignTime）**归属：订单来源不提供发货时间扫描的
+        # 平台（pay_time 通道）整组 data_missing——它们的覆盖是付款时间窗口，
+        # 借来就是冒名顶替。
+        missing = {}
+        for key, shops in runtime.requested_groups.items():
+            drops = [shop for shop in shops
+                     if shop in runtime.candidate_shop_ids
+                     and resolve_consign_source(_record_of(runtime, shop)) is None]
+            if drops:
+                missing[key] = "coverage_time_basis_unverified"
+        runtime.missing_groups = missing
+        for key, shops in runtime.requested_groups.items():
+            if key in missing:
+                for shop in shops:
+                    if (shop in runtime.candidate_shop_ids
+                            and resolve_consign_source(
+                                _record_of(runtime, shop)) is None):
+                        _exclude(runtime, shop, "coverage_time_basis_unverified")
+        if missing:
+            unit = "个平台" if runtime.group_column == "platform" else "家店铺"
+            runtime.limitations.append(CONSIGN_SOURCE_TEXT.format(
+                count=len(missing), unit=unit,
+                groups="、".join(sorted(_group_label(runtime, key)
+                                        for key in missing))))
+        if not runtime.candidate_shop_ids:
+            _stop(runtime, kind="missing_data", code="coverage_time_basis_unverified",
+                  problems=[], stage=CommerceNode.CHECK_CAPABILITIES_AND_COVERAGE,
+                  message="出库口径只有出库通道（发货时间扫描）的平台能出数。",
+                  limitations=[ERP_OUTSTOCK_CALIBER_TEXT])
+            return
+        # 完整性门：一张单缺发货时间，就无法证明它落在请求的出库窗口内还是外——
+        # 整店 fail closed（coverage_incomplete），不补零、不拿 paid_at 顶替。
+        remaining = list(runtime.candidate_shop_ids)
+        sources = sorted({str(resolve_consign_source(_record_of(runtime, shop))[0])
+                          for shop in remaining})
+        completeness = repository.load_consign_completeness(
+            runtime.context.conn, shop_ids=remaining, sources=sources,
+            deadline=runtime.context.deadline)
+        unconsigned = sorted(shop for shop in remaining if completeness.get(shop))
+        for shop in unconsigned:
+            _exclude(runtime, shop, "coverage_incomplete")
+        if unconsigned:
+            blocked_keys = sorted(key for key, shops in runtime.requested_groups.items()
+                                  if any(s in unconsigned for s in shops))
+            runtime.limitations.append(CONSIGN_COMPLETENESS_TEXT.format(
+                count=len(unconsigned),
+                groups="、".join(_group_label(runtime, shop) for shop in unconsigned)
+                if runtime.group_column == "shop_id" else
+                "、".join(sorted(_group_label(runtime, key)
+                                 for key in blocked_keys))))
+        if not runtime.candidate_shop_ids:
+            _stop(runtime, kind="missing_data", code="coverage_incomplete",
+                  problems=[], stage=CommerceNode.CHECK_CAPABILITIES_AND_COVERAGE,
+                  message="出库单据缺发货时间，出库口径不能按完整窗口出数。",
+                  limitations=[ERP_OUTSTOCK_CALIBER_TEXT])
+            return
+    if not runtime.candidate_shop_ids:
+        _stop(runtime, kind="missing_data", code="capability_unavailable", problems=[],
+              stage=CommerceNode.CHECK_CAPABILITIES_AND_COVERAGE,
+              message="本次查询的指标能力尚未开通，换成已开通的指标或先完成来源核验后再查。",
+              limitations=_capability_gap(
+                  [_record_of(runtime, shop) for shop in sorted(runtime.excluded_ids)
+                   if shop in runtime.profiles], list(runtime.tags))
+              or [_capability_gap_text(request)])
+        return
+
+    # 3) 主窗口覆盖：一家店有缺口就整店退出合计，不拿已覆盖段冒充全量汇总。
+    outstock_caliber = (runtime.report_kind == "comparison"
+                        and getattr(request, "caliber", None) == "erp_outstock")
     metrics_by_tag: dict[str, set[str]] = {}
-    for metric in request.metrics:
-        for tag in COMMERCE_METRIC_CAPABILITIES.get(str(metric), ()):
-            metrics_by_tag.setdefault(tag, set()).add(str(metric))
+    if not outstock_caliber:
+        for metric in request.metrics:
+            for tag in COMMERCE_METRIC_CAPABILITIES.get(str(metric), ()):
+                metrics_by_tag.setdefault(tag, set()).add(str(metric))
     if request.sales_basis == "verified_payment":
         # 支付面自己也要过覆盖门禁：它不是“默认完整”，只是换了事实集合。
         for tag in ("paid_amount", "paid_orders"):
@@ -967,6 +1119,21 @@ def check_capabilities_and_coverage(runtime: CommerceRuntime) -> None:
     coverage_blockers: dict[str, dict[str, str]] = {}
     runtime.blocking, runtime.disclosure = {}, {}
     qualities: list[str] = []
+    if outstock_caliber:
+        # 出库口径只认发货时间（orders_consign）覆盖：pay_time 扫描的 covered
+        # 区间是付款时间窗口，借来就是冒名顶替（025 的覆盖契约）。
+        consign = _consign_assessment(runtime, main)
+        qualities.append(consign.quality_status)
+        for gap in consign.gaps:
+            piece_start = max(gap.start, main[0])
+            piece_end = min(gap.end, main[1])
+            if piece_start >= piece_end:
+                continue
+            runtime.main_gaps.setdefault(gap.shop_id, []).append(
+                (piece_start, piece_end))
+            for metric in request.metrics:
+                coverage_blockers.setdefault(gap.shop_id, {}).setdefault(
+                    str(metric), "coverage_incomplete")
     for tag, affected in sorted(metrics_by_tag.items()):
         assessment = _assessment(runtime, tag, main)
         if assessment is None:
@@ -997,8 +1164,11 @@ def check_capabilities_and_coverage(runtime: CommerceRuntime) -> None:
               limitations=["来源质量核验未通过，拒绝出数"])
         return
 
-    # 3) 共同截止：任一依赖没推进 data_as_of，整体截止就是未知。
-    cutoffs = [item.data_as_of for item in runtime.assessments.values()]
+    # 4) 共同截止：任一依赖没推进 data_as_of，整体截止就是未知。
+    if outstock_caliber:
+        cutoffs = [_consign_assessment(runtime, main).data_as_of]
+    else:
+        cutoffs = [item.data_as_of for item in runtime.assessments.values()]
     if not cutoffs or any(item is None for item in cutoffs):
         _stop(runtime, kind="missing_data", code="data_as_of_unknown", problems=[],
               stage=CommerceNode.CHECK_CAPABILITIES_AND_COVERAGE,
@@ -1007,13 +1177,16 @@ def check_capabilities_and_coverage(runtime: CommerceRuntime) -> None:
                            "覆盖未完成，拒绝部分汇总；缺口见coverage.gaps"])
         return
     runtime.data_as_of = min(item for item in cutoffs if item is not None)
-    runtime.source_batches = tuple(sorted({batch
-                                           for item in runtime.assessments.values()
-                                           for batch in item.source_batches}))
+    if outstock_caliber:
+        runtime.source_batches = _consign_assessment(runtime, main).source_batches
+    else:
+        runtime.source_batches = tuple(sorted({batch
+                                               for item in runtime.assessments.values()
+                                               for batch in item.source_batches}))
     if runtime.quality_status != "passed":
         runtime.limitations.append("来源质量未核验（尚无对账记录）")
 
-    # 4) 未认证付款时间口径：实测不成立的店不出数，没逐店对照过的出数但披露为样本。
+    # 5) 未认证付款时间口径：实测不成立的店不出数，没逐店对照过的出数但披露为样本。
     blocking = {shop for shops in runtime.blocking.values() for shop in shops}
     for shop in sorted(blocking):
         _exclude(runtime, shop, "coverage_time_basis_unverified")
@@ -1023,10 +1196,16 @@ def check_capabilities_and_coverage(runtime: CommerceRuntime) -> None:
     disclosed = ({shop for shops in runtime.disclosure.values() for shop in shops}
                  - blocking) & set(runtime.candidate_shop_ids)
     if disclosed:
-        runtime.limitations.append(
-            f"{len(disclosed)} 家店铺的结果来自未认证付款时间口径，按可观测样本披露")
+        if (runtime.report_kind == "comparison"
+                and getattr(request, "caliber", None) == "erp_outstock"):
+            runtime.limitations.append(
+                f"{len(disclosed)} 家店铺的单据时间口径未经逐店对照认证，"
+                "出库口径结果按可观测样本披露")
+        else:
+            runtime.limitations.append(
+                f"{len(disclosed)} 家店铺的结果来自未认证付款时间口径，按可观测样本披露")
 
-    # 5) 覆盖缺口店铺退出。
+    # 6) 覆盖缺口店铺退出。
     for shop in sorted(runtime.main_gaps):
         if shop in runtime.candidate_shop_ids:
             _exclude(runtime, shop, "coverage_incomplete", runtime.main_gaps[shop])
@@ -1138,6 +1317,7 @@ def _record_statuses(runtime: CommerceRuntime,
         for metric in request.metrics:
             bindings = runtime.bindings.get((shop, str(metric)), ())
             if bindings:
+                # 逐店绑定签名：同名不同口径（含不同时间归属）不许并入同一个合计。
                 signatures.setdefault(str(metric), set()).add(
                     binding_signature(bindings))
     incomparable = {metric for metric, items in signatures.items() if len(items) > 1}
@@ -1251,8 +1431,11 @@ def plan_fixed_queries(runtime: CommerceRuntime) -> None:
     document_tags = {tag for metric in request.metrics
                      if METRIC_FACET.get(str(metric)) == "erp_document"
                      for tag in COMMERCE_METRIC_CAPABILITIES.get(str(metric), ())}
+    outstock = (runtime.report_kind == "comparison"
+                and getattr(request, "caliber", None) == "erp_outstock")
     runtime.plan = QueryPlan(
         read_window=(min(starts), max(ends)),
+        outstock=outstock,
         # 商品父行面只在 ERP 有效销售父项口径下有事实；换到已验证支付口径就不许
         # 继续发布商品数字，否则同一份报告里会出现两套"销售额"。
         product_facet=(runtime.report_kind == "product"
@@ -1288,12 +1471,16 @@ def execute_aggregates(runtime: CommerceRuntime) -> None:
             start=plan.read_window[0], end=plan.read_window[1],
             deadline=context.deadline))
     if plan.group_facet:
-        runtime.groups = tuple(repository.load_shop_day_groups(
+        loader = (repository.load_outstock_shop_day_groups if plan.outstock
+                  else repository.load_shop_day_groups)
+        runtime.groups = tuple(loader(
             context.conn, shop_ids=shops,
             start=plan.read_window[0], end=plan.read_window[1],
             deadline=context.deadline))
     if plan.document_facet:
-        runtime.documents = repository.load_document_facts(
+        loader = (repository.load_outstock_document_facts if plan.outstock
+                  else repository.load_document_facts)
+        runtime.documents = loader(
             context.conn, shop_ids=shops, start=request.start, end=request.end,
             deadline=context.deadline)
     if plan.payment_facet:
@@ -1755,6 +1942,17 @@ def _group_metric_statuses(runtime: CommerceRuntime,
                 entry.update(status="missing",
                              reason=reason or "comparison_cell_withheld")
             runtime.statuses.append(entry)
+    # 双口径（S1）：整组答不了本口径的分组格以 data_missing 留在场——带稳定原因
+    # 码，不补零、不缺席。整店退出的店已由 excluded_scope 逐店说，这里只说分组格。
+    for key in sorted(runtime.missing_groups):
+        plan = runtime.plan
+        for column in comparison_row_columns(
+                runtime.request.metrics,
+                payments=bool(plan.payment_facet) if plan is not None else False):
+            runtime.statuses.append({label: _group_label(runtime, key),
+                                     "metric": column,
+                                     "status": "missing",
+                                     "reason": runtime.missing_groups[key]})
 
 
 def _group_statuses(runtime: CommerceRuntime) -> None:
@@ -1815,9 +2013,14 @@ def _comparison_totals(runtime: CommerceRuntime, columns: tuple[str, ...],
         if column in COMPARISON_RANKED_COLUMNS:
             # 两份单据计数不是"可比较的指标"：它们进合计行，不进排名块
             # （排名块的 metric 必须是已登记报告指标，见 runtime.models._ranking）。
-            runtime.ranking.append(_ranking_block(runtime, column, per_group,
-                                                 complete=complete,
-                                                 incomparable=incomparable))
+            # 口径成员门有缺席分组时，排名集合对请求范围而言不完整：名次一个不发
+            # （`incomplete` 的既有不变量），缺席格走 missing 清单；合计不受影响，
+            # 它本来就只覆盖已发布分组。
+            member_missing = bool(runtime.missing_groups)
+            runtime.ranking.append(_ranking_block(
+                runtime, column, per_group,
+                complete=complete and not member_missing,
+                incomparable=incomparable))
     runtime.totals.append(project(columns, totals))
     if withheld:
         runtime.limitations.append(
@@ -1852,8 +2055,12 @@ def _ranking_block(runtime: CommerceRuntime, column: str,
     `missing` 里带原因，不从排名里静默消失。
     """
     label = COMPARISON_GROUP_COLUMN[runtime_group_by(runtime)]
+    caliber = getattr(runtime.request, "caliber", None)
     block: dict[str, Any] = {"metric": column, "ranking_scope": "evaluated_only",
                              "rows": [], "missing": []}
+    if caliber is not None:
+        # 口径维度进每个排名块：同名指标的值在不同口径下不可比，载荷自己说清。
+        block["caliber"] = caliber
     if incomparable:
         block["status"] = "incomparable"
         block["reason"] = "basis_incompatible"
@@ -1880,7 +2087,9 @@ def _ranking_block(runtime: CommerceRuntime, column: str,
     if withheld_cells and CELL_WITHHELD_TEXT not in runtime.limitations:
         # 每个指标都会各自判一次缺格；这句说的是同一件事，只说一遍。
         runtime.limitations.append(CELL_WITHHELD_TEXT)
-    block["missing"] = missing
+    block["missing"] = [*missing,
+                        *({label: _group_label(runtime, key), "reason": reason}
+                          for key, reason in sorted(runtime.missing_groups.items()))]
     if not block["missing"]:
         block.pop("missing")
     return block
@@ -1899,12 +2108,36 @@ def build_comparison_and_trend(runtime: CommerceRuntime) -> None:
         _build_comparison(runtime)
 
 
+def _consign_assessment(runtime: "CommerceRuntime",
+                        window: tuple[date, date]):
+    """出库口径（发货时间）的覆盖评估，按窗口缓存；只读 orders_consign 覆盖。"""
+    cached = runtime.consign_assessments.get(window)
+    if cached is None:
+        cached = assess_consign_coverage(
+            runtime.context.conn,
+            [(shop, _record_of(runtime, shop))
+             for shop in runtime.candidate_shop_ids],
+            start=window[0], end=window[1])
+        runtime.consign_assessments[window] = cached
+    return cached
+
+
 def _window_gaps(runtime: CommerceRuntime,
                  window: tuple[date, date]) -> dict[str, list[tuple[date, date]]]:
     """一个窗口内逐店未覆盖段：趋势与上期各自单独检查，缺口不挪到另一组七天。"""
     request = runtime.request
     out: dict[str, list[tuple[date, date]]] = {}
     if request is None:
+        return out
+    if (runtime.report_kind == "comparison"
+            and getattr(request, "caliber", None) == "erp_outstock"):
+        # 出库口径：趋势窗口的缺口同样只按发货时间覆盖判，不借付款时间覆盖。
+        assessment = _consign_assessment(runtime, window)
+        for gap in assessment.gaps:
+            piece_start = max(gap.start, window[0])
+            piece_end = min(gap.end, window[1])
+            if piece_start < piece_end:
+                out.setdefault(gap.shop_id, []).append((piece_start, piece_end))
         return out
     tags = sorted({tag for metric in request.metrics
                    for tag in COMMERCE_METRIC_CAPABILITIES.get(str(metric), ())})
@@ -2026,7 +2259,8 @@ def _plan_charts(runtime: CommerceRuntime) -> None:
         runtime.chart_plans.append(ChartPlan(
             dataset_type="comparison_table", kind="bar", x=group_column, y=metric,
             series=(group_column,),
-            basis_entry=f"{metric}|{block['basis']}|{block['time_basis']}"))
+            basis_entry=f"{metric}|{block['basis']}|{block['time_basis']}",
+            caliber=getattr(request, "caliber", None)))
     trend_metrics = [key for key in ("sold_quantity", "sales_amount")
                      if runtime.group_trend_rows
                      and key in {str(metric) for metric in request.metrics}]
@@ -2042,7 +2276,8 @@ def _plan_charts(runtime: CommerceRuntime) -> None:
             continue
         runtime.chart_plans.append(ChartPlan(
             dataset_type="trend_series", kind="line", x="day", y=metric,
-            series=(group_column,), basis_entry=signature))
+            series=(group_column,), basis_entry=signature,
+            caliber=getattr(request, "caliber", None)))
     if not runtime.chart_plans:
         runtime.limitations.append(CHART_UNAVAILABLE_TEXT)
 
@@ -2517,7 +2752,7 @@ def _persist_charts(runtime: CommerceRuntime, store: Any,
             spec = build_chart_spec(
                 dataset, kind=plan.kind, x=plan.x, y=plan.y, series=plan.series,
                 unit=CHART_METRIC_UNITS[plan.y], metric_basis=plan.basis_entry,
-                coverage_ref=dataset)
+                coverage_ref=dataset, caliber=plan.caliber)
             payload = spec.as_payload()
             ref = store.save_artifact(runtime.state.run_id, NewArtifact(
                 artifact_type="chart_spec", payload=payload,

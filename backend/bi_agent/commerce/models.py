@@ -29,10 +29,14 @@ from bi_agent.sources import registration
 from .metrics import (
     COMMERCE_METRICS,
     CommerceMetric,
+    ComparisonCaliber,
     ComparisonGroupBy,
     ComparisonMode,
+    CALIBER_SALES_BASIS,
+    DEFAULT_COMPARISON_CALIBER,
     PLATFORM_GROUP_RULE,
     ProfitBasis,
+    SALES_BASIS_CALIBER,
     SalesBasis,
     ScopeMode,
     TREND_DAYS,
@@ -203,10 +207,31 @@ class PerformanceComparisonRequest(BaseModel):
     end: date
     group_by: ComparisonGroupBy
     metrics: list[CommerceMetric] = Field(min_length=1)
+    # 双口径契约（S1）：每一个对比数都必须带着口径说话。口径与 sales_basis 是
+    # 同一个选择的两面（口径是公开维度，sales_basis 是图内事实选择器），缺一边
+    # 由另一边推出，两边都给且矛盾就拒绝——不猜、不静默取其一。
+    caliber: ComparisonCaliber = DEFAULT_COMPARISON_CALIBER
     sales_basis: SalesBasis = "erp_effective_parent"
     profit_basis: ProfitBasis = "none"
     trend_days: Literal[7] = TREND_DAYS
     currency: Literal["CNY"] = "CNY"
+
+    @model_validator(mode="after")
+    def _pair_caliber_with_sales_basis(self) -> "PerformanceComparisonRequest":
+        """口径与事实集合一对一配对：交叉组合（出库口径配支付事实）不存在。"""
+        given_caliber = "caliber" in self.model_fields_set
+        given_basis = "sales_basis" in self.model_fields_set
+        implied_basis = CALIBER_SALES_BASIS[self.caliber]
+        implied_caliber = SALES_BASIS_CALIBER[self.sales_basis]
+        if given_caliber and given_basis and implied_basis != self.sales_basis:
+            raise ValueError(
+                "caliber 与 sales_basis 不配对："
+                f"caliber={self.caliber} 只能配 sales_basis={implied_basis}")
+        if given_caliber and not given_basis:
+            self.sales_basis = implied_basis        # type: ignore[assignment]
+        elif given_basis and not given_caliber:
+            self.caliber = implied_caliber          # type: ignore[assignment]
+        return self
 
     @model_validator(mode="after")
     def _check_bounds(self) -> "PerformanceComparisonRequest":
@@ -260,6 +285,8 @@ class PerformanceComparisonRequest(BaseModel):
             "end": self.end.isoformat(),
             "currency": self.currency,
             "group_by": self.group_by,
+            # 口径参与指纹：同一个问题换个口径就不是同一个答案，旧结果不许命中。
+            "caliber": self.caliber,
             "sales_basis": self.sales_basis,
             "profit_basis": self.profit_basis,
             "trend_days": self.trend_days,

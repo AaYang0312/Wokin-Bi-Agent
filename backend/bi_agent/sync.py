@@ -25,9 +25,11 @@ from .catalog import EntityKind, bump_catalog_version, ensure_refs
 from .config import load_sync_settings
 from .data_quality import QUALITY_RULE, reconcile_source_quality
 from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
+from .metrics import _BudgetExhausted, _set_query_budget
 from .sources import (
-    AFTERSALE_SOURCE, OUTSTOCK_SOURCE, ShopRecord, TRADE_LIST_SOURCE,
-    capabilities_from_evidence, platform_order_sources, resolve_order_source)
+    AFTERSALE_SOURCE, CONSIGN_ORDERS_ENTITY, OUTSTOCK_SOURCE, ShopRecord,
+    TRADE_LIST_SOURCE, capabilities_from_evidence, platform_order_sources,
+    resolve_consign_source, resolve_order_source)
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +74,7 @@ COHORT_TIDS_BATCH = 50
 MAX_QUERY_DAYS = 366
 
 _REQUIRED_SYNC_COLUMNS = {
-    "orders": frozenset({"unified_status", "system_status"}),
+    "orders": frozenset({"unified_status", "system_status", "consigned_at"}),
     "order_items": frozenset({"source_type"}),
     "products": frozenset({"title", "source_modified_at"}),
 }
@@ -276,6 +278,9 @@ def normalise_trade(raw: dict[str, Any], *, source: str = ORDER_SOURCE) -> dict[
     shop_id = str(raw.get("userId") or "").strip()
     source_updated_at = parse_timestamp(raw.get("updTime")) or parse_timestamp(raw.get("modified"))
     paid_at = parse_business_timestamp(raw.get("payTime"))
+    # 发货时间（consignTime）与付款时间（payTime）是两个事实，分别入列、
+    # 永不互替：出库口径只认 consigned_at（025）。
+    consigned_at = parse_business_timestamp(raw.get("consignTime"))
     raw_pay_amount = to_decimal(raw.get("payAmount"))
     status = "normal"
     if not erp_id or not shop_id or source_updated_at is None:
@@ -308,6 +313,7 @@ def normalise_trade(raw: dict[str, Any], *, source: str = ORDER_SOURCE) -> dict[
         "source_updated_at": source_updated_at,
         "platform_modified_at": parse_timestamp(raw.get("modified")),
         "paid_at": paid_at,
+        "consigned_at": consigned_at,
         "raw_pay_amount": raw_pay_amount,
         "raw_payment": to_decimal(raw.get("payment")),
         "raw_platform_payment": to_decimal(raw.get("platformPaymentAmount")),
@@ -512,9 +518,9 @@ def rebuild_payments(conn, shop_id: str, commercial_ids: set[str]) -> int:
 
 _ORDER_COLUMNS = (
     "shop_id, erp_id, commercial_ids, split_parent_id, source, source_updated_at, "
-    "platform_modified_at, paid_at, raw_pay_amount, raw_payment, raw_platform_payment, "
-    "raw_cost, raw_gross_profit, unified_status, system_status, active, "
-    "normalization_status, batch_id"
+    "platform_modified_at, paid_at, consigned_at, raw_pay_amount, raw_payment, "
+    "raw_platform_payment, raw_cost, raw_gross_profit, unified_status, system_status, "
+    "active, normalization_status, batch_id"
 )
 
 
@@ -522,14 +528,15 @@ def _trade_row(trade: dict[str, Any], batch_id: str) -> tuple:
     return (
         trade["shop_id"], trade["erp_id"], trade["commercial_ids"], trade["split_parent_id"],
         trade["source"], trade["source_updated_at"], trade["platform_modified_at"],
-        trade["paid_at"], trade["raw_pay_amount"], trade["raw_payment"],
-        trade["raw_platform_payment"], trade["raw_cost"], trade["raw_gross_profit"],
-        trade["unified_status"], trade["system_status"], trade["active"],
-        trade["normalization_status"], batch_id,
+        trade["paid_at"], trade["consigned_at"], trade["raw_pay_amount"],
+        trade["raw_payment"], trade["raw_platform_payment"], trade["raw_cost"],
+        trade["raw_gross_profit"], trade["unified_status"], trade["system_status"],
+        trade["active"], trade["normalization_status"], batch_id,
     )
 
 
-def apply_trade(conn, trade: dict[str, Any], *, batch_id: str, force: bool = False) -> bool:
+def apply_trade(conn, trade: dict[str, Any], *, batch_id: str, force: bool = False,
+                rebuild_payment: bool = True) -> bool:
     """版本保护入库；replay 仅可重规范化时间戳相等的同版本记录。"""
     if trade["normalization_status"] == "invalid":
         return False
@@ -542,7 +549,7 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str, force: bool = Fal
     updated = conn.execute(
         f"""
         INSERT INTO bi.orders ({_ORDER_COLUMNS})
-        VALUES ({", ".join(["%s"] * 18)})
+        VALUES ({", ".join(["%s"] * 19)})
         ON CONFLICT (shop_id, erp_id) DO UPDATE SET
             commercial_ids = EXCLUDED.commercial_ids,
             split_parent_id = EXCLUDED.split_parent_id,
@@ -550,6 +557,7 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str, force: bool = Fal
             source_updated_at = EXCLUDED.source_updated_at,
             platform_modified_at = EXCLUDED.platform_modified_at,
             paid_at = EXCLUDED.paid_at,
+            consigned_at = EXCLUDED.consigned_at,
             raw_pay_amount = EXCLUDED.raw_pay_amount,
             raw_payment = EXCLUDED.raw_payment,
             raw_platform_payment = EXCLUDED.raw_platform_payment,
@@ -616,7 +624,10 @@ def apply_trade(conn, trade: dict[str, Any], *, batch_id: str, force: bool = Fal
                 ),
             )
     old_ids |= set(trade["commercial_ids"])
-    rebuild_payments(conn, str(trade["shop_id"]), old_ids)
+    if rebuild_payment:
+        # 出库/发货时间专项扫描（S1）带 rebuild_payment=False 进来：它只补单据/行
+        # 事实，不重建支付事实——已验证支付不得被出库通道的证据降级或覆盖。
+        rebuild_payments(conn, str(trade["shop_id"]), old_ids)
     return True
 
 
@@ -1123,6 +1134,128 @@ def sync_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
                                window=window, mode=mode, batch_id=batch_id,
                                row_count=accepted)
     return accepted
+
+
+class ConsignScanIncomplete(Exception):
+    """出库窗口存在无效/缺发货时间/越窗单据：orders_consign 覆盖不得推进。
+
+    `problems` 是逐类计数（invalid/unconsigned/out_of_window），作为 fail-closed
+    凭证返回给调用方；绝不写部分覆盖，也绝不把缺口当 0 补进覆盖区间。
+    """
+
+    def __init__(self, problems: dict[str, int]) -> None:
+        self.problems = dict(problems)
+        super().__init__("consign_scan_incomplete")
+
+
+def fetch_consign_window(client: KuaimaiClient, *, shop_id: str,
+                         window: Window) -> Iterator[dict[str, Any]]:
+    """出库口径专项拉取：`erp.trade.outstock.simple.query` + `timeType=consign_time`。
+
+    分页完整性复用订单通道同一套机器（在线通道 cursor/hasNext + total 证据，
+    归档通道双查），任何一页无法证明完整就抛 KuaimaiError——半窗数据永远不会
+    离开这个生成器。与支付通道无关：这是 S1 出库口径的独立采集路径。
+    """
+    yield from _fetch_orders_cursor(client, shop_id=shop_id, window=window,
+                                    time_type="consign_time", query_type="0",
+                                    method=OUTSTOCK_SOURCE)
+    yield from _fetch_orders_paged(client, shop_id=shop_id, window=window,
+                                   time_type="consign_time", query_type="1",
+                                   method=OUTSTOCK_SOURCE,
+                                   allow_omitted_list=True)
+
+
+def _refresh_allocation_flags(conn, shop_id: str,
+                              commercial_ids: set[str]) -> int:
+    """按**现有**支付事实确定性重导出库行的分摊核验标记（consign 专用）。
+
+    `rebuild_payment=False` 的路径不重建支付事实，但 `apply_trade` 重写行时会把
+    `allocation_verified` 重置为规范化初值 False——对同一商业单已有已验证支付的
+    行，这是无声降级（出库金额会被 withhold）。本语句镜像 `rebuild_payments` 的
+    同一条推导规则，但**只读** `bi.order_payments` 的 verified 状态、只写行标记：
+      allocation_verified =（该商业单存在已验证支付）AND 行 active AND 行有分摊金额；
+    无已验证支付的商业单不发生提升（保持 False）。单条集合 UPDATE，事务内执行，
+    不逐行往返，也不触碰支付的任何字段。
+    """
+    cids = sorted({cid for cid in commercial_ids if cid})
+    if not cids:
+        return 0
+    result = conn.execute(
+        "UPDATE bi.order_items i "
+        "SET allocation_verified = (p.verified IS TRUE) "
+        "AND i.active AND i.allocated_paid_amount IS NOT NULL "
+        "FROM (SELECT commercial_id, verified FROM bi.order_payments "
+        "      WHERE shop_id=%s AND commercial_id = ANY(%s)) p "
+        "WHERE i.shop_id=%s AND i.commercial_id = p.commercial_id",
+        (shop_id, cids, shop_id),
+    )
+    return getattr(result, "rowcount", 0) or 0
+
+
+def sync_consign_window(conn, client: KuaimaiClient, *, shop_id: str,
+                        window: Window, mode: str = "backfill",
+                        deadline: float | None = None) -> dict[str, int]:
+    """单个发货时间窗口的事务同步：拉取→规范化→入库→（全部干净才）推进覆盖。
+
+    - 请求固定 `timeType=consign_time`、方法固定出库通道，与各平台的支付来源
+      绑定无关（fxg/jd/kuaishou 等付款时间通道同样由此获得出库口径路径）；
+    - 只写单据/行事实（bi.orders / bi.order_items，batch 独立），**不经手
+      order_payments**：已验证支付事实不会被本路径降级或覆盖；
+    - 任何一单规范化无效、缺 consigned_at、或发货时间越出请求窗口 → 整窗回滚，
+      记 `last_error_code=consign_scan_incomplete`，orders_consign 覆盖不推进；
+    - 完整扫描（包括"确实没有单据"的空窗）才把 [start,end) 计入覆盖。
+    """
+    if mode not in ("backfill", "replay", "reconcile"):
+        raise ValueError(f"出库口径窗口不支持模式 {mode}（只收业务时间模式）")
+    if deadline is not None and not _set_query_budget(conn, deadline):
+        # 与查询侧同一份预算机器：预算耗尽时连一条覆盖写入都不该发生。
+        raise _BudgetExhausted
+    batch_id = uuid.uuid4().hex
+    accepted = 0
+    touched_commercials: set[str] = set()
+    problems: dict[str, int] = {}
+    try:
+        with conn.transaction():
+            for raw in fetch_consign_window(client, shop_id=shop_id, window=window):
+                trade = normalise_trade(raw, source=OUTSTOCK_SOURCE)
+                if trade["normalization_status"] == "invalid":
+                    problems["invalid"] = problems.get("invalid", 0) + 1
+                    continue
+                consigned_at = trade["consigned_at"]
+                if consigned_at is None:
+                    problems["unconsigned"] = problems.get("unconsigned", 0) + 1
+                    continue
+                if not (window.start <= consigned_at < window.end):
+                    # 出库窗口按发货时间主张：返回单据的 consignTime 落在窗外，
+                    # 说明通道裁剪与窗口语义不一致，覆盖声明会是假的。
+                    problems["out_of_window"] = problems.get("out_of_window", 0) + 1
+                    continue
+                apply_trade(conn, trade, batch_id=batch_id, force=(mode == "replay"),
+                            rebuild_payment=False)
+                accepted += 1
+                touched_commercials.update(trade["commercial_ids"])
+            # 不重建支付事实，但要把被重写行的分摊核验标记按**现有**已验证支付
+            # 确定性重导出：同一商业单已有已验证支付的行保持 true（不出库金额被
+            # withhold 的无声降级），没有的不提升（负例）。单条集合 UPDATE。
+            _refresh_allocation_flags(conn, shop_id, touched_commercials)
+            if problems:
+                raise ConsignScanIncomplete(problems)
+            _record_window_success(conn, source=OUTSTOCK_SOURCE,
+                                   entity=CONSIGN_ORDERS_ENTITY, shop_id=shop_id,
+                                   window=window, mode=mode, batch_id=batch_id,
+                                   row_count=accepted)
+    except ConsignScanIncomplete as exc:
+        # 回滚后的短事务只留 fail-closed 凭证；覆盖区间分毫不动。
+        record_failure(conn, source=OUTSTOCK_SOURCE, entity=CONSIGN_ORDERS_ENTITY,
+                       shop_id=shop_id, code="consign_scan_incomplete")
+        raise
+    except KuaimaiError as exc:
+        # 分页/响应不完整：同样只留失败凭证，覆盖分毫不动，异常向上交调度处置。
+        record_failure(conn, source=OUTSTOCK_SOURCE, entity=CONSIGN_ORDERS_ENTITY,
+                       shop_id=shop_id,
+                       code=getattr(exc, "code", None) or "consign_scan_failed")
+        raise
+    return {"accepted": accepted}
 
 
 def check_cohort_window(conn, client: KuaimaiClient, *, shop_id: str,
@@ -1802,6 +1935,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("incremental")
     reconcile = sub.add_parser("reconcile")
     reconcile.add_argument("--days", type=int, default=7)
+    consign = sub.add_parser(
+        "consign-scan",
+        help="出库口径专项扫描：erp.trade.outstock.simple.query + timeType=consign_time，"
+             "写 orders_consign 覆盖（S1 出库口径唯一覆盖来源；不动支付事实与覆盖）")
+    consign.add_argument("--days", type=int, default=90,
+                         help="回填最近 N 天（北京时间，按天切窗）")
+    consign.add_argument("--start", help="含，YYYY-MM-DD（北京时间）；给定则按 [--start,--end) 精确回放")
+    consign.add_argument("--end", help="排他，YYYY-MM-DD（北京时间）")
+    consign.add_argument("--mode", choices=["backfill", "replay", "reconcile"],
+                         default="backfill")
     replay = sub.add_parser("replay")
     replay.add_argument("--entity", required=True,
                         choices=["orders", "aftersales_occurrence", "aftersales_cohort"])
@@ -1877,6 +2020,51 @@ def main(argv: list[str] | None = None) -> int:
                         GUARD_STATS.payment_downgrade_blocked - before)
                     print(json.dumps({"action": "incremental", "shop_id": shop_id,
                                       "stats": stats}))
+            elif args.command == "consign-scan":
+                if args.days > MAX_QUERY_DAYS:
+                    raise SystemExit(f"回填跨度最多{MAX_QUERY_DAYS}天")
+                if (args.start is None) != (args.end is None):
+                    raise SystemExit("--start 与 --end 必须同时给定")
+                mode = "replay" if args.start is not None else args.mode
+                if args.start is not None:
+                    windows = list(day_windows(_parse_date(args.start),
+                                               _parse_date(args.end)))
+                else:
+                    t0 = datetime.now(BEIJING)
+                    windows = list(day_windows(t0 - timedelta(days=args.days), t0))
+                scanned = 0
+                for shop_id in sorted(settings.shop_ids):
+                    row = conn.execute(
+                        "SELECT platform FROM bi.shops WHERE shop_id=%s",
+                        (shop_id,)).fetchone()
+                    platform = str(row[0]).strip().lower() if row else ""
+                    if resolve_consign_source(
+                            ShopRecord.from_row(shop_id, platform, ())) is None:
+                        print(json.dumps({"action": "consign-scan",
+                                          "shop_id": shop_id,
+                                          "skipped": "no_consign_source"},
+                                         ensure_ascii=False))
+                        continue
+                    ok, failed = 0, 0
+                    for window in windows:
+                        try:
+                            sync_consign_window(conn, client, shop_id=shop_id,
+                                                window=window, mode=mode)
+                            ok += 1
+                        except (KuaimaiError, ConsignScanIncomplete) as exc:
+                            failed += 1
+                            print(json.dumps(
+                                {"action": "consign-scan", "shop_id": shop_id,
+                                 "window": [window.start.isoformat(),
+                                            window.end.isoformat()],
+                                 "error": _shop_error(exc),
+                                 "problems": getattr(exc, "problems", {})},
+                                ensure_ascii=False))
+                    scanned += ok
+                    print(json.dumps({"action": "consign-scan", "shop_id": shop_id,
+                                      "windows_ok": ok, "windows_failed": failed},
+                                     ensure_ascii=False))
+                print(json.dumps({"action": "consign-scan", "windows_ok": scanned}))
             elif args.command == "reconcile":
                 run_end = datetime.now(BEIJING)
                 for shop_id in sorted(settings.shop_ids):

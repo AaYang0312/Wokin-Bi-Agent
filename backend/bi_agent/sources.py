@@ -41,6 +41,9 @@ OUTSTOCK_SOURCE = "erp.trade.outstock.simple.query"
 AFTERSALE_SOURCE = "erp.aftersale.list.query"
 
 ORDERS_ENTITY = "orders"
+# 出库/发货时间扫描的覆盖实体（025）：只有按 `timeType=consign_time` 建立的扫描
+# 才允许写这个实体的覆盖；出库口径只消费它，绝不借用 pay_time 扫描的覆盖。
+CONSIGN_ORDERS_ENTITY = "orders_consign"
 AFTERSALE_ENTITY = "aftersales_occurrence"
 AFTERSALE_COHORT_ENTITY = "aftersales_cohort"
 
@@ -258,6 +261,21 @@ def resolve_order_source(shop: ShopRecord) -> str | None:
     """这家店的订单来源；没有登记就没有来源，不回退。"""
     reg = registration(shop.platform)
     return None if reg is None else reg.order_source
+
+
+def resolve_consign_source(shop: ShopRecord) -> tuple[str, str] | None:
+    """这家店的**出库/发货时间扫描**来源 (source, entity)；未登记/拼多多为 None。
+
+    出库口径的采集与覆盖一律走专用通道 `erp.trade.outstock.simple.query`
+    （请求 `timeType=consign_time`，实体 `orders_consign`），**与各平台的支付来源
+    绑定相互独立**：fxg/jd/kuaishou/wxsph/wsxc 的支付走 trade.list（付款时间），
+    出库口径照样由这条专用通道获得发货时间路径。拼多多按 2026-09-12 范围决定
+    永久排除（与支付同一边界，非延后）。没有凭证时调用方必须 fail closed。
+    """
+    reg = registration(shop.platform)
+    if reg is None or reg.payment_basis is None:
+        return None
+    return OUTSTOCK_SOURCE, CONSIGN_ORDERS_ENTITY
 
 
 def resolve_metric_dependencies(shop: ShopRecord,

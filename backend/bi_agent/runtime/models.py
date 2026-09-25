@@ -21,6 +21,7 @@ from pydantic import (
 from bi_agent.catalog import EntityKind, REF_RE, is_safe_display_name
 from bi_agent.commerce.metrics import (
     CHART_SERIES_COLUMNS, CHART_X_COLUMNS, CHART_Y_COLUMNS,
+    COMPARISON_CALIBERS,
     COMMERCE_LIMITATION_CODES, COMMERCE_LIMITATION_PATTERNS,
     COMMERCE_METRIC_DEFINITIONS, COMMERCE_METRIC_UNITS, COMMERCE_METRICS,
     COMMERCE_PUBLIC_LIMITATIONS, COMMERCE_RESULT_COLUMNS, EXCLUDED_REASONS,
@@ -164,6 +165,8 @@ _OPPORTUNITY_STATUSES = OPPORTUNITY_STATUSES
 # （见下方 _STATUS_REASONS），不新造第三种说法。
 _EXCLUDED_REASONS = EXCLUDED_REASONS
 _COVERAGE_STATUSES = frozenset({"complete", "partial", "missing"})
+# 对比口径（S1）：载荷里出现的口径只能是登记过的两个值。
+_CALIBERS = COMPARISON_CALIBERS
 _PROBLEM_CODES = frozenset({
     "missing_parameters", "invalid_parameters", "invalid_date_range", "invalid_metric",
     "invalid_group_by", "invalid_compare", "invalid_top_n", "invalid_shop", "forbidden",
@@ -278,6 +281,8 @@ _NORMALIZED_REQUEST_KEYS = frozenset({
     "profit_basis", "trend_days", "report_kind", "opportunity_policy_ref",
     # 对比报告的分组规则版本：分组规则换了就是另一个问题，旧结果不许命中。
     "platform_group_rule",
+    # 对比口径（S1）：口径参与指纹，换口径就是另一个问题。
+    "caliber",
     # 上架复核（Task 9）：本轮目标价参与指纹，换价就是换问题；缺它就没有依据可言。
     "expected_prices", "price_basis", "as_of",
     # 库存预警（Task 10）：本轮阈值同样参与指纹——换个阈值再问不是同一个问题。
@@ -352,6 +357,8 @@ _FILTER_KEYS = frozenset({
     "start", "end", "shop_refs", "metrics", "group_by", "compare", "top_n", "currency",
     "basis_policy", "mode", "sales_basis", "profit_basis", "platforms", "product_ref",
     "report_kind", "sales_share_basis",
+    # 对比口径（S1）：展示层靠它区分默认出库排名与支付口径视图。
+    "caliber",
     # 上架复核：一次复核回答的是「哪个口径、哪个时点、按哪些本轮目标价」。
     "price_basis", "as_of", "expected_prices",
     # 库存预警：一次预警回答的是「哪两个口径、按哪些本轮阈值、用了哪一版策略」。
@@ -756,11 +763,14 @@ def _ranking(value: object) -> None:
     for item in value:
         block = _mapping(item, allowed=frozenset({"metric", "status", "reason",
                                                  "basis", "time_basis",
-                                                 "ranking_scope", "rows", "missing"}),
+                                                 "ranking_scope", "rows", "missing",
+                                                 "caliber"}),
                          required=frozenset({"metric", "status", "ranking_scope",
                                              "rows"}))
         if block["metric"] not in _METRICS:
             _unsafe_payload()
+        if "caliber" in block:
+            _string_in(block["caliber"], _CALIBERS)
         if str(block["metric"]) in seen:
             _unsafe_payload()      # 一个指标两份排名就有一份是多余的说法
         seen.add(str(block["metric"]))
@@ -1048,6 +1058,8 @@ def _normalized_request(value: object) -> dict[str, object]:
                          ("profit_basis", _PROFIT_BASES), ("report_kind", _REPORT_KINDS)):
         if key in request:
             _string_in(request[key], allowed)
+    if "caliber" in request:
+        _string_in(request["caliber"], _CALIBERS)
     if "product_ref" in request:
         _ref(request["product_ref"])
     if "opportunity_policy_ref" in request:
@@ -1281,6 +1293,8 @@ def _filters(value: object, *, public: bool) -> None:
                          ("report_kind", _REPORT_KINDS)):
         if key in filters:
             _string_in(filters[key], allowed)
+    if "caliber" in filters:
+        _string_in(filters["caliber"], _CALIBERS)
     if filters.get("sales_share_basis") != "evaluated_only":
         # 份额只有"对已评估集合"这一种分母；出现别的取值就是有人偷偷换了分母。
         if "sales_share_basis" in filters:

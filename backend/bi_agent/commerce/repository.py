@@ -63,6 +63,47 @@ LIMIT %s
 """
 
 
+# 出库口径分组面（S1）：`reporting.v_outstock_daily` 与 v_product_cost_daily 同一
+# 套纳入条件与列形，唯独按发货时间（bi.orders.consigned_at）归日，且只含带发货
+# 时间的单据。缺发货时间的行在视图里就不存在——出库口径不把它们当 0，也不借用
+# paid_at 的归属；窗口完整性由查询侧的覆盖与完整性门禁判定。
+_OUTSTOCK_GROUPS_SQL = """
+SELECT shop_id, day, line_kind, sum(quantity), sum(gift_quantity),
+       sum(sales_amount), bool_and(allocation_verified), sum(line_count),
+       sum(cost_line_count), sum(cost_quantity), sum(cost_total)
+FROM reporting.v_outstock_daily
+WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
+GROUP BY shop_id, day, line_kind
+ORDER BY shop_id, day, line_kind
+LIMIT %s
+"""
+
+# 出库口径单据面：与 v_erp_document_daily 同列形，按发货时间归日。
+_OUTSTOCK_DOCUMENTS_SQL = """
+SELECT shop_id,
+       count(*),
+       count(*) FILTER (WHERE raw_gross_profit IS NOT NULL),
+       sum(raw_gross_profit),
+       count(*) FILTER (WHERE split_parent_id IS NOT NULL),
+       count(*) FILTER (WHERE commercial_ids_count > 1)
+FROM reporting.v_outstock_document_daily
+WHERE shop_id = ANY(%s) AND day >= %s AND day < %s
+GROUP BY shop_id
+ORDER BY shop_id
+LIMIT %s
+"""
+
+# 发货时间完整性探针：出库通道单据里缺 consigned_at 的数量（不分窗口——
+# 缺发货时间的单据无法证明它落在请求窗口内还是外，存在即整店 fail closed）。
+_CONSIGN_COMPLETENESS_SQL = """
+SELECT shop_id, count(*)
+FROM reporting.v_order_consign
+WHERE shop_id = ANY(%s) AND source = ANY(%s) AND consigned_at IS NULL
+GROUP BY shop_id
+ORDER BY shop_id
+LIMIT %s
+"""
+
 # 分组面（Task 8 对比报告）：与商品面**同一张视图、同一入条件**，只是不再按商品筛，
 # 而在 SQL 端把同一 (店铺, 日, 行性质) 下的**全部商品**合起来。
 # 两件原因：① 一家店的平台对比要的是整店经营量，不是某个商品；
@@ -210,6 +251,58 @@ def load_document_facts(conn, *, shop_ids: list[str], start: date, end: date,
             for row in raw}
 
 
+def load_outstock_shop_day_groups(conn, *, shop_ids: list[str], start: date,
+                                  end: date, deadline: float) -> list[ProductLine]:
+    """取获准店铺 `[start,end)` 内按**发货时间**归日的整店出库聚合行。
+
+    与 `load_shop_day_group` 完整同形（同一 `ProductLine`、同一套算术与成本覆盖
+    判定）；差别只有归属时间（consigned_at）与“缺发货时间的行不存在”。仍是一条
+    集合查询：按店循环会把 N 家店变成 N 条查询。
+    """
+    if not shop_ids:
+        return []
+    if not _set_query_budget(conn, deadline):
+        raise _BudgetExhausted
+    raw = _fetch_capped(conn, _OUTSTOCK_GROUPS_SQL, (shop_ids, start, end))
+    return [ProductLine(shop_id=str(row[0]), day=row[1], line_kind=str(row[2]),
+                        quantity=row[3], gift_quantity=row[4], sales_amount=row[5],
+                        allocation_verified=bool(row[6]), line_count=int(row[7]),
+                        cost_line_count=int(row[8]), cost_quantity=row[9],
+                        cost_total=row[10], sku_ids=())
+            for row in raw]
+
+
+def load_outstock_document_facts(conn, *, shop_ids: list[str], start: date,
+                                 end: date, deadline: float) -> dict[str, DocumentFacts]:
+    """出库口径的单据事实：按发货时间归日的唯一单据粒度聚合（每家店一行）。"""
+    if not shop_ids:
+        return {}
+    if not _set_query_budget(conn, deadline):
+        raise _BudgetExhausted
+    raw = _fetch_capped(conn, _OUTSTOCK_DOCUMENTS_SQL, (shop_ids, start, end))
+    return {str(row[0]): DocumentFacts(shop_id=str(row[0]), documents=int(row[1]),
+                                       documents_with_gross_profit=int(row[2]),
+                                       gross_profit=row[3],
+                                       split_documents=int(row[4]),
+                                       merged_documents=int(row[5]))
+            for row in raw}
+
+
+def load_consign_completeness(conn, *, shop_ids: list[str], sources: list[str],
+                              deadline: float) -> dict[str, int]:
+    """逐店统计已登记来源单据中缺发货时间（consigned_at IS NULL）的数量。
+
+    一张单缺发货时间就无法证明它落在请求的出库窗口内还是外：count>0 的店整店
+    fail closed，不补零、不拿 paid_at 顶替。一次集合查询，不逐店往返。
+    """
+    if not shop_ids or not sources:
+        return {}
+    if not _set_query_budget(conn, deadline):
+        raise _BudgetExhausted
+    raw = _fetch_capped(conn, _CONSIGN_COMPLETENESS_SQL, (shop_ids, sources))
+    return {str(row[0]): int(row[1]) for row in raw}
+
+
 def load_payment_facts(conn, *, shop_ids: list[str], start_ts: Any, end_ts: Any,
                        deadline: float) -> dict[str, PaymentFacts]:
     """按支付时间归属的已验证支付事实（每家店一行）。"""
@@ -229,7 +322,10 @@ __all__ = [
     "PaymentFacts",
     "ProductLine",
     "ShopProfile",
+    "load_consign_completeness",
     "load_document_facts",
+    "load_outstock_document_facts",
+    "load_outstock_shop_day_groups",
     "load_payment_facts",
     "load_product_lines",
     "load_shop_day_groups",

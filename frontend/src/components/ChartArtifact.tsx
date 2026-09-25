@@ -1,4 +1,5 @@
 import type { Artifact, DrilldownIntent } from '../types'
+import { caliberLabel } from '../types'
 import { artifactEntities, cellText, isRef, platformLabel } from './ArtifactView'
 
 /**
@@ -289,6 +290,8 @@ export function ChartArtifact({
   const resolved = resolveChartDataset(artifacts, artifact)
   const kind = typeof artifact.kind === 'string' ? artifact.kind : '未标注'
   const axis = axisTitle(artifact)
+  // 口径徽标（S1）：值来自载荷的 caliber 字段；词表外的写法原样不猜。
+  const caliber = caliberLabel(artifact.caliber)
 
   if (resolved.kind !== 'ok') {
     return (
@@ -329,6 +332,7 @@ export function ChartArtifact({
     <section className="artifact chart-artifact" aria-label={axis}>
       <header className="artifact-head">
         <span className="artifact-title">{axis}</span>
+        {caliber && <span className="pill caliber-pill" data-caliber={String(spec.caliber)}>{caliber}</span>}
         <span className="pill">{spec.kind === 'line' ? '折线' : '柱状'}</span>
         <span className="pill">{spec.baseline === 'zero' ? '零基线' : '自适应轴'}</span>
       </header>

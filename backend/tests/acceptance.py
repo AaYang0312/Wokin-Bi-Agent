@@ -44,7 +44,7 @@ from bi_agent.sources import AFTERSALE_SOURCE, OUTSTOCK_SOURCE, TRADE_LIST_SOURC
 from tests.fakeconn import S1_REF
 
 QUESTIONS_PATH = Path(__file__).with_name("questions.jsonl")
-EXPECTED_QUESTION_COUNT = 26
+EXPECTED_QUESTION_COUNT = 28
 # 多来源合成基准（原路线图 Task 5 的"新增多来源合成基准"一节）。
 TB1 = "TB1"
 PDD1 = "PDD1"
@@ -139,7 +139,7 @@ def _shop_row(conn, shop_id: str, platform: str, display_name: str,
 
 def _trade(conn, *, shop_id: str, erp_id: str, commercial_id: str, amount: str | None,
            day: int, source: str, unified_status: str | None = None,
-           product_id: str = "P_TB") -> None:
+           product_id: str = "P_TB", consigned_day: int | None = None) -> None:
     from bi_agent.sync import apply_trade, normalise_trade
 
     raw: dict[str, object] = {
@@ -147,6 +147,9 @@ def _trade(conn, *, shop_id: str, erp_id: str, commercial_id: str, amount: str |
         "payTime": _ms(_beijing(day)), "updTime": _ms(_beijing(day, 11)),
         "orders": [{"oid": f"{erp_id}-1", "tid": commercial_id, "num": "1",
                     "itemSysId": product_id}]}
+    if consigned_day is not None:
+        # 发货时间（consignTime）与付款时间可以不同日：出库口径按它归属（025）。
+        raw["consignTime"] = _ms(_beijing(consigned_day))
     if amount is not None:
         raw["payAmount"] = amount
         raw["orders"][0]["payAmount"] = amount
@@ -177,12 +180,15 @@ def seed_multi_source_case(conn) -> None:
     # TB1：出库通道，一单活动支付 100（09-02）+ 已匹配退款 30 + 未匹配成功退款 20。
     _shop_row(conn, TB1, "tb", "淘系测试店", list(ALL_NINE))
     _trade(conn, shop_id=TB1, erp_id="E-TB1", commercial_id="C-TB1",
-           amount="100.00", day=2, source=OUTSTOCK_SOURCE)
+           amount="100.00", day=2, source=OUTSTOCK_SOURCE, consigned_day=5)
     _aftersale(conn, shop_id=TB1, aid="R-TB1", commercial_id="C-TB1",
                amount="30.00", day=3)
     _aftersale(conn, shop_id=TB1, aid="R-TB2", commercial_id="C-TB-MISSING",
                amount="20.00", day=4)
     _sync_state(conn, source=OUTSTOCK_SOURCE, entity="orders", shop_id=TB1,
+                spans=FULL_WINDOW, data_as_of=_beijing(8, 0))
+    # 出库口径只认 orders_consign（timeType=consign_time 扫描）覆盖。
+    _sync_state(conn, source=OUTSTOCK_SOURCE, entity="orders_consign", shop_id=TB1,
                 spans=FULL_WINDOW, data_as_of=_beijing(8, 0))
     for entity in ("aftersales_occurrence", "aftersales_cohort"):
         _sync_state(conn, source=AFTERSALE_SOURCE, entity=entity, shop_id=TB1,
@@ -201,7 +207,7 @@ def seed_multi_source_case(conn) -> None:
     _shop_row(conn, FX1, "fxg", "关闭单测试店", list(ALL_NINE))
     _trade(conn, shop_id=FX1, erp_id="E-FX1", commercial_id="C-FX1",
            amount="100.00", day=2, source=TRADE_LIST_SOURCE,
-           unified_status="CLOSED", product_id="P_FX")
+           unified_status="CLOSED", product_id="P_FX", consigned_day=2)
     _aftersale(conn, shop_id=FX1, aid="R-FX1", commercial_id="C-FX1",
                amount="30.00", day=3)
     _aftersale(conn, shop_id=FX1, aid="R-FX2", commercial_id="C-FX-MISSING",
@@ -211,6 +217,9 @@ def seed_multi_source_case(conn) -> None:
                            ("aftersales_cohort", AFTERSALE_SOURCE)):
         _sync_state(conn, source=source, entity=entity, shop_id=FX1,
                     spans=FULL_WINDOW, data_as_of=_beijing(8, 0))
+    # FX1 的出库口径证据：consign-scan 完成后写入（专项通道，与支付通道无关）。
+    _sync_state(conn, source=OUTSTOCK_SOURCE, entity="orders_consign", shop_id=FX1,
+                spans=FULL_WINDOW, data_as_of=_beijing(8, 0))
 
 
 def apply_coverage_holes(conn) -> None:
@@ -334,6 +343,24 @@ def _model_script(question: dict) -> list[ModelReply]:
             "shop_ids": [TB1_REF], "metrics": ["paid_amount"]}),
             _reply(text="不能：接口扫描覆盖与支付时间覆盖是两件事，"
                         "付款时间口径未经对照认证，本次不按完整支付窗口出数。")]
+    if qid == "27":
+        compare = {"scope": {"mode": "all_authorized"},
+                   "start": "2026-09-01", "end": "2026-09-08",
+                   "group_by": "platform",
+                   "metrics": ["sold_quantity", "sales_amount"]}
+        return [_call_reply("compare_performance", compare),
+                _reply(text="ERP出库口径（consign-scan 完成后）：fxg 是关闭单、出库行"
+                            "真实为 0；tb 出库 1 件/100 元；拼多多不在出库口径内，"
+                            "缺口见 excluded_scope。")]
+    if qid == "28":
+        compare = {"caliber": "platform_payment",
+                   "sales_basis": "verified_payment",
+                   "scope": {"mode": "all_authorized"},
+                   "start": "2026-09-01", "end": "2026-09-08",
+                   "group_by": "platform", "metrics": ["sales_amount"]}
+        return [_call_reply("compare_performance", compare),
+                _reply(text="支付口径只认已认证平台：fxg支付100元；"
+                            "tb与pdd未经认证，支付格是data_missing，不补零。")]
     return [_call_reply("query_business", query), _reply(text="已完成查询。")]
 
 
@@ -460,6 +487,103 @@ def _structured_problems(expected: dict, result: ToolResult) -> list[str]:
     return problems
 
 
+def _verify_commerce_turn(expected: dict, calls: list) -> list[str]:
+    """compare_performance 回合的机器核对：参数、口径、行值、缺失格与分组边界。
+
+    断言全部落在已校验载荷的**结构化字段**上（filters.caliber、data、
+    metric_statuses、ranking、group_statuses、excluded_scope），
+    不做跨 UUID 载荷的子串扫描。
+    """
+    problems: list[str] = []
+    if expected.get("tool") != "compare_performance":
+        return problems
+    if not calls:
+        return ["compare_performance未被调用"]
+    entry = calls[-1]
+    arguments = entry["arguments"]
+    for key, value in (expected.get("parameters") or {}).items():
+        actual_value = arguments.get(key)
+        if key in ("metrics", "platforms", "shop_refs"):
+            if sorted(value if isinstance(value, list) else [value]) != sorted(
+                    actual_value if isinstance(actual_value, list) else [actual_value]):
+                problems.append(f"{key}期望{value}，实际{actual_value}")
+        elif actual_value != value:
+            problems.append(f"{key}期望{value}，实际{actual_value}")
+    payload = entry["payload"]
+    if not isinstance(payload, dict) or "filters" not in payload:
+        problems.append(f"compare_performance无已发布载荷：{payload}")
+        return problems
+    caliber = (expected.get("parameters") or {}).get("caliber", "erp_outstock")
+    if payload["filters"].get("caliber") != caliber:
+        problems.append(f"口径期望{caliber}，"
+                        f"实际{payload['filters'].get('caliber')}")
+    rows = {row["platform"]: row for row in payload.get("data", [])
+            if isinstance(row, dict) and "platform" in row}
+    for platform, cells in (expected.get("rows") or {}).items():
+        if platform == "total":
+            continue
+        row = rows.get(platform)
+        if row is None:
+            problems.append(f"期望{platform}的分组行在场，实际行：{sorted(rows)}")
+            continue
+        for metric, value in cells.items():
+            if row.get(metric) != value:
+                problems.append(f"{platform}.{metric}期望{value}，实际{row.get(metric)}")
+    if "total" in (expected.get("rows") or {}):
+        totals = [row for row in payload.get("data", [])
+                  if isinstance(row, dict) and "platform" not in row
+                  and "shop_ref" not in row]
+        for metric, value in expected["rows"]["total"].items():
+            got = totals[0].get(metric) if totals else None
+            if got != value:
+                problems.append(f"合计.{metric}期望{value}，实际{got}")
+    cells = {(item.get("platform"), str(item["metric"])): item
+             for item in payload.get("metric_statuses", [])
+             if isinstance(item, dict) and "platform" in item}
+    for platform, metric, status, reason in expected.get("cells", []):
+        item = cells.get((platform, metric))
+        if item is None:
+            problems.append(f"缺状态格({platform},{metric})，实际{sorted(cells)}")
+            continue
+        if item.get("status") != status or item.get("reason") != reason:
+            problems.append(f"({platform},{metric})期望{status}/{reason}，"
+                            f"实际{item.get('status')}/{item.get('reason')}")
+    blocks = {block["metric"]: block for block in payload.get("ranking", [])
+              if isinstance(block, dict)}
+    for metric, want in (expected.get("ranking") or {}).items():
+        block = blocks.get(metric)
+        if block is None:
+            problems.append(f"缺{metric}排名块")
+            continue
+        if block.get("status") != want.get("status"):
+            problems.append(f"{metric}排名状态期望{want.get('status')}，"
+                            f"实际{block.get('status')}")
+        if block.get("caliber") != caliber:
+            problems.append(f"{metric}排名块口径期望{caliber}，实际{block.get('caliber')}")
+        for entry_want in want.get("missing", []):
+            missing = block.get("missing") or []
+            if not any(item.get("platform") == entry_want[0]
+                       and item.get("reason") == entry_want[1]
+                       for item in missing):
+                problems.append(f"{metric}排名缺失清单缺{entry_want}，实际{missing}")
+    groups = {item.get("platform"): item for item in payload.get("group_statuses", [])
+              if isinstance(item, dict) and "platform" in item}
+    for platform, want in (expected.get("groups") or {}).items():
+        item = groups.get(platform)
+        if item is None:
+            problems.append(f"缺{platform}分组状态")
+            continue
+        for field in ("status", "shops_evaluated"):
+            if field in want and item.get(field) != want[field]:
+                problems.append(f"{platform}分组{field}期望{want[field]}，"
+                                f"实际{item.get(field)}")
+    reasons = sorted(str(item.get("reason")) for item in
+                     payload.get("excluded_scope", []) if isinstance(item, dict))
+    if "excluded_reasons" in expected and reasons != sorted(expected["excluded_reasons"]):
+        problems.append(f"excluded_scope原因期望{expected['excluded_reasons']}，实际{reasons}")
+    return problems
+
+
 def _run_turn(question: str, state: SessionState, model, conn, allowed, now, store):
     from bi_agent.runtime import TurnContext
 
@@ -577,11 +701,22 @@ def _run_questions(questions: list[dict], conn, *, make_model, prefix: str,
     for question in questions:
         started = time.monotonic()
         recorded: list = []
+        recorded_commerce: list = []
         conn.execute("SAVEPOINT acceptance_question")
 
         def spy(connection, request, **kwargs):
             recorded.append(request)
             return real_query(connection, request, **kwargs)
+
+        from bi_agent.agent import execute_commerce_tool as real_commerce
+
+        def commerce_spy(call, context):
+            execution = real_commerce(call, context)
+            recorded_commerce.append({
+                "arguments": dict(call.arguments or {}),
+                "payload": execution.domain_result.model_payload,
+            })
+            return execution
 
         for step in question.get("seeds", []):
             SEED_STEPS[step](conn)
@@ -592,15 +727,19 @@ def _run_questions(questions: list[dict], conn, *, make_model, prefix: str,
         problems: list[str] = []
         try:
             with patch("bi_agent.business_query.nodes.metrics.query_business",
-                       side_effect=spy):
+                       side_effect=spy),                     patch("bi_agent.agent.execute_commerce_tool",
+                          side_effect=commerce_spy):
                 for turn_text, expected in zip(question["turns"], expected_list):
                     store = _memory_store(allowed)
                     recorded_start = len(recorded)
+                    commerce_start = len(recorded_commerce)
                     turn = _run_turn(turn_text, state, model, conn, allowed,
                                      FROZEN_NOW, store)
                     state = turn.state
                     problems.extend(_verify_turn(expected, turn, recorded, store,
                                                  recorded_start, allowed))
+                    problems.extend(_verify_commerce_turn(
+                        expected, recorded_commerce[commerce_start:]))
                     if problems:
                         break
         except Exception as exc:  # noqa: BLE001

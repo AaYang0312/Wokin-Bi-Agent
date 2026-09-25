@@ -27,7 +27,8 @@ from typing import Literal, Sequence, get_args
 from uuid import UUID
 
 from bi_agent.commerce.metrics import (
-    CHART_METRIC_UNITS, CHART_SERIES_COLUMNS, CHART_X_COLUMNS, CHART_Y_COLUMNS)
+    CHART_METRIC_UNITS, CHART_SERIES_COLUMNS, CHART_X_COLUMNS, CHART_Y_COLUMNS,
+    COMPARISON_CALIBERS)
 from bi_agent.metrics import Coverage
 from bi_agent.runtime.artifacts import (
     BASIS_SIGNATURE_RE, CHART_SPEC_VERSION, DATASET_ARTIFACT_TYPES)
@@ -48,9 +49,9 @@ CHART_PAYLOAD_KEYS: frozenset[str] = frozenset({
     "chart_version", "spec_version", "kind", "x", "y", "series", "unit",
     "metric_basis", "dataset_ref", "dataset_type", "dataset_data_as_of",
     "coverage_ref", "coverage_status", "coverage_start", "coverage_end",
-    "coverage_gaps", "baseline", "null_values", "currency",
+    "coverage_gaps", "baseline", "null_values", "currency", "caliber",
 })
-CHART_OPTIONAL_PAYLOAD_KEYS: frozenset[str] = frozenset({"currency"})
+CHART_OPTIONAL_PAYLOAD_KEYS: frozenset[str] = frozenset({"currency", "caliber"})
 CHART_REQUIRED_PAYLOAD_KEYS: frozenset[str] = (
     CHART_PAYLOAD_KEYS - CHART_OPTIONAL_PAYLOAD_KEYS)
 # 图表契约的名字型版本：与进数据库列的整数（`runtime.artifacts.CHART_SPEC_VERSION`）
@@ -128,7 +129,8 @@ def _check(value: str, allowed: frozenset[str], reason: str) -> str:
 
 def build_chart_spec(dataset_ref: PersistedDataset, *, kind: str, x: str, y: str,
                      series: Sequence[str] = (), unit: str, metric_basis: str,
-                     coverage_ref: PersistedDataset) -> ChartSpec:
+                     coverage_ref: PersistedDataset,
+                     caliber: str | None = None) -> ChartSpec:
     """把一次「已落库数据集 + 一个指标」换成声明式图表规范。
 
     门禁逐条对应 spec §8，全部 fail closed：
@@ -160,6 +162,9 @@ def build_chart_spec(dataset_ref: PersistedDataset, *, kind: str, x: str, y: str
         raise ChartContractError("chart_kind_unsupported")
     if not coverage_ref.same_version(dataset_ref):
         raise ChartContractError("chart_coverage_version_mismatch")
+    if caliber is not None and caliber not in COMPARISON_CALIBERS:
+        # 口径徽标只发登记过的两个值：图表不能携带口径词表之外的说法。
+        raise ChartContractError("chart_caliber_invalid")
     if unit != CHART_METRIC_UNITS.get(y):
         raise ChartContractError("chart_unit_mismatch")
     if not BASIS_SIGNATURE_RE.fullmatch(metric_basis or ""):
@@ -170,7 +175,7 @@ def build_chart_spec(dataset_ref: PersistedDataset, *, kind: str, x: str, y: str
         kind=kind, x=x, y=y, series=tuple(series), unit=unit, metric_basis=metric_basis,
         dataset_ref=dataset_ref, coverage_ref=coverage_ref,
         baseline="zero" if kind == "bar" else "auto",
-        null_values="blank" if kind == "bar" else "break")
+        null_values="blank" if kind == "bar" else "break", caliber=caliber)
 
 
 @dataclass(frozen=True)
@@ -191,6 +196,8 @@ class ChartSpec:
     coverage_ref: PersistedDataset
     baseline: ChartBaseline
     null_values: ChartNullValues
+    # 对比口径（S1）：出库口径是默认排名图，徽标必须随载荷走；非对比图为 None。
+    caliber: str | None = None
 
     @property
     def dataset_artifact_id(self) -> UUID:
@@ -229,4 +236,7 @@ class ChartSpec:
         if self.unit == "CNY":
             # 金额单位必须带币种：只写 CNY 而不留币种字段，换币种时就没地方说。
             payload["currency"] = "CNY"
+        if self.caliber is not None:
+            # 口径徽标随图走：默认排名与支付口径视图靠它区分，不靠读图人猜。
+            payload["caliber"] = self.caliber
         return payload

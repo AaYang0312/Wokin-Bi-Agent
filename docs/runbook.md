@@ -166,6 +166,47 @@ Register-ScheduledTask -TaskName 'BI Agent Hourly Sync' -Action $syncAction -Tri
 
 另建每日低峰的 `reconcile --days 7` 任务。运行账户只读取同步配置；命令参数不含密码。
 
+## 平台对比的双口径（S1，P1 修正后）
+
+「平台对比」自 S1 起按两个口径发布，读数前先认口径徽标：
+
+- **ERP出库口径（默认排名与图表）**：单据数、出库件数、出库金额（行级分摊金额）取自 ERP
+  出库单据事实，**按发货时间 `consignTime` 归属**（迁移 025 的 `bi.orders.consigned_at`，
+  与付款时间 `paid_at`=`payTime` 是两个独立字段，永不互替）；读取视图为
+  `reporting.v_outstock_daily` / `reporting.v_outstock_document_daily`。**覆盖只认
+  `bi.sync_state(entity='orders_consign')` 凭证**，即 `erp.trade.outstock.simple.query`
+  请求 `timeType=consign_time` 建立的扫描；付款时间扫描的覆盖不可借用。出库路径与支付
+  来源绑定无关：`resolve_consign_source` 把全部已登记非 PDD 平台都绑定到这条专项通道。
+  因此**扫描前（无 `orders_consign` 凭证）所有平台 fail closed**；**扫描完成后，任一拥有
+  完整 `orders_consign` 证据的已登记非 PDD 平台都可回答**。存在缺发货时间的单据时整范围
+  fail closed（`coverage_incomplete`）。拼多多不接入，永远只以 `excluded_scope`
+  缺口出现。
+- **平台支付口径**：只聚合已认证支付平台（当前仅抖音 fxg）。淘宝/天猫/京东/快手等未认证
+  平台的支付格显示 `data_missing` + 原因 `coverage_time_basis_unverified`，不补零、不缺席；
+  逐店账单对照（认证）完成后平台才会进入该口径。
+
+机器可查：每个对比 Artifact 的 `filters.caliber`、每个排名块与每张图表的 `caliber` 字段。
+字段/来源/覆盖契约见 `docs/metrics.md` §4.3.1。
+
+**出库口径开通命令**（运营在采集机执行；未执行前出库口径对所有平台 NOT MET 为预期状态）：
+
+```sh
+cd backend
+uv run --env-file ../.env.test python -m bi_agent.sync consign-scan --days 90
+# 有界回放指定窗口（覆盖凭证只按完整窗口推进）：
+uv run --env-file ../.env.test python -m bi_agent.sync consign-scan   --start 2026-09-01 --end 2026-10-01 --mode replay
+```
+
+命令语义：逐个 `BI_SHOP_IDS` 店铺、按 ≤1 天窗口调用 `erp.trade.outstock.simple.query`
+（请求 `timeType=consign_time`，分页完整性复用订单通道同一套机器）；单据规范化入库时
+**不重建/不新建任何支付事实**（`order_payments` 不经此路径）。只有整个窗口扫描完整且全部
+单据带发货时间、发货时间都落在窗口内，才把该窗口计入 `bi.sync_state`
+（source=`erp.trade.outstock.simple.query`，entity=`orders_consign`）；任何一页不完整、
+单据缺 `consignTime` 或发货时间越窗 → 整窗回滚，仅留 `last_error_code=
+consign_scan_incomplete` 等失败凭证（fail closed，不补零、不写部分覆盖）。拼多多店铺
+自动跳过（永久排除）。首次运行后需按既有对账流程核验来源质量
+（`reconcile_source_quality`），出库口径排名才会随认证状态亮起。
+
 ## 数据就绪与质量核对
 
 覆盖、业务截止与质量是三件事（口径见 `docs/metrics.md` 第 6 节）。核对与推进：

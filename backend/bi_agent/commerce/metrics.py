@@ -264,6 +264,19 @@ def project(declared: tuple[str, ...], values: Mapping[str, object]) -> dict[str
 # 披露文本（进 `runtime.models` 的公开限制白名单）
 # ---------------------------------------------------------------------------
 
+# 口径披露的固定文本（进公开限制白名单；改字 = 换契约文案，需同步推进测试）。
+# 它们必须在 COMMERCE_PUBLIC_LIMITATIONS 之前定义：白名单集合按字面引用它们。
+# 文本陈述真实字段/来源/覆盖契约：出库口径按发货时间（consignTime）归属，
+# 只认 timeType=consign_time 扫描建立的 orders_consign 覆盖，绝不是 payTime。
+ERP_OUTSTOCK_CALIBER_TEXT = (
+    "平台对比默认按ERP出库口径排名与出图：ERP出库单据事实（单据数、出库件数、"
+    "行级分摊金额）按发货时间consignTime归属"
+    "（erp.trade.outstock.simple.query，timeType=consign_time），"
+    "覆盖只认orders_consign扫描凭证，不借用付款时间覆盖，不宣称支付窗口完整")
+PAYMENT_CALIBER_TEXT = (
+    "支付口径只聚合已认证支付平台：未认证平台的支付格是data_missing，"
+    "不补零也不缺席")
+
 COMMERCE_PUBLIC_LIMITATIONS = frozenset({
     "商品毛利参考未扣售后、平台费、运费与广告费，不是净利润",
     "商品毛利参考不含套件/组合/加工父项：这些行的成本语义未核验",
@@ -281,6 +294,9 @@ COMMERCE_PUBLIC_LIMITATIONS = frozenset({
     "已验证支付口径下只能按支付面两列对比：报告指标的定义是 ERP 有效销售父项口径",
     "本轮没有可画的指标：图表只引用同口径的已落库数据集，没有可画集合时只发表格",
     "有分组的单元格算不出来（本轮没有可发布的事实行），原因见各面覆盖披露",
+    # 双口径契约（S1）：口径声明与认证边界各一句固定文本。
+    ERP_OUTSTOCK_CALIBER_TEXT,
+    PAYMENT_CALIBER_TEXT,
 })
 
 # 参数化披露：家数 / 行数可变，句式固定。金额片段与 `runtime.models._MONEY` 同源。
@@ -305,6 +321,22 @@ COMMERCE_LIMITATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^[0-9]+ 个分组仍有获准店铺未被评估，不发布该分组数字："
                + _GROUP_KEYS + r"$"),
     re.compile(r"^[0-9]+ 个指标的合计已拒答（有分组拿不出该指标的值或口径不一致）$"),
+    # 支付口径的认证边界：未认证平台/店铺逐组点名，格子保持 data_missing。
+    re.compile(r"^[0-9]+ 个平台的支付时间口径未经认证，支付口径下为data_missing："
+               + _GROUP_KEYS + r"$"),
+    re.compile(r"^[0-9]+ 家店铺的支付时间口径未经认证，支付口径下为data_missing："
+               + _GROUP_KEYS + r"$"),
+    # 出库口径的成员边界：订单来源不提供发货时间（consignTime）扫描的平台。
+    re.compile(r"^[0-9]+ 个平台的订单来源不提供发货时间consignTime扫描，"
+               r"出库口径下为data_missing：" + _GROUP_KEYS + r"$"),
+    re.compile(r"^[0-9]+ 家店铺的订单来源不提供发货时间consignTime扫描，"
+               r"出库口径下为data_missing：" + _GROUP_KEYS + r"$"),
+    # 出库口径的完整性边界：存在缺发货时间的单据 → 无法证明窗口，fail closed。
+    re.compile(r"^[0-9]+ 家店铺存在缺少发货时间consignTime的单据，"
+               r"出库口径不能按完整窗口出数：" + _GROUP_KEYS + r"$"),
+    # 出库口径的样本披露：发货时间未经逐店对照时照发，但必须说是样本。
+    re.compile(r"^[0-9]+ 家店铺的发货时间口径未经逐店对照认证，"
+               r"出库口径结果按可观测样本披露$"),
 )
 
 COMMERCE_LIMITATION_CODES = frozenset({
@@ -333,7 +365,44 @@ COMMERCE_LIMITATION_CODES = frozenset({
     "comparison_cell_withheld",
     "comparison_chart_unavailable",
     "platform_group_rule_unconfigured",
+    # 双口径契约（S1）：口径声明与支付口径认证边界各归一个码。
+    "comparison_caliber_erp_outstock",
+    "comparison_caliber_payment_uncertified",
 })
+
+# ---------------------------------------------------------------------------
+# 对比口径（S1 双口径契约）：平台对比的每一个数都必须带着口径说话
+# ---------------------------------------------------------------------------
+# 两个口径是两个事实族，不是同一组数字的两种叫法：
+#   erp_outstock      —— ERP 出库单据事实（单据数、出库件数、行级分摊金额），
+#                        按发货时间 bi.orders.consigned_at（快麦 consignTime）归属；
+#                        覆盖只认 orders_consign（timeType=consign_time 专项扫描）
+#                        凭证，不宣称支付窗口完整。默认排名与图表走这一口径。
+#   platform_payment  —— 已验证商业支付事实，只聚合注册表认证过的平台组；
+#                        未认证平台的支付格是 data_missing + 原因码，
+#                        不补零、不缺席。
+# 指标语义一个都没有新建（`COMMERCE_METRIC_DEFINITIONS` / 固定指标同源），
+# 口径只是把「哪些事实、按什么时间归属、能跟谁合计」说成显式契约。
+ComparisonCaliber = Literal["erp_outstock", "platform_payment"]
+COMPARISON_CALIBERS: frozenset[str] = frozenset(get_args(ComparisonCaliber))
+DEFAULT_COMPARISON_CALIBER = "erp_outstock"
+# 口径 → 事实集合（sales_basis）：一对一配对，在请求入口锁死；「出库口径配支付
+# 事实」这类交叉组合不存在，也不允许用两个拼写把同一个选择说两遍。
+CALIBER_SALES_BASIS: dict[str, str] = {
+    "erp_outstock": "erp_effective_parent",
+    "platform_payment": "verified_payment",
+}
+SALES_BASIS_CALIBER: dict[str, str] = {
+    value: key for key, value in CALIBER_SALES_BASIS.items()}
+# 出库口径没有自己编造的口径签名：成员绑定就是真实绑定
+# （erp_document/v1 + outstock_time=快麦 consignTime 发货时间 + 逐源认证状态），
+# 只有出库通道（erp.trade.outstock.simple.query，timeType=consign_time 扫描）的
+# 平台才有该绑定，签名因此天然一致；pay_time 通道不提供发货时间，进不了这个口径。
+# 口径徽标的唯一文案来源（前端展示层引用它，不自己另写一份）。
+COMPARISON_CALIBER_LABELS: dict[str, str] = {
+    "erp_outstock": "ERP出库口径",
+    "platform_payment": "平台支付口径",
+}
 
 # ---------------------------------------------------------------------------
 # 状态词表（spec §3、§4）
