@@ -547,6 +547,9 @@ def _limitation_codes(limitations: list[str]) -> list[str]:
             code = "matched_cohort_only"
         if code is None and limitation.startswith("未认证支付"):
             code = "unverified_payments"
+        if code is None and "支付口径已剔除关闭后退款单" in limitation:
+            # S3 口径剔除披露：成功结果上的口径声明，不是失败，也不与未认证支付混同。
+            code = "closed_refunded_excluded"
         if (code is None and " 家店铺的" in limitation
                 and ("付款时间口径未经认证" in limitation
                      or "未认证付款时间口径" in limitation)):

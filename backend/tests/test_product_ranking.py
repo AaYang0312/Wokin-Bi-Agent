@@ -208,29 +208,32 @@ class ProductRankingPartitionDatabaseTests(unittest.TestCase):
         result = self._query(["S1", "JD1", "TB1"], top_n=2)
 
         self.assertEqual(result.status, "ok", result.limitations)
+        # S3 后淘系分区照样本发布：分区号按口径签名排序，出库口径签名在最前。
         self.assertEqual([(group["group"], group["status"], group["shop_ids"])
                           for group in result.rank_groups],
-                         [("g1", "certified", ["S1"]),
-                          ("g2", "observable_sample", ["JD1"])])
-        self.assertEqual(result.rank_exclusions,
-                         [{"shop_id": "TB1",
-                           "reason": "coverage_time_basis_unverified"}])
-        self.assertEqual(result.coverage.status, "partial")
+                         [("g1", "observable_sample", ["TB1"]),
+                          ("g2", "certified", ["S1"]),
+                          ("g3", "observable_sample", ["JD1"])])
+        self.assertEqual(result.rank_exclusions, [])
+        self.assertEqual(result.coverage.status, "complete")
         ranked = [row for row in result.data if "product_id" in row]
         self.assertEqual([(row["shop_id"], row["rank_group"], row["rank"])
                           for row in ranked],
-                         [("S1", "g1", 1), ("S1", "g1", 2), ("JD1", "g2", 1)])
+                         [("TB1", "g1", 1), ("S1", "g2", 1), ("S1", "g2", 2),
+                          ("JD1", "g3", 1)])
         self.assertEqual([Decimal(str(row["product_paid_amount"]))
                           for row in ranked],
-                         [Decimal("300"), Decimal("100"), Decimal("500")])
-        # 口径凭证只覆盖已发布的分区：被排除的店不能借 basis 混进来。
+                         [Decimal("900"), Decimal("300"), Decimal("100"),
+                          Decimal("500")])
+        # 口径凭证覆盖全部已发布分区：每个分区带着自己的认证状态说话。
         self.assertEqual(sorted({item["shop_id"] for item in result.basis}),
-                         ["JD1", "S1"])
+                         ["JD1", "S1", "TB1"])
 
     def test_gap_then_equal_length_prior_window_publishes_eligible_partitions(self):
         """The real test DB has rows before a tail gap; shifting may recover them.
 
-        A disproved outstock source must stay excluded even after the shift.
+        S3 后淘系店不再因时间口径被排除；但前移窗口落在它的覆盖之前时，它仍因
+        覆盖缺口（coverage_incomplete）留在场外——缺覆盖的归因不冒充口径归因。
         """
         from bi_agent.agent import _prior_window_from_exclusions
         from bi_agent.metrics import QueryRequest, query_business
@@ -274,7 +277,9 @@ class ProductRankingPartitionDatabaseTests(unittest.TestCase):
                          [("certified", ["S1"]),
                           ("observable_sample", ["JD1"])])
         self.assertEqual(recovered.rank_exclusions,
-                         [{"shop_id": "TB1", "reason": "coverage_time_basis_unverified"}])
+                         [{"shop_id": "TB1", "reason": "coverage_incomplete",
+                           "windows": ["2026-08-24~2026-09-01"]}],
+                         "前移段不在淘系覆盖内：因缺覆盖留场外，且缺口窗口逐项可查")
         self.assertEqual(len([row for row in recovered.data if "product_id" in row]), 2)
 
     def test_partitioned_ranking_keeps_the_final_group_cap_per_cohort(self):

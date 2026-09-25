@@ -336,12 +336,17 @@ _DIAGNOSIS_KEYS = frozenset({
     "comparison_groups",
     # 分区商品排行发布/排除了几个分区与几家店：不是每家店都能上榜这件事可机器核对。
     "product_ranking",
+    # S3 口径剔除：local_filter 平台的支付口径剔掉了多少关闭后退款单支付，
+    # 旧口径与新口径的差值据此逐项可解释。
+    "closed_refunded_excluded",
 })
 _DIAGNOSIS_FIELDS = {
     "unmatched_refunds": frozenset({
         "unmatched_count", "successful_count", "unmatched_amount", "ratio", "currency"}),
     "unverified_payments": frozenset({
         "total", "amount_undetermined", "amount_known", "known_amount"}),
+    "closed_refunded_excluded": frozenset({
+        "excluded_count", "excluded_amount", "currency"}),
     "matched_cohort_only": frozenset({"unmatched_count"}),
     "erp_document_coverage": frozenset({
         "documents", "documents_with_gross_profit", "publishable"}),
@@ -1428,7 +1433,9 @@ _RANK_GROUP_REQUIRED = frozenset({
 })
 _RANK_GROUP_STATUSES = frozenset({"certified", "observable_sample"})
 _RANK_BASIS_KEYS = frozenset({"metric", "basis", "time_basis", "time_certification"})
-_TIME_CERTIFICATIONS = frozenset({"certified", "unmeasured", "disproved"})
+# 时间认证闭集与 sources.TimeCertification 同一词表：S3 让 local_filter 可达
+# （可答+披露），载荷校验必须认识它，否则合法的分区榜会被误判为不安全载荷。
+_TIME_CERTIFICATIONS = frozenset({"certified", "unmeasured", "disproved", "local_filter"})
 
 
 def _rank_groups(value: object, *, data: object) -> None:

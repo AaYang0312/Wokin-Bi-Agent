@@ -473,7 +473,8 @@ class CommerceGraphTests(unittest.TestCase):
         self.assertEqual([row["sales_amount"] for row in payload["data"]
                           if "shop_ref" not in row], ["100"])
 
-    def test_tb_shop_cannot_answer_a_pay_time_product_window(self):
+    def test_tb_shop_publishes_as_sample_and_stays_out_of_cross_caliber_totals(self):
+        """S3 后覆盖齐全的淘系店以可观测样本发布；与 fxg 的合计照旧拒发。"""
         self._shop("1")
         self._shop("2", platform="tb")
         self._archive("P1", "直钉枪")
@@ -486,13 +487,15 @@ class CommerceGraphTests(unittest.TestCase):
                    amount="900", cost="10", source="erp.trade.outstock.simple.query")
 
         payload = self._run(metrics=["sold_quantity", "sales_amount"]).model_payload
-        excluded = {item["reason"] for item in payload["excluded_scope"]}
-        self.assertIn("coverage_time_basis_unverified", excluded,
-                      "出库通道的 paid_at 实测不成立，不能按支付窗口出数")
-        self.assertTrue(any("付款时间口径未经认证" in text
+        self.assertEqual(payload.get("excluded_scope", []), [])
+        self.assertTrue(any("按可观测样本披露" in text
                             for text in payload["limitations"]), payload["limitations"])
+        per_shop = {row["shop_ref"]: row for row in payload["data"]
+                    if "shop_ref" in row}
+        self.assertEqual(len(per_shop), 2, "淘系店不当 0，也不消失")
         total = [row for row in payload["data"] if "shop_ref" not in row][0]
-        self.assertEqual(total["sold_quantity"], "1")
+        self.assertIsNone(total["sold_quantity"],
+                          "跨口径合计拒发：9 件不得并进 1 件")
 
     def test_erp_documents_only_discloses_the_unverified_time_basis(self):
         """单据数与单据毛利不是支付窗口主张：同一家淘系店在这里可答，只披露。"""
@@ -738,7 +741,7 @@ class CommerceGraphTests(unittest.TestCase):
         self.assertTrue(set(nodes) <= COMMERCE_NODES, nodes)
         self.assertTrue(run["request_fingerprint"])
         provenance = run["provenance"]
-        self.assertEqual(provenance.metric_version, "commerce-metrics/2026-09-13.1")
+        self.assertEqual(provenance.metric_version, "commerce-metrics/2026-09-25.1")
         self.assertEqual(provenance.template_id, "commerce_product_report")
         self.assertTrue(provenance.basis_signature, "口径签名要参与指纹")
         self.assertTrue(provenance.source_batches, "来源批次要进血缘")

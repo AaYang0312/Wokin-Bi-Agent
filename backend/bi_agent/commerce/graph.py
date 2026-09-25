@@ -42,7 +42,8 @@ from bi_agent.catalog.models import ref_for_key
 from bi_agent.catalog.resolver import ProductResolution, Selector, resolve_product
 from bi_agent.data_quality import (
     QUALITY_RULE, CoverageAssessment, assess_consign_coverage,
-    assess_query_coverage, attribution_gap, describe_attribution_gap, money_text,
+    assess_query_coverage, attribution_gap, closed_refunded_payments,
+    describe_attribution_gap, describe_closed_refunded_exclusion, money_text,
     switched_sources_between, unverified_payments)
 from bi_agent.metrics import (
     Coverage, MAX_ROWS, METRIC_DEFINITIONS, QueryRequest, ToolResult,
@@ -67,8 +68,8 @@ from bi_agent.presentation.charts import PersistedDataset, build_chart_spec
 from bi_agent.sources import (
     AFTERSALE_COHORT_ENTITY, AFTERSALE_ENTITY, CONSIGN_ORDERS_ENTITY, DOCUMENT_BASIS,
     ORDERS_ENTITY, PAYMENT_WINDOW_METRICS, ShopRecord, SourceBinding,
-    binding_signature, registration, resolve_consign_source,
-    resolve_metric_dependencies, unsupported_reason)
+    binding_signature, payment_caliber_excludes_closed_refunded, registration,
+    resolve_consign_source, resolve_metric_dependencies, unsupported_reason)
 
 from . import repository
 from .metrics import (
@@ -449,6 +450,7 @@ _FIXED_CODE_BY_FRAGMENT = (
     ("上期与本期数据来源不同", "basis_incompatible"),
     ("支付额中", "revenue_not_attributed"),
     ("未认证支付", "unverified_payments"),
+    ("支付口径已剔除关闭后退款单", "closed_refunded_excluded"),
     ("结果行数达到", "result_too_large"),
 )
 _COMMERCE_CODE_BY_FRAGMENT = (
@@ -1288,7 +1290,9 @@ def _attributed_reason(record: ShopRecord, tag: str, reason: str) -> str:
         return reason
     registered = registration(record.platform)
     if (registered is not None and registered.order_time_basis != "pay_time"
-            and registered.time_certified == "disproved"):
+            and registered.time_certified in ("disproved", "local_filter")):
+        # S3 后 local_filter 平台可答+披露，但那靠的是覆盖与口径剔除，不是
+        # 「开通能力」：拿不到的场合归因仍指向时间口径，不指向对账开通。
         return "coverage_time_basis_unverified"
     return reason
 
@@ -1488,7 +1492,46 @@ def execute_aggregates(runtime: CommerceRuntime) -> None:
         runtime.payments = repository.load_payment_facts(
             context.conn, shop_ids=shops, start_ts=window[0], end_ts=window[1],
             deadline=context.deadline)
+        _apply_closed_refunded_exclusion(runtime)
     _attribution_disclosures(runtime)
+
+
+def _apply_closed_refunded_exclusion(runtime: CommerceRuntime) -> None:
+    """S3 口径剔除：local_filter 平台的支付面在查询侧剔除关闭后退款单支付。
+
+    与固定指标查询同一政策（metrics._query_in_transaction）：只调整已核验支付
+    金额/笔数，退款发生额不动（保持可见）；披露与诊断同源同一份文案。这不是
+    改写事实：只是查询政策，历史数字无需重述。
+    """
+    request = runtime.request
+    assert request is not None
+    caliber_shops = sorted(
+        shop for shop in runtime.candidate_shop_ids
+        if payment_caliber_excludes_closed_refunded(
+            _record_of(runtime, shop).platform))
+    if not caliber_shops:
+        return
+    exclusion = closed_refunded_payments(
+        runtime.context.conn, shop_ids=caliber_shops,
+        start=request.start, end=request.end, limit=MAX_ROWS + 1)
+    if len(exclusion.rows) > MAX_ROWS:
+        raise _RowsTruncated
+    payments: dict[str, repository.PaymentFacts] = {}
+    for shop, facts in runtime.payments.items():
+        amount, orders = exclusion.totals([shop])
+        if amount or orders:
+            facts = repository.PaymentFacts(shop_id=facts.shop_id,
+                                            paid_amount=facts.paid_amount - amount,
+                                            paid_orders=facts.paid_orders - orders)
+        payments[shop] = facts
+    runtime.payments = payments
+    text = describe_closed_refunded_exclusion(exclusion, caliber_shops)
+    if text:
+        amount, orders = exclusion.totals(caliber_shops)
+        runtime.limitations.append(text)
+        runtime.diagnostics["closed_refunded_excluded"] = {
+            "excluded_count": orders, "excluded_amount": money_text(amount),
+            "currency": "CNY"}
 
 
 def _attribution_disclosures(runtime: CommerceRuntime) -> None:

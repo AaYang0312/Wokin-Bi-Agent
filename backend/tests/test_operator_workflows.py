@@ -671,7 +671,7 @@ class OperatorProductWorkflowTests(OperatorFixture):
             self._context(store=store, allowed=allowed))
 
     def _three_platform_five_shops(self, *, cost: str | None = "40") -> None:
-        """三平台五店：fxg 两家、jd 一家能答；tb 一家时间口径不成立；pdd 无支付能力。"""
+        """三平台五店：fxg 两家、jd、tb 各自发布（不同口径不合计）；pdd 无支付能力。"""
         self._archive(PRODUCT, "直钉枪")
         for key, platform in (("1", "fxg"), ("2", "fxg"), ("3", "jd"), ("4", "tb")):
             self._shop(key, platform=platform)
@@ -699,9 +699,9 @@ class OperatorProductWorkflowTests(OperatorFixture):
     def test_product_report_tracks_two_skus_and_keeps_incomparable_shops_apart(self):
         """场景 1：A 商品两种 SKU 跨三平台五店。
 
-        要拿到的是"同款映射可追踪 + SKU 不混价 + 七日趋势独立成集"。已认证支付口径
-        （fxg）与未逐店对照的口径（jd）同名不同认证，所以跨店合计按契约**不发**；
-        各店自己的数照给，缺的两家逐家归因。已评估集合内部的排名属于
+        要拿到的是"同款映射可追踪 + SKU 不混价 + 七日趋势独立成集"。S3 后 fxg（已
+        认证）、jd（未逐店对照）、tb（local_filter 样本）各自发布但互不同认证，跨店
+        合计按契约**不发**；缺能力的 pdd 逐家归因。已评估集合内部的排名属于
         `compare_performance`（商品报告本来不发 `ranking` 块，拿它的缺席当护栏会是假断言），
         那边由本文件的比较域用例钉住。
         """
@@ -719,7 +719,9 @@ class OperatorProductWorkflowTests(OperatorFixture):
         # SKU 不混价：逐店行各自保留自己的均价，合并只发生在合计行那一格。
         per_shop = {row["shop_ref"]: row for row in payload["data"] if "shop_ref" in row}
         self.assertEqual(sorted(str(row["weighted_avg_paid_price"])
-                                for row in per_shop.values()), ["100", "100", "50"])
+                                for row in per_shop.values()),
+                         ["100", "100", "100", "50"],
+                         "S3 后淘系店（SKU_A 7件700）也发布自己的均价")
         for raw_sku in (self._sku(SKU_A), self._sku(SKU_B), self._product()):
             self.assertNotIn(raw_sku, json.dumps(payload, ensure_ascii=False,
                                                  default=str),
@@ -732,24 +734,22 @@ class OperatorProductWorkflowTests(OperatorFixture):
         self.assertEqual({(str(item["status"]), str(item["reason"]))
                           for item in statuses},
                          {("incomparable", "basis_incompatible")})
-        # 已评估集合里同时挂着已认证支付与未逐店对照的支付：份额只在这些店之间算，
-        # 缺的两家不进分母。“不排名”在本域不能拿 `ranking` 缺席当证据：商品报告本来
-        # 就不发排名块（排名属于 compare_performance），真正的护栏是上面那两个 null。
+        # 已评估集合里同时挂着已认证支付、未逐店对照与 local_filter 样本：份额只在
+        # 同口径内算，跨口径一概不发。“不排名”在本域不能拿 `ranking` 缺席当证据：商品
+        # 报告本来就不发排名块（排名属于 compare_performance），真正的护栏是上面 null。
         shares = [str(row.get("sales_share")) for row in per_shop.values()]
-        self.assertEqual(shares, ["None", "None", "None"],
-                         "口径不可比时逐店份额也不发：否则三个百分比会被读成一个集合的占比")
+        self.assertEqual(shares, ["None", "None", "None", "None"],
+                         "口径不可比时逐店份额也不发：否则四个百分比会被读成一个集合的占比")
         # 七日趋势独立成一份数据集，缺日留 gap 而不是抹平。
         trend = payload_for(result, "trend_series")
         self.assertEqual(len({row["day"] for row in trend["data"]}), 7)
-        # 答不了本口径的两家店整店退出合计，原因逐家列出，不给 0。
+        # 答不了本口径的店整店退出合计，原因逐家列出，不给 0。
         excluded = {item["shop_ref"]: item["reason"] for item in payload["excluded_scope"]}
         self.assertEqual(excluded,
-                         {ref_for_key("shop", self.shops["4"]):
-                          "coverage_time_basis_unverified",
-                          ref_for_key("shop", self.shops["5"]):
+                         {ref_for_key("shop", self.shops["5"]):
                           "coverage_time_basis_unverified"},
-                         "出库通道的两家（淘系与拼多多）都归因到实测不成立的付款时间口径；"
-                         "拼多多另外永远解析不出支付依赖，那条断言在 PDD 边界用例里钉")
+                         "S3 后淘系店照样本发布；拼多多没有支付依赖，归因到实测不成立的"
+                         "付款时间口径而不是缺数据（那条边界在 PDD 用例里钉）")
         dumped = json.dumps(payload, ensure_ascii=False, default=str)
         self.assertNotIn(self.shops["5"], dumped)
         self.assertEqual(payload["status"], "partial",
@@ -797,7 +797,11 @@ class OperatorProductWorkflowTests(OperatorFixture):
         self.assertEqual(total_row(payload)["sales_amount"], "200")
 
     def test_product_workflow_refuses_unverified_time_basis_without_zeroing_the_shop(self):
-        """部分来源的另一副面孔：出库通道的店不当 0，也不拉低已有销量。"""
+        """部分来源的另一副面孔：出库通道的店不当 0，也不拉低已有销量。
+
+        S3 后覆盖齐全的淘系店按可观测样本发布；但它与 fxg 不同认证，合计行照旧
+        拒发——8 件不得并进 1 件，也不得把它当 0 件。
+        """
         self._archive(PRODUCT, "直钉枪")
         self._shop("1")
         self._shop("2", platform="tm")
@@ -807,11 +811,15 @@ class OperatorProductWorkflowTests(OperatorFixture):
         self._sale("2", "E2", quantity="8", amount="800", cost="40",
                    source=OUTSTOCK_SOURCE)
         payload = self._run().model_payload
-        self.assertEqual([row["shop_ref"] for row in dataset_rows(payload)
-                          if "sales_amount" in row],
-                         [ref_for_key("shop", self.shops["1"])])
-        self.assertEqual(total_row(payload)["sold_quantity"], "1",
-                         "不能把未认证那家店的 8 件算进来，也不能把它当 0 件")
+        self.assertEqual({row["shop_ref"] for row in dataset_rows(payload)
+                          if "sales_amount" in row},
+                         {ref_for_key("shop", self.shops["1"]),
+                          ref_for_key("shop", self.shops["2"])},
+                         "两家店各自发布：淘系店不当 0，也不消失")
+        self.assertIsNone(total_row(payload)["sold_quantity"],
+                          "跨口径合计照旧拒发：8 件不得并进 1 件")
+        self.assertTrue(any("按可观测样本披露" in text
+                            for text in payload["limitations"]), payload["limitations"])
 
     # -- 无权限路径 --------------------------------------------------------
 
@@ -2414,9 +2422,12 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
                          "一次提问里要先看到混口径被拒，再看到分列那一次")
         self.assertEqual(refused["calls"][0]["parameters"]["basis_policy"], "strict")
         self.assertEqual(refused["calls"][1]["parameters"]["basis_policy"], "separate")
+        # S3 后淘系覆盖齐全时可答+披露：混口径分列的结果是逐店数值而非拒答，
+        # 但披露码仍在（不冒充已认证），且不产跨口径合计。
         self.assertIn("coverage_time_basis_unverified", refused["codes"])
-        self.assertTrue(refused["no_values"])
-        self.assertTrue(separate["no_total"], "分列结果里不得藏一个跳店合计")
+        self.assertEqual(refused["values"],
+                         {"paid_amount": ["1000.000000", "100.000000"]})
+        self.assertTrue(refused["no_total"], "分列结果里不得藏一个跳店合计")
         self.assertEqual({entry[3] for entry in separate["basis"]},
                          {"pay_time", "outstock_time"},
                          "两个时间归属都要逐项看见")
@@ -2430,17 +2441,22 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
                          ["erp_document/v1", "outstock_time"],
                          "单据口径不能伪装成支付订单数")
 
-    def test_q23_discloses_unmatched_refunds_and_q26_refuses_the_window(self):
+    def test_q23_discloses_unmatched_refunds_and_q26_answers_with_disclosure(self):
         refund = self._expected("23", 0)
         self.assertEqual(refund["values"], {"refund_amount": "50"})
         self.assertEqual(refund["diagnostics"]["unmatched_refunds"]["ratio"], "50%")
         self.assertIn("unmatched_refunds", refund["codes"])
+        # S3 后收支差与同批率可答：披露码仍在，但必须有数值而不是拒答。
         refused = self._expected("23", 1)
         self.assertIn("coverage_time_basis_unverified", refused["codes"])
-        self.assertTrue(refused["no_values"])
+        self.assertEqual(refused["values"], {"cash_difference": "50.000000",
+                                             "cohort_refund_rate": "0.3"})
+        self.assertIn("closed_refunded_excluded", refused["not_codes"],
+                      "淘系种子没有关闭后退款单：剔除诊断不得凭空出现")
         q26 = self._expected("26")
         self.assertIn("coverage_time_basis_unverified", q26["codes"])
-        self.assertTrue(q26["no_values"])
+        self.assertEqual(q26["values"], {"paid_amount": "100.000000"},
+                         "Q26 钉的是可答+披露：数值要给，认证不得冒充")
 
     def test_q24_intersection_keeps_gaps_and_refuses_a_union(self):
         expected = self._expected("24")

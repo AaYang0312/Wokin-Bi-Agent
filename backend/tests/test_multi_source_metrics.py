@@ -378,16 +378,17 @@ class CapabilityGateDatabaseTests(unittest.TestCase):
         self.assertEqual(money.status, "missing_data", money.limitations)
         self.assertEqual(money.data, [])
 
-    def test_disproved_or_local_filter_channel_refuses_a_payment_window_result(self):
-        """出库来源不能宣称完整支付窗口：S2 前 pay_time 参数实测漂移（83/8367 行
-        越窗），S2 后同步改宽出库窗+本地过滤，但出库人群结构上限与 S3 口径决策
-        未落地前，完整支付窗口主张仍 fail closed——数据齐、覆盖全也不能出数。"""
+    def test_local_filter_channel_answers_with_disclosure_when_covered(self):
+        """S3 落地（默认建议，待所有者追认）：local_filter 平台在完整/新鲜覆盖与
+        全部既有门禁下可答+披露；支付口径剔除关闭后退款单（另有专类覆盖）。
+        数据齐、覆盖全时不再因时间口径拒答，但也不宣称完整支付窗口。"""
         self._grant("{paid_amount}", platform="tb")
         result = self._query(["paid_amount"])
-        self.assertEqual(result.status, "missing_data", result.limitations)
-        self.assertEqual(result.data, [])
-        self.assertIn("coverage_time_basis_unverified", self._codes(result))
-        self.assertEqual(sorted(result.filters["shop_ids"]), ["S1"], "原请求不得被改写")
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertIn("coverage_time_basis_unverified", self._codes(result),
+                      "可答+披露：按可观测样本披露，不冒充已认证")
+        self.assertEqual(sorted(result.filters["shop_ids"]), ["S1"],
+                         "原请求不得被改写")
 
     def test_document_count_is_answered_but_disclosed_as_a_sample(self):
         """设计 §4：单据数仍可在覆盖成立时查询，但必须披露它是出库来源样本。"""
@@ -770,6 +771,251 @@ class CapabilityMaintenanceTests(unittest.TestCase):
         self.assertEqual(capability_target_shops(self.conn, {"CM_FXG"}), ["CM_FXG"])
         every = capability_target_shops(self.conn, {"CM_FXG"}, all_shops=True)
         self.assertIn("CM_PDD", every, "回收必须能碰到授权范围外还在挂旧标签的店")
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class S3ClosedRefundedCaliberTests(unittest.TestCase):
+    """S3 关闭单口径决策落地（默认建议，待所有者追认）：
+
+    tb/tm（`local_filter`）的支付口径在查询侧剔除**结构性证明的关闭后退款单**的
+    已核验支付；退款仍单独列示；`paid_amount − refund_amount` 只叫期间收支差额。
+    关闭**未**退款单的支付必须留在口径里；fxg 语义不变；覆盖不完整照旧 fail closed；
+    存量事实不改写（查询政策，无需重述/replay）。
+    """
+
+    WINDOW = ("2026-09-01", "2026-09-08")
+
+    def setUp(self):
+        from tests.dbfixtures import connect_test_db
+
+        self.conn = connect_test_db(self)
+        self.conn.execute(self._migration_sql())
+
+    @staticmethod
+    def _migration_sql() -> str:
+        from pathlib import Path
+
+        path = Path(__file__).parents[1] / "sql" / "026_closed_refunded_payment_caliber.sql"
+        return path.read_text(encoding="utf-8")
+
+    def _shop(self, shop_id: str, platform: str) -> None:
+        from bi_agent.data_quality import QUALITY_RULE
+
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name, capabilities) "
+            "VALUES (%s, %s, %s, '{paid_amount, paid_orders, aov, cash_difference, "
+            "refund_amount, cohort_refund_rate, erp_documents}') "
+            "ON CONFLICT (shop_id) DO UPDATE SET platform = EXCLUDED.platform",
+            (shop_id, platform, f"S3测试店{shop_id}"))
+        # 业务覆盖（local_filter 路径写入的 orders 实体）+ 退款发生/同批覆盖。
+        # 订单实体跟平台走（淘系=出库源）；售后实体一律是售后通道。
+        order_source = ("erp.trade.outstock.simple.query" if platform == "tb"
+                        else "erp.trade.list.query")
+        for entity, source in (("orders", order_source),
+                               ("aftersales_occurrence", "erp.aftersale.list.query"),
+                               ("aftersales_cohort", "erp.aftersale.list.query")):
+            self.conn.execute(
+                "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, "
+                "covered, data_as_of, quality_status, quality_rule) VALUES "
+                "(%s, %s, %s, '2026-09-08 00:00+08', "
+                "tstzmultirange(tstzrange('2026-09-01','2026-09-08','[)')), "
+                "'2026-09-08 00:00+08', 'passed', %s) "
+                "ON CONFLICT (source, entity, shop_id) DO UPDATE SET "
+                "covered = EXCLUDED.covered, data_as_of = EXCLUDED.data_as_of, "
+                "quality_status = EXCLUDED.quality_status, "
+                "quality_rule = EXCLUDED.quality_rule",
+                (source, entity, shop_id, QUALITY_RULE))
+
+    def _fact(self, shop_id: str, *, erp_id: str, commercial: str, day: int,
+              amount: str, active: bool = True) -> None:
+        paid_at = datetime(2026, 9, day, 12, tzinfo=BEIJING)
+        self.conn.execute(
+            "INSERT INTO bi.orders(shop_id, erp_id, commercial_ids, source, "
+            "source_updated_at, paid_at, raw_pay_amount, active, batch_id) "
+            "VALUES (%s, %s, %s, 'erp.trade.outstock.simple.query', now(), %s, "
+            "%s, %s, 's3-seed') ON CONFLICT (shop_id, erp_id) DO NOTHING",
+            (shop_id, erp_id, [commercial], paid_at, Decimal(amount), active))
+        self.conn.execute(
+            "INSERT INTO bi.order_payments(shop_id, commercial_id, paid_at, amount, "
+            "currency, basis, verified) VALUES "
+            "(%s, %s, %s, %s, 'CNY', 'head', true) "
+            "ON CONFLICT (shop_id, commercial_id) DO NOTHING",
+            (shop_id, commercial, paid_at, Decimal(amount)))
+
+    def _refund(self, shop_id: str, *, commercial: str, day: int) -> None:
+        self.conn.execute(
+            "INSERT INTO bi.aftersales(shop_id, aftersale_id, commercial_id, "
+            "raw_platform_amount, platform_completed_at, source_updated_at, "
+            "platform_success, refund_canonical, matched, batch_id) VALUES "
+            "(%s, %s, %s, %s, %s, now(), true, true, true, 's3-seed')",
+            (shop_id, f"A-{commercial}", commercial, "70",
+             datetime(2026, 9, day, 18, tzinfo=BEIJING)))
+
+    def _seed_tb(self) -> None:
+        """TB1：活动单100；关闭后退款单70；关闭未退款单30。"""
+        self._shop("TB1", "tb")
+        self._fact("TB1", erp_id="E-A", commercial="C-A", day=2, amount="100")
+        self._fact("TB1", erp_id="E-R", commercial="C-R", day=2, amount="70",
+                   active=False)
+        self._refund("TB1", commercial="C-R", day=3)
+        self._fact("TB1", erp_id="E-U", commercial="C-U", day=3, amount="30",
+                   active=False)
+
+    def _query(self, metrics, shop_ids=("TB1",), **overrides):
+        import time as time_module
+
+        from bi_agent.metrics import QueryRequest, query_business
+
+        # 种子以管理员身份写入；金额查询按真实查询身份（只读 reporting）执行。
+        self.conn.execute("RESET ROLE")
+        self.conn.execute("SET LOCAL ROLE bi_reader")
+        defaults = dict(start=self.WINDOW[0], end=self.WINDOW[1],
+                        shop_ids=list(shop_ids), metrics=list(metrics))
+        defaults.update(overrides)
+        return query_business(self.conn, QueryRequest(**defaults),
+                              allowed_shop_ids=frozenset({"TB1", "FX1"}),
+                              now=FROZEN_NOW, deadline=time_module.monotonic() + 30)
+
+    def _codes(self, result) -> list[str]:
+        from bi_agent.business_query.nodes import _limitation_codes
+
+        return _limitation_codes(result.limitations)
+
+    def test_closed_then_refunded_payment_leaves_the_payment_caliber(self):
+        self._seed_tb()
+        result = self._query(["paid_amount", "paid_orders", "refund_amount",
+                              "cash_difference"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        row = result.data[0]
+        self.assertEqual(Decimal(row["paid_amount"]), Decimal("130"),
+                         "200 − 70：关闭后退款单的支付退出口径，关闭未退款的30留在口径内")
+        self.assertEqual(row["paid_orders"], 2)
+        self.assertEqual(Decimal(row["refund_amount"]), Decimal("70"),
+                         "退款仍单独列示：口径剔除不吞掉退款发生额")
+        self.assertEqual(Decimal(row["cash_difference"]), Decimal("60"),
+                         "现金差额 = 剔除后支付130 − 退款70")
+        # 旧数字对比回归：差值必须逐项可解释——旧口径 200 与新口径 130 的差
+        # 恰等于被剔除的那一笔（诊断给出同额同笔数）。
+        self.assertEqual(result.diagnostics.get("closed_refunded_excluded"),
+                         {"excluded_count": 1, "excluded_amount": "70",
+                          "currency": "CNY"})
+        self.assertTrue(any("支付口径已剔除关闭后退款单" in text
+                            for text in result.limitations), result.limitations)
+        self.assertIn("closed_refunded_excluded", self._codes(result))
+
+    def test_period_difference_is_labeled_not_net_payment_or_profit(self):
+        self._seed_tb()
+        result = self._query(["cash_difference"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertIn("不是净利润", result.metric_definition["cash_difference"])
+        self.assertIn("净支付", result.metric_definition["cash_difference"],
+                      "指标定义必须点名它不是净支付")
+
+    def test_day_grouping_applies_the_exclusion_per_payment_day(self):
+        self._seed_tb()
+        result = self._query(["paid_amount", "cash_difference"], group_by="day")
+        self.assertEqual(result.status, "ok", result.limitations)
+        rows = {(row["shop_id"], row["day"]): row for row in result.data}
+        self.assertEqual(Decimal(rows[("TB1", "2026-09-02")]["paid_amount"]),
+                         Decimal("100"), "09-02 剔除 C-R 的 70")
+        self.assertEqual(Decimal(rows[("TB1", "2026-09-03")]["paid_amount"]),
+                         Decimal("30"))
+        self.assertEqual(Decimal(rows[("TB1", "2026-09-02")]["cash_difference"]),
+                         Decimal("100"))
+        self.assertEqual(Decimal(rows[("TB1", "2026-09-03")]["cash_difference"]),
+                         Decimal("-40"), "当日支付30 − 当日完成退款70")
+
+    def test_aov_follows_the_excluded_caliber(self):
+        self._seed_tb()
+        result = self._query(["aov"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(result.data[0]["aov"]), Decimal("65"),
+                         "130 / 2 单：客单价用剔除后的口径")
+
+    def test_cohort_refund_rate_keeps_the_full_cohort(self):
+        """同批退款率不是支付口径金额：同批分母不减关闭后退款单，退款保持可见。"""
+        self._seed_tb()
+        result = self._query(["cohort_refund_rate"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertAlmostEqual(float(result.data[0]["cohort_refund_rate"]), 0.35,
+                               places=6,
+                               msg="70 / 200：同批率仍以全部同批支付为分母")
+
+    def test_fxg_caliber_keeps_closed_refunded_payments(self):
+        """fxg 的支付口径语义不变：关闭后退款单的支付留在 certified 口径里。"""
+        self._shop("FX1", "fxg")
+        self._fact("FX1", erp_id="E-X", commercial="C-X", day=2, amount="90")
+        self._fact("FX1", erp_id="E-Y", commercial="C-Y", day=2, amount="60",
+                   active=False)
+        self._refund("FX1", commercial="C-Y", day=3)
+        result = self._query(["paid_amount"], shop_ids=("FX1",))
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(result.data[0]["paid_amount"]), Decimal("150"),
+                         "fxg 不做 S3 剔除：两笔支付都在口径里")
+        self.assertNotIn("closed_refunded_excluded", result.diagnostics)
+
+    def test_local_filter_answers_with_disclosure_but_never_claims_certified(self):
+        self._seed_tb()
+        result = self._query(["paid_amount"])
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertIn("coverage_time_basis_unverified", self._codes(result),
+                      "可答+披露：不宣称完整支付窗口，也不假装已认证")
+        self.assertTrue(any("按可观测样本披露" in text
+                            for text in result.limitations), result.limitations)
+
+    def test_local_filter_without_coverage_still_fails_closed(self):
+        self._seed_tb()
+        self.conn.execute("RESET ROLE")
+        self.conn.execute(
+            "UPDATE bi.sync_state SET covered = tstzmultirange() "
+            "WHERE shop_id='TB1'")
+        result = self._query(["paid_amount"])
+        self.assertEqual(result.status, "missing_data", result.limitations)
+        self.assertEqual(result.data, [])
+        self.assertIn("coverage_incomplete", self._codes(result),
+                      "没有真实 local_filter 覆盖就在覆盖门禁处拒答，不冒充零")
+
+    def test_previous_period_comparison_applies_the_same_exclusion(self):
+        """P1 回归钉：上期行与本期同用 S3 剔除口径，change 不得把口径漂移当增长。
+
+        本期（09-08~09-15）只有一笔活动支付 50；上期（09-01~09-08）被剔 70。
+        若上期行不剔除，paid_amount_previous 会是 200，差额 −150 会把口径切换
+        伪造成业务下滑；修复后上期 = 130，差额 −80 逐项可解释。
+        """
+        self._seed_tb()
+        self._fact("TB1", erp_id="E-N", commercial="C-N", day=9, amount="50")
+        self.conn.execute("RESET ROLE")
+        self.conn.execute(
+            "UPDATE bi.sync_state SET covered = "
+            "tstzmultirange(tstzrange('2026-09-01','2026-09-15','[)')) "
+            "WHERE shop_id='TB1' AND entity='orders'")
+        result = self._query(["paid_amount"], start="2026-09-08", end="2026-09-15",
+                             compare="previous_period")
+        self.assertEqual(result.status, "ok", result.limitations)
+        row = result.data[0]
+        self.assertEqual(Decimal(row["paid_amount"]), Decimal("50"))
+        self.assertEqual(Decimal(row["paid_amount_previous"]), Decimal("130"),
+                         "上期同口径：200 − 70；不得拿未剔除的 200 冒充上期")
+        self.assertEqual(Decimal(row["paid_amount_change"]), Decimal("-80"),
+                         "差额 = 50 − 130：剔除量不再被伪造成下滑")
+        self.assertIsNotNone(row["paid_amount_change_ratio"])
+        self.assertTrue(any("上期支付口径已剔除关闭后退款单" in text
+                            and "1笔/70元" in text for text in result.limitations),
+                        result.limitations)
+        self.assertIn("closed_refunded_excluded", self._codes(result))
+        # 本期窗口没有剔除事实：诊断只描述本期，不为上期凭空出现。
+        self.assertNotIn("closed_refunded_excluded", result.diagnostics)
+
+    def test_partial_local_filter_coverage_refuses_the_whole_window(self):
+        self._seed_tb()
+        self.conn.execute("RESET ROLE")
+        self.conn.execute(
+            "UPDATE bi.sync_state SET covered = "
+            "tstzmultirange(tstzrange('2026-09-01','2026-09-04','[)')) "
+            "WHERE shop_id='TB1' AND entity='orders'")
+        result = self._query(["paid_amount"])
+        self.assertEqual(result.status, "missing_data", result.limitations)
+        self.assertEqual(result.coverage.gaps, ["2026-09-04~2026-09-08"])
 
 
 if __name__ == "__main__":

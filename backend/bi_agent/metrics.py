@@ -43,13 +43,18 @@ Metric = Literal["paid_amount", "paid_orders", "erp_documents", "aov",
                  "quantity", "product_paid_amount"]
 
 METRIC_DEFINITIONS: dict[str, str] = {
-    "paid_amount": "已验证商业订单支付金额之和（人民币，按支付时间归属，[start,end)）",
-    "paid_orders": "已验证商业订单数（一行对应一次支付事实）",
+    "paid_amount": "已验证商业订单支付金额之和（人民币，按支付时间归属，[start,end)）"
+                   "；local_filter 口径平台（淘系）剔除结构性证明的关闭后退款单支付，"
+                   "退款单独列示",
+    "paid_orders": "已验证商业订单数（一行对应一次支付事实；local_filter 口径平台"
+                   "同样剔除关闭后退款单）",
     "erp_documents": "ERP单据数（拆合单粒度，仅作对账参考，不作客单价分母）",
     "aov": "客单价=支付金额/商业订单数（总口径，不平均每日客单价）",
     "refund_amount": "平台退款成功发生额（按平台完成时间归属；系统实退口径未发布）",
-    "cash_difference": "期间收支差额=支付金额-期间退款发生额（不是净利润，也不是同批净收入）",
-    "cohort_refund_rate": "同批退款率=[start,end)支付商业单在明确截止时刻前的累计退款/同批支付额",
+    "cash_difference": "期间收支差额=支付金额-期间退款发生额；是期间现金差额，"
+                      "不是净支付，不是净利润，也不是同批净收入",
+    "cohort_refund_rate": "同批退款率=[start,end)支付商业单在明确截止时刻前的累计退款/同批支付额"
+                          "（同批分母不减关闭后退款单：退款保持可见）",
     "quantity": "有效非赠品父项数量（含套件/组合/加工，按line_kind标注）",
     "product_paid_amount": "已核验的非赠品父项行级分摊支付金额（按line_kind标注）",
 }
@@ -57,12 +62,14 @@ METRIC_DEFINITIONS: dict[str, str] = {
 # 指标→实体依赖与覆盖来源定义在 sources 注册表（唯一真源）；data_quality 向外转发，
 # 本模块只引用，不再存第二份，避免门禁与指标两边口径漂移。
 from bi_agent.data_quality import (
-    ENTITY_REQUIREMENTS, assess_query_coverage, attribution_gap,
-    describe_attribution_gap, money_text, refund_attribution_gap, required_entities,
-    switched_sources_between, unverified_payments)
+    ClosedRefundedPayments, ENTITY_REQUIREMENTS, assess_query_coverage,
+    attribution_gap, closed_refunded_payments, describe_attribution_gap,
+    describe_closed_refunded_exclusion, describe_previous_closed_refunded_exclusion,
+    money_text, refund_attribution_gap, required_entities, switched_sources_between,
+    unverified_payments)
 from bi_agent.sources import (
-    METRIC_VERSION, ShopRecord, binding_signature, resolve_metric_sources,
-    unsupported_reason)
+    METRIC_VERSION, ShopRecord, binding_signature, payment_caliber_excludes_closed_refunded,
+    resolve_metric_sources, unsupported_reason)
 
 
 class QueryRequest(BaseModel):
@@ -778,6 +785,42 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
                 f"已知原始金额{money_text(unverified.known_amount)}元"
                 f"（{unverified.amount_known}笔）")
 
+    # S3 口径剔除（默认建议，待所有者追认）：local_filter 平台（淘系）的支付口径在
+    # 查询侧剔除结构性证明的关闭后退款单的已核验支付；退款发生额与同批率不动
+    # （退款保持可见）。这是查询政策：存量事实不改写，历史数字无需重述。
+    caliber_metrics = bool(set(request.metrics) & {"paid_amount", "paid_orders", "aov",
+                                                   "cash_difference"})
+    exclusion = None
+    caliber_shops = sorted(record.shop_id for record in records
+                           if payment_caliber_excludes_closed_refunded(record.platform))
+    if caliber_shops and caliber_metrics:
+        if not _set_query_budget(conn, deadline):
+            return ToolResult(status="unavailable", coverage=coverage,
+                              metric_definition={m: METRIC_DEFINITIONS[m]
+                                                 for m in request.metrics},
+                              filters=filters, data_as_of=data_as_of,
+                              limitations=limitations + ["本次查询时间预算已耗尽"])
+        exclusion = closed_refunded_payments(conn, shop_ids=caliber_shops,
+                                             start=request.start, end=request.end,
+                                             limit=MAX_ROWS + 1)
+        if len(exclusion.rows) > MAX_ROWS:
+            return ToolResult(status="unavailable", coverage=coverage,
+                              metric_definition={m: METRIC_DEFINITIONS[m]
+                                                 for m in request.metrics},
+                              filters=filters, data_as_of=data_as_of,
+                              limitations=limitations + [
+                                  f"结果行数达到{MAX_ROWS}上限，已拒绝出数以避免静默截断；"
+                                  "请缩小日期范围或店铺范围"])
+        text = describe_closed_refunded_exclusion(exclusion, caliber_shops)
+        if text:
+            amount, orders = exclusion.totals(caliber_shops)
+            limitations.append(text)
+            diagnostics["closed_refunded_excluded"] = {
+                "excluded_count": orders,
+                "excluded_amount": money_text(amount),
+                "currency": "CNY",
+            }
+
     # 行数预检：只对逐日分组有意义（total/shop 在SQL端按店聚合，日行不进 Python）
     if request.group_by == "day":
         groups = conn.execute(_GROUP_COUNT_SQL,
@@ -831,7 +874,7 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         if request.group_by in ("total", "shop", "day"):
             rows = _period_rows(conn, request, start_ts=start_ts, end_ts=end_ts,
                                 deadline=deadline, data_as_of=data_as_of,
-                                limitations=limitations)
+                                limitations=limitations, exclusion=exclusion)
         else:
             rows = _product_rows(conn, request, start_ts=start_ts, end_ts=end_ts,
                                  deadline=deadline)
@@ -840,9 +883,26 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
             if request.group_by in ("total", "shop"):
                 prev_request = request.model_copy(update={
                     "start": prev_start, "end": prev_end, "compare": "none"})
+                # 上期行必须与本期同一剔除口径，change/change_ratio 才是经营变化
+                # 而不是口径漂移：为本期也做了剔除的店铺另取上期窗口的剔除事实，
+                # 预算/截断护栏与本期相同；上期被剔的量单独披露。
+                prev_exclusion = None
+                if caliber_shops and caliber_metrics:
+                    if not _set_query_budget(conn, deadline):
+                        raise _BudgetExhausted
+                    prev_exclusion = closed_refunded_payments(
+                        conn, shop_ids=caliber_shops, start=prev_start, end=prev_end,
+                        limit=MAX_ROWS + 1)
+                    if len(prev_exclusion.rows) > MAX_ROWS:
+                        raise _RowsTruncated
+                    prev_text = describe_previous_closed_refunded_exclusion(
+                        prev_exclusion, caliber_shops)
+                    if prev_text:
+                        limitations.append(prev_text)
                 prev_rows = _period_rows(conn, prev_request, start_ts=prev_ts[0],
                                          end_ts=prev_ts[1], deadline=deadline,
-                                         data_as_of=data_as_of, limitations=[])
+                                         data_as_of=data_as_of, limitations=[],
+                                         exclusion=prev_exclusion)
                 _attach_compare(rows, prev_rows, request)
             else:
                 limitations.append("比较仅支持total/shop分组")
@@ -869,10 +929,15 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
 
 def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: datetime,
                  deadline: float, data_as_of: datetime,
-                 limitations: list[str]) -> list[dict[str, str | int | None]]:
+                 limitations: list[str],
+                 exclusion: ClosedRefundedPayments | None = None) -> list[dict[str, str | int | None]]:
     """total/shop/day三种分组的指标行；退款率单独查询。
 
     total/shop 取 _AGG_SQL（每店一行的SQL端聚合），day 取 _DAILY_SQL（日行）。
+    `exclusion` 是 S3 口径剔除事实（local_filter 平台）：按支付日从支付口径里
+    减掉关闭后退款单的已核验支付，现金差额同步调整；客单价在调整后重算。
+    调用方对本期与上期（compare）各自取当期窗口的剔除事实传入，两侧同口径，
+    change/change_ratio 才是经营变化而不是口径漂移。
     预算耗尽/行数截断一律抛私有异常，由 _query_in_transaction 降级为 unavailable。
     """
     if not _set_query_budget(conn, deadline):
@@ -897,6 +962,10 @@ def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: dat
             limitations.append("同批支付额为0或无支付，同批退款率不可计算")
 
     metrics = list(request.metrics)
+    if exclusion is None:
+        excluded = ClosedRefundedPayments()
+    else:
+        excluded = exclusion
     if request.group_by == "total":
         totals: dict[str, Decimal | int | None] = {
             "paid_amount": Decimal(0), "paid_orders": 0, "erp_documents": 0,
@@ -907,6 +976,10 @@ def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: dat
             totals["erp_documents"] += row[3]
             totals["refund_amount"] += row[4]
             totals["cash_difference"] += row[5]
+        amount, orders = excluded.totals(request.shop_ids)
+        totals["paid_amount"] -= amount
+        totals["paid_orders"] -= orders
+        totals["cash_difference"] -= amount
         totals["aov"] = _compute_aov(totals)
         if need_cohort:
             totals["cohort_refund_rate"] = cohort_rate
@@ -922,7 +995,11 @@ def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: dat
             entry["erp_documents"] += row[3]
             entry["refund_amount"] += row[4]
             entry["cash_difference"] += row[5]
-        for entry in by_shop.values():
+        for shop_id, entry in by_shop.items():
+            amount, orders = excluded.totals([shop_id])
+            entry["paid_amount"] -= amount
+            entry["paid_orders"] -= orders
+            entry["cash_difference"] -= amount
             entry["aov"] = _compute_aov(entry)
             if need_cohort:
                 entry["cohort_refund_rate"] = cohort_rate
@@ -941,6 +1018,13 @@ def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: dat
             entry = by_day.get((shop_id, day), {
                 "paid_amount": Decimal(0), "paid_orders": 0, "erp_documents": 0,
                 "refund_amount": Decimal(0), "cash_difference": Decimal(0)})
+            entry = dict(entry)
+            # S3 口径剔除按支付日落到具体哪一天：日行与合计必须能逐项对上。
+            amount = excluded.amount(shop_id, day)
+            orders = excluded.orders(shop_id, day)
+            entry["paid_amount"] -= amount
+            entry["paid_orders"] -= orders
+            entry["cash_difference"] -= amount
             # 逐日客单价同样按本日的支付金额/商业订单数算，不把整段总额摊到每一天；
             # 无单日不可除，_compute_aov 返回 None，_group_rows 只按请求指标投影。
             entry["aov"] = _compute_aov(entry)

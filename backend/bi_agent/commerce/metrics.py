@@ -31,7 +31,9 @@ from bi_agent.sources import platform_codes
 
 # 口径版本：参考指标是本轮新增的面，单独一个版本号参与血缘，
 # 只改商品参考口径时不该让固定指标的血缘版本跟着动。
-COMMERCE_METRIC_VERSION = "commerce-metrics/2026-09-13.1"
+# /2026-09-25.1：S3 关闭单口径决策（local_filter 平台支付面剔除关闭后退款单）。
+# 旧指纹的复用结果不得再命中；旧 Artifact 原样可读并标旧口径。
+COMMERCE_METRIC_VERSION = "commerce-metrics/2026-09-25.1"
 COMMERCE_GRAPH_VERSION = "commerce_graph/2026-09-13.1"
 # 趋势窗口首版固定七天（计划 §校验：trend_days 首版固定 7）；它参与请求指纹。
 TREND_DAYS = 7

@@ -1380,7 +1380,8 @@ class FakeWarehouse:
                  quality_status="passed", quality_rule=QUALITY_RULE,
                  capabilities=("paid_amount", "paid_orders", "erp_documents", "aov",
                                "quantity", "product_paid_amount", "refund_amount",
-                               "cash_difference", "cohort_refund_rate")):
+                               "cash_difference", "cohort_refund_rate"),
+                 closed_refunded=()):
         self.daily_rows = [tuple(row) for row in daily_rows]
         # 视图列形以 tests.dbfixtures.PRODUCT_DAILY_COLUMNS 为单一真源，这里不再手抄列数：
         # 测试行没给末尾的名称 / 成交快照 / 规格列就按契约补上。
@@ -1406,6 +1407,9 @@ class FakeWarehouse:
         self.refund_gap = tuple(refund_gap)
         self.unverified_payments = tuple(unverified_payments)
         self.statements: list[tuple[str, tuple]] = []
+        # S3 口径剔除事实（reporting.v_closed_refunded_payments 的替身）：
+        # 默认空 = 没有结构性证明的关闭后退款单；正向用例显式给行。
+        self.closed_refunded = [tuple(row) for row in closed_refunded]
 
     def _shop_row(self, row: tuple) -> tuple:
         """把用例写的 (店, 开关, 币种) 补齐成 v_shops 的五列形状。"""
@@ -1476,6 +1480,19 @@ class FakeWarehouse:
             # 最终分组数。列序与生产 SQL 逐一对应，替身不得比生产少聚合一层。
             if "GROUP BY shop_id, product_id, line_kind" in text:
                 rows = self._aggregate_products(rows)
+            return _FakeResult(rows[:params[-1]])
+        if "FROM reporting.v_closed_refunded_payments" in text:
+            # S3 口径剔除事实：按 (店铺, 支付日) 聚合已核验支付，与生产 SQL 同形。
+            shop_ids, start, end = params[0], params[1], params[2]
+            grouped: dict[tuple[str, date], list] = {}
+            for shop_id, day, amount in self.closed_refunded:
+                if shop_id not in shop_ids or not (start <= day < end):
+                    continue
+                entry = grouped.setdefault((shop_id, day), [Decimal("0"), 0])
+                entry[0] += amount
+                entry[1] += 1
+            rows = [(shop_id, day, values[0], values[1])
+                    for (shop_id, day), values in sorted(grouped.items())]
             return _FakeResult(rows[:params[-1]])
         if "FROM reporting.v_shop_daily" in text:
             rows = self._select(self.daily_rows, params)
@@ -1905,8 +1922,8 @@ class PartitionedProductRankingTests(unittest.TestCase):
         self.assertFalse(any(item.startswith("未认证支付")
                              for item in clean_result.limitations))
 
-    def test_disproved_cohort_publishes_no_rows_and_is_excluded(self):
-        """实测不成立的付款时间口径：一行都不出，且原因是口径未认证而不是“指标冲突”。"""
+    def test_local_filter_cohort_publishes_as_observable_sample(self):
+        """S3 后 local_filter 不再整组排除：以可观测样本分区发布，与认证组分开。"""
         warehouse = self._warehouse(
             [self._shop("FX1", "fxg"), self._shop("TB1", "tb")],
             self._products("FX1", {"P1": "300"})
@@ -1915,17 +1932,23 @@ class PartitionedProductRankingTests(unittest.TestCase):
         result = self._query(warehouse, ["FX1", "TB1"])
 
         self.assertEqual(result.status, "ok", result.limitations)
-        self.assertEqual([row["shop_id"] for row in result.data], ["FX1"])
-        self.assertEqual([row["rank"] for row in result.data], [1])
-        self.assertEqual(result.rank_exclusions,
-                         [{"shop_id": "TB1",
-                           "reason": "coverage_time_basis_unverified"}])
-        self.assertIn("1 家店铺的付款时间口径未经认证（实测不成立），未列入本次排行",
-                      result.limitations)
-        self.assertEqual(result.coverage.status, "partial")
-        # 反恒真：不得把口径缺口说成“指标互不兼容”，也不得建议换个指标再试。
-        self.assertFalse(any("互不兼容" in item for item in result.limitations))
-        self.assertFalse(any("quantity" in item for item in result.limitations))
+        # 分区号按口径签名排序：淘系出库口径签名排在交易通道认证签名之前。
+        self.assertEqual([(group["group"], group["status"], group["shop_ids"])
+                          for group in result.rank_groups],
+                         [("g1", "observable_sample", ["TB1"]),
+                          ("g2", "certified", ["FX1"])])
+        self.assertEqual(result.rank_exclusions, [],
+                         "完整覆盖的淘系店在 S3 后照样本发布，不再排除")
+        self.assertTrue(any("按可观测样本披露" in item for item in result.limitations),
+                        result.limitations)
+        self.assertEqual(result.coverage.status, "complete")
+        ranked = self.data_rows(result)
+        self.assertEqual([(row["shop_id"], row["rank_group"], row["rank"])
+                          for row in ranked],
+                         [("TB1", "g1", 1), ("FX1", "g2", 1)])
+        # 口径凭证只覆盖已发布的分区，分区之间仍不得互相借用认证状态。
+        self.assertEqual(sorted({item["shop_id"] for item in result.basis}),
+                         ["FX1", "TB1"])
 
         # 公开投影只带引用与分区陈述：真实店铺主键不得经新字段泄出去。
         from bi_agent.business_query.tool import to_model_result
@@ -1939,11 +1962,10 @@ class PartitionedProductRankingTests(unittest.TestCase):
         rendered = json.dumps(model_payload, ensure_ascii=False)
         self.assertNotIn("FX1", rendered)
         self.assertNotIn("TB1", rendered)
-        self.assertEqual(model_payload["excluded_scope"],
-                         [{"shop_ref": catalog.shop_ref("TB1"),
-                           "reason": "coverage_time_basis_unverified"}])
+        self.assertEqual(model_payload.get("excluded_scope"), None,
+                         "没有排除就不发排除清单：缺席与空集都不冒充有排除")
         self.assertEqual([group["shop_refs"] for group in model_payload["rank_groups"]],
-                         [[catalog.shop_ref("FX1")]])
+                         [[catalog.shop_ref("TB1")], [catalog.shop_ref("FX1")]])
 
     def test_unsupported_cohort_is_excluded_not_a_whole_request_refusal(self):
         """能力/来源缺口只缩到分区粒度：一家店答不了不得打死整次排行。"""
@@ -2088,10 +2110,12 @@ class PartitionedProductRankingTests(unittest.TestCase):
 
         self.assertEqual(result.status, "ok", result.limitations)
         self.assertEqual(result.data, [])
-        self.assertEqual(result.coverage.status, "partial")
-        self.assertEqual(result.rank_groups[0]["groups_total"], 0)
+        self.assertEqual(result.coverage.status, "complete",
+                         "S3 后淘系分区照常发布：没有排除就没有 partial")
+        self.assertEqual([group["groups_total"] for group in result.rank_groups],
+                         [0, 0])
         target_status, error = _classify(result)
-        self.assertEqual(target_status, DomainStatus.PARTIAL)
+        self.assertEqual(target_status, DomainStatus.SUCCESS)
         self.assertIsNone(error)
 
 
@@ -4842,6 +4866,173 @@ class IsolatedAnalysisAgentIntegrationTests(unittest.TestCase):
         self.assertTrue(artifacts[0]["findings"])
         self.assertEqual(artifacts[0]["narrative"], [])
         self.assertIn("narrative_unavailable", artifacts[0]["limitations"])
+
+
+class S3ClosedRefundedCaliberTests(unittest.TestCase):
+    """S3 关闭单口径决策（默认建议，待所有者追认）的离线契约。
+
+    - `local_filter` 平台的支付口径在查询侧剔除结构性证明的关闭后退款单支付；
+    - 退款仍单独列示；`paid_amount − refund_amount` 只叫期间收支差额；
+    - `local_filter` 从拒答层降到「可答+披露」，前提是完整/新鲜覆盖与全部既有门禁；
+    - 关闭未退款与关闭已退款不得混淆；fxg 语义不变。
+    真实库行为在 tests.test_multi_source_metrics / tests.test_db 的同名主题用例。
+    """
+
+    TZ = ZoneInfo("Asia/Shanghai")
+    START = date(2026, 9, 1)
+    END = date(2026, 9, 8)
+    DATA_AS_OF = datetime(2026, 9, 8, 0, 0, tzinfo=TZ)
+
+    def test_payment_caliber_exclusion_follows_the_local_filter_registration(self):
+        from bi_agent.sources import payment_caliber_excludes_closed_refunded
+
+        self.assertTrue(payment_caliber_excludes_closed_refunded("tb"))
+        self.assertTrue(payment_caliber_excludes_closed_refunded(" TM "))
+        self.assertFalse(payment_caliber_excludes_closed_refunded("fxg"),
+                         "fxg 的 certified 支付口径语义不变")
+        self.assertFalse(payment_caliber_excludes_closed_refunded("jd"))
+        self.assertFalse(payment_caliber_excludes_closed_refunded("pdd"))
+        self.assertFalse(payment_caliber_excludes_closed_refunded("1688"))
+        self.assertFalse(payment_caliber_excludes_closed_refunded(None))
+
+    def test_platform_basis_note_states_the_s3_caliber_without_full_window_claim(self):
+        from bi_agent.agent import platform_basis_note
+
+        note = platform_basis_note("tb")
+        self.assertIn("本地 payTime", note)
+        self.assertIn("关闭后退款", note, "S3 口径决策要写进口径澄清文案")
+        self.assertIn("不宣称", note, "完整支付窗口主张依旧不开放")
+
+    def _assessment(self, platform: str, shop_id: str = "TB1"):
+        from bi_agent.data_quality import assess_query_coverage
+        from bi_agent.metrics import QueryRequest
+
+        warehouse = FakeWarehouse(
+            shops=[(shop_id, True, "CNY", platform, ["paid_amount"])],
+            data_as_of=self.DATA_AS_OF)
+        request = QueryRequest(start=self.START, end=self.END,
+                               shop_ids=[shop_id], metrics=["paid_amount"])
+        return assess_query_coverage(warehouse, request)
+
+    def test_local_filter_time_basis_is_disclosure_not_blocking(self):
+        """S3 落地后 local_filter 不再拒答：降到披露层，由覆盖门禁把关出数。"""
+        assessment = self._assessment("tb")
+        self.assertEqual(assessment.time_basis_blocking, ())
+        self.assertIn("TB1", assessment.time_basis_disclosure)
+
+    def test_disproved_time_basis_keeps_blocking_payment_windows(self):
+        """同层另一态不受影响：实测不成立的通道照旧拒绝支付窗口主张。"""
+        from bi_agent import sources
+
+        fake = sources.PlatformRegistration(
+            "zzz", sources.TRADE_LIST_SOURCE, "pay_time", sources.PAYMENT_BASIS,
+            "disproved", sources.METRIC_CAPABILITIES)
+        with patch.dict(sources._REGISTRATIONS, {"zzz": fake}):
+            assessment = self._assessment("zzz", "Z1")
+        self.assertIn("Z1", assessment.time_basis_blocking)
+        self.assertNotIn("Z1", assessment.time_basis_disclosure)
+
+    def _warehouse(self, platform: str, shop_id: str = "TB1"):
+        return FakeWarehouse(
+            shops=[(shop_id, True, "CNY", platform,
+                    ["paid_amount", "paid_orders", "cash_difference"])],
+            daily_rows=[
+                (shop_id, date(2026, 9, 2), Decimal("170"), 2, 0,
+                 Decimal("0"), Decimal("170")),
+                (shop_id, date(2026, 9, 3), Decimal("30"), 1, 0,
+                 Decimal("70"), Decimal("-40")),
+            ],
+            closed_refunded=[(shop_id, date(2026, 9, 2), Decimal("70"))],
+            data_as_of=self.DATA_AS_OF)
+
+    def _total_query(self, warehouse, shop_id: str = "TB1"):
+        import time as time_module
+
+        from bi_agent.metrics import QueryRequest, query_business
+
+        request = QueryRequest(start=self.START, end=self.END,
+                               shop_ids=[shop_id],
+                               metrics=["paid_amount", "paid_orders",
+                                        "cash_difference"])
+        return query_business(warehouse, request,
+                              allowed_shop_ids=frozenset({shop_id}),
+                              now=self.DATA_AS_OF,
+                              deadline=time_module.monotonic() + 30)
+
+    def test_exclusion_subtracts_only_proven_closed_refunded_payments(self):
+        warehouse = self._warehouse("tb")
+        result = self._total_query(warehouse)
+        self.assertEqual(result.status, "ok", result.limitations)
+        row = result.data[0]
+        self.assertEqual(Decimal(row["paid_amount"]), Decimal("130"), "200 − 70")
+        self.assertEqual(row["paid_orders"], 2)
+        self.assertEqual(Decimal(row["cash_difference"]), Decimal("60"),
+                         "现金差额跟着口径走，且只叫期间收支差额")
+        self.assertEqual(result.diagnostics.get("closed_refunded_excluded"),
+                         {"excluded_count": 1, "excluded_amount": "70",
+                          "currency": "CNY"})
+        self.assertTrue(any("支付口径已剔除关闭后退款单" in text
+                            for text in result.limitations), result.limitations)
+
+    def test_exclusion_is_silent_when_nothing_is_proven(self):
+        """无剔除事实就不出披露也不加诊断：零剔除不是一条限制。"""
+        warehouse = self._warehouse("tb")
+        warehouse.closed_refunded = []
+        result = self._total_query(warehouse)
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(result.data[0]["paid_amount"]), Decimal("200"))
+        self.assertNotIn("closed_refunded_excluded", result.diagnostics)
+        self.assertFalse(any("关闭后退款单" in text for text in result.limitations))
+
+    def test_fxg_query_never_touches_the_exclusion_facts(self):
+        """fxg 语义不变：连剔除查询都不该发（平台范围之外不多查一次）。"""
+        warehouse = self._warehouse("fxg", "FX1")
+        result = self._total_query(warehouse, "FX1")
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(result.data[0]["paid_amount"]), Decimal("200"))
+        self.assertEqual(warehouse.fetches("v_closed_refunded_payments"), [])
+
+    def test_runtime_payload_accepts_local_filter_certification(self):
+        """S3 让 local_filter 可达：运行时载荷闭集必须认识它，且不许冒充 certified。"""
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        group = {
+            "group": "g1", "status": "observable_sample", "shop_refs": [S1_REF],
+            "basis": [{"metric": "product_paid_amount",
+                       "basis": "erp_outstock_payment/v1", "time_basis": "outstock_time",
+                       "time_certification": "local_filter"}],
+            "groups_published": 1, "groups_total": 1, "truncated": False,
+        }
+        payload = {
+            "status": "ok", "metric_definition": {}, "filters": {},
+            "coverage": {"status": "complete", "start": "2026-09-01",
+                         "end": "2026-09-08", "gaps": []},
+            "limitations": [], "data": [],
+            "rank_groups": [group],
+        }
+        validate_artifact_payload(payload)
+        bad = {**payload, "rank_groups": [{**group, "status": "certified"}]}
+        with self.assertRaises(ValueError):
+            validate_artifact_payload(bad)
+
+    def test_local_filter_capability_gap_is_attributed_to_the_time_basis(self):
+        from bi_agent.commerce.graph import _attributed_reason
+        from bi_agent.sources import ShopRecord
+
+        record = ShopRecord.from_row("TB1", "tb", frozenset({"paid_amount"}))
+        self.assertEqual(
+            _attributed_reason(record, "paid_amount", "capability_unavailable"),
+            "coverage_time_basis_unverified",
+            "local_filter 与 disproved 同样不靠「开通能力」解决，归因不能指错路")
+
+    def test_exclusion_disclosure_maps_to_a_stable_code(self):
+        text = ("支付口径已剔除关闭后退款单的已核验支付1笔/70元；退款单独列示，"
+                "支付额−退款额为期间收支差额（不是净支付，也不是净利润）")
+        from bi_agent.business_query.nodes import _limitation_codes
+        from bi_agent.commerce.graph import _limitation_codes as commerce_codes
+
+        self.assertEqual(_limitation_codes([text]), ["closed_refunded_excluded"])
+        self.assertEqual(commerce_codes([text]), ["closed_refunded_excluded"])
 
 
 if __name__ == "__main__":

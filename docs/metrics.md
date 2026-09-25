@@ -51,12 +51,12 @@
 
 | 指标 | 口径 | 来源依赖 |
 | --- | --- | --- |
-| `paid_amount` | 已验证商业订单支付金额之和（`order_payments.verified`，人民币） | orders/order_payments |
-| `paid_orders` | 已验证商业订单数（一行一商业单） | order_payments |
+| `paid_amount` | 已验证商业订单支付金额之和（`order_payments.verified`，人民币）；**local_filter 口径平台（淘系）剔除结构性证明的关闭后退款单支付**（026 视图取证：全部含该商业号的已入库单据均已关闭且存在同号平台成功 canonical 退款），退款单列 | orders/order_payments |
+| `paid_orders` | 已验证商业订单数（一行一商业单；local_filter 口径平台同样剔除关闭后退款单） | order_payments |
 | `erp_documents` | ERP单据数（拆合单粒度，仅作对账参考，不作客单价分母） | orders |
 | `aov` | paid_amount / paid_orders（总口径，不平均每日） | 同上 |
 | `refund_amount` | 平台退款成功（`platform_success` 且 `refund_canonical`）按完成时间归属的发生额 | aftersales_occurrence |
-| `cash_difference` | paid_amount − refund_amount；**期间收支差额，不是净利润** | 上两者 |
+| `cash_difference` | paid_amount − refund_amount；**期间收支差额（现金差），不是净支付，不是净利润** | 上两者 |
 | `cohort_refund_rate` | 同批：`[start,end)` 支付商业单在明确截止时刻前的累计退款 / 同批支付额 | aftersales_cohort + 原单匹配 |
 | `quantity` / `product_paid_amount` | 有效非赠品父项数量与已核验行级分摊金额；结果以 `line_kind` 区分 sale/suite/combination/processing，套件不是子SKU排行 | order_items |
 | 商品运营参考指标（`sold_quantity` 等 6 项） | 只由 `analyze_product_performance` 发布；口径、覆盖与拒发规则见 §4.2 | order_items / orders / order_payments |
@@ -193,8 +193,10 @@ entity='orders_consign')` 的覆盖凭证与批次，否则整窗回滚并留
 之前，出库口径对全部平台 fail closed（`data_missing` / `coverage_incomplete`）。这是有意
 的 fail-closed，不是缺陷；代码路径就绪（DONE）不等于真实扫描证据就绪（FAIL）。`platform_payment` 口径下 jd/kuaishou/wxsph/wsxc 的逐店账单对照
 证据仍是 `unmeasured`，一律 `data_missing`。出库口径不宣称支付窗口完整；淘系付款时间
-窗口同步已改宽出库窗+本地过滤（S2 取证，`local_filter`），但完整支付窗口主张仍不开放、
-支付口径格仍 `data_missing`（与 jd/ks 同待 S3/S6）。
+窗口同步已改宽出库窗+本地过滤（S2 取证，`local_filter`）；S3 口径决策落地后，固定指标
+查询在覆盖齐全时对淘系**可答+披露**（支付口径剔除关闭后退款单，退款单列，见 §6），
+但完整支付窗口主张仍不开放，平台对比的支付口径 tab 仍只收 `certified` 平台
+（jd/ks 与淘系 tab 成员资格分别待 S6/所有者追认）。
 
 回归命令（`backend/`）：
 
@@ -221,12 +223,13 @@ cd ../frontend && npm test -- src/components/ChartArtifact.test.tsx src/componen
 | 拼多多 | 支付族永久解析不通，只以 `excluded_scope` / `capability_unavailable` 出现；本轮未新增连接器、来源、凭证或 onboarding 代码路径 | 不写“待授权 / 延后”，也不拿出库金额补支付数 |
 
 验收题库从 20 题扩到修订后的 26 题（08 / 15 改预期，新增 21–26），结构化断言现在包含原因码、
-逐店逐指标 basis、退款诊断与覆盖形状。一个刻意的取证映射：原路线图把 Q21 / Q23 / Q25 的示例数字
+逐店逐指标 basis、退款诊断与覆盖形状。取证映射的沿革：原路线图把 Q21 / Q23 / Q25 的示例数字
 挂在淘系店上，但出库通道的付款时间口径已被实测判为不可靠（当时 `disproved`；S2 取证后同步改
-宽出库窗+本地过滤，标记 `local_filter`，完整支付窗口主张仍拒答，见 §6 与 Q26），所以混口径分列的
-可执行证据改用两家都能答的 `erp_documents`（抖音 6 / 淘系 1，各带自己的时间归属），未匹配退款披露
-留在淘系的 `refund_amount`（50 元，1/2 未匹配、20 元），而“关闭已付款单 100 / 30 / 70 与销量不回活”
-放到具备合成时间口径认证的抖音基准店上。这一映射是为了不同时违背两条规则，不是宣布淘系支付可用。
+宽出库窗+本地过滤，标记 `local_filter`），故当时把混口径分列的可执行证据换成 `erp_documents`
+并把淘系支付窗口题钉为拒答。S3 关闭单口径决策落地后（默认建议，待所有者追认），Q21 / Q23 / Q26
+的预期改为**可答+披露**：淘系支付口径剔除关闭后退款单、退款单列、`paid_amount − refund_amount`
+只叫期间收支差额（见 §6 与 `2026-09-25-s3-acceptance.md`）；这不是宣布淘系支付已认证——
+出库人群上限仍在，支付口径对比 tab 仍只收 `certified` 平台。
 
 「销售额」的澄清不再是一句固定的“支付还是出库”：它按本轮授权店铺的平台与来源注册表列出候选口径，
 并同时要期间；`certified` / `unmeasured` / `disproved` / `local_filter` 四种说法分开，出库通道明写“非平台账单 GMV”，
@@ -571,19 +574,30 @@ SELECT count(*) FROM bi.query_runs WHERE domain = 'inventory_watch';
 | --- | --- | --- | --- | --- |
 | `fxg` | `erp.trade.list.query` | `platform_payment/v1` | `certified`（逐元对账 + 0/9414 行越界） | 全部 9 项 |
 | `jd` `kuaishou` `wxsph` `wsxc` | `erp.trade.list.query` | `platform_payment/v1` | `unmeasured`：同通道同参数但未逐店对照 | 全部 9 项（仍需逐店取证） |
-| `tb` `tm` | `erp.trade.outstock.simple.query` | `erp_outstock_payment/v1` | **`local_filter`**（S2 取证：同步改宽出库窗+本地 payTime 过滤；完整支付窗口主张仍不开放） | 全部 9 项（出库口径，非平台账单） |
+| `tb` `tm` | `erp.trade.outstock.simple.query` | `erp_outstock_payment/v1`（S3 起**剔除结构性证明的关闭后退款单支付**，退款单列） | **`local_filter`**（S2 取证：同步改宽出库窗+本地 payTime 过滤；S3 落地后覆盖齐全时可答+披露，完整支付窗口主张仍不开放） | 全部 9 项（出库口径，非平台账单） |
 | `pdd` | 出库通道（官方交易接口按文档排除拼多多） | 无（不接入） | `disproved` | **仅 `erp_documents`** |
 | `1688` `alibabac2m` 及未登记平台 | 无 | 无 | — | 无：不回退交易源 |
 
 业务时间认证是四态，因为“没测过”、“测了不成立”与“本地过滤已修正”后果不同（Task 5.2c、
-S2 取证已消费）：`disproved` / `local_filter` 的店不得给支付窗口类结果，返回
+S2 取证已消费）：`disproved` 的店不得给支付窗口类结果，返回
 `coverage_time_basis_unverified` 并拒答；`unmeasured` 的店照常出数但必须披露为可观测样本。
 `erp_documents` 是单据计数、不是支付窗口主张，所以各种情况都只披露不拒答（设计 §4：拼多多
 单据数仍可查）。`local_filter`（S2 取证，见 `docs/superpowers/research/2026-09-25-s2-acceptance.md`）
 的含义是：淘系支付窗口同步改由**宽出库窗（consign_time ±15 天）+ 本地 payTime ∈ 窗口过滤**建立，
 窗口归属不再依赖 API 的 pay_time 参数语义（实测漂移 83/8367 行）；它修正的是取数方式，
-不等于「完整支付窗口」已认证——出库人群上限（未发货单不可见）与 S3 关闭单口径决策未落地前
-仍然 fail closed。
+不等于「完整支付窗口」已认证——出库人群上限（未发货单不可见）仍在。
+**S3 关闭单口径决策（默认建议，待所有者追认，见
+`docs/superpowers/research/2026-09-25-s3-acceptance.md`）落地后**：`local_filter` 不再与
+`disproved` 同属拒绝层——在**完整且新鲜的 local_filter 覆盖**与全部既有门禁（能力、质量、
+覆盖、截止、预算）成立时可答+披露；查询侧按 026 的取证视图剔除「全部含该商业号的已入库
+单据均已关闭且存在同号平台成功 canonical 退款」的已核验支付（关闭**未**退款单不剔除，
+fxg 口径不变，同批退款率分母不减）；剔除量由 `closed_refunded_excluded` 诊断与披露逐项给出，
+旧口径与新口径的差值因此逐项可解释。**上期对比（compare=previous_period）同样按剔除口径**：
+上期窗口另取一次剔除事实后同步扣减（预算/截断护栏相同），上期被剔的量由
+「上期支付口径已剔除…」披露单独给出，`change/change_ratio` 才是经营变化而不是口径漂移。
+这是**查询政策**：存量事实不改写，历史数字无需重述，
+replay 仍非必需。没有真实覆盖时照旧在覆盖门禁处 fail closed；`disproved`（拼多多）的拒答
+语义不变；平台对比支付口径 tab 仍只收 `certified` 平台。
 认证目前是按通道登记的代码事实；逐店与后台账单对照的证据到齐前不先建“无人写入”的
 登记表。金额口径与逐指标能力仍按店由对账证据开通，不拿抖音的结论复制给别的平台。
 

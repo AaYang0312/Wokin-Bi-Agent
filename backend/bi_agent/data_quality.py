@@ -75,6 +75,19 @@ WHERE shop_id = ANY(%s) AND NOT verified
   AND paid_at >= %s AND paid_at < %s
 """
 
+# S3 口径剔除事实（026）：结构性证明的关闭后退款单的**已核验**支付，按支付日
+# 归属。只剔 verified 行：口径里本来只有它们；未核验支付继续走各自的披露。
+CLOSED_REFUNDED_PAYMENTS_SQL = """
+SELECT shop_id, day,
+       coalesce(sum(amount), 0),
+       count(*)::bigint
+FROM reporting.v_closed_refunded_payments
+WHERE shop_id = ANY(%s) AND verified AND day >= %s AND day < %s
+GROUP BY shop_id, day
+ORDER BY shop_id, day
+LIMIT %s
+"""
+
 # 核验口径版本：规则一变，旧的 passed 自动失效（降级为 unknown）。
 # /2：未匹配退款从「整店 failed」改成「可量化限制 + 逐结果披露」（计划 5.3d）。
 # 升级后必须按运行手册重跑 `reconcile` 再 `capabilities --apply`，否则既有 passed
@@ -359,6 +372,88 @@ def unverified_payments(conn, *, shop_ids: Sequence[str],
                               Decimal(str(amount or 0)))
 
 
+@dataclass(frozen=True)
+class ClosedRefundedPayments:
+    """S3 口径剔除事实：按 (店铺, 支付日) 分组的已核验支付合计与笔数。
+
+    这些支付属于「全部单据已关闭且存在 canonical 平台成功退款」的商业单
+    （026 的取证谓词）；本地_filter 口径在查询侧把它们从支付口径剔除。
+    事实本身一个都不改写：本类只是查询政策的输入。
+    """
+
+    rows: tuple[tuple[str, date, Decimal, int], ...] = ()
+
+    def _by_shop_day(self) -> dict[tuple[str, date], tuple[Decimal, int]]:
+        index: dict[tuple[str, date], tuple[Decimal, int]] = {}
+        for shop_id, day, amount, orders in self.rows:
+            previous = index.get((shop_id, day), (Decimal(0), 0))
+            index[(shop_id, day)] = (previous[0] + amount, previous[1] + orders)
+        return index
+
+    def amount(self, shop_id: str, day: date) -> Decimal:
+        return self._by_shop_day().get((str(shop_id), day), (Decimal(0), 0))[0]
+
+    def orders(self, shop_id: str, day: date) -> int:
+        return self._by_shop_day().get((str(shop_id), day), (Decimal(0), 0))[1]
+
+    def totals(self, shop_ids: Sequence[str]) -> tuple[Decimal, int]:
+        """指定店铺范围的剔除合计 (金额, 笔数)：total/shop 分组的调整量。"""
+        wanted = {str(shop_id) for shop_id in shop_ids}
+        amount = Decimal(0)
+        orders = 0
+        for row_shop, _day, row_amount, row_orders in self.rows:
+            if row_shop in wanted:
+                amount += row_amount
+                orders += row_orders
+        return amount, orders
+
+    def material(self, shop_ids: Sequence[str]) -> bool:
+        return self.totals(shop_ids)[1] > 0
+
+
+def closed_refunded_payments(conn, *, shop_ids: Sequence[str],
+                             start: date, end: date,
+                             limit: int) -> ClosedRefundedPayments:
+    """读 026 的剔除事实；`limit` 由调用方按行数上限传入并自行检查截断。"""
+    shops = [str(shop_id) for shop_id in shop_ids]
+    if not shops:
+        return ClosedRefundedPayments()
+    rows = conn.execute(CLOSED_REFUNDED_PAYMENTS_SQL,
+                        (shops, start, end, limit)).fetchall()
+    return ClosedRefundedPayments(rows=tuple(
+        (str(row[0]), row[1], Decimal(str(row[2])), int(row[3])) for row in rows))
+
+
+def describe_closed_refunded_exclusion(payments: ClosedRefundedPayments,
+                                       shop_ids: Sequence[str]) -> str | None:
+    """S3 剔除披露：笔数、金额与「不是净支付」一起说，没有剔除就不出声。
+
+    文案必须同时说清三件事：剔除的是什么（关闭后退款单的支付）、退款没有消失
+    （单独列示）、`paid − refund` 的名字（期间收支差额，不是净支付/净利润）。
+    """
+    amount, orders = payments.totals(shop_ids)
+    if orders <= 0:
+        return None
+    return (f"支付口径已剔除关闭后退款单的已核验支付{orders}笔/"
+            f"{money_text(amount)}元；退款单独列示，"
+            "支付额−退款额为期间收支差额（不是净支付，也不是净利润）")
+
+
+def describe_previous_closed_refunded_exclusion(
+        payments: ClosedRefundedPayments,
+        shop_ids: Sequence[str]) -> str | None:
+    """上期剔除披露（compare 模式专用）：本期与上期必须同口径，差额才不是口径漂移。
+
+    上期行与本期行共用同一套 S3 剔除后，`change/change_ratio` 才是经营变化；
+    上期被剔的量在此逐项给出，防止「差额=剔除量」被读成本期下滑。
+    """
+    amount, orders = payments.totals(shop_ids)
+    if orders <= 0:
+        return None
+    return (f"上期支付口径已剔除关闭后退款单的已核验支付{orders}笔/"
+            f"{money_text(amount)}元（本期与上期对比按同一剔除口径）")
+
+
 def required_entities(metrics: Sequence[str]) -> list[str]:
     """这次查询到底依赖哪些业务实体。"""
     return sorted({entity for metric in metrics for entity in ENTITY_REQUIREMENTS[metric]})
@@ -615,11 +710,15 @@ def assess_query_coverage(conn, request) -> CoverageAssessment:
         certification = binding.time_certification
         if certification == "certified":
             continue
-        # disproved：通道 pay_time 过滤语义实测不成立；local_filter：S2 取证后
-        # 淘系同步改宽出库窗+本地 payTime 过滤，窗口归属已按构造精确，但出库
-        # 人群上限（未发货单不可见）与 S3 关闭单口径决策未落地前，「完整支付
-        # 窗口」主张仍然 fail closed（见 2026-09-25-s2-acceptance.md）。
-        if certification in ("disproved", "local_filter") and shop_id in window_shops:
+        # disproved：通道 pay_time 过滤语义实测不成立，照旧拒绝支付窗口主张。
+        # local_filter：S3 口径决策落地（默认建议，待所有者追认）后不再拒答——
+        # 窗口归属由本地 payTime 过滤按构造精确，支付口径已剔除结构性证明的
+        # 关闭后退款单；降到披露层，出数前提是本函数之后的覆盖/截止/质量门禁
+        # 全部成立（没有真实 local_filter 覆盖就在覆盖门禁处照旧 fail closed），
+        # 出库人群上限（未发货单不可见）仍在，「完整支付窗口」主张依旧不开放。
+        if certification == "local_filter":
+            disclosure.add(shop_id)
+        elif certification == "disproved" and shop_id in window_shops:
             blocking.add(shop_id)
         else:
             disclosure.add(shop_id)

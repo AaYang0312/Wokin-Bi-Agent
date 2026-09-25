@@ -26,8 +26,11 @@
 - `local_filter`：S2 取证（2026-09-25，两店半月窗口、对称差集 100% 归因，见
   `docs/superpowers/research/2026-09-25-s2-acceptance.md`）后，淘系支付窗口改由
   **宽出库窗 + 本地 payTime 过滤**建立：窗口归属不再依赖 API 的 pay_time 参数语义，
-  覆盖区间内的行按构造真在窗内。但它仍是出库人群（未发货单不可见），且只对样本窗口
-  做过对照——「完整支付窗口」主张依旧不开放，与 `disproved` 同属拒绝层。
+  覆盖区间内的行按构造真在窗内。S3 口径决策（默认建议，待所有者追认，见
+  `docs/superpowers/research/2026-09-25-s3-acceptance.md`）落地后，它不再与
+  `disproved` 同属拒绝层：在完整/新鲜覆盖与全部既有门禁成立时可答+披露，但
+  支付口径剔除结构性证明的关闭后退款单，且出库人群上限仍在——「完整支付窗口」
+  主张依旧不开放。
 
 三态（现四态）判断只看通道语义；**金额口径与逐指标能力仍是逐店取证**（5.1 的
 capabilities 只能由对账证据开通），不把抖音的结论复制给别的平台。
@@ -132,7 +135,10 @@ class PlatformRegistration:
 # 版本标识：来源、口径与能力策略都参与请求指纹，版本一变旧结果就不许再命中。
 # 定义放在注册表旁边，避免运行层与指标层各抄一份后互相漂移。
 SOURCE_REGISTRY_VERSION = "sources/2026-09-12.1"
-METRIC_VERSION = "metrics/2026-09-12.1"
+# /2026-09-25.1：S3 关闭单口径决策（local_filter 平台支付口径剔除关闭后退款单）。
+# 口径变了，旧指纹的缓存/复用结果不得再命中：指纹纳入本版本，旧 Artifact 原样
+# 可读并标旧口径。
+METRIC_VERSION = "metrics/2026-09-25.1"
 POLICY_VERSION = "multi-source-policy/2026-09-12.1"
 
 # 拼多多上限：仅已核验单据能力（行标识缺失、售后未逐店取证，其余一律关）。
@@ -152,8 +158,8 @@ _REGISTRATIONS: dict[str, PlatformRegistration] = {
     "wsxc": PlatformRegistration("wsxc", TRADE_LIST_SOURCE, "pay_time",
                                  PAYMENT_BASIS, "unmeasured", METRIC_CAPABILITIES),
     # 淘系唯一非敏感订单通道是销售出库；它的 pay_time 参数按自身时间字段裁剪，
-    # 不承诺支付窗口完整。S2 取证后同步改宽出库窗+本地过滤（local_filter），
-    # 但出库人群上限与 S3 口径决策未落地前，完整支付窗口主张仍不开放。
+    # 不承诺支付窗口完整。S2 取证后同步改宽出库窗+本地过滤（local_filter）；
+    # S3 落地后查询侧降为可答+披露（覆盖门禁把关），支付口径剔除关闭后退款单。
     "tb": PlatformRegistration("tb", OUTSTOCK_SOURCE, "outstock_time", OUTSTOCK_BASIS,
                                "local_filter", METRIC_CAPABILITIES),
     "tm": PlatformRegistration("tm", OUTSTOCK_SOURCE, "outstock_time", OUTSTOCK_BASIS,
@@ -248,6 +254,18 @@ def payment_window_fetch(platform: object) -> str | None:
     if reg.payment_basis == OUTSTOCK_BASIS:
         return PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER
     return PAYMENT_FETCH_API_PAY_TIME
+
+
+def payment_caliber_excludes_closed_refunded(platform: object) -> bool:
+    """这家店的支付口径是否剔除「关闭后退款单」的已核验支付（S3 默认建议）。
+
+    S3 决策只对 `local_filter` 平台（tb/tm）生效：它们的支付窗口由出库来源建立，
+    未发货的关闭单结构性不可见，把可证明已退款的关闭单支付留在口径里会造成
+    系统性偏移；fxg 的 certified 口径语义不变，未登记平台自然不含。
+    这是**查询政策**：存量支付事实不改写，历史数字无需重述，replay 仍非必需。
+    """
+    reg = registration(platform)
+    return reg is not None and reg.time_certified == "local_filter"
 
 
 def registration(platform: object) -> PlatformRegistration | None:

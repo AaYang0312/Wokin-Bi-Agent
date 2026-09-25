@@ -174,6 +174,8 @@ class RuntimeModelTests(unittest.TestCase):
             )
 
     def test_allowlisted_future_state_event_and_artifact_shapes_are_valid(self):
+        from bi_agent.metrics import METRIC_DEFINITIONS
+
         normalized_request = {
             "shop_refs": [S1_REF],
             "metrics": ["paid_amount"],
@@ -211,7 +213,7 @@ class RuntimeModelTests(unittest.TestCase):
         public_artifact = {
             "status": "ok",
             "metric_definition": {
-                "paid_amount": "已验证商业订单支付金额之和（人民币，按支付时间归属，[start,end)）",
+                "paid_amount": METRIC_DEFINITIONS["paid_amount"],
             },
             "coverage": coverage,
             "limitations": ["同批支付额为0或无支付，同批退款率不可计算"],

@@ -4514,5 +4514,140 @@ class ConsignTimeSyncTests(unittest.TestCase):
             0, "出库扫描不得新建支付行")
 
 
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ClosedRefundedPaymentCaliberTests(unittest.TestCase):
+    """026：S3 关闭单口径（默认建议，待所有者追认）的查询政策事实面。
+
+    S3 只在**查询侧**剔除「结构性证明的关闭后退款单」的已核验支付：存量事实
+    （bi.orders 的 active、bi.order_payments、bi.aftersales）一个都不改写，
+    因此不需要重述通道、也不需要 replay。本类验证 026 视图的取证谓词本身：
+    关闭未退款与关闭已退款不得混淆；查询路径（bi_app/bi_reader）必须读得到。
+    查询侧算术在 tests.test_multi_source_metrics 的 S3 用例里。
+    """
+
+    def setUp(self):
+        from tests.dbfixtures import connect_test_db
+
+        self.conn = connect_test_db(self)
+        self.conn.execute(self._migration_sql())
+
+    @staticmethod
+    def _migration_sql() -> str:
+        from pathlib import Path
+
+        path = Path(__file__).parents[1] / "sql" / "026_closed_refunded_payment_caliber.sql"
+        return path.read_text(encoding="utf-8")
+
+    def _order(self, erp_id: str, commercial: str, *, active: bool,
+               day: int, amount: str) -> None:
+        paid_at = datetime(2026, 9, day, 12, tzinfo=BEIJING)
+        self.conn.execute(
+            "INSERT INTO bi.orders(shop_id, erp_id, commercial_ids, source, "
+            "source_updated_at, paid_at, raw_pay_amount, active, batch_id) "
+            "VALUES ('CR1', %s, %s, 'erp.trade.outstock.simple.query', now(), %s, "
+            "%s, %s, 's3-seed') ON CONFLICT (shop_id, erp_id) DO NOTHING",
+            (erp_id, [commercial], paid_at, Decimal(amount), active))
+        self.conn.execute(
+            "INSERT INTO bi.order_payments(shop_id, commercial_id, paid_at, amount, "
+            "currency, basis, verified) VALUES "
+            "('CR1', %s, %s, %s, 'CNY', 'head', true) "
+            "ON CONFLICT (shop_id, commercial_id) DO NOTHING",
+            (commercial, paid_at, Decimal(amount)))
+
+    def _refund(self, aftersale_id: str, commercial: str, *, day: int,
+                success: bool = True, canonical: bool = True,
+                platform_refund_id: str | None = None) -> None:
+        self.conn.execute(
+            "INSERT INTO bi.aftersales(shop_id, aftersale_id, platform_refund_id, "
+            "commercial_id, raw_platform_amount, platform_completed_at, "
+            "source_updated_at, platform_success, refund_canonical, matched, "
+            "batch_id) VALUES ('CR1', %s, %s, %s, '50', %s, now(), %s, %s, "
+            "true, 's3-seed')",
+            (aftersale_id, platform_refund_id, commercial,
+             datetime(2026, 9, day, 18, tzinfo=BEIJING), success, canonical))
+
+    def _seed(self) -> None:
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) "
+            "VALUES ('CR1', 'tb', '关闭单口径测试店') "
+            "ON CONFLICT (shop_id) DO UPDATE SET platform = EXCLUDED.platform")
+        self._order(erp_id="E-A", commercial="C-A", active=True, day=2, amount="100")
+        # 结构性证明的关闭后退款单：closed + 同商业号平台成功 canonical 退款。
+        self._order(erp_id="E-R", commercial="C-R", active=False, day=2, amount="70")
+        self._refund(aftersale_id="A-R", commercial="C-R", day=3)
+        # 关闭但**未**退款：支付留在支付口径里，绝不与关闭已退款混为一谈。
+        self._order(erp_id="E-U", commercial="C-U", active=False, day=3, amount="30")
+
+    def test_view_admits_only_proven_closed_then_refunded_payments(self):
+        self._seed()
+        # 活动单收到 canonical 退款（部分退款未关闭）：支付不得被剔除。
+        self._refund(aftersale_id="A-B", commercial="C-A", day=4)
+        # 关闭单只有未成功退款：退款未成立，不构成「关闭后退款」。
+        self._order(erp_id="E-F", commercial="C-F", active=False, day=2, amount="20")
+        self._refund(aftersale_id="A-F", commercial="C-F", day=3, success=False)
+        rows = self.conn.execute(
+            "SELECT commercial_id, sum(amount) FROM reporting.v_closed_refunded_payments "
+            "WHERE shop_id='CR1' GROUP BY commercial_id ORDER BY commercial_id").fetchall()
+        self.assertEqual([(row[0], Decimal(row[1])) for row in rows],
+                         [("C-R", Decimal("70"))],
+                         "只有结构性证明的关闭后退款单进视图：活动单/未退款/退款未成功的都不在")
+
+    def test_split_refund_workorders_exclude_the_payment_once(self):
+        """同平台售后号拆成多笔工单时只有一笔 canonical：支付只剔除一次。"""
+        self._seed()
+        self._order(erp_id="E-N", commercial="C-N", active=False, day=2, amount="40")
+        self._refund(aftersale_id="A-N1", commercial="C-N", day=3,
+                     platform_refund_id="PR-N")
+        self._refund(aftersale_id="A-N2", commercial="C-N", day=3,
+                     platform_refund_id="PR-N", canonical=False)
+        rows = self.conn.execute(
+            "SELECT commercial_id, count(*) FROM reporting.v_closed_refunded_payments "
+            "WHERE shop_id='CR1' AND commercial_id = 'C-N' GROUP BY commercial_id").fetchall()
+        self.assertEqual([(row[0], row[1]) for row in rows], [("C-N", 1)])
+
+    def test_commercial_in_an_active_document_is_not_fully_closed(self):
+        """同一商业号还挂在活动单据上时，「已全额关闭」未被证明：不剔除。"""
+        self._seed()
+        self.conn.execute(
+            "INSERT INTO bi.orders(shop_id, erp_id, commercial_ids, source, "
+            "source_updated_at, paid_at, raw_pay_amount, active, batch_id) "
+            "VALUES ('CR1', 'E-M2', ARRAY['C-A']::text[], "
+            "'erp.trade.outstock.simple.query', now(), "
+            "'2026-09-02 12:00+08', '10', false, 's3-seed') "
+            "ON CONFLICT (shop_id, erp_id) DO NOTHING")
+        self._refund(aftersale_id="A-M", commercial="C-A", day=4)
+        rows = self.conn.execute(
+            "SELECT count(*) FROM reporting.v_closed_refunded_payments "
+            "WHERE shop_id='CR1' AND commercial_id='C-A'").fetchone()
+        self.assertEqual(rows[0], 0,
+                         "活动单据仍在：C-A 的支付不满足结构性证明，留在支付口径")
+
+    def test_view_exposes_no_pii_and_stays_readable_for_the_query_role(self):
+        self._seed()
+        columns = [row[0] for row in self.conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='reporting' "
+            "AND table_name='v_closed_refunded_payments' "
+            "ORDER BY ordinal_position").fetchall()]
+        self.assertEqual(sorted(columns),
+                         sorted(["shop_id", "commercial_id", "paid_at", "day",
+                                 "amount", "verified"]),
+                         "视图只暴露 v_payments 已有的非 PII 字段加归属日")
+        self.conn.execute("SET LOCAL ROLE bi_app")
+        count = self.conn.execute(
+            "SELECT count(*) FROM reporting.v_closed_refunded_payments "
+            "WHERE shop_id='CR1'").fetchone()[0]
+        self.conn.execute("RESET ROLE")
+        self.assertEqual(count, 1, "查询身份必须能读口径剔除事实，否则政策无法执行")
+
+    def test_migration_is_idempotent(self):
+        self._seed()
+        self.conn.execute(self._migration_sql())
+        rows = self.conn.execute(
+            "SELECT commercial_id FROM reporting.v_closed_refunded_payments "
+            "WHERE shop_id='CR1' ORDER BY commercial_id").fetchall()
+        self.assertEqual([row[0] for row in rows], ["C-R"])
+
+
 if __name__ == "__main__":
     unittest.main()
