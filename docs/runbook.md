@@ -140,7 +140,8 @@ psql -d bi_agent -c "SELECT basis, verified, count(*), coalesce(sum(amount),0) "
 ```powershell
 Set-Location backend
 uv run --env-file ../.env.sync python -m bi_agent.sync shops
-uv run --env-file ../.env.sync python -m bi_agent.sync backfill --days 90
+# 历史深度自 2026-09-28 起为 180 天（分段扩历史的做法见下一节）
+uv run --env-file ../.env.sync python -m bi_agent.sync backfill --days 180
 uv run --env-file ../.env.sync python -m bi_agent.sync incremental
 uv run --env-file ../.env.sync python -m bi_agent.sync reconcile --days 7
 # 对账凭证落下后才能开通指标能力：先只报告，确认后再接着跑 --apply
@@ -149,6 +150,12 @@ uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --apply
 ```
 
 同步在完整分页、校验和事务提交后才推进水位。分页、权限或上游错误不会成为零业务数据；每日重核最近七天以处理晚到退款。
+
+重试与窗口容错（2026-09-28 起）：
+
+- 单次调用：限流类错误（HTTP 429 与业务信封「频繁/限流」）最多尝试 5 次，服务端 `Retry-After` 在 30 秒上限内完整尊重；其余错误（超时/5xx）仍为 3 次指数退避；authentication/permission 不重试。
+- 窗口级：回填/重核的每个日窗口对瞬态错误（rate_limit/timeout/upstream）冷却 30 秒后重试 2 次，最终失败记入该店输出 JSON 的 `failed_windows` 清单后**继续后续窗口**，不再中断整店；失败窗口覆盖不推进（fail-closed 语义不变），由下次运行或 `reconcile --missing-only` 补上。增量（incremental）保持失败即停：水位不前移，下一小时从原水位自愈。
+- `reconcile --missing-only`：逐实体（orders/aftersales_occurrence/aftersales_cohort）只拉 `bi.sync_state.covered` 在请求区间内的缺口窗口，已覆盖窗口零请求（淘系全量重核每店每天 434+ 次流式请求，missing-only 稳态接近零）。适合安排每小时/更高频的自愈任务；没有任何状态行时等价于全量重核，可直接用于新店首拉。
 
 空返回与支付核验的额外约束：
 
@@ -165,7 +172,27 @@ $syncSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
 Register-ScheduledTask -TaskName 'BI Agent Hourly Sync' -Action $syncAction -Trigger $syncTrigger -Settings $syncSettings
 ```
 
-另建每日低峰的 `reconcile --days 7` 任务。运行账户只读取同步配置；命令参数不含密码。
+另建每日低峰的 `reconcile --days 7` 任务，以及可选的每小时 `reconcile --days 2 --missing-only` 自愈任务（缺口零成本重拉，持续保持近期窗口无洞）。运行账户只读取同步配置；命令参数不含密码。
+
+长时间回填与小时任务的锁竞争属预期：同步 CLI 全程持有 advisory 锁，长任务运行期间小时任务以「已有同步任务运行」快速失败，不做排队；回填结束后下一次整点自动恢复。需要缩短连续持锁时间时，用 `replay` 按月分段补历史（见下）。
+
+### 历史深度扩展（180 天，2026-09-28）
+
+覆盖目标区间 `[今天-180天, 今天)`。已覆盖近段的店不要整体重跑 `backfill --days 180`，用 `replay` 只补缺口段（覆盖按窗口累加，重放已覆盖区间是纯浪费）：
+
+```powershell
+Set-Location backend
+# 已接入店：先追平停摆缺口（backfill 会重建 data_as_of 并补水位扫描段）
+uv run --env-file ../.env.sync python -m bi_agent.sync backfill --days <停摆天数>
+# 再按月分段把历史从已覆盖起点扩到 180 天（orders → 售后 → cohort 三实体都要）
+uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity orders --start 2026-04-01 --end 2026-05-01
+uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity aftersales_occurrence --start 2026-04-01 --end 2026-05-01
+uv run --env-file ../.env.sync python -m bi_agent.sync replay --entity aftersales_cohort --start 2026-04-01 --end 2026-05-01
+# 逐月推进到既有覆盖起点；新接入店直接：
+uv run --env-file ../.env.sync python -m bi_agent.sync backfill --days 180
+```
+
+淘系（tb/tm）历史回填的请求量提醒：宽出库窗路径每个支付日 ≥62 次流式请求，180 天约 1.1 万次/店，单店连续持锁可达数小时——放在低峰段、按店分段执行（临时用环境变量覆盖 `BI_SHOP_IDS` 逐店跑，不改 `.env.sync`）。回填输出里的 `failed_windows` 清单在自愈任务 `--days` 跨度内的条目由 `reconcile --missing-only` 自动补；更早的失败窗口需要 `replay` 或加大 `--days` 重跑。
 
 ## 平台对比的双口径（S1，P1 修正后）
 

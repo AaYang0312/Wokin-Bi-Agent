@@ -456,6 +456,60 @@ class KuaimaiTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "upstream")
         self.assertEqual(len(calls), 3)
 
+    def test_rate_limit_gets_larger_retry_budget(self):
+        # 淘系宽窗取数每支付日 62+ 次流式请求，429 只给 3 次机会会整窗失败；
+        # 限流类单独放宽到 5 次，其余类别维持 3 次。
+        responses = ([httpx.Response(429)] * 4
+                     + [httpx.Response(200, json={"success": True, "total": 0})])
+        client, calls = self._client(responses)
+        with patch("bi_agent.kuaimai._sleep"):
+            payload = client.call("m", {})
+        self.assertEqual(payload["total"], 0)
+        self.assertEqual(len(calls), 5)
+
+    def test_rate_limit_gives_up_at_five_attempts(self):
+        from bi_agent.kuaimai import KuaimaiError
+
+        client, calls = self._client([httpx.Response(429)])
+        with patch("bi_agent.kuaimai._sleep"):
+            with self.assertRaises(KuaimaiError) as ctx:
+                client.call("m", {})
+        self.assertEqual(ctx.exception.code, "rate_limit")
+        self.assertEqual(len(calls), 5)
+
+    def test_retry_after_honored_up_to_cap(self):
+        from bi_agent.kuaimai import KuaimaiError
+
+        def limited(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, headers={"Retry-After": "20"})
+
+        client, calls = self._client([limited])
+        with patch("bi_agent.kuaimai._sleep") as sleep:
+            with self.assertRaises(KuaimaiError):
+                client.call("m", {})
+        self.assertEqual(sleep.call_args_list[0].args, (20.0,))
+
+        def long_limited(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(429, headers={"Retry-After": "120"})
+
+        client, calls = self._client([long_limited])
+        with patch("bi_agent.kuaimai._sleep") as sleep:
+            with self.assertRaises(KuaimaiError):
+                client.call("m", {})
+        self.assertEqual(sleep.call_args_list[0].args, (30.0,))
+
+    def test_envelope_rate_limit_uses_rate_budget(self):
+        # 业务信封 success:false +「频繁」与 HTTP 429 同一预算，不按 3 次放弃。
+        envelope = httpx.Response(200, json={"success": False, "code": "1004",
+                                             "message": "请求过于频繁"})
+        responses = ([envelope] * 4
+                     + [httpx.Response(200, json={"success": True, "total": 0})])
+        client, calls = self._client(responses)
+        with patch("bi_agent.kuaimai._sleep"):
+            payload = client.call("m", {})
+        self.assertEqual(payload["total"], 0)
+        self.assertEqual(len(calls), 5)
+
     def test_timeout_and_network_map(self):
         from bi_agent.kuaimai import KuaimaiError
 
@@ -805,6 +859,194 @@ class SyncBackfillTests(unittest.TestCase):
         parameters = inspect.signature(_backfill_shop).parameters
         self.assertNotIn("t1", parameters)
         self.assertIn("now", parameters)
+
+
+class SyncWindowResilienceTests(unittest.TestCase):
+    """单窗口失败不得中断整店运行：瞬态错误先冷却重试，最终失败后继续后续窗口。
+
+    一个限流窗口抛错上抛会让当天剩余窗口全部跳过，覆盖缺口越积越大，
+    查询侧 fail-closed 拒答就是这么「经常报错」的。
+    """
+
+    T0 = datetime(2026, 9, 8, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    class _Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class _Connection:
+        def __init__(self):
+            self.statements: list[tuple[str, object]] = []
+
+        def transaction(self):
+            return SyncWindowResilienceTests._Transaction()
+
+        def execute(self, sql, parameters=None):
+            self.statements.append((sql, parameters))
+            return None
+
+    @staticmethod
+    def _failing_run_window(fail_when, code="rate_limit"):
+        from bi_agent.kuaimai import KuaimaiError
+
+        calls: list[tuple[str, str, object]] = []
+
+        def run_window(_conn, _client, **kwargs):
+            window = kwargs["window"]
+            key = (kwargs["mode"], kwargs["entity"], window.start)
+            calls.append(key)
+            if fail_when(*key):
+                raise KuaimaiError(code)
+            return 0
+
+        return run_window, calls
+
+    def _backfill(self, run_window, cohort=None):
+        from bi_agent import sync
+
+        conn = self._Connection()
+        t1 = self.T0 + timedelta(seconds=3600)
+        with patch.object(sync, "_run_window", side_effect=run_window), patch.object(
+            sync, "check_cohort_window",
+            side_effect=cohort or (lambda *_args, **_kw: 0),
+        ), patch.object(sync, "_window_sleep") as cooldown:
+            stats = sync._backfill_shop(conn, Mock(), shop_id="S1", days=2,
+                                        t0=self.T0, now=lambda: t1)
+        return stats, cooldown
+
+    def test_transient_window_failure_is_retried_then_skipped(self):
+        first_orders = ("backfill", "orders", self.T0 - timedelta(days=2))
+        run_window, calls = self._failing_run_window(
+            lambda mode, entity, start: (mode, entity, start) == first_orders)
+        stats, cooldown = self._backfill(run_window)
+        # 失败窗口共尝试 3 次（初试 + 2 次冷却重试），每次重试前冷却。
+        orders_calls = [key for key in calls
+                        if key[0] == "backfill" and key[1] == "orders"]
+        self.assertEqual(orders_calls.count(first_orders), 3)
+        self.assertEqual(cooldown.call_count, 2)
+        # 后一个 orders 窗口照常执行；失败窗口进入汇总而不是中断整店。
+        self.assertIn(("backfill", "orders", self.T0 - timedelta(days=1)), calls)
+        # orders 失败的窗口，其 cohort 核对基线（本窗口支付事实）不完整，
+        # 覆盖凭证同样不能写——记为 cohort 缺口，由下次运行补。
+        self.assertEqual(stats["failed_windows"],
+                         ["orders@2026-09-06", "aftersales_cohort@2026-09-06"])
+
+    def test_authentication_failure_is_not_retried(self):
+        first_orders = ("backfill", "orders", self.T0 - timedelta(days=2))
+        run_window, calls = self._failing_run_window(
+            lambda mode, entity, start: (mode, entity, start) == first_orders,
+            code="authentication")
+        stats, cooldown = self._backfill(run_window)
+        orders_calls = [key for key in calls
+                        if key[0] == "backfill" and key[1] == "orders"]
+        self.assertEqual(orders_calls.count(first_orders), 1)
+        self.assertEqual(cooldown.call_count, 0)
+        self.assertIn(("backfill", "orders", self.T0 - timedelta(days=1)), calls)
+        self.assertEqual(stats["failed_windows"],
+                         ["orders@2026-09-06", "aftersales_cohort@2026-09-06"])
+
+    def test_backfill_orders_failure_skips_cohort_despite_aftersales_success(self):
+        """P1（复审）：orders 失败的窗口，售后成功也不得写 cohort 覆盖。
+
+        cohort 的 tid 基线来自本窗口的已核验支付事实；orders 失败即基线缺失，
+        写下的 cohort 覆盖是假凭证，且 missing-only 自愈永不重访。
+        """
+        bad_start = self.T0 - timedelta(days=2)
+        run_window, _calls = self._failing_run_window(
+            lambda mode, entity, start: entity == "orders" and start == bad_start)
+        cohort_starts: list[object] = []
+
+        def cohort(_conn, _client, **kwargs):
+            cohort_starts.append(kwargs["window"].start)
+            return 0
+
+        stats, _cooldown = self._backfill(run_window, cohort=cohort)
+        self.assertNotIn(bad_start, cohort_starts)
+        self.assertEqual(len(cohort_starts), 1)
+        self.assertEqual(stats["cohort_windows"], 1)
+        self.assertIn("orders@2026-09-06", stats["failed_windows"])
+        self.assertIn("aftersales_cohort@2026-09-06", stats["failed_windows"])
+
+    def test_scan_failure_still_propagates(self):
+        from bi_agent.kuaimai import KuaimaiError
+
+        run_window, _calls = self._failing_run_window(
+            lambda mode, _entity, _start: mode == "scan")
+        with self.assertRaises(KuaimaiError):
+            self._backfill(run_window)
+
+    def test_reconcile_continues_and_skips_cohort_for_failed_windows(self):
+        from bi_agent import sync
+        from bi_agent.kuaimai import KuaimaiError
+
+        bad_start = self.T0 - timedelta(days=1)
+        succeeded_after: set[object] = set()
+
+        def run_window(_conn, _client, **kwargs):
+            window = kwargs["window"]
+            if (kwargs["entity"] == "aftersales_occurrence"
+                    and window.start == bad_start):
+                raise KuaimaiError("rate_limit")
+            if kwargs["entity"] == "aftersales_occurrence":
+                succeeded_after.add(window.start)
+            return 0
+
+        cohort_starts: list[object] = []
+
+        def cohort(_conn, _client, **kwargs):
+            cohort_starts.append(kwargs["window"].start)
+            return 0
+
+        def covered(_conn, *, source, entity, shop_id, window):
+            if entity == "orders":
+                return True
+            return window.start in succeeded_after
+
+        conn = self._Connection()
+        with patch.object(sync, "_run_window", side_effect=run_window), patch.object(
+            sync, "check_cohort_window", side_effect=cohort,
+        ), patch.object(sync, "window_covered", side_effect=covered), patch.object(
+            sync, "_window_sleep"), patch.object(
+            sync, "unmatched_commercials", return_value=set(),
+        ), patch.object(sync, "reconcile_source_quality", return_value={}):
+            stats = sync._reconcile_shop(conn, Mock(), shop_id="S1", days=2,
+                                         run_end=self.T0)
+        # 售后失败的窗口不再跑 cohort（覆盖证据不完整），另一个窗口照常。
+        self.assertNotIn(bad_start, cohort_starts)
+        self.assertEqual(len(cohort_starts), 1)
+        # orders 两个窗口都成功执行。
+        self.assertEqual(stats["orders"], 0)
+        self.assertEqual(stats["cohort_windows"], 1)
+        self.assertIn("aftersales_occurrence@2026-09-07", stats["failed_windows"])
+        self.assertIn("aftersales_cohort@2026-09-07", stats["failed_windows"])
+
+    def test_reconcile_cohort_failure_does_not_abort_next_window(self):
+        from bi_agent import sync
+        from bi_agent.kuaimai import KuaimaiError
+
+        first_start = self.T0 - timedelta(days=2)
+        run_window, _calls = self._failing_run_window(lambda *_args: False)
+
+        def cohort(_conn, _client, **kwargs):
+            if kwargs["window"].start == first_start:
+                raise KuaimaiError("rate_limit")
+            return 0
+
+        conn = self._Connection()
+        with patch.object(sync, "_run_window", side_effect=run_window), patch.object(
+            sync, "check_cohort_window", side_effect=cohort,
+        ), patch.object(sync, "window_covered", return_value=True), patch.object(
+            sync, "_window_sleep"), patch.object(
+            sync, "unmatched_commercials", return_value=set(),
+        ), patch.object(sync, "reconcile_source_quality", return_value={}):
+            stats = sync._reconcile_shop(conn, Mock(), shop_id="S1", days=2,
+                                         run_end=self.T0)
+        # 第一个窗口 cohort 失败只记入汇总，第二个窗口的 cohort 照常执行。
+        self.assertIn("aftersales_cohort@2026-09-06", stats["failed_windows"])
+        self.assertEqual(stats["cohort_windows"], 1)
 
 
 class ProductMasterNormalisationTests(unittest.TestCase):

@@ -984,6 +984,65 @@ class DatabaseTests(unittest.TestCase):
             "WHERE shop_id='TB_QUALITY' AND entity='orders'"
         ).fetchall()), {ORDER_SOURCE: "unknown", OUTSTOCK_SOURCE: "passed"})
 
+    def test_reconcile_missing_only_fetches_only_uncovered_windows(self):
+        """--missing-only：已覆盖窗口零请求，只补 bi.sync_state 覆盖缺口。"""
+        from pydantic import SecretStr
+
+        from bi_agent.config import SyncSettings
+        from bi_agent.kuaimai import KuaimaiClient
+        from bi_agent.sync import _reconcile_shop
+
+        self._seed_shop()
+        base = datetime(2026, 9, 5, tzinfo=BEIJING)
+        run_end = base + timedelta(days=3)
+        # orders/aftersales 已覆盖中间一天 [09-06, 09-07)；cohort 全缺。
+        for source, entity in (("erp.trade.list.query", "orders"),
+                               ("erp.aftersale.list.query", "aftersales_occurrence")):
+            self.conn.execute(
+                "INSERT INTO bi.sync_state(source, entity, shop_id, covered) "
+                "VALUES (%s, %s, 'S1', tstzmultirange(tstzrange(%s, %s, '[)')))",
+                (source, entity, base + timedelta(days=1), base + timedelta(days=2)))
+        self.conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id) "
+            "VALUES ('erp.aftersale.list.query', 'aftersales_cohort', 'S1')")
+
+        requested: list[tuple[str, str]] = []
+
+        def record(request: httpx.Request) -> httpx.Response:
+            params = dict(httpx.QueryParams(request.content.decode()))
+            requested.append((params.get("method"), params.get("startTime")
+                              or params.get("startPlatformCompleteTime") or ""))
+            return httpx.Response(200, json={"success": True, "total": 0})
+
+        client = KuaimaiClient(SyncSettings(
+            writer_dsn=SecretStr("postgresql://localhost/bi_agent_test"),
+            shop_ids=frozenset({"S1"}),
+            app_key=SecretStr("k"), app_secret=SecretStr("s"),
+            access_token=SecretStr("t"), refresh_token=SecretStr("r")),
+            httpx.Client(transport=httpx.MockTransport(record)))
+
+        stats = _reconcile_shop(self.conn, client, shop_id="S1", days=3,
+                                run_end=run_end, missing_only=True)
+
+        # 订单与售后只拉两个缺口日；已覆盖的 09-06 一个请求都不发。
+        order_starts = sorted({start for method, start in requested
+                               if method == "erp.trade.list.query"})
+        self.assertEqual(order_starts, ["2026-09-05 00:00:00", "2026-09-07 00:00:00"])
+        after_starts = sorted({start for method, start in requested
+                               if method == "erp.aftersale.list.query" and start})
+        self.assertEqual(after_starts, ["2026-09-05 00:00:00", "2026-09-07 00:00:00"])
+        self.assertEqual(stats["failed_windows"], [])
+        self.assertEqual(stats["cohort_windows"], 3)
+        # 三个实体的 [09-05, 09-08) 全部补成已覆盖。
+        for entity in ("orders", "aftersales_occurrence", "aftersales_cohort"):
+            source = ("erp.trade.list.query" if entity == "orders"
+                      else "erp.aftersale.list.query")
+            covered = self.conn.execute(
+                "SELECT covered @> tstzmultirange(tstzrange(%s, %s, '[)')) "
+                "FROM bi.sync_state WHERE source=%s AND entity=%s AND shop_id='S1'",
+                (base, run_end, source, entity)).fetchone()[0]
+            self.assertTrue(covered, entity)
+
     def test_metric_semantics_migration_appends_line_kind_to_legacy_view(self):
         from pathlib import Path
 

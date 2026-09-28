@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -70,6 +71,14 @@ LOCK_ID = 7319041
 # 增量重叠；回填开始前记录T0，完成后补拉[T0,固定T1)
 SYNC_OVERLAP = timedelta(minutes=10)
 PAGE_SIZE = 200
+# 窗口级容错：一个日窗口失败直接上抛会跳过该店当天所有后续窗口，覆盖缺口
+# 越积越大（查询侧 fail-closed 拒答）。瞬态错误先冷却重试；最终失败记入
+# 失败清单后继续下一个窗口。authentication/permission/invalid_response 这类
+# 确定性错误重试无意义，一次即放弃。
+WINDOW_RETRY_ATTEMPTS = 2
+WINDOW_RETRY_COOLDOWN_SECONDS = 30.0
+_TRANSIENT_ERROR_CODES = frozenset({"rate_limit", "timeout", "upstream"})
+_window_sleep = time.sleep
 # 同批退款tids补查单次ID数量；执行4.7时按官方文档或小样本确认后固定
 COHORT_TIDS_BATCH = 50
 MAX_QUERY_DAYS = 366
@@ -1113,6 +1122,38 @@ def record_failure(conn, *, source: str, entity: str, shop_id: str, code: str) -
     )
 
 
+def missing_day_windows(conn, *, shop_id: str, source: str, entity: str,
+                        start: datetime, end: datetime) -> list[Window]:
+    """[start, end) 内该 (店铺×来源×实体) 尚未覆盖的日窗口，按时间升序。
+
+    请求区间减去 covered 即缺口，再按既有 day_windows 切成 ≤1 天窗口——
+    缺口边界来自历史运行，可能是半天（如水位扫描切出的 [t0, t1)），照实
+    保留原边界，不取整到自然日。没有状态行（从未回填）时整个区间都是缺口。
+    """
+    row = conn.execute(
+        "SELECT tstzmultirange(tstzrange(%s, %s, '[)')) - covered "
+        "FROM bi.sync_state WHERE source=%s AND entity=%s AND shop_id=%s",
+        (start, end, source, entity, shop_id),
+    ).fetchone()
+    windows: list[Window] = []
+    if row is None:
+        return list(day_windows(start, end))
+    for component in row[0]:
+        windows.extend(day_windows(component.lower, component.upper))
+    return windows
+
+
+def window_covered(conn, *, source: str, entity: str, shop_id: str,
+                   window: Window) -> bool:
+    """该窗口是否已整体处于 covered 内；cohort 核对基线用它判定。"""
+    row = conn.execute(
+        "SELECT covered @> tstzmultirange(tstzrange(%s, %s, '[)')) "
+        "FROM bi.sync_state WHERE source=%s AND entity=%s AND shop_id=%s",
+        (window.start, window.end, source, entity, shop_id),
+    ).fetchone()
+    return bool(row and row[0])
+
+
 def sync_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
                 window: Window, mode: str,
                 order_source: str = ORDER_SOURCE,
@@ -1670,6 +1711,50 @@ def _run_window(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
         raise
 
 
+def _run_window_resilient(conn, client: KuaimaiClient, *, entity: str, shop_id: str,
+                          window: Window, mode: str,
+                          order_source: str = ORDER_SOURCE,
+                          payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME) -> int | None:
+    """_run_window 的容错版：瞬态错误冷却重试，最终失败返回 None 不上抛。
+
+    调用方继续跑后续窗口并把失败窗口记入 failed_windows；覆盖不推进的
+    fail-closed 语义不变（整窗事务已回滚，下次运行重试同一窗口）。
+    """
+    attempts = 1 + WINDOW_RETRY_ATTEMPTS
+    for attempt in range(1, attempts + 1):
+        try:
+            return _run_window(conn, client, entity=entity, shop_id=shop_id,
+                               window=window, mode=mode, order_source=order_source,
+                               payment_fetch=payment_fetch)
+        except KuaimaiError as exc:
+            if exc.code not in _TRANSIENT_ERROR_CODES or attempt >= attempts:
+                logger.warning("sync window failed finally attempt=%s/%s entity=%s "
+                               "shop=%s window=%s..%s code=%s", attempt, attempts,
+                               entity, shop_id, window.start.isoformat(),
+                               window.end.isoformat(), exc.code)
+                return None
+            logger.warning("sync window retry attempt=%s/%s entity=%s shop=%s code=%s",
+                           attempt, attempts, entity, shop_id, exc.code)
+            _window_sleep(WINDOW_RETRY_COOLDOWN_SECONDS)
+    return None
+
+
+def _check_cohort_resilient(conn, client: KuaimaiClient, *, shop_id: str,
+                            window: Window, failed: list[str]) -> bool:
+    """cohort 窗口的容错版：失败自记凭证并计入失败清单，不中断后续窗口。"""
+    try:
+        check_cohort_window(conn, client, shop_id=shop_id, window=window)
+    except KuaimaiError as exc:
+        record_failure(conn, source=AFTERSALE_SOURCE, entity="aftersales_cohort",
+                       shop_id=shop_id, code=exc.code)
+        failed.append(f"aftersales_cohort@{window.start.date().isoformat()}")
+        logger.warning("cohort window failed shop=%s window=%s..%s code=%s",
+                       shop_id, window.start.isoformat(), window.end.isoformat(),
+                       exc.code)
+        return False
+    return True
+
+
 def _beijing_now() -> datetime:
     """北京时间当前时刻；回填结束时刻单独取，不能沿用开工瞬间。"""
     return datetime.now(BEIJING)
@@ -1678,7 +1763,7 @@ def _beijing_now() -> datetime:
 def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
                    t0: datetime, order_source: str = ORDER_SOURCE,
                    payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME,
-                   now: Callable[[], datetime] = _beijing_now) -> dict[str, int]:
+                   now: Callable[[], datetime] = _beijing_now) -> dict[str, object]:
     """回填最近N天并补拉[t0,t1)；t1 是回填完成瞬间，补齐后才发布data_as_of。
 
     t1 必须等回填循环全部跑完再重新取：回填本身可能跑几小时，沿用开工瞬间（旧代码
@@ -1688,18 +1773,36 @@ def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
     if days > MAX_QUERY_DAYS:
         raise SystemExit(f"回填跨度最多{MAX_QUERY_DAYS}天")
     start = t0 - timedelta(days=days)
-    stats = {"orders": 0, "aftersales_occurrence": 0, "cohort_windows": 0}
+    stats: dict[str, object] = {"orders": 0, "aftersales_occurrence": 0,
+                                "cohort_windows": 0, "failed_windows": []}
+    failed = stats["failed_windows"]
+    orders_failed_starts: set[datetime] = set()
     for window in day_windows(start, t0):
-        stats["orders"] += _run_window(conn, client, entity="orders", shop_id=shop_id,
-                                       window=window, mode="backfill",
-                                       order_source=order_source,
-                                       payment_fetch=payment_fetch)
+        count = _run_window_resilient(conn, client, entity="orders", shop_id=shop_id,
+                                      window=window, mode="backfill",
+                                      order_source=order_source,
+                                      payment_fetch=payment_fetch)
+        if count is None:
+            failed.append(f"orders@{window.start.date().isoformat()}")
+            orders_failed_starts.add(window.start)
+        else:
+            stats["orders"] += count
     for window in day_windows(start, t0):
-        stats["aftersales_occurrence"] += _run_window(
+        count = _run_window_resilient(
             conn, client, entity="aftersales_occurrence", shop_id=shop_id,
             window=window, mode="backfill")
-        check_cohort_window(conn, client, shop_id=shop_id, window=window)
-        stats["cohort_windows"] += 1
+        if count is None:
+            failed.append(f"aftersales_occurrence@{window.start.date().isoformat()}")
+            continue  # 售后窗口失败时 cohort 的核对基线不完整，跳过该窗口
+        stats["aftersales_occurrence"] += count
+        if window.start in orders_failed_starts:
+            # cohort 的 tid 基线来自本窗口的已核验支付事实：orders 失败同样构成
+            # 基线缺失，cohort 覆盖不能写（写了就是 missing-only 永不重访的假凭证）。
+            failed.append(f"aftersales_cohort@{window.start.date().isoformat()}")
+            continue
+        if _check_cohort_resilient(conn, client, shop_id=shop_id, window=window,
+                                   failed=failed):
+            stats["cohort_windows"] += 1
     # 补拉回填期间的变化：修改时间扫描推进水位
     t1 = now()
     if t1 <= t0:
@@ -1751,22 +1854,62 @@ def _incremental_shop(conn, client: KuaimaiClient, *, shop_id: str,
 def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
                     run_end: datetime,
                     order_source: str = ORDER_SOURCE,
-                    payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME) -> dict[str, object]:
-    """按支付日/退款完成日重核最近N天，刷新cohort覆盖与data_as_of，并按凭证推进质量状态。"""
+                    payment_fetch: str = PAYMENT_FETCH_API_PAY_TIME,
+                    missing_only: bool = False) -> dict[str, object]:
+    """按支付日/退款完成日重核最近N天，刷新cohort覆盖与data_as_of，并按凭证推进质量状态。
+
+    missing_only=True 时逐实体只补 bi.sync_state 覆盖缺口（已覆盖窗口零请求），
+    适合高频自愈任务；cohort 只在窗口的 orders/aftersales 覆盖完整时执行。
+    """
     if days > MAX_QUERY_DAYS:
         raise SystemExit(f"重核跨度最多{MAX_QUERY_DAYS}天")
     start = run_end - timedelta(days=days)
-    stats: dict[str, object] = {"orders": 0, "aftersales_occurrence": 0, "cohort_windows": 0}
-    for window in day_windows(start, run_end):
-        stats["orders"] += _run_window(conn, client, entity="orders", shop_id=shop_id,
-                                       window=window, mode="reconcile",
-                                       order_source=order_source,
-                                       payment_fetch=payment_fetch)
-        stats["aftersales_occurrence"] += _run_window(
+    stats: dict[str, object] = {"orders": 0, "aftersales_occurrence": 0,
+                                "cohort_windows": 0, "failed_windows": []}
+    failed = stats["failed_windows"]
+    if missing_only:
+        windows_orders = missing_day_windows(
+            conn, shop_id=shop_id, source=order_source, entity="orders",
+            start=start, end=run_end)
+        windows_after = missing_day_windows(
+            conn, shop_id=shop_id, source=AFTERSALE_SOURCE,
+            entity="aftersales_occurrence", start=start, end=run_end)
+        windows_cohort = missing_day_windows(
+            conn, shop_id=shop_id, source=AFTERSALE_SOURCE,
+            entity="aftersales_cohort", start=start, end=run_end)
+    else:
+        windows_orders = windows_after = windows_cohort = list(
+            day_windows(start, run_end))
+    for window in windows_orders:
+        count = _run_window_resilient(
+            conn, client, entity="orders", shop_id=shop_id, window=window,
+            mode="reconcile", order_source=order_source,
+            payment_fetch=payment_fetch)
+        if count is None:
+            failed.append(f"orders@{window.start.date().isoformat()}")
+        else:
+            stats["orders"] += count
+    for window in windows_after:
+        count = _run_window_resilient(
             conn, client, entity="aftersales_occurrence", shop_id=shop_id,
             window=window, mode="reconcile")
-        check_cohort_window(conn, client, shop_id=shop_id, window=window)
-        stats["cohort_windows"] += 1
+        if count is None:
+            failed.append(f"aftersales_occurrence@{window.start.date().isoformat()}")
+        else:
+            stats["aftersales_occurrence"] += count
+    for window in windows_cohort:
+        # cohort 的核对基线是本窗口的支付事实与售后事实：orders/aftersales 覆盖
+        # 不完整（本轮失败或既有缺口）时跳过，并如实记为 cohort 缺口。
+        if not (window_covered(conn, source=order_source, entity="orders",
+                               shop_id=shop_id, window=window)
+                and window_covered(conn, source=AFTERSALE_SOURCE,
+                                   entity="aftersales_occurrence", shop_id=shop_id,
+                                   window=window)):
+            failed.append(f"aftersales_cohort@{window.start.date().isoformat()}")
+            continue
+        if _check_cohort_resilient(conn, client, shop_id=shop_id, window=window,
+                                   failed=failed):
+            stats["cohort_windows"] += 1
     missing = unmatched_commercials(conn, shop_id)
     if missing:
         refetch_orders_for_commercials(conn, client, shop_id=shop_id, commercial_ids=missing,
@@ -2022,6 +2165,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("incremental")
     reconcile = sub.add_parser("reconcile")
     reconcile.add_argument("--days", type=int, default=7)
+    reconcile.add_argument(
+        "--missing-only", action="store_true",
+        help="只补 bi.sync_state 覆盖缺口（已覆盖窗口零请求），适合高频自愈任务")
     consign = sub.add_parser(
         "consign-scan",
         help="出库口径专项扫描：erp.trade.outstock.simple.query + timeType=consign_time，"
@@ -2165,7 +2311,8 @@ def main(argv: list[str] | None = None) -> int:
                         stats = _reconcile_shop(conn, client, shop_id=shop_id,
                                                 days=args.days, run_end=run_end,
                                                 order_source=order_source,
-                                                payment_fetch=payment_fetch)
+                                                payment_fetch=payment_fetch,
+                                                missing_only=args.missing_only)
                     except (KuaimaiError, SystemExit) as exc:
                         print(json.dumps({"action": "reconcile", "shop_id": shop_id,
                                           "error": _shop_error(exc)}, ensure_ascii=False))

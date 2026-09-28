@@ -24,7 +24,11 @@ ROUTER_URL = "https://gw.superboss.cc/router"
 VERSION = "1.0"
 SIGN_METHOD = "hmac-sha256"
 MAX_ATTEMPTS = 3
-RETRY_AFTER_CAP_SECONDS = 5.0
+# 限流单独放宽：淘系宽窗取数每支付日 62+ 次流式请求，429 只给 3 次机会会整窗失败，
+# 覆盖缺口直接拒答查询；服务端 Retry-After 在上限内完整尊重（原 5 秒截断等于
+# 让限流重试必然失败）。
+RATE_LIMIT_MAX_ATTEMPTS = 5
+RETRY_AFTER_CAP_SECONDS = 30.0
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +130,9 @@ class KuaimaiClient:
     def call(self, method: str, params: dict[str, str]) -> dict[str, object]:
         secret = self.settings.app_secret.get_secret_value()
         last_error: KuaimaiError | None = None
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        upstream_attempts = 0
+        rate_limit_attempts = 0
+        while True:
             public: dict[str, str] = {
                 "appKey": self.settings.app_key.get_secret_value(),
                 "session": self.settings.access_token.get_secret_value(),
@@ -140,28 +146,34 @@ class KuaimaiClient:
             try:
                 response = self.http.post(ROUTER_URL, data=public, follow_redirects=False)
             except httpx.TransportError as exc:
-                logger.warning("kuaimai transport error attempt=%s", attempt)
+                logger.warning("kuaimai transport error attempt=%s", upstream_attempts + 1)
                 last_error = KuaimaiError("timeout" if isinstance(exc, httpx.TimeoutException) else "upstream")
-                if attempt < MAX_ATTEMPTS:
-                    _sleep(2.0 ** (attempt - 1))
+                upstream_attempts += 1
+                if upstream_attempts >= MAX_ATTEMPTS:
+                    raise last_error
+                _sleep(2.0 ** (upstream_attempts - 1))
                 continue
             if response.status_code == 429:
-                logger.warning("kuaimai rate limit attempt=%s", attempt)
+                logger.warning("kuaimai rate limit attempt=%s", rate_limit_attempts + 1)
                 retry_after = response.headers.get("Retry-After")
                 delay = RETRY_AFTER_CAP_SECONDS
                 if retry_after is not None and retry_after.isdigit():
                     delay = min(float(retry_after), RETRY_AFTER_CAP_SECONDS)
                 last_error = KuaimaiError("rate_limit")
-                if attempt < MAX_ATTEMPTS:
-                    _sleep(delay)
+                rate_limit_attempts += 1
+                if rate_limit_attempts >= RATE_LIMIT_MAX_ATTEMPTS:
+                    raise last_error
+                _sleep(delay)
                 continue
             if response.status_code in (401, 403):
                 raise KuaimaiError("authentication")
             if response.status_code >= 500:
-                logger.warning("kuaimai server error attempt=%s", attempt)
+                logger.warning("kuaimai server error attempt=%s", upstream_attempts + 1)
                 last_error = KuaimaiError("upstream")
-                if attempt < MAX_ATTEMPTS:
-                    _sleep(2.0 ** (attempt - 1))
+                upstream_attempts += 1
+                if upstream_attempts >= MAX_ATTEMPTS:
+                    raise last_error
+                _sleep(2.0 ** (upstream_attempts - 1))
                 continue
             if response.status_code != 200:
                 raise KuaimaiError("upstream")
@@ -173,13 +185,17 @@ class KuaimaiClient:
                 raise KuaimaiError("invalid_response")
             if payload.get("success") is False:
                 code = _classify_error_code(payload.get("code"), payload.get("message"))
-                if code in ("rate_limit",) and attempt < MAX_ATTEMPTS:
+                if code == "rate_limit":
+                    logger.warning("kuaimai envelope rate limit attempt=%s",
+                                   rate_limit_attempts + 1)
                     last_error = KuaimaiError(code)
-                    _sleep(2.0 ** (attempt - 1))
+                    rate_limit_attempts += 1
+                    if rate_limit_attempts >= RATE_LIMIT_MAX_ATTEMPTS:
+                        raise last_error
+                    _sleep(2.0 ** (rate_limit_attempts - 1))
                     continue
                 raise KuaimaiError(code)
             return payload
-        raise last_error or KuaimaiError("upstream")
 
     def refresh_session(self, *, now: datetime | None = None) -> datetime:
         """续期会话：核对两个 Token 不变，返回已核验单位后的过期时刻。
