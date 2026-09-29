@@ -16,7 +16,7 @@
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020 → 021 → 022`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020，approved 查询学习记忆的样例表、不可变事件表、`bi_approver` 审核角色与只含 approved 行的投影视图落在 021，隔离分析的第五个领域 `isolated_analysis` 与 Artifact 类型 `analysis_result` 的两份 CHECK 扩展落在 022（它不建任何事实表）。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。缺 021 时审核 API 的投影视图不存在，approved 查询学习记忆保持关闭（审核路由按未启用返回 404），不影响其它功能。缺 022 时隔离分析的 `analysis_result` 写不进 Artifact 表（CHECK 拒绝），图在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的分析结果；门禁关闭时 022 是否已应用都不影响聊天。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020 → 021 → 022 → 023 → 024 → 025 → 026 → 027`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020，approved 查询学习记忆的样例表、不可变事件表、`bi_approver` 审核角色与只含 approved 行的投影视图落在 021，隔离分析的第五个领域 `isolated_analysis` 与 Artifact 类型 `analysis_result` 的两份 CHECK 扩展落在 022（它不建任何事实表），持续库存通知的观测事实落在 023，同步侧可运维性字段落在 024，出库口径的 `consigned_at` 列落在 025，关闭后退款支付剔除的时间列落在 026，S4 档案价快照两表、两个 reporting 视图与逐项授权落在 027。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。缺 021 时审核 API 的投影视图不存在，approved 查询学习记忆保持关闭（审核路由按未启用返回 404），不影响其它功能。缺 022 时隔离分析的 `analysis_result` 写不进 Artifact 表（CHECK 拒绝），图在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的分析结果；门禁关闭时 022 是否已应用都不影响聊天。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
@@ -36,6 +36,11 @@ psql -d bi_agent -f backend/sql/019_inventory_snapshots.sql
 psql -d bi_agent -f backend/sql/020_controlled_sql_exploration.sql
 psql -d bi_agent -f backend/sql/021_approved_query_memory.sql
 psql -d bi_agent -f backend/sql/022_isolated_analysis_artifacts.sql
+psql -d bi_agent -f backend/sql/023_continuous_inventory_notifications.sql
+psql -d bi_agent -f backend/sql/024_sync_role_operability.sql
+psql -d bi_agent -f backend/sql/025_outstock_consign_time.sql
+psql -d bi_agent -f backend/sql/026_closed_refunded_payment_caliber.sql
+psql -d bi_agent -f backend/sql/027_item_price_snapshots.sql
 ```
 
 单实例：全程持有数据库 advisory 锁，重复启动立即失败。
@@ -173,6 +178,15 @@ Register-ScheduledTask -TaskName 'BI Agent Hourly Sync' -Action $syncAction -Tri
 ```
 
 另建每日低峰的 `reconcile --days 7` 任务，以及可选的每小时 `reconcile --days 2 --missing-only` 自愈任务（缺口零成本重拉，持续保持近期窗口无洞）。运行账户只读取同步配置；命令参数不含密码。
+
+S4 档案价日频扫描（`item-price-scan`，迁移 027 之后可用）：逐 `BI_SHOP_IDS` 店铺按本地 `bi.products` 枚举分块（≤20 个 sysItemId/批）调用 `erp.item.list.get`，单事务落一份 `scan_complete` 快照；期望集合与返回集合必须完全相等，任何缺失/多出/无效行/超预算都整批回滚，不写部分快照。拼多多与未登记平台在入口直接跳过。快照超过 7 天未刷新时商品报告的参考价/参考毛利降级为 `data_missing`（不补零），所以建议与 `products` 档案同步同日调度：
+
+```powershell
+uv run --locked --env-file ../.env.sync python -m bi_agent.sync products
+uv run --locked --env-file ../.env.sync python -m bi_agent.sync item-price-scan
+```
+
+注意 `item-price-scan` 需要持有同步 advisory 锁，与增量/重核任务错峰；单店商品目录超过 `ITEM_PRICE_MAX_BATCHES × 20`（默认 2 万）时会整批失败——那是失控护栏，先裁剪档案再扫。
 
 长时间回填与小时任务的锁竞争属预期：同步 CLI 全程持有 advisory 锁，长任务运行期间小时任务以「已有同步任务运行」快速失败，不做排队；回填结束后下一次整点自动恢复。需要缩短连续持锁时间时，用 `replay` 按月分段补历史（见下）。
 

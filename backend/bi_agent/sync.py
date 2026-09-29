@@ -28,10 +28,11 @@ from .data_quality import QUALITY_RULE, reconcile_source_quality
 from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
 from .metrics import _BudgetExhausted, _set_query_budget
 from .sources import (
-    AFTERSALE_SOURCE, CONSIGN_ORDERS_ENTITY, OUTSTOCK_SOURCE, ShopRecord,
-    TRADE_LIST_SOURCE, capabilities_from_evidence, payment_window_fetch,
-    platform_order_sources, resolve_consign_source, resolve_order_source,
-    PAYMENT_FETCH_API_PAY_TIME, PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
+    AFTERSALE_SOURCE, CONSIGN_ORDERS_ENTITY, ITEM_PRICE_SOURCE, OUTSTOCK_SOURCE,
+    ShopRecord, TRADE_LIST_SOURCE, capabilities_from_evidence, item_price_scan_allowed,
+    payment_window_fetch, platform_order_sources, resolve_consign_source,
+    resolve_order_source, PAYMENT_FETCH_API_PAY_TIME,
+    PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,17 @@ ORDER_SOURCE = TRADE_LIST_SOURCE
 # 官方 erp.trade.list.query 明确排除淘系、拼多多订单；两类平台改走交易模块销售
 # 出库通道，只有非敏感字段（收件人/买家昵称/平台支付金额等不返回）。
 ITEM_SOURCE = "item.list.query"
+# S4 档案价来源方法名唯一真源在 sources.py（`ITEM_PRICE_SOURCE`，
+# erp.item.list.get）；这里不再拄第二份字符串。
+# erp.item.list.get 没有页码分页：每批最多 20 个系统主商品 ID（官方上限），
+# 全店扫描由本地档案枚举分块驱动。批次上限是失控护栏（20k 商品的档案远超
+# 实测规模），超过即整批回滚：宁可不出快照，也不出无凭据的“完整”主张。
+ITEM_PRICE_BATCH = 20
+ITEM_PRICE_MAX_BATCHES = 1000
+# 快照落库的来源标签：027 的 CHECK 只认 'kuaimai_item_api'。它与方法名
+# erp.item.list.get 是两个概念（一个给血缘/凭据，一个给路由），不共用一个常量，
+# 防一边改名时悄悄穿透另一边的约束。
+ITEM_PRICE_SNAPSHOT_SOURCE = "kuaimai_item_api"
 
 # 平台→订单源路由：直接取自注册表。sync_state 主键含 source，出库通道与交易通道的
 # 覆盖/水位互不干扰；未命中的平台不再回退默认源（见 `_shop_order_source`）。
@@ -1640,6 +1652,216 @@ def sync_products(conn, client: KuaimaiClient) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
+# S4：ERP 档案价快照（erp.item.list.get）——全店扫描、凭据化完整性、fail closed
+# ---------------------------------------------------------------------------
+
+
+class ItemPriceScanIncomplete(Exception):
+    """档案价扫描不完整：快照不得发布，也不得推进任何完整性主张。
+
+    `problems` 是逐类计数（missing_items/unexpected_items/invalid/over_budget/
+    enumeration_empty），作为 fail-closed 凭证返回给调用方；任何一类缺口都
+    意味着「看完全店目录」这个主张不成立，整批数据必须回滚。
+    """
+
+    def __init__(self, problems: dict[str, int]) -> None:
+        self.problems = dict(problems)
+        super().__init__("item_price_scan_incomplete")
+
+
+class ItemPriceScanRefused(Exception):
+    """平台不接档案价扫描（未登记平台、拼多多永久排除）：一个 API 调用都不该发生。"""
+
+
+def normalise_item_price_sku(raw_sku: dict[str, Any]) -> dict[str, Any]:
+    """白名单规范化一条 SKU 档案价行；缺 sysSkuId 或可用状态一律拒绝。
+
+    可用状态是「显式已停用」披露的依据，缺了它就等于丢了事实的一半；
+    价格/成本缺失保留 None（data_missing），不补零。状态域外整数同样拒绝：
+    让它穿透到 027 的 CHECK 才炸，会以裸 CheckViolation 终止 CLI 的多店循环。
+    """
+    sys_sku_id = str(raw_sku.get("sysSkuId") or "").strip()
+    active_status = _source_int(raw_sku.get("activeStatus"))
+    if not sys_sku_id or active_status is None:
+        raise ValueError("item_price_sku_identity_or_status_unusable")
+    if active_status not in (0, 1):
+        raise ValueError("item_price_sku_active_status_out_of_domain")
+    return {
+        "sys_sku_id": sys_sku_id,
+        "sku_outer_id": (str(raw_sku.get("skuOuterId") or "").strip() or None),
+        "reference_price": to_decimal(raw_sku.get("priceOutput")),
+        "purchase_price": to_decimal(raw_sku.get("purchasePrice")),
+        "active_status": active_status,
+    }
+
+
+def normalise_item_price(raw_item: dict[str, Any]) -> dict[str, Any]:
+    """白名单规范化一条商品档案价：名称、图片等字段不进结果，主键缺失即拒绝。
+
+    键集是闭集（tests.test_core 钉住）：sys_item_id/outer_id/reference_price/
+    purchase_price/active_status/skus；SKU 行是 `normalise_item_price_sku` 的
+    同一闭集。`activeStatus` 缺失/非法与缺主键同罪：停用状态要显式披露，
+    不能在源头就丢掉。同商品内重复 sysSkuId 也在这里拒绝——落库才会以
+    PK 冲突炸掉 CLI 属于把约束当校验器用。
+    """
+    sys_item_id = str(raw_item.get("sysItemId") or "").strip()
+    active_status = _source_int(raw_item.get("activeStatus"))
+    if not sys_item_id or active_status is None:
+        raise ValueError("item_price_identity_or_status_unusable")
+    if active_status not in (0, 1):
+        raise ValueError("item_price_active_status_out_of_domain")
+    raw_skus = raw_item.get("skus")
+    skus = [normalise_item_price_sku(raw_sku)
+            for raw_sku in (raw_skus if isinstance(raw_skus, list) else [])
+            if isinstance(raw_sku, dict)]
+    if len({sku["sys_sku_id"] for sku in skus}) != len(skus):
+        raise ValueError("item_price_duplicate_sku")
+    return {
+        "sys_item_id": sys_item_id,
+        "outer_id": (str(raw_item.get("outerId") or "").strip() or None),
+        "reference_price": to_decimal(raw_item.get("priceOutput")),
+        "purchase_price": to_decimal(raw_item.get("purchasePrice")),
+        "active_status": active_status,
+        "skus": skus,
+    }
+
+
+def _item_price_evidence(*, expected: int, fetched: dict[str, dict[str, Any]],
+                         batches: int, item_rows: int, sku_rows: int) -> str:
+    """聚合扫描凭据：只有计数与完整标志，绝不含商品 ID、名称或店铺信息。"""
+    items = list(fetched.values())
+    skus = [sku for item in items for sku in item["skus"]]
+    return json.dumps({
+        "enumeration": "bi.products",
+        "expected_items": expected,
+        "fetched_items": len(items),
+        "batches": batches,
+        "item_rows": item_rows,
+        "sku_rows": sku_rows,
+        "items_with_price": sum(1 for item in items
+                                if item["reference_price"] is not None),
+        "items_with_cost": sum(1 for item in items
+                               if item["purchase_price"] is not None),
+        "skus_with_price": sum(1 for sku in skus
+                               if sku["reference_price"] is not None),
+        "skus_with_cost": sum(1 for sku in skus
+                              if sku["purchase_price"] is not None),
+        "items_active": sum(1 for item in items if item["active_status"] == 1),
+        "items_disabled": sum(1 for item in items if item["active_status"] == 0),
+        "skus_active": sum(1 for sku in skus if sku["active_status"] == 1),
+        "skus_disabled": sum(1 for sku in skus if sku["active_status"] == 0),
+    }, sort_keys=True, ensure_ascii=False)
+
+
+def sync_item_prices(conn, client: KuaimaiClient, *, shop_id: str,
+                     now: datetime | None = None) -> dict[str, Any]:
+    """全店档案价日频快照：本地枚举分块 → erp.item.list.get → 单事务落库。
+
+    完整性主张的边界（全部有凭据才算完整，任何一类缺口整批回滚）：
+    - 枚举来源是**本地商品档案** bi.products（由既有 products 同步维护）；
+      空枚举没有「全店」主张的证据，直接失败；
+    - 返回的商品集合必须与期望集合**完全相等**：缺商品 = 上游漏行；
+      多出商品 = 本地枚举过期（先重跑 products 同步再扫描）；
+    - 每批 ≤20 个 sysItemId（官方上限）；批次数受 ITEM_PRICE_MAX_BATCHES
+      硬上限约束——达到上限仍未枚举完即停止打接口并整批回滚（守卫在循环内
+      执法：已发生的批次数恰好等于上限，不多打一批）；
+    - 限流/超时/上游错误由客户端既有重试退避处理，最终失败原样上抛，
+      事务回滚，不落任何快照行，也不写 sync_state（快照头本身就是覆盖凭证，
+      档案价没有时间窗口覆盖语义，不得冒用同步水位机器）。
+
+    幂等：snapshot_id 由 (店, 北京时间日) 确定性派生，同日重扫先删后插，
+    内容只由上游数据决定。拼多多/未登记平台在入口处直接拒绝。
+    """
+    row = conn.execute("SELECT platform FROM bi.shops WHERE shop_id=%s",
+                       (shop_id,)).fetchone()
+    platform = str(row[0]).strip().lower() if row else None
+    if not item_price_scan_allowed(platform):
+        raise ItemPriceScanRefused(
+            f"item_price_scan_platform_not_allowed:{platform or 'unknown'}")
+    expected = [str(row[0]) for row in conn.execute(
+        "SELECT product_id FROM bi.products "
+        "WHERE product_id IS NOT NULL AND btrim(product_id) <> '' "
+        "ORDER BY product_id").fetchall()]
+    if not expected:
+        raise ItemPriceScanIncomplete({"enumeration_empty": 1})
+
+    moment = now or datetime.now(BEIJING)
+    problems: dict[str, int] = {}
+    fetched: dict[str, dict[str, Any]] = {}
+    batches = 0
+    with conn.transaction():
+        for offset in range(0, len(expected), ITEM_PRICE_BATCH):
+            batches += 1
+            if batches > ITEM_PRICE_MAX_BATCHES:
+                problems["over_budget"] = 1
+                break
+            page = parse_page(client.call(ITEM_PRICE_SOURCE, {
+                "sysItemIds": ",".join(
+                    expected[offset:offset + ITEM_PRICE_BATCH]),
+                "returnSkus": "1",
+            }), list_key="items")
+            for raw in page.rows:
+                try:
+                    item = normalise_item_price(raw)
+                except ValueError:
+                    problems["invalid"] = problems.get("invalid", 0) + 1
+                    continue
+                if item["sys_item_id"] in fetched:
+                    problems["duplicate_items"] = (
+                        problems.get("duplicate_items", 0) + 1)
+                    continue
+                fetched[item["sys_item_id"]] = item
+        if not problems:
+            missing = set(expected) - set(fetched)
+            if missing:
+                problems["missing_items"] = len(missing)
+            unexpected = set(fetched) - set(expected)
+            if unexpected:
+                problems["unexpected_items"] = len(unexpected)
+        if problems:
+            # 事务内抛出：所有已写行随事务回滚，快照头也不会出现。
+            raise ItemPriceScanIncomplete(problems)
+        capture_day = moment.astimezone(BEIJING).date()
+        snapshot_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"bi://item-price/{shop_id}/{capture_day.isoformat()}").hex
+        item_rows = len(fetched)
+        sku_rows = sum(len(item["skus"]) for item in fetched.values())
+        evidence = _item_price_evidence(
+            expected=len(expected), fetched=fetched, batches=batches,
+            item_rows=item_rows, sku_rows=sku_rows)
+        conn.execute(
+            "DELETE FROM bi.item_price_snapshots WHERE shop_id=%s "
+            "AND snapshot_id=%s", (shop_id, snapshot_id))
+        conn.execute(
+            "INSERT INTO bi.item_price_snapshots(snapshot_id, shop_id, source, "
+            "captured_at, scan_complete, scan_evidence) "
+            "VALUES (%s, %s, %s, %s, true, %s)",
+            (snapshot_id, shop_id, ITEM_PRICE_SNAPSHOT_SOURCE, moment, evidence))
+        for item in fetched.values():
+            for sku_key, sku in [("", None)] + [
+                    (item_sku["sys_sku_id"], item_sku)
+                    for item_sku in item["skus"]]:
+                values = item if sku is None else sku
+                is_sku = sku is not None
+                conn.execute(
+                    "INSERT INTO bi.item_price_snapshot_items(shop_id, "
+                    "snapshot_id, sys_item_id, sys_sku_id, outer_id, "
+                    "sku_outer_id, reference_price, purchase_price, "
+                    "item_active_status, sku_active_status, captured_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (shop_id, snapshot_id, item["sys_item_id"], sku_key,
+                     item["outer_id"], values["sku_outer_id"] if is_sku else None,
+                     values["reference_price"], values["purchase_price"],
+                     item["active_status"],
+                     values["active_status"] if is_sku else None,
+                     moment))
+    return {"snapshot_id": snapshot_id, "items": item_rows,
+            "item_rows": item_rows, "sku_rows": sku_rows,
+            "batches": batches, "captured_at": moment.isoformat()}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2157,6 +2379,10 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("shops")
     sub.add_parser("products", help="全量拉商品档案，为订单行补可读名称")
+    item_price = sub.add_parser(
+        "item-price-scan",
+        help="S4 档案价日频快照：本地枚举分块调用 erp.item.list.get，"
+             "单店单日一份 scan_complete 快照；不完整/超预算/接口失败整批回滚")
     probe = sub.add_parser("probe")
     probe.add_argument("--start", required=True, help="含，YYYY-MM-DD（北京时间）")
     probe.add_argument("--end", required=True, help="排他，YYYY-MM-DD（北京时间）")
@@ -2213,6 +2439,30 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "products":
                 stats = sync_products(conn, client)
                 print(json.dumps({"action": "products", "stats": stats}))
+            elif args.command == "item-price-scan":
+                for shop_id in sorted(settings.shop_ids):
+                    row = conn.execute(
+                        "SELECT platform FROM bi.shops WHERE shop_id=%s",
+                        (shop_id,)).fetchone()
+                    platform = str(row[0]).strip().lower() if row else None
+                    if not item_price_scan_allowed(platform):
+                        print(json.dumps({"action": "item-price-scan",
+                                          "shop_id": shop_id,
+                                          "skipped": "platform_not_allowed"},
+                                         ensure_ascii=False))
+                        continue
+                    try:
+                        stats = sync_item_prices(conn, client, shop_id=shop_id)
+                    except (KuaimaiError, ItemPriceScanIncomplete) as exc:
+                        print(json.dumps(
+                            {"action": "item-price-scan", "shop_id": shop_id,
+                             "error": _shop_error(exc),
+                             "problems": getattr(exc, "problems", {})},
+                            ensure_ascii=False))
+                        continue
+                    print(json.dumps({"action": "item-price-scan",
+                                      "shop_id": shop_id, "stats": stats},
+                                     ensure_ascii=False))
             elif args.command == "probe":
                 shop_id = _require_single_shop(settings)
                 summary = _probe(client, shop_id=shop_id,

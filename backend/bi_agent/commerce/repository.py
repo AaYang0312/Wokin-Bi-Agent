@@ -62,6 +62,28 @@ ORDER BY shop_id
 LIMIT %s
 """
 
+# S4 档案价参考事实：每家店**最新一份完整快照**里该商品的全部档案价行
+# （商品级行 sys_sku_id='' + SKU 级行）。新鲜度（快照是否在时效内）由查询侧
+# 按 captured_at 判定：SQL 只回答“最新一份是什么”，不在这里偷换时效策略。
+_ITEM_PRICE_LATEST_SQL = """
+WITH latest AS (
+  SELECT DISTINCT ON (s.shop_id)
+         s.shop_id, s.snapshot_id, s.captured_at
+  FROM reporting.v_item_price_snapshots s
+  WHERE s.scan_complete AND s.shop_id = ANY(%s)
+  ORDER BY s.shop_id, s.captured_at DESC
+)
+SELECT i.shop_id, l.captured_at, i.sys_item_id, i.sys_sku_id,
+       i.reference_price, i.purchase_price,
+       i.item_active_status, i.sku_active_status
+FROM latest l
+JOIN reporting.v_item_price_snapshot_items i
+  ON i.shop_id = l.shop_id AND i.snapshot_id = l.snapshot_id
+WHERE i.sys_item_id = %s
+ORDER BY i.shop_id, i.sys_sku_id
+LIMIT %s
+"""
+
 
 # 出库口径分组面（S1）：`reporting.v_outstock_daily` 与 v_product_cost_daily 同一
 # 套纳入条件与列形，唯独按发货时间（bi.orders.consigned_at）归日，且只含带发货
@@ -167,6 +189,30 @@ class ShopProfile(NamedTuple):
     currency: str | None
     platform: str
     capabilities: frozenset[str]
+
+
+class ItemPriceRow(NamedTuple):
+    """一条档案价快照明细（商品级 sys_sku_id='' 或 SKU 级）。
+
+    缺价格/成本是 NULL：data_missing 不是 0；active_status 取值 0/1，
+    0=已停用档案，必须显式披露。
+    """
+
+    shop_id: str
+    sys_item_id: str
+    sys_sku_id: str
+    reference_price: Decimal | None
+    purchase_price: Decimal | None
+    item_active_status: int
+    sku_active_status: int | None
+
+
+class ItemPriceSnapshot(NamedTuple):
+    """一家店最新一份完整快照的档案价行与抓取时刻（新鲜度由查询侧判定）。"""
+
+    shop_id: str
+    captured_at: Any
+    rows: dict[str, ItemPriceRow]
 
 
 def shop_profiles(conn, shop_ids: list[str], *, deadline: float) -> list[ShopProfile]:
@@ -316,14 +362,51 @@ def load_payment_facts(conn, *, shop_ids: list[str], start_ts: Any, end_ts: Any,
             for row in raw}
 
 
+def load_item_prices(conn, *, shop_ids: list[str], erp_product_id: str,
+                     deadline: float) -> dict[str, ItemPriceSnapshot]:
+    """取获准店铺各自**最新一份完整**档案价快照中该商品的全部档案价行。
+
+    一次集合查询：按店取最新 scan_complete 快照（DISTINCT ON + captured_at
+    降序），再取其中该商品的商品级与 SKU 级行。快照过不过期由查询侧用
+    context.now 判定，这里不做时效决策；拼多多店铺永远没有快照行，天然
+    data_missing。命中 MAX_ROWS 一律抛 `_RowsTruncated`，截断的参考面比
+    缺失更危险。
+    """
+    if not shop_ids or not erp_product_id:
+        return {}
+    if not _set_query_budget(conn, deadline):
+        raise _BudgetExhausted
+    raw = _fetch_capped(conn, _ITEM_PRICE_LATEST_SQL, (shop_ids, erp_product_id))
+    snapshots: dict[str, ItemPriceSnapshot] = {}
+    for row in raw:
+        shop_id = str(row[0])
+        captured_at = row[1]
+        item = ItemPriceRow(
+            shop_id=shop_id, sys_item_id=str(row[2]), sys_sku_id=str(row[3] or ""),
+            reference_price=row[4], purchase_price=row[5],
+            item_active_status=int(row[6]),
+            sku_active_status=(int(row[7]) if row[7] is not None else None))
+        existing = snapshots.get(shop_id)
+        if existing is None or existing.captured_at == captured_at:
+            rows = dict(existing.rows) if existing is not None else {}
+            rows[item.sys_sku_id] = item
+            snapshots[shop_id] = ItemPriceSnapshot(shop_id=shop_id,
+                                                   captured_at=captured_at,
+                                                   rows=rows)
+    return snapshots
+
+
 __all__ = [
     "MAX_ROWS",
     "DocumentFacts",
+    "ItemPriceRow",
+    "ItemPriceSnapshot",
     "PaymentFacts",
     "ProductLine",
     "ShopProfile",
     "load_consign_completeness",
     "load_document_facts",
+    "load_item_prices",
     "load_outstock_document_facts",
     "load_outstock_shop_day_groups",
     "load_payment_facts",

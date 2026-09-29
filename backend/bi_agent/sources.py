@@ -268,6 +268,26 @@ def payment_caliber_excludes_closed_refunded(platform: object) -> bool:
     return reg is not None and reg.time_certified == "local_filter"
 
 
+# S4 档案价快照的来源方法（快麦方法名）：`erp.item.list.get` 按系统主商品 ID
+# 批量取回商品档案（每批最多 20 个，`returnSkus=1` 带回 SKU 行）。它不是指标
+# 能力通道（不进 METRIC_CAPABILITIES，也不授予任何支付/单据指标），只是
+# 商品档案参考价的专用只读通道；全店枚举由既有商品档案同步（item.list.query
+# → bi.products）提供，本通道只对价格/成本/可用状态取证。
+ITEM_PRICE_SOURCE = "erp.item.list.get"
+
+
+def item_price_scan_allowed(platform: object) -> bool:
+    """这家店的平台是否允许进入 ERP 档案价扫描（S4）。
+
+    与 `resolve_consign_source` 同一边界：未登记平台与拼多多一律 False。
+    拼多多按 2026-09-12 范围决定永久排除，不接任何新事实通道，档案价快照
+    表里也永远不该出现它的店铺；档案本身是企业级的，但快照按店落账、按店
+    判新鲜度，所以排除在扫描入口处生效。
+    """
+    reg = registration(platform)
+    return reg is not None and reg.platform != "pdd"
+
+
 def registration(platform: object) -> PlatformRegistration | None:
     """平台登记；未登记返回 None，调用方必须按 fail closed 处理。"""
     return _REGISTRATIONS.get(_normalise_platform(platform))

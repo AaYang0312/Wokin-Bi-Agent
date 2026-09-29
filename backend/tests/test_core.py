@@ -5277,5 +5277,136 @@ class S3ClosedRefundedCaliberTests(unittest.TestCase):
         self.assertEqual(commerce_codes([text]), ["closed_refunded_excluded"])
 
 
+class S4ItemPriceReferenceTests(unittest.TestCase):
+    """S4：ERP 档案价快照的离线契约（规范化白名单 / 平台排除 / 新鲜度 / 参考毛利）。
+
+    真库与图上的集成行为在 tests.test_db（迁移与扫描）与 tests.test_commerce
+    （商品分析展示）里；这里只钉不依赖数据库的纯函数与词表边界。
+    """
+
+    BEIJING = ZoneInfo("Asia/Shanghai")
+
+    def test_item_price_normaliser_keeps_a_closed_whitelist_without_pii(self):
+        """档案价规范化只收白名单字段：多余字段（含 PII 字面键）一律不进结果。"""
+        from bi_agent.sync import PII_FORBIDDEN_FIELDS, normalise_item_price
+
+        raw = {
+            "sysItemId": 123, "outerId": "OUT-1", "title": "不该入库的名称",
+            "picPath": "http://example/img.png", "buyerNick": "不该出现",
+            "priceOutput": 12.5, "purchasePrice": "8", "activeStatus": 1,
+            "skus": [{"sysSkuId": 456, "skuOuterId": "SKU-1",
+                      "priceOutput": "10", "purchasePrice": None,
+                      "activeStatus": 0, "propertiesName": "规格属性"}],
+        }
+        item = normalise_item_price(raw)
+        self.assertEqual(sorted(item), sorted(
+            ["sys_item_id", "outer_id", "reference_price", "purchase_price",
+             "active_status", "skus"]), item)
+        self.assertEqual(sorted(item["skus"][0]), sorted(
+            ["sys_sku_id", "sku_outer_id", "reference_price", "purchase_price",
+             "active_status"]))
+        self.assertEqual(item["sys_item_id"], "123")
+        self.assertEqual(item["reference_price"], Decimal("12.5"))
+        self.assertEqual(item["purchase_price"], Decimal("8"))
+        self.assertEqual(item["active_status"], 1)
+        self.assertEqual(item["skus"][0]["reference_price"], Decimal("10"))
+        self.assertIsNone(item["skus"][0]["purchase_price"],
+                          "缺成本存 null：data_missing 不是 0")
+        self.assertEqual(item["skus"][0]["active_status"], 0)
+        for payload in (item, item["skus"][0]):
+            self.assertFalse(set(payload) & PII_FORBIDDEN_FIELDS)
+
+    def test_item_price_normaliser_reports_unusable_identity_or_status(self):
+        from bi_agent.sync import normalise_item_price
+
+        with self.assertRaises(ValueError):
+            normalise_item_price({"outerId": "OUT-1", "activeStatus": 1})
+        with self.assertRaises(ValueError):
+            normalise_item_price({"sysItemId": 1, "activeStatus": "启用"})
+        with self.assertRaises(ValueError):
+            normalise_item_price({"sysItemId": 1, "activeStatus": 1,
+                                  "skus": [{"skuOuterId": "S"}]})
+
+    def test_item_price_scan_is_refused_for_pdd_and_unregistered_platforms(self):
+        from bi_agent.sources import item_price_scan_allowed
+
+        for platform in ("fxg", "jd", "kuaishou", "wxsph", "wsxc", "tb", "tm"):
+            self.assertTrue(item_price_scan_allowed(platform), platform)
+        self.assertFalse(item_price_scan_allowed("pdd"), "拼多多永久排除")
+        self.assertFalse(item_price_scan_allowed("taobao"), "未登记平台 fail closed")
+        self.assertFalse(item_price_scan_allowed(None))
+
+    def test_reference_freshness_boundary_is_exactly_seven_days(self):
+        from bi_agent.commerce.metrics import ITEM_PRICE_MAX_AGE, item_price_fresh
+
+        self.assertEqual(ITEM_PRICE_MAX_AGE, timedelta(days=7),
+                         "默认 7 天是计划建议值，待所有者追认后才可改动")
+        now = datetime(2026, 9, 25, 12, tzinfo=self.BEIJING)
+        self.assertTrue(item_price_fresh(now - timedelta(days=7), now),
+                        "恰好 7 天仍算新鲜（边界含）")
+        self.assertFalse(item_price_fresh(now - timedelta(days=7) - timedelta(seconds=1), now))
+        self.assertFalse(item_price_fresh(None, now), "缺抓取时间=不新鲜")
+
+    def test_reference_margin_is_a_sku_level_ratio_that_never_divides_by_zero(self):
+        from bi_agent.commerce.metrics import reference_margin
+
+        self.assertEqual(reference_margin(Decimal("100"), Decimal("40")), Decimal("0.600000"))
+        self.assertIsNone(reference_margin(None, Decimal("40")))
+        self.assertIsNone(reference_margin(Decimal("0"), Decimal("40")),
+                          "分母 0 是 null 不是 0")
+        self.assertIsNone(reference_margin(Decimal("100"), None),
+                          "缺档案成本是 null 不是 0")
+
+    def test_reference_columns_are_permanently_outside_rankings_and_charts(self):
+        from bi_agent.commerce.metrics import (
+            CHART_Y_COLUMNS, COMPARISON_RANKED_COLUMNS, COMMERCE_METRICS,
+            COMMERCE_PRODUCT_COLUMNS)
+
+        for column in ("reference_price", "margin_ref"):
+            self.assertNotIn(column, COMMERCE_METRICS)
+            self.assertNotIn(column, COMPARISON_RANKED_COLUMNS,
+                             f"{column} 是参考列，永远不进排名")
+            self.assertNotIn(column, CHART_Y_COLUMNS)
+            self.assertIn(column, COMMERCE_PRODUCT_COLUMNS)
+
+    def test_reference_definitions_carry_the_catalog_caliber_label(self):
+        from bi_agent.commerce.metrics import COMMERCE_METRIC_DEFINITIONS
+
+        price = COMMERCE_METRIC_DEFINITIONS.get("reference_price", "")
+        margin = COMMERCE_METRIC_DEFINITIONS.get("margin_ref", "")
+        self.assertIn("ERP", price)
+        self.assertIn("档案", price)
+        self.assertIn("促销", price, "必须永久否认它是渠道促销价/实售价")
+        self.assertIn("SKU", margin)
+        self.assertIn("排名", margin, "参考毛利必须自我声明不进排名")
+
+    def test_reference_disclosures_map_to_stable_codes(self):
+        from bi_agent.commerce.graph import _limitation_codes
+
+        cases = {
+            "2 家店铺没有7天内的完整ERP档案价快照，参考价与参考毛利为data_missing："
+            "ent-a、ent-b": "item_price_reference_missing",
+            "1 家店铺的ERP档案价快照没有覆盖该商品成交的SKU，"
+            "参考价与参考毛利为data_missing：ent-a": "item_price_reference_missing",
+            "1 家店铺该商品窗口内成交跨多个SKU，参考价与参考毛利不跨SKU平均，"
+            "为data_missing：ent-a": "item_price_multi_sku",
+            "1 家店铺的平台不接入ERP档案价（拼多多永久排除），"
+            "参考价与参考毛利为data_missing：ent-a": "item_price_pdd_excluded",
+            "3 家店铺该商品的ERP档案为已停用状态（activeStatus=0），"
+            "参考价按已停用档案披露：ent-a、ent-b、ent-c": "item_price_disabled",
+            "档案参考价与参考毛利按ERP商品档案价（priceOutput，kuaimai_item_api）"
+            "计算，是档案目录价，不是渠道促销价或实际成交价":
+                "item_price_catalog_caliber",
+        }
+        for text, code in cases.items():
+            self.assertEqual(_limitation_codes([text]), [code], text)
+
+    def test_commerce_metric_version_is_bumped_for_the_reference_payload(self):
+        from bi_agent.commerce.metrics import COMMERCE_METRIC_VERSION
+
+        self.assertEqual(COMMERCE_METRIC_VERSION, "commerce-metrics/2026-09-25.2",
+                         "商品面载荷新增参考列：旧指纹的复用必须失效")
+
+
 if __name__ == "__main__":
     unittest.main()

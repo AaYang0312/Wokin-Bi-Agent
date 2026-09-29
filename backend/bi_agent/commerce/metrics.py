@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from types import MappingProxyType
 from typing import Literal, get_args
@@ -32,8 +33,10 @@ from bi_agent.sources import platform_codes
 # 口径版本：参考指标是本轮新增的面，单独一个版本号参与血缘，
 # 只改商品参考口径时不该让固定指标的血缘版本跟着动。
 # /2026-09-25.1：S3 关闭单口径决策（local_filter 平台支付面剔除关闭后退款单）。
-# 旧指纹的复用结果不得再命中；旧 Artifact 原样可读并标旧口径。
-COMMERCE_METRIC_VERSION = "commerce-metrics/2026-09-25.1"
+# /2026-09-25.2：S4 档案参考价——商品面载荷新增 reference_price / margin_ref /
+# reference_item_status 三列，旧指纹的复用结果不得再命中；旧 Artifact 原样可读
+# 并标旧口径。
+COMMERCE_METRIC_VERSION = "commerce-metrics/2026-09-25.2"
 COMMERCE_GRAPH_VERSION = "commerce_graph/2026-09-13.1"
 # 趋势窗口首版固定七天（计划 §校验：trend_days 首版固定 7）；它参与请求指纹。
 TREND_DAYS = 7
@@ -78,6 +81,15 @@ COMMERCE_METRIC_DEFINITIONS: dict[str, str] = {
                                       "（分母为 0 或成本覆盖不全时 null；不平均店铺利润率）",
     "erp_gross_profit_reference": "ERP 毛利参考=bi.orders.raw_gross_profit 按唯一 ERP 单据"
                                   "聚合（单据口径，与商品毛利分面展示，不相加也不分摊到商品）",
+    # S4 档案参考价：档案目录价不是渠道促销价/实售价；两个词并列展示、不可互相冒充。
+    "reference_price": "ERP 档案参考价=商品档案的 priceOutput（erp.item.list.get，"
+                       "来源 kuaimai_item_api 档案价快照），是档案目录价，"
+                       "不是渠道促销价或实际成交价；快照缺失或超过 7 天时效（默认值，"
+                       "待所有者追认）时为 null（data_missing），不补零",
+    "margin_ref": "档案参考毛利=(成交均价-ERP 档案成本)÷成交均价，只到 SKU 级参考"
+                  "（该店该商品窗口内单一成交 SKU 时才发布），不进任何排名；"
+                  "档案价为已停用档案时仍按已停用披露；未扣售后/平台费/运费/广告费，"
+                  "不是净利润",
 }
 
 # 报告指标 → 来源注册表里已登记的指标能力标签。报告指标名是业务口径，能力标签是
@@ -97,6 +109,10 @@ COMMERCE_METRIC_UNITS: dict[str, MetricUnit] = {
     "sold_quantity": "piece",
     "sales_amount": "CNY",
     "weighted_avg_paid_price": "CNY",
+    # S4 档案参考三列随 metric_definition 一并发布，单位登记不能缺席：
+    # 模型必须看得见单位，缺了会把金额当比率读。
+    "reference_price": "CNY",
+    "margin_ref": "ratio",
     "product_gross_profit_reference": "CNY",
     "product_gross_margin_reference": "ratio",
     "erp_gross_profit_reference": "CNY",
@@ -129,6 +145,11 @@ COMMERCE_COLUMN_KINDS: Mapping[str, str] = {
     "erp_gross_profit_reference": "decimal",
     "erp_documents_with_gross_profit": "int",
     "platform": "label",
+    # S4 档案参考价：参考列永远不进 COMMERCE_METRICS（不进排名/图表），
+    # 已停用状态是封闭标签列（active/disabled），缺参考就是 null。
+    "reference_price": "decimal",
+    "margin_ref": "decimal",
+    "reference_item_status": "label",
 }
 COMMERCE_RESULT_COLUMNS = frozenset(COMMERCE_COLUMN_KINDS)
 COMMERCE_NUMERIC_RESULT_COLUMNS = frozenset(
@@ -137,12 +158,16 @@ COMMERCE_NUMERIC_RESULT_COLUMNS = frozenset(
 # 非数值列只允许 `label`（枚举取值），新增形态必须先在这里登记再使用。
 assert {kind for kind in COMMERCE_COLUMN_KINDS.values()} <= {"decimal", "int", "label"}
 assert COMMERCE_RESULT_COLUMNS == (
-    COMMERCE_NUMERIC_RESULT_COLUMNS | {"platform"})
+    COMMERCE_NUMERIC_RESULT_COLUMNS | {"platform", "reference_item_status"})
+
+# S4 档案参考价的封闭标签取值：runtime.models 按同一集合逐值校验。
+REFERENCE_ITEM_STATUS_VALUES: frozenset[str] = frozenset({"active", "disabled"})
 
 # 商品面与单据面各自能出现在哪些列上：两面同表的写法一律当场拒绝。
 COMMERCE_PRODUCT_COLUMNS: frozenset[str] = frozenset(
     ("sold_quantity", "sales_amount", "weighted_avg_paid_price",
-     "product_gross_profit_reference", "product_gross_margin_reference", "sales_share"))
+     "product_gross_profit_reference", "product_gross_margin_reference", "sales_share",
+     "reference_price", "margin_ref", "reference_item_status"))
 COMMERCE_DOCUMENT_COLUMNS: frozenset[str] = frozenset(
     ("erp_gross_profit_reference", "erp_documents_with_gross_profit"))
 assert (COMMERCE_PRODUCT_COLUMNS | COMMERCE_DOCUMENT_COLUMNS | {"platform"}
@@ -162,10 +187,18 @@ assert not (COMMERCE_RESULT_COLUMNS
 NAME_COLUMNS: tuple[str, ...] = ("product_name", "product_name_snapshot", "sku_label")
 
 # 商品面：一行 = (店铺, 行性质)；跨店合计行不带 shop_id，避免被读成"某家店"。
+# S4：档案参考价三列只在商品面行上与成交均价并列出现；合计行永远是 null——
+# 跨店/跨行性质合计参考价就是把不同 SKU、不同店铺的档案目录价平均成一个
+# 谁的档案里都不存在的数。
+REFERENCE_VALUE_COLUMNS: tuple[str, ...] = (
+    "reference_price", "margin_ref", "reference_item_status")
+REFERENCE_MISSING_COLUMNS: dict[str, object] = {
+    column: None for column in REFERENCE_VALUE_COLUMNS}
 PRODUCT_ROWS: tuple[str, ...] = (
     "shop_id", "product_id", "line_kind", "sold_quantity", "sales_amount",
     "weighted_avg_paid_price", "product_gross_profit_reference",
-    "product_gross_margin_reference", "sales_share", *NAME_COLUMNS)
+    "product_gross_margin_reference", *REFERENCE_VALUE_COLUMNS, "sales_share",
+    *NAME_COLUMNS)
 PRODUCT_TOTAL_ROWS: tuple[str, ...] = tuple(k for k in PRODUCT_ROWS if k != "shop_id")
 # 七日趋势：一行 = (店铺, 日)。缺失日的数值列一律 null，真实零成交才是 0。
 TREND_ROWS: tuple[str, ...] = (
@@ -279,6 +312,12 @@ PAYMENT_CALIBER_TEXT = (
     "支付口径只聚合已认证支付平台：未认证平台的支付格是data_missing，"
     "不补零也不缺席")
 
+# S4 档案参考价的口径声明（永久标签）：档案目录价不是渠道促销价/实售价。
+# 文本进公开白名单、码映射见 graph._COMMERCE_CODE_BY_FRAGMENT（"ERP商品档案价"）。
+ITEM_PRICE_CATALOG_CALIBER_TEXT = (
+    "档案参考价与参考毛利按ERP商品档案价（priceOutput，kuaimai_item_api）"
+    "计算，是档案目录价，不是渠道促销价或实际成交价")
+
 COMMERCE_PUBLIC_LIMITATIONS = frozenset({
     "商品毛利参考未扣售后、平台费、运费与广告费，不是净利润",
     "商品毛利参考不含套件/组合/加工父项：这些行的成本语义未核验",
@@ -299,6 +338,8 @@ COMMERCE_PUBLIC_LIMITATIONS = frozenset({
     # 双口径契约（S1）：口径声明与认证边界各一句固定文本。
     ERP_OUTSTOCK_CALIBER_TEXT,
     PAYMENT_CALIBER_TEXT,
+    # S4 档案参考价：永久口径标签（档案目录价 ≠ 渠道实价）。
+    ITEM_PRICE_CATALOG_CALIBER_TEXT,
 })
 
 # 参数化披露：家数 / 行数可变，句式固定。金额片段与 `runtime.models._MONEY` 同源。
@@ -339,6 +380,18 @@ COMMERCE_LIMITATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     # 出库口径的样本披露：发货时间未经逐店对照时照发，但必须说是样本。
     re.compile(r"^[0-9]+ 家店铺的发货时间口径未经逐店对照认证，"
                r"出库口径结果按可观测样本披露$"),
+    # S4 档案参考价的缺口披露：快照过期/缺失、SKU 未覆盖、多 SKU 不平均、
+    # 拼多多排除、已停用档案，各自一句固定句式（家数与引用可变）。
+    re.compile(r"^[0-9]+ 家店铺没有7天内的完整ERP档案价快照，"
+               r"参考价与参考毛利为data_missing：" + _GROUP_KEYS + r"$"),
+    re.compile(r"^[0-9]+ 家店铺的ERP档案价快照没有覆盖该商品成交的SKU，"
+               r"参考价与参考毛利为data_missing：" + _GROUP_KEYS + r"$"),
+    re.compile(r"^[0-9]+ 家店铺该商品窗口内成交跨多个SKU，"
+               r"参考价与参考毛利不跨SKU平均，为data_missing：" + _GROUP_KEYS + r"$"),
+    re.compile(r"^[0-9]+ 家店铺的平台不接入ERP档案价（拼多多永久排除），"
+               r"参考价与参考毛利为data_missing：" + _GROUP_KEYS + r"$"),
+    re.compile(r"^[0-9]+ 家店铺该商品的ERP档案为已停用状态（activeStatus=0），"
+               r"参考价按已停用档案披露：" + _GROUP_KEYS + r"$"),
 )
 
 COMMERCE_LIMITATION_CODES = frozenset({
@@ -370,6 +423,12 @@ COMMERCE_LIMITATION_CODES = frozenset({
     # 双口径契约（S1）：口径声明与支付口径认证边界各归一个码。
     "comparison_caliber_erp_outstock",
     "comparison_caliber_payment_uncertified",
+    # S4 档案参考价：口径标签与四类缺口各自归一个码。
+    "item_price_catalog_caliber",
+    "item_price_reference_missing",
+    "item_price_multi_sku",
+    "item_price_pdd_excluded",
+    "item_price_disabled",
 })
 
 # ---------------------------------------------------------------------------
@@ -597,6 +656,39 @@ def combine_reference_metrics(
         (to_decimal(row.get("quantity")), to_decimal(row.get("sales_amount")),
          to_decimal(row.get("cost_total")))
         for row in groups])
+
+
+# ---------------------------------------------------------------------------
+# S4 档案参考价：纯函数层（新鲜度边界、参考毛利算术）
+# ---------------------------------------------------------------------------
+
+# 快照时效默认值：计划 §4-3 的建议值（7 天）。**待所有者追认**：追认前它是
+# 测试锁定的默认，不是所有者拍板的口径；追认后若改值，这里与披露文案一起改。
+ITEM_PRICE_MAX_AGE = timedelta(days=7)
+
+
+def item_price_fresh(captured_at: datetime | None, now: datetime,
+                     *, max_age: timedelta = ITEM_PRICE_MAX_AGE) -> bool:
+    """快照是否仍在时效内：边界含（恰好 max_age 仍新鲜），缺抓取时间即不新鲜。
+
+    与 inventory.rules.freshness_ok 同一语义：过期快照是 data_missing（列留
+    null + 披露），绝不把旧价冒充现价，也不把缺快照判成 0。
+    """
+    if captured_at is None:
+        return False
+    return (now - captured_at).total_seconds() <= max_age.total_seconds()
+
+
+def reference_margin(avg_paid_price: Decimal | None,
+                     purchase_price: Decimal | None) -> Decimal | None:
+    """SKU 级参考毛利=(成交均价-档案成本)÷成交均价；分母缺失/非正是 null。
+
+    只在单一成交 SKU 时由图上调用：多 SKU 成交时不平均档案价（spec §10），
+    整列留 null 并单独披露。结果是 SKU 级参考，永不进排名。"""
+    if avg_paid_price is None or purchase_price is None or avg_paid_price <= 0:
+        return None
+    return ((avg_paid_price - purchase_price)
+            / avg_paid_price).quantize(RATIO_SCALE, rounding=ROUND_HALF_UP)
 
 
 # ---------------------------------------------------------------------------

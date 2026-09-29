@@ -342,7 +342,13 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(catalog_version(self.conn), before + 2, "名称未变不推进版本")
 
     def test_product_daily_view_gives_the_archive_name_without_the_cost(self):
-        """成本价只能留在 bi.products，不能随商品名进任何 reporting 视图。"""
+        """bi.products 的采购成本不得随商品名进任何 reporting 视图。
+
+        例外：S4 档案价快照视图（v_item_price_snapshot_items）按 margin_ref
+        口径显式暴露 ERP 档案参考成本——那是快照事实本身，与 bi.products
+        采购成本是两个口径（2026-09-28 决策，见
+        docs/superpowers/research/2026-09-28-s4-acceptance.md）。
+        """
         columns = [row[0] for row in self.conn.execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_schema='reporting' AND table_name='v_product_daily' "
@@ -353,6 +359,8 @@ class DatabaseTests(unittest.TestCase):
             "WHERE table_schema='reporting'").fetchall()
         self.assertTrue(exposed)
         for name, definition in exposed:
+            if name == "v_item_price_snapshot_items":
+                continue
             self.assertNotIn("purchase_price", definition, f"{name} 暴露了成本列")
 
     def test_product_daily_marks_several_skus_instead_of_choosing_one(self):
@@ -4706,6 +4714,463 @@ class ClosedRefundedPaymentCaliberTests(unittest.TestCase):
             "SELECT commercial_id FROM reporting.v_closed_refunded_payments "
             "WHERE shop_id='CR1' ORDER BY commercial_id").fetchall()
         self.assertEqual([row[0] for row in rows], ["C-R"])
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ItemPriceSnapshotMigrationTests(unittest.TestCase):
+    """027：ERP 档案价快照（S4）的存储契约：schema、凭据配对、视图列形与授权。
+
+    scan_complete 凭据同 019 契约精神：完整声明必须带分页凭据，缺声明时凭据
+    不得存在；取证字段只留在写入侧，reporting 视图不暴露。001–026 零改动。
+    """
+
+    def setUp(self):
+        from tests.dbfixtures import connect_test_db
+
+        self.conn = connect_test_db(self)
+
+    @staticmethod
+    def _migration_sql() -> str:
+        from pathlib import Path
+
+        path = Path(__file__).parents[1] / "sql" / "027_item_price_snapshots.sql"
+        return path.read_text(encoding="utf-8")
+
+    def _shop(self, shop_id: str = "IP1", platform: str = "fxg") -> None:
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) VALUES "
+            "(%s, %s, '档案价测试店') ON CONFLICT (shop_id) DO NOTHING",
+            (shop_id, platform))
+
+    def _head(self, *, snapshot_id: str = "SNAP-1", shop_id: str = "IP1",
+              scan_complete: bool = True, evidence: str | None = '{"batches": 1}',
+              captured_at: str = "2026-09-25 06:00+08") -> None:
+        self._shop(shop_id)
+        self.conn.execute(
+            "INSERT INTO bi.item_price_snapshots(snapshot_id, shop_id, source, "
+            "captured_at, scan_complete, scan_evidence) VALUES "
+            "(%s, %s, 'kuaimai_item_api', %s, %s, %s)",
+            (snapshot_id, shop_id, captured_at, scan_complete, evidence))
+
+    def _item(self, *, sys_sku_id: str = "", price: str | None = "90",
+              cost: str | None = "40", item_status: int = 1,
+              sku_status: int | None = 1, snapshot_id: str = "SNAP-1",
+              shop_id: str = "IP1", sys_item_id: str = "P1") -> None:
+        self.conn.execute(
+            "INSERT INTO bi.item_price_snapshot_items(shop_id, snapshot_id, "
+            "sys_item_id, sys_sku_id, outer_id, sku_outer_id, reference_price, "
+            "purchase_price, item_active_status, sku_active_status, captured_at) "
+            "VALUES (%s, %s, %s, %s, 'OUT-1', %s, %s, %s, %s, %s, "
+            "'2026-09-25 06:00+08')",
+            (shop_id, snapshot_id, sys_item_id, sys_sku_id,
+             sys_sku_id or None, price, cost, item_status, sku_status))
+
+    def test_migration_is_idempotent_and_creates_both_views(self):
+        self._migration_sql()
+        self._migration_sql()  # 重复执行不得报错（幂等）
+        for table in ("item_price_snapshots", "item_price_snapshot_items"):
+            count = self.conn.execute(
+                "SELECT count(*) FROM information_schema.tables "
+                "WHERE table_schema='bi' AND table_name=%s", (table,)).fetchone()[0]
+            self.assertEqual(count, 1, table)
+        for view in ("v_item_price_snapshots", "v_item_price_snapshot_items"):
+            count = self.conn.execute(
+                "SELECT count(*) FROM information_schema.views "
+                "WHERE table_schema='reporting' AND table_name=%s", (view,)).fetchone()[0]
+            self.assertEqual(count, 1, view)
+
+    def test_complete_claim_requires_scan_evidence_and_vice_versa(self):
+        self._shop()
+        with self.assertRaises(psycopg.errors.CheckViolation), self.conn.transaction():
+            self._head(scan_complete=True, evidence=None)
+        with self.assertRaises(psycopg.errors.CheckViolation), self.conn.transaction():
+            self._head(scan_complete=False, evidence='{"batches": 1}')
+        with self.assertRaises(psycopg.errors.CheckViolation), self.conn.transaction():
+            self.conn.execute(
+                "INSERT INTO bi.item_price_snapshots(snapshot_id, shop_id, source, "
+                "captured_at, scan_complete, scan_evidence) VALUES "
+                "('BAD-SOURCE', 'IP1', 'item.list.query', '2026-09-25 06:00+08', "
+                "true, '{\"batches\": 1}')")
+        self._head()
+        self._item()
+        rows = self.conn.execute(
+            "SELECT count(*) FROM bi.item_price_snapshots WHERE shop_id='IP1'").fetchone()
+        self.assertEqual(rows[0], 1, "合法头表照常写入")
+
+    def test_items_cascade_with_their_head_and_require_active_status(self):
+        self._head()
+        with self.assertRaises(psycopg.errors.CheckViolation), self.conn.transaction():
+            self._item(sys_sku_id="S-BAD", item_status=2)
+        with self.assertRaises(psycopg.errors.CheckViolation), self.conn.transaction():
+            self._item(sys_sku_id="S-BAD2", sku_status=3)
+        self._item()
+        self._item(sys_sku_id="S-1", sku_status=None, price=None, cost=None)
+        self.conn.execute(
+            "DELETE FROM bi.item_price_snapshots WHERE snapshot_id='SNAP-1'")
+        count = self.conn.execute(
+            "SELECT count(*) FROM bi.item_price_snapshot_items "
+            "WHERE shop_id='IP1'").fetchone()[0]
+        self.assertEqual(count, 0, "删除头表必须级联删除明细")
+
+    def test_views_expose_closed_column_sets_without_evidence(self):
+        self._head()
+        self._item()
+        head_columns = [row[0] for row in self.conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='reporting' AND table_name='v_item_price_snapshots' "
+            "ORDER BY ordinal_position").fetchall()]
+        item_columns = [row[0] for row in self.conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema='reporting' "
+            "AND table_name='v_item_price_snapshot_items' "
+            "ORDER BY ordinal_position").fetchall()]
+        self.assertEqual(sorted(head_columns),
+                         sorted(["snapshot_id", "shop_id", "source", "captured_at",
+                                 "scan_complete"]), head_columns)
+        self.assertEqual(sorted(item_columns),
+                         sorted(["snapshot_id", "shop_id", "sys_item_id",
+                                 "sys_sku_id", "outer_id", "sku_outer_id",
+                                 "reference_price", "purchase_price",
+                                 "item_active_status", "sku_active_status",
+                                 "captured_at"]), item_columns)
+        self.assertNotIn("scan_evidence", head_columns + item_columns,
+                         "取证凭据只留在写入侧，不进 reporting 视图")
+
+    def test_query_role_reads_views_but_not_base_tables(self):
+        self._head()
+        self._item()
+        with self.conn.transaction():
+            self.conn.execute("SET LOCAL ROLE bi_app")
+            # 计数只看本用例种的店：共享测试库里可能有真实探针的快照行。
+            self.assertEqual(self.conn.execute(
+                "SELECT count(*) FROM reporting.v_item_price_snapshot_items "
+                "WHERE shop_id='IP1'").fetchone()[0], 1)
+            self.assertEqual(self.conn.execute(
+                "SELECT count(*) FROM reporting.v_item_price_snapshots "
+                "WHERE shop_id='IP1'").fetchone()[0], 1)
+            # 预期内的权限错误各自包 savepoint：失败语句会中止外层事务，
+            # 不隔离的话第二个断言只能看到 InFailedSqlTransaction。
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege), \
+                    self.conn.transaction():
+                self.conn.execute("SELECT count(*) FROM bi.item_price_snapshots")
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege), \
+                    self.conn.transaction():
+                self.conn.execute("SELECT count(*) FROM bi.item_price_snapshot_items")
+
+    def test_sync_role_writes_and_app_role_cannot(self):
+        self._shop()
+        with self.conn.transaction():
+            self.conn.execute("SET LOCAL ROLE bi_sync")
+            self.conn.execute(
+                "INSERT INTO bi.item_price_snapshots(snapshot_id, shop_id, source, "
+                "captured_at, scan_complete, scan_evidence) VALUES "
+                "('SYNC-1', 'IP1', 'kuaimai_item_api', '2026-09-25 06:00+08', "
+                "true, '{\"batches\": 1}')")
+            self.conn.execute("RESET ROLE")
+        with self.conn.transaction():
+            self.conn.execute("SET LOCAL ROLE bi_app")
+            # savepoint 隔离预期内的权限错误，事务内后续 RESET ROLE 才能执行。
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege), \
+                    self.conn.transaction():
+                self.conn.execute(
+                    "INSERT INTO bi.item_price_snapshot_items(shop_id, snapshot_id, "
+                    "sys_item_id, sys_sku_id, item_active_status, captured_at) "
+                    "VALUES ('IP1', 'SYNC-1', 'P1', '', 1, '2026-09-25 06:00+08')")
+            self.conn.execute("RESET ROLE")
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ItemPriceScanSyncTests(unittest.TestCase):
+    """S4 档案价扫描：有界分页、完整性凭据、fail-closed 回滚与日频幂等。
+
+    全店扫描 = 本地商品档案枚举（bi.products，由既有 products 同步维护）
+    分块 ≤20 个 sysItemId 逐批调用 erp.item.list.get；期望集合与返回集合
+    必须完全相等，任何缺失/多出/预算超限/接口错误都整批回滚，不落任何快照。
+    """
+
+    def setUp(self):
+        from tests.dbfixtures import connect_test_db
+
+        self.conn = connect_test_db(self)
+        self.now = datetime(2026, 9, 25, 6, tzinfo=BEIJING)
+        # 测试库可能已有真实探针写入的商品档案（验收探针会提交真实目录）；
+        # 枚举必须只看见本用例种的商品，删除在外层回滚事务内、不会提交。
+        self.conn.execute("DELETE FROM bi.products")
+
+    def _shop(self, shop_id: str = "IP1", platform: str = "tb") -> None:
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name) VALUES "
+            "(%s, %s, '档案价扫描店') ON CONFLICT (shop_id) DO UPDATE "
+            "SET platform = EXCLUDED.platform", (shop_id, platform))
+
+    def _archive(self, *product_ids: str) -> None:
+        for product_id in product_ids:
+            self.conn.execute(
+                "INSERT INTO bi.products(product_id, title, source_modified_at) "
+                "VALUES (%s, %s, now()) ON CONFLICT (product_id) DO NOTHING",
+                (product_id, f"档案{product_id}"))
+
+    def _item_payload(self, item_id: str, *, price: object = "90",
+                      cost: object = "40", status: int = 1,
+                      skus: list[dict] | None = None) -> dict:
+        payload: dict = {"sysItemId": int(item_id), "outerId": f"OUT-{item_id}",
+                         "activeStatus": status, "priceOutput": price,
+                         "purchasePrice": cost}
+        if skus is not None:
+            payload["skus"] = skus
+        return payload
+
+    def _client(self, pages: list):
+        class Client:
+            def __init__(self, pages):
+                self.pages = list(pages)
+                self.calls: list[tuple[str, dict]] = []
+
+            def call(self, method, params):
+                self.calls.append((method, dict(params)))
+                page = self.pages.pop(0)
+                if isinstance(page, Exception):
+                    raise page
+                return page
+
+        return Client(pages)
+
+    def _scan(self, client, *, shop_id: str = "IP1"):
+        from bi_agent.sync import sync_item_prices
+
+        return sync_item_prices(self.conn, client, shop_id=shop_id, now=self.now)
+
+    def _head_rows(self, shop_id: str = "IP1"):
+        return self.conn.execute(
+            "SELECT snapshot_id, captured_at, scan_complete, scan_evidence "
+            "FROM bi.item_price_snapshots WHERE shop_id=%s "
+            "ORDER BY captured_at", (shop_id,)).fetchall()
+
+    def test_full_scan_writes_one_complete_snapshot_per_day(self):
+        self._shop()
+        self._archive("11", "22")
+        client = self._client([
+            {"success": True, "items": [
+                self._item_payload("11", skus=[
+                    {"sysSkuId": 111, "skuOuterId": "S-111",
+                     "priceOutput": "10", "purchasePrice": "4",
+                     "activeStatus": 1}]),
+                self._item_payload("22", price=None, cost=None, status=0,
+                                   skus=[]),
+            ]},
+        ])
+        stats = self._scan(client)
+        self.assertEqual(stats["items"], 2)
+        self.assertEqual(stats["item_rows"], 2)
+        self.assertEqual(stats["sku_rows"], 1)
+        self.assertEqual(stats["batches"], 1)
+        method, params = client.calls[0]
+        self.assertEqual(method, "erp.item.list.get")
+        self.assertEqual(params["returnSkus"], "1")
+        self.assertEqual(sorted(params["sysItemIds"].split(",")), ["11", "22"])
+        head = self._head_rows()
+        self.assertEqual(len(head), 1)
+        self.assertTrue(head[0][2], "完整扫描的 scan_complete 必须为真")
+        evidence = json.loads(head[0][3])
+        self.assertEqual(evidence["expected_items"], 2)
+        self.assertEqual(evidence["fetched_items"], 2)
+        self.assertEqual(evidence["batches"], 1)
+        self.assertEqual(evidence["items_with_price"], 1)
+        self.assertEqual(evidence["items_disabled"], 1)
+        row = self.conn.execute(
+            "SELECT reference_price, purchase_price FROM reporting.v_item_price_snapshot_items "
+            "WHERE shop_id='IP1' AND sys_item_id='22'").fetchone()
+        self.assertIsNone(row[0], "缺价格存 null：data_missing 不是 0")
+        self.assertIsNone(row[1])
+
+    def test_rerunning_the_same_day_is_idempotent(self):
+        self._shop()
+        self._archive("11")
+        page = {"success": True,
+                "items": [self._item_payload("11", skus=[])]}
+        first = self._scan(self._client([dict(page)]))
+        second = self._scan(self._client([dict(page)]))
+        self.assertEqual(first["snapshot_id"], second["snapshot_id"],
+                         "同店同日重扫必须是同一张快照（确定性 id）")
+        self.assertEqual(len(self._head_rows()), 1)
+        count = self.conn.execute(
+            "SELECT count(*) FROM bi.item_price_snapshot_items "
+            "WHERE shop_id='IP1'").fetchone()[0]
+        self.assertEqual(count, 1, "重扫不得翻倍明细")
+
+    def test_next_day_creates_a_fresh_snapshot(self):
+        from bi_agent.sync import sync_item_prices
+
+        self._shop()
+        self._archive("11")
+        page = {"success": True,
+                "items": [self._item_payload("11", skus=[])]}
+        self._scan(self._client([dict(page)]))
+        sync_item_prices(self.conn, self._client([dict(page)]), shop_id="IP1",
+                         now=self.now + timedelta(days=1))
+        heads = self._head_rows()
+        self.assertEqual([row[2] for row in heads], [True, True])
+        self.assertNotEqual(heads[0][0], heads[1][0])
+
+    def test_missing_item_fails_closed_and_rolls_back(self):
+        self._shop()
+        self._archive("11", "22")
+        client = self._client([
+            {"success": True, "items": [self._item_payload("11", skus=[])]},
+        ])
+        from bi_agent.sync import ItemPriceScanIncomplete
+
+        with self.assertRaises(ItemPriceScanIncomplete) as caught:
+            self._scan(client)
+        self.assertEqual(caught.exception.problems.get("missing_items"), 1)
+        self.assertEqual(len(self._head_rows()), 0, "不完整扫描不得发布快照")
+        # 只数本用例的店：共享测试库里可能有真实探针写入的快照行。
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM bi.item_price_snapshot_items "
+            "WHERE shop_id='IP1'").fetchone()[0], 0)
+
+    def test_unexpected_item_proves_stale_enumeration_and_rolls_back(self):
+        self._shop()
+        self._archive("11")
+        client = self._client([
+            {"success": True, "items": [
+                self._item_payload("11", skus=[]),
+                self._item_payload("99", skus=[]),
+            ]},
+        ])
+        from bi_agent.sync import ItemPriceScanIncomplete
+
+        with self.assertRaises(ItemPriceScanIncomplete) as caught:
+            self._scan(client)
+        self.assertEqual(caught.exception.problems.get("unexpected_items"), 1,
+                         "返回了枚举之外的商品=本地枚举过期，完整性主张不成立")
+        self.assertEqual(len(self._head_rows()), 0)
+
+    def test_batch_budget_exhaustion_rolls_back(self):
+        from bi_agent.sync import ItemPriceScanIncomplete
+
+        self._shop()
+        self._archive(*(str(index) for index in range(1, 42)))  # 3 批
+        client = self._client([
+            {"success": True, "items": [self._item_payload(str(index), skus=[])
+                                        for index in range(1, 21)]},
+            {"success": True, "items": [self._item_payload(str(index), skus=[])
+                                        for index in range(21, 41)]},
+            {"success": True, "items": [self._item_payload("41", skus=[])]},
+        ])
+        with patch("bi_agent.sync.ITEM_PRICE_MAX_BATCHES", 2):
+            with self.assertRaises(ItemPriceScanIncomplete) as caught:
+                self._scan(client)
+        self.assertEqual(caught.exception.problems.get("over_budget"), 1)
+        self.assertEqual(len(client.calls), 2, "超预算后不得继续打接口")
+        self.assertEqual(len(self._head_rows()), 0)
+
+    def test_requests_are_chunked_by_twenty(self):
+        self._shop()
+        self._archive(*(str(index) for index in range(1, 23)))  # 22 个 → 2 批
+        pages = []
+        for chunk_start in (1, 21):
+            pages.append({"success": True, "items": [
+                self._item_payload(str(index), skus=[])
+                for index in range(chunk_start, chunk_start + 20)
+                if index <= 22]})
+        client = self._client(pages)
+        self._scan(client)
+        self.assertEqual(len(client.calls), 2)
+        first_ids = client.calls[0][1]["sysItemIds"].split(",")
+        second_ids = client.calls[1][1]["sysItemIds"].split(",")
+        self.assertLessEqual(len(first_ids), 20)
+        self.assertLessEqual(len(second_ids), 20)
+        self.assertEqual(sorted(first_ids + second_ids),
+                         sorted(str(index) for index in range(1, 23)))
+
+    def test_invalid_active_status_fails_closed(self):
+        self._shop()
+        self._archive("11")
+        client = self._client([
+            {"success": True,
+             "items": [self._item_payload("11", status="启用", skus=[])]},
+        ])
+        from bi_agent.sync import ItemPriceScanIncomplete
+
+        with self.assertRaises(ItemPriceScanIncomplete) as caught:
+            self._scan(client)
+        self.assertEqual(caught.exception.problems.get("invalid"), 1)
+        self.assertEqual(len(self._head_rows()), 0)
+
+    def test_active_status_out_of_domain_fails_closed(self):
+        """P2（复审）：activeStatus=2 这类域外整数必须在规范化层拒绝。
+
+        穿透到 027 的 CHECK 才炸会以裸 CheckViolation 终止 CLI 多店循环，
+        一家店的坏值不该拦住其余店铺的扫描。
+        """
+        self._shop()
+        self._archive("12")
+        client = self._client([
+            {"success": True,
+             "items": [self._item_payload("12", status=2, skus=[])]},
+        ])
+        from bi_agent.sync import ItemPriceScanIncomplete
+
+        with self.assertRaises(ItemPriceScanIncomplete) as caught:
+            self._scan(client)
+        self.assertEqual(caught.exception.problems.get("invalid"), 1)
+        self.assertEqual(len(self._head_rows()), 0)
+
+    def test_duplicate_sku_id_fails_closed(self):
+        """P2（复审）：同商品内重复 sysSkuId 归入 invalid，不得以 PK 冲突炸 CLI。"""
+        sku = {"sysSkuId": 9001, "activeStatus": 1, "priceOutput": "90",
+               "purchasePrice": "40"}
+        self._shop()
+        self._archive("13")
+        client = self._client([
+            {"success": True,
+             "items": [self._item_payload("13", skus=[sku, dict(sku)])]},
+        ])
+        from bi_agent.sync import ItemPriceScanIncomplete
+
+        with self.assertRaises(ItemPriceScanIncomplete) as caught:
+            self._scan(client)
+        self.assertEqual(caught.exception.problems.get("invalid"), 1)
+        self.assertEqual(len(self._head_rows()), 0)
+
+    def test_rate_limit_error_propagates_without_publishing(self):
+        from bi_agent.kuaimai import KuaimaiError
+
+        self._shop()
+        self._archive("11")
+        client = self._client([KuaimaiError("rate_limit")])
+        with self.assertRaises(KuaimaiError):
+            self._scan(client)
+        self.assertEqual(len(self._head_rows()), 0)
+
+    def test_pdd_shop_is_refused_before_any_call(self):
+        self._shop(platform="pdd")
+        self._archive("11")
+        client = self._client([])
+        from bi_agent.sync import ItemPriceScanRefused
+
+        with self.assertRaises(ItemPriceScanRefused):
+            self._scan(client)
+        self.assertEqual(client.calls, [], "拒绝的平台不得发生任何 API 调用")
+        self.assertEqual(len(self._head_rows()), 0)
+
+    def test_unregistered_platform_is_refused(self):
+        self._shop(platform="taobao")
+        self._archive("11")
+        from bi_agent.sync import ItemPriceScanRefused
+
+        with self.assertRaises(ItemPriceScanRefused):
+            self._scan(self._client([]), shop_id="IP1")
+
+    def test_empty_enumeration_fails_closed(self):
+        self._shop()
+        from bi_agent.sync import ItemPriceScanIncomplete
+
+        with self.assertRaises(ItemPriceScanIncomplete) as caught:
+            self._scan(self._client([]))
+        self.assertEqual(caught.exception.problems.get("enumeration_empty"), 1,
+                         "空枚举=没有全店主张的证据，不得落一张'完整'空快照")
 
 
 if __name__ == "__main__":

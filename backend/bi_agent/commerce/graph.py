@@ -68,7 +68,8 @@ from bi_agent.presentation.charts import PersistedDataset, build_chart_spec
 from bi_agent.sources import (
     AFTERSALE_COHORT_ENTITY, AFTERSALE_ENTITY, CONSIGN_ORDERS_ENTITY, DOCUMENT_BASIS,
     ORDERS_ENTITY, PAYMENT_WINDOW_METRICS, ShopRecord, SourceBinding,
-    binding_signature, payment_caliber_excludes_closed_refunded, registration,
+    binding_signature, item_price_scan_allowed,
+    payment_caliber_excludes_closed_refunded, registration,
     resolve_consign_source, resolve_metric_dependencies, unsupported_reason)
 
 from . import repository
@@ -88,6 +89,7 @@ from .metrics import (
     COMPARISON_TREND_SHOP_ROWS,
     DOCUMENT_ROWS,
     ERP_OUTSTOCK_CALIBER_TEXT,
+    ITEM_PRICE_CATALOG_CALIBER_TEXT,
     METRIC_FACET,
     PAYMENT_CAPABILITY_COLUMNS,
     PAYMENT_CALIBER_TEXT,
@@ -97,14 +99,18 @@ from .metrics import (
     PRODUCT_ROWS,
     PRODUCT_TOTAL_ROWS,
     RATIO_VALUE_COLUMNS,
+    REFERENCE_MISSING_COLUMNS,
+    REFERENCE_VALUE_COLUMNS,
     TAOBAO_FAMILY_PLATFORMS,
     TREND_ROWS,
     combine_reference_metrics,
     comparison_row_columns,
+    item_price_fresh,
     low_profit_candidates,
     money_of,
     platform_group_of,
     project,
+    reference_margin,
     rank_groups,
     sales_shares,
     to_decimal,
@@ -292,6 +298,8 @@ class CommerceRuntime:
     groups: tuple[repository.ProductLine, ...] = ()
     documents: Mapping[str, repository.DocumentFacts] = field(default_factory=dict)
     payments: Mapping[str, repository.PaymentFacts] = field(default_factory=dict)
+    # S4 档案价：每家店最新一份完整快照的参考价行（新鲜度判定延到 compute）。
+    item_prices: Mapping[str, repository.ItemPriceSnapshot] = field(default_factory=dict)
     rows: list[dict[str, Any]] = field(default_factory=list)
     totals: list[dict[str, Any]] = field(default_factory=list)
     trend_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -457,6 +465,13 @@ _COMMERCE_CODE_BY_FRAGMENT = (
     ("按发货时间consignTime归属", "comparison_caliber_erp_outstock"),
     ("支付口径下为data_missing", "comparison_caliber_payment_uncertified"),
     ("发货时间口径未经逐店对照认证", "comparison_caliber_erp_outstock"),
+    # S4 档案参考价：口径标签与四类缺口（快照缺/过期与 SKU 未覆盖同归一类）。
+    ("ERP商品档案价", "item_price_catalog_caliber"),
+    ("没有7天内的完整ERP档案价快照", "item_price_reference_missing"),
+    ("的ERP档案价快照没有覆盖该商品成交的SKU", "item_price_reference_missing"),
+    ("成交跨多个SKU", "item_price_multi_sku"),
+    ("不接入ERP档案价", "item_price_pdd_excluded"),
+    ("ERP档案为已停用状态", "item_price_disabled"),
     ("未列入本次合计", "commerce_scope_excluded"),
     ("已评估店铺集合的合计", "commerce_scope_excluded"),
     ("已发布分组的合计", "commerce_scope_excluded"),
@@ -1493,6 +1508,12 @@ def execute_aggregates(runtime: CommerceRuntime) -> None:
             context.conn, shop_ids=shops, start_ts=window[0], end_ts=window[1],
             deadline=context.deadline)
         _apply_closed_refunded_exclusion(runtime)
+    if plan.product_facet:
+        # S4：档案价参考事实与商品面同批读入（一次集合查询，预算护栏同一套）。
+        # 新鲜度在这里不判：compute 节点用 context.now 判定，策略只写一处。
+        runtime.item_prices = repository.load_item_prices(
+            context.conn, shop_ids=shops, erp_product_id=str(runtime.erp_product_id),
+            deadline=context.deadline)
     _attribution_disclosures(runtime)
 
 
@@ -1605,14 +1626,19 @@ def compute_metrics(runtime: CommerceRuntime) -> None:
     lines = [line for line in runtime.lines if _in(main, line.day)] if plan.product_facet else []
     names = _name_columns(runtime)
     if plan.product_facet:
+        # S4：按店归类档案参考价（快照存在性/新鲜度/单 SKU 可发布性一次判定），
+        # 逐行叠加后再统一出披露；合计行永远是 null（跨店档案价不可平均）。
+        reference = _item_price_reference(runtime, lines)
         for shop in sorted(runtime.candidate_shop_ids):
-            for kind in sorted({line.line_kind for line in lines if line.shop_id == shop}):
+            shop_lines = [line for line in lines if line.shop_id == shop]
+            for kind in sorted({line.line_kind for line in shop_lines}):
                 values = combine_reference_metrics(
-                    [_group_input(line) for line in lines
-                     if line.shop_id == shop and line.line_kind == kind])
+                    [_group_input(line) for line in shop_lines
+                     if line.line_kind == kind])
                 runtime.rows.append(project(PRODUCT_ROWS, {
                     "shop_id": shop, "product_id": str(runtime.erp_product_id),
-                    "line_kind": kind, "sales_share": None, **values, **names}))
+                    "line_kind": kind, "sales_share": None, **values, **names,
+                    **_reference_columns(reference.get(shop), values)}))
         for kind in sorted({line.line_kind for line in lines}):
             values = combine_reference_metrics(
                 [_group_input(line) for line in lines if line.line_kind == kind])
@@ -1622,10 +1648,124 @@ def compute_metrics(runtime: CommerceRuntime) -> None:
                     values[metric] = None
             runtime.totals.append(project(PRODUCT_TOTAL_ROWS, {
                 "product_id": str(runtime.erp_product_id), "line_kind": kind,
-                **values, **names}))
+                **values, **names, **REFERENCE_MISSING_COLUMNS}))
+        _item_price_disclosures(runtime, reference)
         _cost_disclosures(runtime, lines)
     _document_rows(runtime)
     _payment_rows(runtime)
+
+
+def _item_price_reference(
+        runtime: CommerceRuntime,
+        lines: Sequence[repository.ProductLine]) -> dict[str, dict[str, Any]]:
+    """按店归类档案参考价：快照是否可用、为什么不可用、SKU 级行是哪一条。
+
+    归类规则（缺一都算 data_missing，不补零、不替位）：
+    - `excluded`：平台不接档案价（拼多多永久排除 / 未登记平台 fail closed）；
+    - `stale`：没有快照，或最新快照超过 7 天默认时效（计划建议值，待所有者追认）；
+    - `multi_sku`：窗口内成交跨多个 SKU——档案价不跨 SKU 平均；
+    - `sku_gap`：快照里没有成交 SKU 的档案行；
+    - 可用：单一成交 SKU（或无规格商品的商品级行）的参考价 + 已停用标志。
+    """
+    reference: dict[str, dict[str, Any]] = {}
+    for shop in runtime.candidate_shop_ids:
+        shop_lines = [line for line in lines if line.shop_id == shop]
+        if not shop_lines:
+            # 本窗口没有该商品成交行的店不参与归类：它不缺快照、也无行可挂
+            # 参考值——算进缺快照披露或 published 计数都是失实陈述。
+            continue
+        sku_ids = sorted({sku for line in shop_lines for sku in line.sku_ids if sku})
+        entry: dict[str, Any] = {"row": None, "reason": "stale", "disabled": False}
+        if not item_price_scan_allowed(_record_of(runtime, shop).platform):
+            entry["reason"] = "excluded"
+            reference[shop] = entry
+            continue
+        snapshot = runtime.item_prices.get(shop)
+        if snapshot is None or not item_price_fresh(
+                snapshot.captured_at, runtime.context.now):
+            reference[shop] = entry
+            continue
+        entry["captured_at"] = snapshot.captured_at
+        if len(sku_ids) > 1:
+            entry["reason"] = "multi_sku"
+            reference[shop] = entry
+            continue
+        row = snapshot.rows.get(sku_ids[0] if sku_ids else "")
+        if row is None:
+            entry["reason"] = "sku_gap"
+            reference[shop] = entry
+            continue
+        entry["row"] = row
+        # 可用分支必须清掉初值 reason="stale"：_reference_columns 以
+        # reason is not None 判不可用，挂着初值会把可用参考整体打成 data_missing。
+        entry["reason"] = None
+        entry["disabled"] = (row.sku_active_status == 0
+                             or row.item_active_status == 0)
+        reference[shop] = entry
+    return reference
+
+
+def _reference_columns(entry: Mapping[str, Any] | None,
+                       values: Mapping[str, Any]) -> dict[str, Any]:
+    """一行结果上的档案参考价三列：不可用时全部 null（data_missing 不是 0）。"""
+    if entry is None or entry.get("reason") is not None or entry.get("row") is None:
+        return dict(REFERENCE_MISSING_COLUMNS)
+    row = entry["row"]
+    avg = to_decimal(values.get("weighted_avg_paid_price"))
+    return {
+        "reference_price": money_of(row.reference_price),
+        "margin_ref": money_of(reference_margin(avg, row.purchase_price)),
+        "reference_item_status": "disabled" if entry.get("disabled") else "active",
+    }
+
+
+def _item_price_disclosures(
+        runtime: CommerceRuntime,
+        reference: Mapping[str, dict[str, Any]]) -> None:
+    """档案参考价的口径标签与缺口披露：按类聚合家数与引用，一句一类。
+
+    可用但档案已停用的店也要显式说（activeStatus=0 不得冒充在售）；
+    诊断只留计数（published/missing/disabled），不含店铺主键。
+    """
+    if not reference:
+        return
+    runtime.limitations.append(ITEM_PRICE_CATALOG_CALIBER_TEXT)
+    groups: dict[str, list[str]] = {}
+    disabled: list[str] = []
+    published = 0
+    for shop, entry in sorted(reference.items()):
+        ref = _ref_of(runtime, shop)
+        reason = entry.get("reason")
+        if reason is not None:
+            groups.setdefault(str(reason), []).append(ref)
+        else:
+            published += 1
+            if entry.get("disabled"):
+                disabled.append(ref)
+    reason_texts = {
+        "stale": ("没有7天内的完整ERP档案价快照，参考价与参考毛利为data_missing："),
+        "sku_gap": ("的ERP档案价快照没有覆盖该商品成交的SKU，"
+                    "参考价与参考毛利为data_missing："),
+        "multi_sku": ("该商品窗口内成交跨多个SKU，参考价与参考毛利不跨SKU平均，"
+                      "为data_missing："),
+        "excluded": ("的平台不接入ERP档案价（拼多多永久排除），"
+                     "参考价与参考毛利为data_missing："),
+    }
+    for reason, shops in sorted(groups.items()):
+        text = reason_texts.get(reason)
+        if text is None or not shops:
+            continue
+        runtime.limitations.append(
+            f"{len(shops)} 家店铺{text}{'、'.join(shops)}")
+    if disabled:
+        runtime.limitations.append(
+            f"{len(disabled)} 家店铺该商品的ERP档案为已停用状态（activeStatus=0），"
+            f"参考价按已停用档案披露：{'、'.join(disabled)}")
+    missing = sum(len(shops) for shops in groups.values())
+    runtime.diagnostics["item_price_reference"] = {
+        "shops_published": published,
+        "shops_missing": missing,
+        "shops_disabled": len(disabled)}
 
 
 def _name_columns(runtime: CommerceRuntime) -> dict[str, Any]:
@@ -2562,6 +2702,12 @@ _FACET_LIMITATIONS: dict[str, tuple[str, ...]] = {
     "gross_profit_not_net": ("metric_result",),
     "product_zero_rows": ("metric_result",),
     "opportunity_policy_unconfigured": ("metric_result",),
+    # S4 档案参考价：口径标签与缺口只约束商品面那份 metric_result。
+    "item_price_catalog_caliber": ("metric_result",),
+    "item_price_reference_missing": ("metric_result",),
+    "item_price_multi_sku": ("metric_result",),
+    "item_price_pdd_excluded": ("metric_result",),
+    "item_price_disabled": ("metric_result",),
     "trend_coverage_incomplete": ("trend_series",),
     "trend_zero_days": ("trend_series",),
     "erp_document_coverage_incomplete": ("comparison_table",),
@@ -2599,12 +2745,17 @@ def _datasets(runtime: CommerceRuntime) -> list[CommerceDataset]:
     if plan.product_facet and (runtime.rows or runtime.totals):
         names = sorted({str(metric) for metric in request.metrics
                         if metric in PRODUCT_FACET_METRICS})
+        definitions = {name: COMMERCE_METRIC_DEFINITIONS[name]
+                       for name in names}
+        # S4：参考价两列随商品面同行发布，口径文本一起发——没有定义的列
+        # 就是让模型自己猜语义。
+        for name in ("reference_price", "margin_ref"):
+            definitions[name] = COMMERCE_METRIC_DEFINITIONS[name]
         datasets.append(CommerceDataset(
             artifact_type="metric_result",
             result=_tool_result(runtime, [*runtime.rows, *runtime.totals], coverage,
                                 _dataset_limitations(runtime, "metric_result"),
-                                {name: COMMERCE_METRIC_DEFINITIONS[name]
-                                 for name in names})))
+                                definitions)))
     if plan.product_facet and runtime.trend_rows:
         gaps = sorted({f"{start.isoformat()}~{end.isoformat()}"
                        for windows in _window_gaps(runtime, runtime.trend_window).values()

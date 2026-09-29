@@ -741,7 +741,7 @@ class CommerceGraphTests(unittest.TestCase):
         self.assertTrue(set(nodes) <= COMMERCE_NODES, nodes)
         self.assertTrue(run["request_fingerprint"])
         provenance = run["provenance"]
-        self.assertEqual(provenance.metric_version, "commerce-metrics/2026-09-25.1")
+        self.assertEqual(provenance.metric_version, "commerce-metrics/2026-09-25.2")
         self.assertEqual(provenance.template_id, "commerce_product_report")
         self.assertTrue(provenance.basis_signature, "口径签名要参与指纹")
         self.assertTrue(provenance.source_batches, "来源批次要进血缘")
@@ -1008,6 +1008,354 @@ class CommerceGraphTests(unittest.TestCase):
             self.assertIsNone(margin[key], f"product_gross_margin_reference.{key}")
 
 
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class ItemPriceReferenceTests(unittest.TestCase):
+    """S4：商品分析把 ERP 档案参考价放在成交均价旁边，参考毛利只到 SKU 级。
+
+    数据来源是 027 快照表（由 item-price-scan 离线写入，这里直接种完整快照）；
+    缺快照 / 过期 / 多 SKU / 拼多多 / 已停用各自有独立披露，缺价格与缺成本
+    永远是 data_missing（null）而不是 0，参考列永远不进排名。
+    """
+
+    def setUp(self):
+        self.conn = connect_test_db(self)
+        self.tag = uuid4().hex[:5].upper()
+        self.shops: dict[str, str] = {}
+
+    def _shop(self, key: str, platform: str = "fxg") -> str:
+        shop_id = f"S{self.tag}{key}"
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name, capabilities) "
+            "VALUES (%s, %s, %s, %s) ON CONFLICT (shop_id) DO UPDATE SET "
+            "platform = EXCLUDED.platform",
+            (shop_id, platform, f"档案价测试店{key}", list(ALL_CAPABILITIES)))
+        self.shops[key] = shop_id
+        return shop_id
+
+    def _cover(self, shop_key: str, start: datetime, end: datetime) -> None:
+        self.conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
+            "data_as_of, quality_status, quality_rule) "
+            "VALUES ('erp.trade.list.query', 'orders', %s, %s, "
+            "tstzmultirange(tstzrange(%s, %s, '[)')), %s, 'passed', %s) "
+            "ON CONFLICT (source, entity, shop_id) DO UPDATE SET "
+            "covered = bi.sync_state.covered + EXCLUDED.covered, "
+            "data_as_of = greatest(coalesce(bi.sync_state.data_as_of, '-infinity'), "
+            "EXCLUDED.data_as_of)",
+            (self.shops[shop_key], end, start, end, end, QUALITY_RULE))
+        self.conn.execute(
+            "INSERT INTO bi.sync_batches(source, entity, shop_id, batch_id, "
+            "business_window, window_kind, mode, row_count, business_end) "
+            "VALUES ('erp.trade.list.query', 'orders', %s, %s, "
+            "tstzrange(%s, %s, '[)'), 'business', 'backfill', 1, %s) "
+            "ON CONFLICT (source, entity, shop_id, batch_id) DO NOTHING",
+            (self.shops[shop_key], f"ip-{start:%m%d}", start, end, end))
+
+    def _archive(self, product: str) -> None:
+        self.conn.execute(
+            "INSERT INTO bi.products(product_id, title, source_modified_at) "
+            "VALUES (%s, %s, now()) ON CONFLICT (product_id) "
+            "DO UPDATE SET title = EXCLUDED.title", (product, f"档案{product}"))
+
+    def _sale(self, shop_key: str, erp_id: str, *, product: str, day: date,
+              quantity: str, amount: str, sku: str | None = None) -> None:
+        shop_id = self.shops[shop_key]
+        paid_at = datetime(day.year, day.month, day.day, 12, tzinfo=BEIJING)
+        self.conn.execute(
+            "INSERT INTO bi.orders(shop_id, erp_id, commercial_ids, source, "
+            "source_updated_at, paid_at, active, batch_id) VALUES "
+            "(%s, %s, %s, 'erp.trade.list.query', now(), %s, true, 's4-seed') "
+            "ON CONFLICT (shop_id, erp_id) DO NOTHING",
+            (shop_id, erp_id, [f"C{erp_id}"], paid_at))
+        self.conn.execute(
+            "INSERT INTO bi.order_items(shop_id, erp_id, line_id, commercial_id, "
+            "product_id, sku_id, paid_at, quantity, allocated_paid_amount, "
+            "allocation_verified, line_kind, active) VALUES "
+            "(%s, %s, %s, %s, %s, %s, %s, %s, %s, true, 'sale', true) "
+            "ON CONFLICT (shop_id, erp_id, line_id) DO NOTHING",
+            (shop_id, erp_id, f"{erp_id}-L1", f"C{erp_id}", product,
+             sku or f"{product}-sku", paid_at, quantity, amount))
+
+    def _snapshot(self, shop_key: str, *, captured_at: datetime,
+                  prices: dict[str, tuple[object, object]],  # sku_key → (price, cost)
+                  item_status: int = 1, sku_status: int | None = 1,
+                  product: str = "P1") -> None:
+        """直接种一张 scan_complete 的快照（等价于一次完整的 item-price-scan）。"""
+        shop_id = self.shops[shop_key]
+        snapshot_id = f"SNAP-{self.tag}-{shop_key}"
+        self.conn.execute(
+            "INSERT INTO bi.item_price_snapshots(snapshot_id, shop_id, source, "
+            "captured_at, scan_complete, scan_evidence) VALUES "
+            "(%s, %s, 'kuaimai_item_api', %s, true, %s) "
+            "ON CONFLICT (shop_id, snapshot_id) DO UPDATE "
+            "SET captured_at = EXCLUDED.captured_at",
+            (snapshot_id, shop_id, captured_at,
+             '{"batches": 1, "expected_items": 1, "fetched_items": 1}'))
+        self.conn.execute(
+            "DELETE FROM bi.item_price_snapshot_items WHERE shop_id=%s "
+            "AND snapshot_id=%s", (shop_id, snapshot_id))
+        rows = [('', prices.get('', (None, None)))] + [
+            (sku, value) for sku, value in sorted(prices.items()) if sku]
+        for sku_key, (price, cost) in rows:
+            self.conn.execute(
+                "INSERT INTO bi.item_price_snapshot_items(shop_id, snapshot_id, "
+                "sys_item_id, sys_sku_id, outer_id, sku_outer_id, reference_price, "
+                "purchase_price, item_active_status, sku_active_status, captured_at) "
+                "VALUES (%s, %s, %s, %s, 'OUT-1', %s, %s, %s, %s, %s, %s)",
+                (shop_id, snapshot_id, product, sku_key,
+                 sku_key or None, price, cost, item_status,
+                 sku_status if sku_key else None, captured_at))
+
+    def _context(self) -> DomainContext:
+        allowed = frozenset(self.shops.values())
+        refs = {shop: ref_for_key("shop", shop) for shop in allowed}
+        return DomainContext(
+            subject_id=f"s4-{self.tag}", allowed_shop_ids=allowed, shop_refs=refs,
+            conn=self.conn,
+            store=MemoryQueryRunStore(forbidden_values=set(allowed)),
+            chat_id=UUID(int=1), user_message_id=UUID(int=2),
+            root_request_id=UUID(int=3), now=NOW,
+            deadline=time.monotonic() + 30, attempt_no=1)
+
+    def _run(self):
+        from bi_agent.commerce.tool import analyze_product_performance
+
+        request = _request(
+            product={"text": "档案P1"},
+            profit_basis="existing_fields",
+            metrics=["sold_quantity", "sales_amount", "weighted_avg_paid_price",
+                     "product_gross_profit_reference",
+                     "product_gross_margin_reference"])
+        result = analyze_product_performance(request, self._context())
+        self.assertEqual(result.status.value, "success",
+                         result.model_payload.get("limitations"))
+        return result, _payload_for(result, "metric_result")
+
+    def _row_for(self, payload: dict, shop_key: str) -> dict:
+        matches = [row for row in payload["data"]
+                   if row.get("shop_ref") == ref_for_key("shop", self.shops[shop_key])]
+        assert len(matches) == 1, (shop_key, payload["data"])
+        return matches[0]
+
+    def test_reference_price_sits_beside_the_average_price_with_margin(self):
+        self._shop("1")
+        self._archive("P1")
+        self._cover("1", WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._snapshot("1", captured_at=NOW, prices={"P1-sku": ("90", "40")})
+
+        _result, payload = self._run()
+        row = self._row_for(payload, "1")
+        self.assertEqual(row["weighted_avg_paid_price"], "100")
+        self.assertEqual(row["reference_price"], "90",
+                         "档案参考价必须与成交均价并列展示")
+        self.assertEqual(row["margin_ref"], "0.6",
+                         "参考毛利=(成交均价−档案成本)/成交均价；比率与 sales_share "
+                         "同一 money_of 渲染（去尾零），不留单独格式")
+        self.assertEqual(row["reference_item_status"], "active")
+        self.assertEqual(payload.get("metric_units", {}).get("reference_price"), "CNY")
+        self.assertEqual(payload.get("metric_units", {}).get("margin_ref"), "ratio")
+        self.assertIn("ERP", payload["metric_definition"].get("reference_price", ""))
+        self.assertIn("档案价", payload["metric_definition"].get("margin_ref", ""))
+        diagnostics = payload.get("diagnostics", {}).get("item_price_reference", {})
+        self.assertEqual(diagnostics.get("shops_published"), 1)
+        self.assertTrue(any("ERP商品档案价" in text for text in payload["limitations"]),
+                        payload["limitations"])
+
+    def test_missing_price_and_cost_stay_data_missing_not_zero(self):
+        self._shop("1")
+        self._archive("P1")
+        self._cover("1", WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._snapshot("1", captured_at=NOW, prices={"P1-sku": (None, None)})
+
+        _result, payload = self._run()
+        row = self._row_for(payload, "1")
+        self.assertIsNone(row["reference_price"], "缺档案价是 null 不是 0")
+        self.assertIsNone(row["margin_ref"], "缺档案成本是 null 不是 0")
+
+    def test_snapshot_older_than_seven_days_is_data_missing(self):
+        self._shop("1")
+        self._archive("P1")
+        self._cover("1", WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._snapshot("1", captured_at=NOW - timedelta(days=7, seconds=1),
+                       prices={"P1-sku": ("90", "40")})
+
+        _result, payload = self._run()
+        row = self._row_for(payload, "1")
+        self.assertIsNone(row["reference_price"], "过期快照是 data_missing，不是旧值")
+        self.assertIsNone(row["margin_ref"])
+        self.assertTrue(any("ERP档案价快照" in text and "data_missing" in text
+                            for text in payload["limitations"]),
+                        payload["limitations"])
+
+    def test_snapshot_at_exactly_seven_days_is_still_fresh(self):
+        self._shop("1")
+        self._archive("P1")
+        self._cover("1", WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._snapshot("1", captured_at=NOW - timedelta(days=7),
+                       prices={"P1-sku": ("90", "40")})
+
+        _result, payload = self._run()
+        row = self._row_for(payload, "1")
+        self.assertEqual(row["reference_price"], "90", "恰好 7 天仍在时效内（边界含）")
+
+    def test_multi_sku_windows_never_average_across_skus(self):
+        self._shop("1")
+        self._archive("P1")
+        self._cover("1", WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100", sku="P1-skuA")
+        self._sale("1", "E2", product="P1", day=date(2026, 9, 3),
+                   quantity="2", amount="160", sku="P1-skuB")
+        self._snapshot("1", captured_at=NOW,
+                       prices={"P1-skuA": ("90", "40"), "P1-skuB": ("80", "30")})
+
+        _result, payload = self._run()
+        row = self._row_for(payload, "1")
+        self.assertIsNone(row["reference_price"],
+                          "两个 SKU 成交时不得合成平均档案价")
+        self.assertIsNone(row["margin_ref"], "参考毛利只到 SKU 级")
+        self.assertTrue(any("跨多个SKU" in text for text in payload["limitations"]),
+                        payload["limitations"])
+
+    def test_disabled_archive_item_is_explicitly_labelled_disabled(self):
+        self._shop("1")
+        self._archive("P1")
+        self._cover("1", WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._snapshot("1", captured_at=NOW, prices={"P1-sku": ("90", "40")},
+                       item_status=0)
+
+        _result, payload = self._run()
+        row = self._row_for(payload, "1")
+        self.assertEqual(row["reference_item_status"], "disabled",
+                         "activeStatus=0 必须显式已停用，不得冒充在售")
+        self.assertEqual(row["reference_price"], "90",
+                         "已停用档案价仍披露，但必须带已停用标签")
+        self.assertTrue(any("已停用" in text for text in payload["limitations"]),
+                        payload["limitations"])
+
+    def test_shop_without_sales_gets_no_reference_disclosure(self):
+        """P1（复审）：本窗口没有该商品成交的获准店不参与档案参考归类。
+
+        它不缺快照、也无行可挂参考值——算进缺快照披露或 published 计数
+        都是对用户失实的陈述（多店报告、商品只在部分店成交是常态）。
+        """
+        self._shop("1")
+        self._shop("2")
+        self._archive("P1")
+        for key in self.shops:
+            self._cover(key, WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._snapshot("1", captured_at=NOW, prices={"P1-sku": ("90", "40")})
+        # 店 2 没有成交，也没有快照：修复后它不应出现在任何参考披露里。
+
+        _result, payload = self._run()
+        self.assertFalse(
+            any("没有7天内的完整ERP档案价快照" in text
+                for text in payload["limitations"]),
+            payload["limitations"])
+        diagnostics = payload.get("diagnostics", {}).get("item_price_reference", {})
+        self.assertEqual(diagnostics.get("shops_published"), 1)
+        row = self._row_for(payload, "1")
+        self.assertEqual(row["reference_price"], "90")
+
+    def test_pdd_shop_reference_stays_excluded(self):
+        """拼多多不接入档案价：按既有契约整店退出商品报告，参考值永远不存在。
+
+        与 test_platform_without_payment_source_is_excluded_not_zeroed 同一契约：
+        拼多多商品销售额走出库通道、付款时间口径实测不成立 → excluded_scope +
+        状态 partial，被排除店铺不出现在任何行里——参考值自然不会出现，
+        也不允许以"缺参考价"以外的口径出现（不补零、不冒充）。
+        """
+        from bi_agent.commerce.tool import analyze_product_performance
+
+        self._shop("1")
+        self._shop("pd", platform="pdd")
+        self._archive("P1")
+        for key in self.shops:
+            self._cover(key, WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._sale("pd", "E2", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._snapshot("1", captured_at=NOW, prices={"P1-sku": ("90", "40")})
+
+        request = _request(
+            product={"text": "档案P1"},
+            profit_basis="existing_fields",
+            metrics=["sold_quantity", "sales_amount", "weighted_avg_paid_price",
+                     "product_gross_profit_reference",
+                     "product_gross_margin_reference"])
+        result = analyze_product_performance(request, self._context())
+        payload = _payload_for(result, "metric_result")
+        self.assertEqual(result.status.value, "partial")
+        excluded = {item["shop_ref"]: item for item in payload["excluded_scope"]}
+        pd_ref = ref_for_key("shop", self.shops["pd"])
+        self.assertIn(pd_ref, excluded)
+        self.assertEqual(excluded[pd_ref]["reason"],
+                         "coverage_time_basis_unverified")
+        self.assertEqual(excluded[pd_ref].get("platform"), "pdd")
+        pdd_rows = [row for row in payload["data"]
+                    if row.get("shop_ref") == pd_ref]
+        self.assertEqual(pdd_rows, [], "被排除店铺不出现任何行，更不会有参考值")
+        row = self._row_for(payload, "1")
+        self.assertEqual(row["reference_price"], "90", "获准店铺的参考值不受影响")
+        self.assertEqual(row["reference_item_status"], "active")
+
+    def test_reference_columns_never_enter_rankings(self):
+        self._shop("1")
+        self._shop("2")
+        self._archive("P1")
+        for key in self.shops:
+            self._cover(key, WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._sale("2", "E2", product="P1", day=date(2026, 9, 3),
+                   quantity="9", amount="450")
+        self._snapshot("1", captured_at=NOW, prices={"P1-sku": ("90", "40")})
+        self._snapshot("2", captured_at=NOW, prices={"P1-sku": ("10", "1")})
+
+        _result, payload = self._run()
+        self.assertNotIn("ranking", payload, "商品报告参考列不产生排名块")
+        for row in payload["data"]:
+            self.assertNotIn("rank", row)
+        # 店 1 参考毛利 0.6 远高于店 2 的 0.1，但排名若按它排会泄露在断言里：
+        # 这里直接验证不存在任何按参考列排序的结构。
+        self.assertNotIn("rank_groups", payload)
+
+    def test_old_artifact_payload_without_reference_columns_still_validates(self):
+        """旧 Artifact（无参考列）原样可读：新增列只是白名单扩容，不回改旧契约。"""
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        payload = {
+            "status": "ok",
+            "metric_definition": {
+                "weighted_avg_paid_price": COMMERCE_METRIC_DEFINITIONS[
+                    "weighted_avg_paid_price"]},
+            "filters": {},
+            "coverage": {"status": "complete", "start": "2026-09-01",
+                         "end": "2026-09-08", "gaps": []},
+            "limitations": [],
+            "data": [{"shop_ref": ref_for_key("shop", "S1"),
+                      "product_ref": ref_for_key("product", "P1"),
+                      "line_kind": "sale", "sold_quantity": "1",
+                      "sales_amount": "100", "weighted_avg_paid_price": "100",
+                      "sales_share": None}],
+        }
+        validate_artifact_payload(payload)
+        self.assertNotIn("reference_price", payload["data"][0])
+
+
 class CommerceContractTests(unittest.TestCase):
     """不需要数据库的契约用例：白名单、词表与算术自锁。"""
 
@@ -1054,7 +1402,9 @@ class CommerceContractTests(unittest.TestCase):
                          {"sold_quantity", "sales_amount", "weighted_avg_paid_price",
                           "product_gross_profit_reference",
                           "product_gross_margin_reference",
-                          "erp_gross_profit_reference"})
+                          "erp_gross_profit_reference",
+                          # S4 档案参考价：与成交均价并列的档案目录价与 SKU 级参考毛利。
+                          "reference_price", "margin_ref"})
 
     def test_request_rejects_out_of_range_windows_and_unknown_metrics(self):
         from pydantic import ValidationError

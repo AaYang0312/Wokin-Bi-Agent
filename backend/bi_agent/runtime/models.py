@@ -26,7 +26,8 @@ from bi_agent.commerce.metrics import (
     COMMERCE_METRIC_DEFINITIONS, COMMERCE_METRIC_UNITS, COMMERCE_METRICS,
     COMMERCE_PUBLIC_LIMITATIONS, COMMERCE_RESULT_COLUMNS, EXCLUDED_REASONS,
     GROUP_STATUS_VALUES, METRIC_STATUS_VALUES, OPPORTUNITY_STATUSES,
-    PLATFORM_GROUP_CODES, RANKING_SCOPES, RANKING_STATUSES, TREND_DAYS)
+    PLATFORM_GROUP_CODES, RANKING_SCOPES, RANKING_STATUSES, REFERENCE_ITEM_STATUS_VALUES,
+    TREND_DAYS)
 from bi_agent.inventory.rules import (
     AUDIT_LEVELS as INVENTORY_LEVELS,
     INVENTORY_DATETIME_RESULT_COLUMNS, INVENTORY_INT_RESULT_COLUMNS,
@@ -339,6 +340,8 @@ _DIAGNOSIS_KEYS = frozenset({
     # S3 口径剔除：local_filter 平台的支付口径剔掉了多少关闭后退款单支付，
     # 旧口径与新口径的差值据此逐项可解释。
     "closed_refunded_excluded",
+    # S4 档案参考价：几家发布、几家 data_missing、几家按已停用披露。
+    "item_price_reference",
 })
 _DIAGNOSIS_FIELDS = {
     "unmatched_refunds": frozenset({
@@ -355,6 +358,8 @@ _DIAGNOSIS_FIELDS = {
     "product_ranking": frozenset({
         "groups_published", "shops_published", "shops_excluded", "rows_published",
         "row_cap"}),
+    "item_price_reference": frozenset({
+        "shops_published", "shops_missing", "shops_disabled"}),
 }
 # 名称只在授权展示层出现：模型载荷带上这两项就是契约违规。
 _PUBLIC_ONLY_ARTIFACT_KEYS = frozenset({"entities", "catalog_version"})
@@ -422,7 +427,13 @@ _LABEL_RESULT_VALUES: dict[str, frozenset[str]] = {
     **LISTING_LABEL_RESULT_VALUES,
     # 库存预警的口径、判定态与候选动作：只能取 spec §5.5 / §6 的那几个值。
     **INVENTORY_LABEL_RESULT_VALUES,
+    # S4 档案参考价的已停用标签：档案可用状态只有 active/disabled 两态，
+    # activeStatus=0 必须显式已停用，不给自由文本留通道。
+    "reference_item_status": REFERENCE_ITEM_STATUS_VALUES,
 }
+# S4 档案参考三列在「参考不可用」时整体为 NULL（graph.REFERENCE_MISSING_COLUMNS）：
+# 这里的可空是成组降级语义，不是自由文本通道——非 NULL 时仍只收登记值。
+_NULLABLE_LABEL_RESULT_COLUMNS = frozenset({"reference_item_status"})
 _RESULT_COLUMNS = (_METRIC_RESULT_COLUMNS | PROMOTION_RESULT_COLUMNS
                    | COMMERCE_RESULT_COLUMNS | LISTING_RESULT_COLUMNS
                    | INVENTORY_RESULT_COLUMNS)
@@ -992,10 +1003,16 @@ def _candidate_cards(value: object) -> None:
 
 
 def _metric_units(value: object) -> None:
-    """每个指标的计量单位：模型不能靠口径文本自己认单位。"""
-    units = _mapping(value, allowed=frozenset(_METRICS))
+    """每个指标（含 S4 档案参考列）的计量单位：模型不能靠口径文本自己认单位。
+
+    档案参考列随 metric_definition 一并发布且带单位，但它们是结果列、不是
+    可请求指标——键集从生产方 COMMERCE_METRIC_UNITS 推导，不并入 _METRICS
+    请求面，防止用户把列名当指标请求。
+    """
+    unit_columns = frozenset(COMMERCE_METRIC_UNITS) - COMMERCE_METRICS
+    units = _mapping(value, allowed=frozenset(_METRICS) | unit_columns)
     for metric, unit in units.items():
-        if metric not in COMMERCE_METRICS:
+        if metric not in COMMERCE_METRICS and metric not in unit_columns:
             _unsafe_payload()
         _string_in(unit, _METRIC_UNITS)
 
@@ -1238,7 +1255,11 @@ def _result_rows(value: object, *, public: bool) -> None:
             elif key in INVENTORY_UNIT_RESULT_COLUMNS:
                 _inventory_unit(result_value)
             elif key in _LABEL_RESULT_VALUES:
-                _string_in(result_value, _LABEL_RESULT_VALUES[key])
+                if result_value is None:
+                    if key not in _NULLABLE_LABEL_RESULT_COLUMNS:
+                        _unsafe_payload()
+                else:
+                    _string_in(result_value, _LABEL_RESULT_VALUES[key])
             elif key in _REF_RESULT_COLUMNS:
                 _ref(result_value)
             elif key in _TEXT_RESULT_COLUMNS:

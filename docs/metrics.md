@@ -99,6 +99,16 @@ deadline 全部来自服务端 `DomainContext`。旧 `query_business` 不变，�
 | `product_gross_margin_reference` | 同一行集合的商品毛利参考 ÷ 同集合收入；分母 0 或成本覆盖不全 ⇒ null | 不平均店铺利润率，也不拿已知成本除全部收入 |
 | `erp_gross_profit_reference` | `bi.orders.raw_gross_profit` 按**唯一 ERP 单据**聚合（拆合单不摊平）；一半单据无毛利字段 ⇒ null 并披露覆盖率 | 不摊到商品，不与商品毛利相加或相除 |
 
+S4 档案参考三列（2026-09-28 起，随商品报告逐行发布；来源 `erp.item.list.get` 日频快照，`027` 迁移）：
+
+| 列 | 口径 | 不能是什么 |
+| --- | --- | --- |
+| `reference_price` | ERP 商品档案价（`priceOutput`，SKU 级；无规格商品取商品级行）；快照须为 7 天内 `scan_complete`，且窗口内成交单一 SKU——多 SKU 不跨规格平均 | 不是渠道促销价，也不是实际成交价 |
+| `margin_ref` | 参考毛利 = (成交均价 − 档案成本) ÷ 成交均价，SKU 级；缺档案价/成本、快照过期、多 SKU ⇒ null | 不是净利润（未扣售后、平台费、运费、广告费），不进排名 |
+| `reference_item_status` | `active` / `disabled`（档案 `activeStatus=0` 显式已停用）；参考不可用时整列 null | 不是在售状态主张，停用档案的成交照常计数 |
+
+三列永远不进排名与图表轴；跨店合计行恒为 null（跨店档案价不可平均）。披露按类各说各的：平台不接档案价（拼多多永久排除）、缺快照或快照过期（7 天）、多 SKU、快照缺该成交 SKU、档案已停用，另有 `item_price_reference` 诊断计数（shops_published/missing/disabled）；本窗口没有该商品成交的店不参与归类（不算缺快照，也不计数）。拼多多整店按既有契约退出商品报告，不出现任何参考值。
+
 不可让步的七条规则（均有用例钉在 `backend/tests/test_commerce.py`）：
 
 1. **两个口径面分开发布**。商品面是 `metric_result` 与 `trend_series`，ERP 单据面与
