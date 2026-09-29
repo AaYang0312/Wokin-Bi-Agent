@@ -5148,6 +5148,42 @@ class ItemPriceScanSyncTests(unittest.TestCase):
         self.assertEqual(caught.exception.problems.get("invalid"), 1)
         self.assertEqual(len(self._head_rows()), 0)
 
+    def test_out_of_range_price_magnitude_fails_closed(self):
+        """P2（三轮复审）：numeric(20,6) 装不下的量级必须在规范化层拒绝。
+
+        priceOutput/purchasePrice ≥10^14 可通过 to_decimal，落库时才以裸
+        NumericValueOutOfRange 终止 CLI 多店循环——与域外 activeStatus 同罪。
+        """
+        self._shop()
+        self._archive("14")
+        client = self._client([
+            {"success": True,
+             "items": [self._item_payload("14", price="99999999999999999",
+                                          skus=[])]},
+        ])
+        from bi_agent.sync import ItemPriceScanIncomplete
+
+        with self.assertRaises(ItemPriceScanIncomplete) as caught:
+            self._scan(client)
+        self.assertEqual(caught.exception.problems.get("invalid"), 1)
+        self.assertEqual(len(self._head_rows()), 0)
+
+    def test_out_of_range_sku_cost_magnitude_fails_closed(self):
+        sku = {"sysSkuId": 9002, "activeStatus": 1, "priceOutput": "90",
+               "purchasePrice": "1E+20"}
+        self._shop()
+        self._archive("15")
+        client = self._client([
+            {"success": True,
+             "items": [self._item_payload("15", skus=[sku])]},
+        ])
+        from bi_agent.sync import ItemPriceScanIncomplete
+
+        with self.assertRaises(ItemPriceScanIncomplete) as caught:
+            self._scan(client)
+        self.assertEqual(caught.exception.problems.get("invalid"), 1)
+        self.assertEqual(len(self._head_rows()), 0)
+
     def test_rate_limit_error_propagates_without_publishing(self):
         from bi_agent.kuaimai import KuaimaiError
 

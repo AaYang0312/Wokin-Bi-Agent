@@ -57,6 +57,10 @@ ITEM_PRICE_MAX_BATCHES = 1000
 # erp.item.list.get 是两个概念（一个给血缘/凭据，一个给路由），不共用一个常量，
 # 防一边改名时悄悄穿透另一边的约束。
 ITEM_PRICE_SNAPSHOT_SOURCE = "kuaimai_item_api"
+# 027 的价格/成本列是 numeric(20,6)：整数部分最多 14 位。更大的量级不可能是一笔
+# 真实档案价，落库时只会以裸 NumericValueOutOfRange 炸掉 CLI 多店循环——在
+# 规范化层按域外值拒绝（problems["invalid"]），与 activeStatus 域校验同一纪律。
+ITEM_PRICE_MAX_ABS = Decimal("100000000000000")
 
 # 平台→订单源路由：直接取自注册表。sync_state 主键含 source，出库通道与交易通道的
 # 覆盖/水位互不干扰；未命中的平台不再回退默认源（见 `_shop_order_source`）。
@@ -1660,8 +1664,8 @@ class ItemPriceScanIncomplete(Exception):
     """档案价扫描不完整：快照不得发布，也不得推进任何完整性主张。
 
     `problems` 是逐类计数（missing_items/unexpected_items/invalid/over_budget/
-    enumeration_empty），作为 fail-closed 凭证返回给调用方；任何一类缺口都
-    意味着「看完全店目录」这个主张不成立，整批数据必须回滚。
+    duplicate_items/enumeration_empty），作为 fail-closed 凭证返回给调用方；
+    任何一类缺口都意味着「看完全店目录」这个主张不成立，整批数据必须回滚。
     """
 
     def __init__(self, problems: dict[str, int]) -> None:
@@ -1686,6 +1690,10 @@ def normalise_item_price_sku(raw_sku: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("item_price_sku_identity_or_status_unusable")
     if active_status not in (0, 1):
         raise ValueError("item_price_sku_active_status_out_of_domain")
+    for source_key in ("priceOutput", "purchasePrice"):
+        value = to_decimal(raw_sku.get(source_key))
+        if value is not None and value.copy_abs() >= ITEM_PRICE_MAX_ABS:
+            raise ValueError("item_price_sku_magnitude_out_of_range")
     return {
         "sys_sku_id": sys_sku_id,
         "sku_outer_id": (str(raw_sku.get("skuOuterId") or "").strip() or None),
@@ -1710,6 +1718,10 @@ def normalise_item_price(raw_item: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("item_price_identity_or_status_unusable")
     if active_status not in (0, 1):
         raise ValueError("item_price_active_status_out_of_domain")
+    for source_key in ("priceOutput", "purchasePrice"):
+        value = to_decimal(raw_item.get(source_key))
+        if value is not None and value.copy_abs() >= ITEM_PRICE_MAX_ABS:
+            raise ValueError("item_price_magnitude_out_of_range")
     raw_skus = raw_item.get("skus")
     skus = [normalise_item_price_sku(raw_sku)
             for raw_sku in (raw_skus if isinstance(raw_skus, list) else [])
