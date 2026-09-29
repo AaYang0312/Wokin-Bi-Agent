@@ -1969,7 +1969,7 @@ def _check_cohort_resilient(conn, client: KuaimaiClient, *, shop_id: str,
     except KuaimaiError as exc:
         record_failure(conn, source=AFTERSALE_SOURCE, entity="aftersales_cohort",
                        shop_id=shop_id, code=exc.code)
-        failed.append(f"aftersales_cohort@{window.start.date().isoformat()}")
+        failed.append(f"aftersales_cohort@{window.start.isoformat()}")
         logger.warning("cohort window failed shop=%s window=%s..%s code=%s",
                        shop_id, window.start.isoformat(), window.end.isoformat(),
                        exc.code)
@@ -2005,7 +2005,7 @@ def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
                                       order_source=order_source,
                                       payment_fetch=payment_fetch)
         if count is None:
-            failed.append(f"orders@{window.start.date().isoformat()}")
+            failed.append(f"orders@{window.start.isoformat()}")
             orders_failed_starts.add(window.start)
         else:
             stats["orders"] += count
@@ -2014,13 +2014,13 @@ def _backfill_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
             conn, client, entity="aftersales_occurrence", shop_id=shop_id,
             window=window, mode="backfill")
         if count is None:
-            failed.append(f"aftersales_occurrence@{window.start.date().isoformat()}")
+            failed.append(f"aftersales_occurrence@{window.start.isoformat()}")
             continue  # 售后窗口失败时 cohort 的核对基线不完整，跳过该窗口
         stats["aftersales_occurrence"] += count
         if window.start in orders_failed_starts:
             # cohort 的 tid 基线来自本窗口的已核验支付事实：orders 失败同样构成
             # 基线缺失，cohort 覆盖不能写（写了就是 missing-only 永不重访的假凭证）。
-            failed.append(f"aftersales_cohort@{window.start.date().isoformat()}")
+            failed.append(f"aftersales_cohort@{window.start.isoformat()}")
             continue
         if _check_cohort_resilient(conn, client, shop_id=shop_id, window=window,
                                    failed=failed):
@@ -2108,7 +2108,7 @@ def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
             mode="reconcile", order_source=order_source,
             payment_fetch=payment_fetch)
         if count is None:
-            failed.append(f"orders@{window.start.date().isoformat()}")
+            failed.append(f"orders@{window.start.isoformat()}")
         else:
             stats["orders"] += count
     for window in windows_after:
@@ -2116,7 +2116,7 @@ def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
             conn, client, entity="aftersales_occurrence", shop_id=shop_id,
             window=window, mode="reconcile")
         if count is None:
-            failed.append(f"aftersales_occurrence@{window.start.date().isoformat()}")
+            failed.append(f"aftersales_occurrence@{window.start.isoformat()}")
         else:
             stats["aftersales_occurrence"] += count
     for window in windows_cohort:
@@ -2127,7 +2127,7 @@ def _reconcile_shop(conn, client: KuaimaiClient, *, shop_id: str, days: int,
                 and window_covered(conn, source=AFTERSALE_SOURCE,
                                    entity="aftersales_occurrence", shop_id=shop_id,
                                    window=window)):
-            failed.append(f"aftersales_cohort@{window.start.date().isoformat()}")
+            failed.append(f"aftersales_cohort@{window.start.isoformat()}")
             continue
         if _check_cohort_resilient(conn, client, shop_id=shop_id, window=window,
                                    failed=failed):

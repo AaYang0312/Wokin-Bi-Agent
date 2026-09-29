@@ -932,7 +932,8 @@ class SyncWindowResilienceTests(unittest.TestCase):
         # orders 失败的窗口，其 cohort 核对基线（本窗口支付事实）不完整，
         # 覆盖凭证同样不能写——记为 cohort 缺口，由下次运行补。
         self.assertEqual(stats["failed_windows"],
-                         ["orders@2026-09-06", "aftersales_cohort@2026-09-06"])
+                         ["orders@2026-09-06T09:00:00+08:00",
+                          "aftersales_cohort@2026-09-06T09:00:00+08:00"])
 
     def test_authentication_failure_is_not_retried(self):
         first_orders = ("backfill", "orders", self.T0 - timedelta(days=2))
@@ -946,7 +947,8 @@ class SyncWindowResilienceTests(unittest.TestCase):
         self.assertEqual(cooldown.call_count, 0)
         self.assertIn(("backfill", "orders", self.T0 - timedelta(days=1)), calls)
         self.assertEqual(stats["failed_windows"],
-                         ["orders@2026-09-06", "aftersales_cohort@2026-09-06"])
+                         ["orders@2026-09-06T09:00:00+08:00",
+                          "aftersales_cohort@2026-09-06T09:00:00+08:00"])
 
     def test_backfill_orders_failure_skips_cohort_despite_aftersales_success(self):
         """P1（复审）：orders 失败的窗口，售后成功也不得写 cohort 覆盖。
@@ -967,8 +969,10 @@ class SyncWindowResilienceTests(unittest.TestCase):
         self.assertNotIn(bad_start, cohort_starts)
         self.assertEqual(len(cohort_starts), 1)
         self.assertEqual(stats["cohort_windows"], 1)
-        self.assertIn("orders@2026-09-06", stats["failed_windows"])
-        self.assertIn("aftersales_cohort@2026-09-06", stats["failed_windows"])
+        self.assertIn("orders@2026-09-06T09:00:00+08:00",
+                      stats["failed_windows"])
+        self.assertIn("aftersales_cohort@2026-09-06T09:00:00+08:00",
+                      stats["failed_windows"])
 
     def test_scan_failure_still_propagates(self):
         from bi_agent.kuaimai import KuaimaiError
@@ -1020,8 +1024,10 @@ class SyncWindowResilienceTests(unittest.TestCase):
         # orders 两个窗口都成功执行。
         self.assertEqual(stats["orders"], 0)
         self.assertEqual(stats["cohort_windows"], 1)
-        self.assertIn("aftersales_occurrence@2026-09-07", stats["failed_windows"])
-        self.assertIn("aftersales_cohort@2026-09-07", stats["failed_windows"])
+        self.assertIn("aftersales_occurrence@2026-09-07T09:00:00+08:00",
+                      stats["failed_windows"])
+        self.assertIn("aftersales_cohort@2026-09-07T09:00:00+08:00",
+                      stats["failed_windows"])
 
     def test_reconcile_cohort_failure_does_not_abort_next_window(self):
         from bi_agent import sync
@@ -1045,7 +1051,8 @@ class SyncWindowResilienceTests(unittest.TestCase):
             stats = sync._reconcile_shop(conn, Mock(), shop_id="S1", days=2,
                                          run_end=self.T0)
         # 第一个窗口 cohort 失败只记入汇总，第二个窗口的 cohort 照常执行。
-        self.assertIn("aftersales_cohort@2026-09-06", stats["failed_windows"])
+        self.assertIn("aftersales_cohort@2026-09-06T09:00:00+08:00",
+                      stats["failed_windows"])
         self.assertEqual(stats["cohort_windows"], 1)
 
 
