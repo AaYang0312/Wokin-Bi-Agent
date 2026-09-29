@@ -2339,11 +2339,11 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
         return expected[index] if isinstance(expected, list) else expected
 
     def test_the_set_is_28_questions_and_ids_are_contiguous(self):
-        """S1 起题集扩到 28：新增 27/28 双口径题（出库口径 + 支付口径/PDD 负边界）。"""
-        self.assertEqual(len(self.questions), 28)
+        """题集扩到 29：27/28 双口径题 + 29 档案价商品报告题（S4）。"""
+        self.assertEqual(len(self.questions), 29)
         self.assertEqual(sorted(self.questions),
-                         [f"{index:02d}" for index in range(1, 29)])
-        self.assertEqual(self.module.EXPECTED_QUESTION_COUNT, 28)
+                         [f"{index:02d}" for index in range(1, 30)])
+        self.assertEqual(self.module.EXPECTED_QUESTION_COUNT, 29)
         for qid in ("27", "28"):
             expected_list = (self.questions[qid]["expected"]
                              if isinstance(self.questions[qid]["expected"], list)
@@ -2355,6 +2355,12 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
             "platform_payment", "28 必须显式考支付口径")
         self.assertIn("cells", json.dumps(self.questions["28"], ensure_ascii=False),
                       "支付口径的 data_missing 格必须按结构化字段核对")
+        self.assertEqual(self._expected("29").get("tool"),
+                         "analyze_product_performance", "29 考档案价商品报告")
+        self.assertIn("reference_price", self._expected("29").get("rows", {}).get("S1", {}),
+                      "29 必须按结构化行核对档案参考列")
+        self.assertIn("item_price_snapshot", self.questions["29"].get("seeds", []),
+                      "29 必须自带新鲜快照种子")
 
     def test_every_answer_question_compares_structured_facts_not_only_words(self):
         """设计 §6 / 计划 Task 11：不能只用“最终正文含某个词”判通过。

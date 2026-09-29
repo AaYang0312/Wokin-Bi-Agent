@@ -47,7 +47,7 @@ from bi_agent.sources import AFTERSALE_SOURCE, OUTSTOCK_SOURCE, TRADE_LIST_SOURC
 from tests.fakeconn import S1_REF
 
 QUESTIONS_PATH = Path(__file__).with_name("questions.jsonl")
-EXPECTED_QUESTION_COUNT = 28
+EXPECTED_QUESTION_COUNT = 29
 # 多来源合成基准（原路线图 Task 5 的"新增多来源合成基准"一节）。
 TB1 = "TB1"
 PDD1 = "PDD1"
@@ -237,8 +237,37 @@ def apply_coverage_holes(conn) -> None:
                     spans=HOLE_WINDOWS, data_as_of=_beijing(5, 0))
 
 
+def seed_item_price_snapshot(conn) -> None:
+    """S4 档案价：给 S1 的 P_A 种一份对冻结时刻新鲜的 scan_complete 快照。
+
+    captured_at=09-07 06:00，冻结时刻 09-08 09:00，约 27 小时 < 7 天时效；
+    商品级行（sys_sku_id=''）对应成交行的无规格 SKU。"""
+    captured = datetime(2026, 9, 7, 6, tzinfo=ZoneInfo("Asia/Shanghai"))
+    conn.execute(
+        "INSERT INTO bi.products(product_id, title, normalization_status) "
+        "VALUES ('P_A', '直钉枪', 'normal') "
+        "ON CONFLICT (product_id) DO UPDATE SET title=EXCLUDED.title")
+    conn.execute(
+        "INSERT INTO bi.item_price_snapshots(snapshot_id, shop_id, source, "
+        "captured_at, scan_complete, scan_evidence) VALUES "
+        "('ACC-SNAP-1', 'S1', 'kuaimai_item_api', %s, true, "
+        "'{\"batches\": 1, \"expected_items\": 1, \"fetched_items\": 1}') "
+        "ON CONFLICT (shop_id, snapshot_id) DO UPDATE "
+        "SET captured_at = EXCLUDED.captured_at", (captured,))
+    conn.execute(
+        "DELETE FROM bi.item_price_snapshot_items "
+        "WHERE shop_id='S1' AND snapshot_id='ACC-SNAP-1'")
+    conn.execute(
+        "INSERT INTO bi.item_price_snapshot_items(shop_id, snapshot_id, "
+        "sys_item_id, sys_sku_id, outer_id, sku_outer_id, reference_price, "
+        "purchase_price, item_active_status, sku_active_status, captured_at) "
+        "VALUES ('S1', 'ACC-SNAP-1', 'P_A', '', 'OUT-A', NULL, '90.00', "
+        "'40.00', 1, NULL, %s)", (captured,))
+
+
 SEED_STEPS = {"multi_source": seed_multi_source_case,
-              "coverage_holes": apply_coverage_holes}
+              "coverage_holes": apply_coverage_holes,
+              "item_price_snapshot": seed_item_price_snapshot}
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +393,17 @@ def _model_script(question: dict) -> list[ModelReply]:
         return [_call_reply("compare_performance", compare),
                 _reply(text="支付口径只认已认证平台：fxg支付100元；"
                             "tb与pdd未经认证，支付格是data_missing，不补零。")]
+    if qid == "29":
+        return [_call_reply("analyze_product_performance", {
+                    "product": {"text": "直钉枪"},
+                    "profit_basis": "existing_fields",
+                    "start": "2026-09-05", "end": "2026-09-08",
+                    "metrics": ["sold_quantity", "sales_amount",
+                                "weighted_avg_paid_price",
+                                "product_gross_margin_reference"]}),
+                _reply(text="直钉枪9月5日至7日卖了1件、成交额80元、均价80元；"
+                            "档案参考价90元、参考毛利0.5——档案目录价不是促销价，"
+                            "参考毛利未扣售后与平台费。")]
     return [_call_reply("query_business", query), _reply(text="已完成查询。")]
 
 
@@ -491,13 +531,15 @@ def _structured_problems(expected: dict, result: ToolResult) -> list[str]:
 
 
 def _verify_commerce_turn(expected: dict, calls: list) -> list[str]:
-    """compare_performance 回合的机器核对：参数、口径、行值、缺失格与分组边界。
+    """compare_performance / analyze_product_performance 回合的机器核对。
 
     断言全部落在已校验载荷的**结构化字段**上（filters.caliber、data、
     metric_statuses、ranking、group_statuses、excluded_scope），
     不做跨 UUID 载荷的子串扫描。
     """
     problems: list[str] = []
+    if expected.get("tool") == "analyze_product_performance":
+        return _verify_product_turn(expected, calls)
     if expected.get("tool") != "compare_performance":
         return problems
     if not calls:
@@ -584,6 +626,51 @@ def _verify_commerce_turn(expected: dict, calls: list) -> list[str]:
                      payload.get("excluded_scope", []) if isinstance(item, dict))
     if "excluded_reasons" in expected and reasons != sorted(expected["excluded_reasons"]):
         problems.append(f"excluded_scope原因期望{expected['excluded_reasons']}，实际{reasons}")
+    return problems
+
+
+def _verify_product_turn(expected: dict, calls: list) -> list[str]:
+    """商品报告回合的机器核对：参数、逐店行值、参考列、诊断与单位。
+
+    期望行以原始店号（如 S1）书写，映射到载荷里的 ent- 店引用再比对。"""
+    if not calls:
+        return ["analyze_product_performance未被调用"]
+    problems: list[str] = []
+    entry = calls[-1]
+    arguments = entry["arguments"]
+    for key, value in (expected.get("parameters") or {}).items():
+        actual_value = arguments.get(key)
+        if key in ("metrics",):
+            if sorted(value) != sorted(actual_value or []):
+                problems.append(f"{key}期望{value}，实际{actual_value}")
+        elif actual_value != value:
+            problems.append(f"{key}期望{value}，实际{actual_value}")
+    payload = entry["payload"]
+    if not isinstance(payload, dict) or "data" not in payload:
+        return problems + [f"analyze_product_performance无已发布载荷：{payload}"]
+    rows = {row.get("shop_ref"): row for row in payload.get("data", [])
+            if isinstance(row, dict) and row.get("shop_ref")}
+    for shop, cells in (expected.get("rows") or {}).items():
+        row = rows.get(ref_for_key("shop", shop))
+        if row is None:
+            problems.append(f"期望{shop}的行在场，实际行：{sorted(rows)}")
+            continue
+        for column, value in cells.items():
+            if row.get(column) != value:
+                problems.append(f"{shop}.{column}期望{value}，实际{row.get(column)}")
+    for key, want in (expected.get("diagnostics") or {}).items():
+        diag = (payload.get("diagnostics") or {}).get(key)
+        if not isinstance(diag, dict):
+            problems.append(f"诊断缺{key}，实际{payload.get('diagnostics')}")
+            continue
+        for field, value in want.items():
+            if str(diag.get(field)) != str(value):
+                problems.append(
+                    f"诊断{key}.{field}期望{value}，实际{diag.get(field)}")
+    for metric, unit in (expected.get("metric_units") or {}).items():
+        actual = (payload.get("metric_units") or {}).get(metric)
+        if actual != unit:
+            problems.append(f"单位{metric}期望{unit}，实际{actual}")
     return problems
 
 

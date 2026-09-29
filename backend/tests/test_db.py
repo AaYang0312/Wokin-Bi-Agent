@@ -2314,8 +2314,10 @@ class RefetchConvergenceTests(unittest.TestCase):
 
         self.assertEqual(self.conn.execute(
             "SELECT count(*) FROM bi.orders WHERE erp_id='E9'").fetchone()[0], 0)
+        # 只数本用例的店：共享测试库里有真实同步写入的增量批次。
         self.assertEqual(self.conn.execute(
-            "SELECT count(*) FROM bi.sync_batches WHERE mode='incremental'"
+            "SELECT count(*) FROM bi.sync_batches "
+            "WHERE shop_id='S1' AND mode='incremental'"
         ).fetchone()[0], 0, "失败的上游页不能留下批次凭证")
         self.assertEqual(self._pending(), {"C9"})
 
@@ -4766,8 +4768,20 @@ class ItemPriceSnapshotMigrationTests(unittest.TestCase):
              sys_sku_id or None, price, cost, item_status, sku_status))
 
     def test_migration_is_idempotent_and_creates_both_views(self):
-        self._migration_sql()
-        self._migration_sql()  # 重复执行不得报错（幂等）
+        """真实执行迁移脚本两遍：只读文本证明不了幂等。
+
+        在外层回滚事务内先撤掉已应用的对象，模拟"从未迁移"的库再连续重放两次；
+        事务回滚后共享测试库的原对象不受影响。
+        """
+        sql = self._migration_sql()
+        self.conn.execute(
+            "DROP VIEW IF EXISTS reporting.v_item_price_snapshot_items, "
+            "reporting.v_item_price_snapshots")
+        self.conn.execute(
+            "DROP TABLE IF EXISTS bi.item_price_snapshot_items, "
+            "bi.item_price_snapshots CASCADE")
+        self.conn.execute(sql)
+        self.conn.execute(sql)  # 重复执行不得报错（幂等）
         for table in ("item_price_snapshots", "item_price_snapshot_items"):
             count = self.conn.execute(
                 "SELECT count(*) FROM information_schema.tables "
