@@ -181,6 +181,8 @@ Register-ScheduledTask -TaskName 'BI Agent Hourly Sync' -Action $syncAction -Tri
 
 2026-09-29 本机已注册的实际调度（任务名 → 周期）：`BI Agent Hourly Sync`（每小时增量）、`BI Agent Gap Healer`（每 2 小时 `reconcile --days 2 --missing-only`，错峰起于 :35）、`BI Agent Daily Reconcile`（每日 03:10 `reconcile --days 7`）、`BI Agent Daily Products`（每日 04:10）、`BI Agent Daily Item Price Scan`（每日 04:40）。重复持续 10 年（任务 XML 不接受无限时长），全部 `IgnoreNew` 单实例；互相争锁时快速失败属预期。
 
+任务经 `deploy/scheduled-tasks/run-hidden.vbs` 隐藏窗口启动（免管理员的零弹窗方案）：stdout 逐店统计追加到 `backend/logs/tasks/<任务名>.log`（python 对重定向是块缓冲，行会在任务退出时才出现），结构化告警与轮转 JSON 日志仍在 `backend/logs/sync.log`。任务本体退出码恒为 0（wscript 异步拉起即返回），判断成败看任务日志与 `bi.sync_state.last_error_code`。
+
 S4 档案价日频扫描（`item-price-scan`，迁移 027 之后可用）：逐 `BI_SHOP_IDS` 店铺按本地 `bi.products` 枚举分块（≤20 个 sysItemId/批）调用 `erp.item.list.get`，单事务落一份 `scan_complete` 快照；期望集合与返回集合必须完全相等，任何缺失/多出/无效行/超预算都整批回滚，不写部分快照。拼多多与未登记平台在入口直接跳过。快照超过 7 天未刷新时商品报告的参考价/参考毛利降级为 `data_missing`（不补零），所以建议与 `products` 档案同步同日调度：
 
 ```powershell
