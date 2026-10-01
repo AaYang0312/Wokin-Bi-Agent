@@ -706,6 +706,53 @@ class QuantifiedLimitationContractTests(unittest.TestCase):
                     validate_artifact_payload(self._payload(bad))
 
 
+class LimitationVocabularyConsistencyTests(unittest.TestCase):
+    """发射方登记的每个限制码，消费方词表都必须认识（防复发的结构测试）。
+
+    S3 的 closed_refunded_excluded 曾只登记在发射方（business_query/commerce 的
+    文本→码映射），runtime.models._LIMITATION_CODES 不认识它：真实数据上带披露的
+    成功支付查询在 classify_result 抛 unsafe_persistence_payload，运行被收尾成
+    FAILED/unavailable。这里把"文本→码→公开校验"钉成回环，缺哪一环都直接红。
+    """
+
+    def test_fragment_mapped_codes_are_all_in_the_runtime_vocabulary(self):
+        from bi_agent.commerce.graph import (
+            _COMMERCE_CODE_BY_FRAGMENT, _FIXED_CODE_BY_FRAGMENT)
+        from bi_agent.runtime import models
+
+        mapped = {code for _fragment, code
+                  in _FIXED_CODE_BY_FRAGMENT + _COMMERCE_CODE_BY_FRAGMENT}
+        self.assertTrue(mapped, "片段映射不该是空的：空集会让本断言恒真")
+        self.assertLessEqual(mapped, models._LIMITATION_CODES)
+
+    def test_disclosure_corpus_round_trips_through_codes_and_public_check(self):
+        """语料回环：文本→码（非空）→码已登记→文本过公开校验，逐层不许断。"""
+        from datetime import date
+        from decimal import Decimal
+
+        from bi_agent.business_query.nodes import _limitation_codes
+        from bi_agent.data_quality import (
+            ClosedRefundedPayments, describe_closed_refunded_exclusion,
+            describe_previous_closed_refunded_exclusion)
+        from bi_agent.runtime import models
+
+        payments = ClosedRefundedPayments(
+            rows=(("S1", date(2026, 9, 2), Decimal("70"), 1),))
+        corpus = (
+            describe_closed_refunded_exclusion(payments, ["S1"]),
+            describe_previous_closed_refunded_exclusion(payments, ["S1"]),
+            # 已有模式的回归对照：支付归属披露必须继续走通同一条回环。
+            "支付额中3130.51元未计入商品维度"
+            "（关闭订单行3130.51元；赠品行0元；无商品归属0元；其他0元）",
+        )
+        for text in corpus:
+            with self.subTest(text=text[:20]):
+                codes = _limitation_codes([text])
+                self.assertTrue(codes, "语料文本必须能归因到至少一个码")
+                self.assertLessEqual(set(codes), models._LIMITATION_CODES)
+                models._public_limitation(text)
+
+
 class PartitionedRankingContractTests(unittest.TestCase):
     """分区榜单是新增载荷块：新列与新块都要在白名单处声明类型与取值。"""
 

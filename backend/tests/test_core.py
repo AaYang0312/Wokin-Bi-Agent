@@ -5283,6 +5283,30 @@ class S3ClosedRefundedCaliberTests(unittest.TestCase):
         self.assertEqual(_limitation_codes([text]), ["closed_refunded_excluded"])
         self.assertEqual(commerce_codes([text]), ["closed_refunded_excluded"])
 
+    def test_exclusion_disclosure_texts_are_registered_public_limitations(self):
+        """S3 两条披露文本（本期+上期）必须过公开校验：漏登会把载荷整体拒掉。
+
+        文本一律由 data_quality 的构造函数现场生成，禁止手抄——文案漂移时
+        测试必须跟着构造函数走，而不是钉在旧句式上。
+        """
+        from bi_agent.data_quality import (
+            ClosedRefundedPayments, describe_closed_refunded_exclusion,
+            describe_previous_closed_refunded_exclusion)
+        from bi_agent.runtime import models
+
+        payments = ClosedRefundedPayments(
+            rows=(("TB1", self.START, Decimal("70"), 1),))
+        current_text = describe_closed_refunded_exclusion(payments, ["TB1"])
+        previous_text = describe_previous_closed_refunded_exclusion(payments, ["TB1"])
+        for text in (current_text, previous_text):
+            with self.subTest(text=text):
+                self.assertIsNotNone(text)
+                models._public_limitation(text)
+
+        # 反向对照：改坏句式的文本必须被拒，证明上面的断言不是恒真。
+        with self.assertRaises(ValueError):
+            models._public_limitation(current_text + "（店铺166754）")
+
 
 class S4ItemPriceReferenceTests(unittest.TestCase):
     """S4：ERP 档案价快照的离线契约（规范化白名单 / 平台排除 / 新鲜度 / 参考毛利）。

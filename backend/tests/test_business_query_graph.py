@@ -4,6 +4,7 @@ import json
 import unittest
 from dataclasses import is_dataclass
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from time import monotonic
 from unittest.mock import patch
 from uuid import uuid4
@@ -106,6 +107,33 @@ class BusinessQueryStateContractTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValidationError, "unsafe_persistence_payload"):
             state.model_copy(update={"normalized_request": {"shop_refs": ["S1"]}})
+
+    def test_closed_refunded_exclusion_code_passes_the_state_contract(self):
+        """S3 剔除披露的码必须登记进状态词表。
+
+        发射方（文本→码映射）会把 closed_refunded_excluded 写进成功状态的
+        limitations；漏登时 classify_result 的 model_copy 抛
+        unsafe_persistence_payload，整个运行被收尾成 FAILED/unavailable。
+        revenue_not_attributed 是反向对照：本就合法的码必须同样通过，
+        证明这里的断言不是恒真。
+        """
+        state = BusinessQueryState(
+            run_id=uuid4(), node=BusinessQueryNode.CLASSIFY_RESULT)
+        update = {
+            "tool_status": "ok",
+            "target_status": DomainStatus.SUCCESS,
+            "coverage": Coverage(
+                status="complete", start=date(2026, 9, 1), end=date(2026, 9, 8)),
+            "data_as_of": datetime(2026, 9, 8, tzinfo=timezone.utc),
+        }
+
+        control = state.model_copy(
+            update={**update, "limitations": ["revenue_not_attributed"]})
+        self.assertEqual(control.limitations, ["revenue_not_attributed"])
+
+        updated = state.model_copy(
+            update={**update, "limitations": ["closed_refunded_excluded"]})
+        self.assertEqual(updated.limitations, ["closed_refunded_excluded"])
 
     def test_safe_future_state_shape_remains_serializable(self):
         now = datetime.now(timezone.utc)
@@ -608,6 +636,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
         data: list[dict[str, str | int | None]] | None = None,
         coverage: Coverage | None = None,
         filters: dict[str, object] | None = None,
+        limitations: list[str] | None = None,
     ) -> ToolResult:
         return ToolResult(
             status=status,  # type: ignore[arg-type]
@@ -616,6 +645,7 @@ class BusinessQueryExecutionTests(unittest.TestCase):
                 status="complete", start=self.START, end=self.END
             ),
             filters=filters or {},
+            limitations=limitations or [],
         )
 
     def _execute(self, store, result: ToolResult, *, context: BusinessQueryContext | None = None):  # type: ignore[no-untyped-def]
@@ -668,6 +698,43 @@ class BusinessQueryExecutionTests(unittest.TestCase):
         )
         self.assertEqual(len(execution.domain_result.artifacts), 1)
         self.assertEqual(len(store.artifacts), 1)
+
+    def test_closed_refunded_exclusion_disclosure_completes_the_success_chain(self):
+        """S3 剔除披露随成功支付结果一起来：文本→码→状态→事件→Artifact 全链不许断。
+
+        披露文本由 data_quality 的构造函数配最小 ClosedRefundedPayments 存根现场
+        生成，不手抄；local_filter 平台的真实支付查询必现这条披露。
+        """
+        from bi_agent.data_quality import (
+            ClosedRefundedPayments, describe_closed_refunded_exclusion)
+
+        exclusion = ClosedRefundedPayments(
+            rows=((S1_REF, self.START, Decimal("70"), 2),))
+        disclosure = describe_closed_refunded_exclusion(exclusion, [S1_REF])
+        self.assertIsNotNone(disclosure)
+        store = MemoryQueryRunStore(forbidden_values={"S1", "ERP-P-9"})
+
+        execution, query_business = self._execute(
+            store, self._result(limitations=[disclosure]))
+
+        query_business.assert_called_once()
+        self.assertEqual(execution.domain_result.status, DomainStatus.SUCCESS)
+        run_id = execution.domain_result.run_id
+        self.assertEqual(store.runs[run_id]["status"], RunStatus.SUCCEEDED.value)
+        nodes = [event["node"] for event in store.events[run_id]]
+        self.assertIn("classify_result", nodes)
+        self.assertIn("persist_artifact", nodes)
+        self.assertEqual(nodes[-1], "finalize")
+        classify_event = next(event for event in store.events[run_id]
+                              if event["node"] == "classify_result")
+        self.assertEqual(classify_event["payload"]["limitation_codes"],
+                         ["closed_refunded_excluded"])
+        self.assertEqual(store.runs[run_id]["state"]["limitations"],
+                         ["closed_refunded_excluded"])
+        self.assertEqual(len(store.artifacts), 1)
+        artifact = next(iter(store.artifacts.values()))
+        self.assertEqual(artifact["artifact_type"], "metric_result")
+        self.assertIn(disclosure, artifact["payload"]["limitations"])
 
     def test_classifies_zero_missing_and_unavailable_results_without_inventing_partial(self):
         cases = (

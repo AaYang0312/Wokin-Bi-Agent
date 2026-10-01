@@ -1378,6 +1378,13 @@ class CommerceContractTests(unittest.TestCase):
             CommerceState(run_id=uuid4(), node="execute_fixed_query")
         CommerceState(run_id=uuid4(), node="freeze_versions")
 
+    def test_closed_refunded_exclusion_code_is_valid_for_commerce_state(self):
+        """CommerceState 与 BusinessQueryState 共用一份限制码词表：同码必须同过。"""
+        state = CommerceState(run_id=uuid4())
+        updated = state.model_copy(
+            update={"limitations": ["closed_refunded_excluded"]})
+        self.assertEqual(updated.limitations, ["closed_refunded_excluded"])
+
     def test_row_projection_refuses_silent_column_changes(self):
         row = {key: "1" for key in PRODUCT_ROWS}
         self.assertEqual(set(project(PRODUCT_ROWS, row)), set(PRODUCT_ROWS))

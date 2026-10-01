@@ -183,6 +183,9 @@ _LIMITATION_CODES = frozenset({
     "source_quality_failed", "source_quality_unverified",
     # 支付额未进商品维度：金额与成因由确定 SQL 产生，必须可归因不可自创。
     "revenue_not_attributed",
+    # S3 口径剔除披露：成功结果上的口径声明（非缺口、非失败），随 local_filter
+    # 平台的支付查询必现；漏登会让 classify_result 的状态校验整体拒绝。
+    "closed_refunded_excluded",
     "source_not_onboarded",
     # 指标能力门禁：来源存在但逐指标能力未授予，与缺覆盖不同类。
     "capability_unavailable",
@@ -262,6 +265,16 @@ _PUBLIC_LIMITATION_PATTERNS = (
         r"^支付额中" + _MONEY + r"元未计入商品维度"
         r"（关闭订单行" + _MONEY + r"元；赠品行" + _MONEY + r"元；"
         r"无商品归属" + _MONEY + r"元；其他" + _MONEY + r"元）$"),
+    # S3 口径剔除披露（本期/上期）：笔数与金额可变，句式固定（金额片段与 _MONEY
+    # 同源）。文本由 data_quality 的两个 describe_closed_refunded_* 构造函数生成，
+    # 减号是 U+2212；漏登会让 local_filter 平台的成功支付查询在载荷校验处被拒。
+    re.compile(
+        r"^支付口径已剔除关闭后退款单的已核验支付[0-9]+笔/" + _MONEY
+        + r"元；退款单独列示，支付额−退款额为期间收支差额"
+        r"（不是净支付，也不是净利润）$"),
+    re.compile(
+        r"^上期支付口径已剔除关闭后退款单的已核验支付[0-9]+笔/" + _MONEY
+        + r"元（本期与上期对比按同一剔除口径）$"),
     *PROMOTION_LIMITATION_PATTERNS,
     *COMMERCE_LIMITATION_PATTERNS,
 )
