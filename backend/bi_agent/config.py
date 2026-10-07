@@ -39,6 +39,10 @@ class AppSettings(BaseModel):
     # Artifact，聊天行为与没有这个功能的版本一致（计划 Task 1 Step 5）。
     # 本切片的门禁开启不需要附加环境项；loader/graph 属后续 Task。
     isolated_analysis_enabled: bool = False
+    # 生意参谋手工导入上传面（计划 2026-10-02 manual-sycm-export-import D5）
+    # 默认关：关闭时上传路由 404、导入 CLI 拒绝、指标不注册，聊天行为与
+    # 现状逐字一致（既有 gate 纪律）。
+    sycm_manual_import_enabled: bool = False
 
 
 class SyncSettings(BaseModel):
@@ -170,6 +174,7 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
     # 门禁解析沿用 `_flag` 的严格 true/false：缺席与空白都是关，
     # "1"/"yes"/"True" 之类一律当场报错（计划 Task 1 Step 5）。
     isolated_analysis_enabled = _flag(env, "ISOLATED_ANALYSIS_ENABLED")
+    sycm_manual_import_enabled = _flag(env, "SYCM_MANUAL_IMPORT_ENABLED")
     return AppSettings(
         app_dsn=app_dsn,
         shop_ids=shop_ids,
@@ -183,6 +188,7 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
         approver_subjects=approver_subjects,
         approver_dsn=approver_dsn,
         isolated_analysis_enabled=isolated_analysis_enabled,
+        sycm_manual_import_enabled=sycm_manual_import_enabled,
     )
 
 

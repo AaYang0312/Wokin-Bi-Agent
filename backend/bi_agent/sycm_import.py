@@ -23,7 +23,12 @@
    quality_status='unknown'、quality_rule='manual-export/unverified'）。
    能力授予沿用 ``bi.shops.capabilities`` 既有机制，pdd 有第二道独立硬守卫。
 7. **CLI 默认关闭**：``SYCM_MANUAL_IMPORT_ENABLED`` 只认 true/false（沿用
-   ``config._flag`` 语义），缺省/false 拒绝执行并给稳定提示。
+   ``config._flag`` 语义），缺省/false 拒绝执行并给稳定提示。退出码显式：
+   0=全部接收；1=存在失败（含容器损坏收敛出的拒绝），无未捕获 traceback；
+   2=门禁/配置/输入路径错误。
+8. **容器层异常收敛**（M4/B1 收口）：``PARSE_LAYER_ERRORS`` 覆盖 zip/XML 层
+   的已知异常族，一律折算成 parse_failed 并落台账；批内逐文件隔离，单个
+   损坏文件不中止批次。
 
 已知边界（记录在案）：负数金额/未来日期/比率越界等行级值错误由 028 的表
 约束作第二道闸——触发时整个文件事务回滚，**不落台账行**（台账词表里没有
@@ -41,6 +46,7 @@ import sys
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
+import zlib
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
@@ -78,6 +84,16 @@ MAX_COLUMNS = 256
 MAX_SHEETS = 16
 
 _SSML = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+# 解析层收敛异常族（M4/B1 欠账收口）：任何 zip/XML 层异常——成员 CRC 损坏
+# （BadZipFile）、deflate 流截断（zlib.error/EOFError）、不支持的压缩位
+# （NotImplementedError）、伪造单元引用（ValueError）、sharedStrings 越界
+# （IndexError）、表单 XML 畸形（ET.ParseError）——都折算成 parse_failed，
+# 绝不以未捕获 traceback 逃逸。OSError 刻意不在列：文件不存在/无权限是调用
+# 方的输入错误，不是内容攻击面，不得伪装成解析拒绝。
+PARSE_LAYER_ERRORS = (zipfile.BadZipFile, zlib.error, EOFError,
+                      NotImplementedError, ET.ParseError, ValueError,
+                      IndexError)
 
 
 class ReasonCode(StrEnum):
@@ -485,7 +501,16 @@ def parse_sycm_file(path: Path,
     # 体积防线先于内容哈希：超限文件绝不整体读入内存（复审 P1）。
     _ensure_size_within_limit(path)
     content_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-    header, data_rows = read_sycm_sheet(path)
+    try:
+        header, data_rows = read_sycm_sheet(path)
+    except SycmValidationError:
+        raise
+    except PARSE_LAYER_ERRORS as error:
+        # B1 收口：容器/XML 层的任何异常都收敛为稳定原因码，detail 结构化
+        # 进台账事件；绝不把 zipfile/zlib/ElementTree 的原始异常交给调用方。
+        raise SycmValidationError(ReasonCode.PARSE_FAILED, {
+            "detail": "malformed_container",
+            "error": type(error).__name__}) from error
     names = [str(name or "").strip() for name in header]
 
     if any(signature in names for signature in _ITEM_SIGNATURE_COLUMNS):
@@ -536,7 +561,11 @@ def parse_sycm_file(path: Path,
 
 @dataclass(frozen=True)
 class ImportOutcome:
-    """一次文件导入的结果摘要（CLI 逐文件输出；字段即公开契约）。"""
+    """一次文件导入的结果摘要（CLI 逐文件输出；字段即公开契约）。
+
+    `upload_id` 是台账行 ``bi.manual_uploads.id``：上传面（M4）的响应契约
+    以它回指台账；CLI 的 JSON 摘要同样携带。
+    """
 
     filename: str
     content_sha256: str | None
@@ -549,6 +578,7 @@ class ImportOutcome:
     zero_spend_cells: int = 0
     granted_capabilities: tuple[str, ...] = ()
     detail: Mapping[str, object] | None = None
+    upload_id: uuid.UUID | None = None
 
 
 def _ledger_sha256(path: Path) -> str | None:
@@ -594,8 +624,7 @@ def _insert_events(conn: psycopg.Connection, upload_id, events: list) -> None:
             (uuid.uuid4(), upload_id, event_type, Jsonb(payload)))
 
 
-def _reference_payload(path: Path, content_sha256: str | None) -> dict:
-    filename = Path(path).name
+def _reference_payload(filename: str, content_sha256: str | None) -> dict:
     return {
         "filename": filename,
         "content_sha256": content_sha256,
@@ -605,36 +634,64 @@ def _reference_payload(path: Path, content_sha256: str | None) -> dict:
     }
 
 
-def _record_rejection(conn: psycopg.Connection, path: Path,
-                      error: SycmValidationError, subject_id: str) -> ImportOutcome:
-    """拒绝也留台账：一行 manual_uploads + received/rejected 事件（单事务）。"""
-    content_sha256 = _ledger_sha256(path)
+def _insert_upload_ledger(conn: psycopg.Connection, *, upload_id,
+                          subject_id: str, filename: str,
+                          content_sha256: str | None, kind, status: str,
+                          reason_code: str | None, rows_read: int,
+                          rows_written: int, shops: list[str]) -> None:
+    """台账 INSERT 的单一实现：接受与拒绝两条路径共用同一列序。"""
+    conn.execute(
+        "INSERT INTO bi.manual_uploads(id, subject_id, filename, "
+        "content_sha256, kind, status, reason_code, rows_read, rows_written, "
+        "shops, completed_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+        "now())",
+        (upload_id, subject_id, filename, content_sha256,
+         str(kind) if kind else None, status, reason_code, rows_read,
+         rows_written, shops))
+
+
+def record_upload_rejection(conn: psycopg.Connection, *, filename: str,
+                            content_sha256: str | None,
+                            error: SycmValidationError,
+                            subject_id: str) -> ImportOutcome:
+    """无文件路径的拒绝台账（上传面）：字节体拒绝（超限等）也留一行 + 事件。
+
+    与 `_record_rejection` 共用同一 INSERT 与事件结构；调用方自行给出
+    `content_sha256`。上传面对超限请求传入的是**保留内容**的哈希（封顶前缀
+    或零字节），detail 里的 content_scope 说清这一点——绝不冒充整文件哈希。
+    """
     detail = dict(error.detail)
     kind = detail.get("kind")
     kind = kind if kind in (FileKind.SHOP, FileKind.CUSTOMER) else None
     rows_read = int(detail.get("rows_read") or 0)
     with conn.transaction():
         upload_id = uuid.uuid4()
-        conn.execute(
-            "INSERT INTO bi.manual_uploads(id, subject_id, filename, "
-            "content_sha256, kind, status, reason_code, rows_read, rows_written, "
-            "shops, completed_at) VALUES (%s, %s, %s, %s, %s, 'rejected', %s, "
-            "%s, 0, '{}', now())",
-            (upload_id, subject_id, Path(path).name, content_sha256,
-             str(kind) if kind else None, str(error.reason_code), rows_read))
-        reference = _reference_payload(path, content_sha256)
+        _insert_upload_ledger(
+            conn, upload_id=upload_id, subject_id=subject_id,
+            filename=filename, content_sha256=content_sha256, kind=kind,
+            status="rejected", reason_code=str(error.reason_code),
+            rows_read=rows_read, rows_written=0, shops=[])
         _insert_events(conn, upload_id, [
-            ("received", reference),
+            ("received", _reference_payload(filename, content_sha256)),
             ("rejected", {"reason_code": str(error.reason_code),
                           "rows_read": rows_read, **detail}),
         ])
-    logger.info("sycm manual import rejected file=%s reason=%s",
-                Path(path).name, error.reason_code)
+    logger.info("sycm manual upload rejected file=%s reason=%s",
+                filename, error.reason_code)
     return ImportOutcome(
-        filename=Path(path).name, content_sha256=content_sha256,
+        filename=filename, content_sha256=content_sha256,
         kind=str(kind) if kind else None, status="rejected",
         reason_code=str(error.reason_code), rows_read=rows_read,
-        rows_written=0, shops=(), detail=detail)
+        rows_written=0, shops=(), detail=detail, upload_id=upload_id)
+
+
+def _record_rejection(conn: psycopg.Connection, path: Path,
+                      error: SycmValidationError, subject_id: str) -> ImportOutcome:
+    """拒绝也留台账：一行 manual_uploads + received/rejected 事件（单事务）。"""
+    return record_upload_rejection(
+        conn, filename=Path(path).name,
+        content_sha256=_ledger_sha256(path), error=error,
+        subject_id=subject_id)
 
 
 _SHOP_FACT_UPSERT_SQL = """
@@ -718,7 +775,11 @@ def _capability_list(capabilities: object) -> list[str]:
 
 def _grant_capabilities(conn: psycopg.Connection,
                         shop_id: str) -> tuple[str, ...]:
-    """能力并入既有词表（沿用 bi.shops.capabilities 机制）；pdd 硬性守卫。"""
+    """能力并入既有词表（沿用 bi.shops.capabilities 机制）；pdd 硬性守卫。
+
+    返回值是**本次新增**授予的词（B2 收口）：店铺既有词不是这次导入授的，
+    混进返回值会让调用方把旧词当新授披露。
+    """
     row = conn.execute(
         "SELECT platform, capabilities FROM bi.shops WHERE shop_id=%s "
         "FOR UPDATE", (shop_id,)).fetchone()
@@ -730,16 +791,16 @@ def _grant_capabilities(conn: psycopg.Connection,
         logger.warning("sycm manual import refused capabilities for pdd shop=%s",
                        shop_id)
         return ()
-    merged = sorted(set(_capability_list(capabilities))
-                    | set(SYCM_MANUAL_CAPABILITIES))
-    if merged != _capability_list(capabilities):
+    existing = _capability_list(capabilities)
+    merged = sorted(set(existing) | set(SYCM_MANUAL_CAPABILITIES))
+    if merged != existing:
         conn.execute("UPDATE bi.shops SET capabilities=%s WHERE shop_id=%s",
                      (merged, shop_id))
-    return tuple(merged)
+    return tuple(sorted(set(SYCM_MANUAL_CAPABILITIES) - set(existing)))
 
 
-def _write_accepted(conn: psycopg.Connection, path: Path,
-                    parsed: ParsedSycmFile, subject_id: str) -> ImportOutcome:
+def _write_accepted(conn: psycopg.Connection, parsed: ParsedSycmFile,
+                    subject_id: str) -> ImportOutcome:
     """单事务原子写入：事实 upsert + 台账 + 事件 +（店铺维度）覆盖凭证与能力。"""
     rows = parsed.rows
     batch_id = parsed.content_sha256
@@ -765,14 +826,13 @@ def _write_accepted(conn: psycopg.Connection, path: Path,
                     row.repeat_parent_orders, row.repeat_rate_180d,
                     row.shop_fans, row.shop_members, batch_id))
         upload_id = uuid.uuid4()
-        conn.execute(
-            "INSERT INTO bi.manual_uploads(id, subject_id, filename, "
-            "content_sha256, kind, status, reason_code, rows_read, rows_written, "
-            "shops, completed_at) VALUES (%s, %s, %s, %s, %s, 'accepted', NULL, "
-            "%s, %s, %s, now())",
-            (upload_id, subject_id, parsed.filename, batch_id, str(parsed.kind),
-             len(rows), len(rows), [parsed.shop_id]))
-        reference = _reference_payload(path, batch_id)
+        _insert_upload_ledger(
+            conn, upload_id=upload_id, subject_id=subject_id,
+            filename=parsed.filename, content_sha256=batch_id,
+            kind=parsed.kind, status="accepted", reason_code=None,
+            rows_read=len(rows), rows_written=len(rows),
+            shops=[parsed.shop_id])
+        reference = _reference_payload(parsed.filename, batch_id)
         _insert_events(conn, upload_id, [
             ("received", reference),
             ("accepted", {"rows_read": len(rows), "rows_written": len(rows),
@@ -792,7 +852,7 @@ def _write_accepted(conn: psycopg.Connection, path: Path,
         status="accepted", reason_code=None, rows_read=len(rows),
         rows_written=len(rows), shops=(parsed.shop_id,),
         zero_spend_cells=parsed.zero_spend_cells,
-        granted_capabilities=granted)
+        granted_capabilities=granted, upload_id=upload_id)
 
 
 def import_sycm_file(conn: psycopg.Connection, path: Path | str, *,
@@ -803,21 +863,32 @@ def import_sycm_file(conn: psycopg.Connection, path: Path | str, *,
         parsed = parse_sycm_file(path, registered_shops=eligible_shop_mapping(conn))
     except SycmValidationError as error:
         return _record_rejection(conn, path, error, subject_id)
-    return _write_accepted(conn, path, parsed, subject_id)
+    return _write_accepted(conn, parsed, subject_id)
 
 
 def import_sycm_paths(conn: psycopg.Connection,
                       paths: Iterable[Path | str]) -> list[ImportOutcome]:
-    """批量导入：目录展开为其中全部 xlsx（排序），文件按原样导入。"""
+    """批量导入：目录展开为其中全部 xlsx（排序），文件按原样导入。
+
+    批内逐文件隔离（B1 收口）：单个文件的容器层异常折算成 parse_failed
+    拒绝（照常留台账），绝不中止批次——脏批次里每个文件都必须有确定结局。
+    """
     outcomes: list[ImportOutcome] = []
     for entry in paths:
         path = Path(entry)
-        if path.is_dir():
-            outcomes.extend(
-                import_sycm_file(conn, candidate)
-                for candidate in sorted(path.glob("*.xlsx")))
-        else:
-            outcomes.append(import_sycm_file(conn, path))
+        candidates = (sorted(path.glob("*.xlsx")) if path.is_dir()
+                      else [path])
+        for candidate in candidates:
+            try:
+                outcomes.append(import_sycm_file(conn, candidate))
+            except PARSE_LAYER_ERRORS as error:
+                # 双保险：解析器已把容器层异常收敛成 SycmValidationError，
+                # 这里兜住未来解析器改动漏出的同族异常，语义不变。
+                outcomes.append(_record_rejection(
+                    conn, candidate,
+                    SycmValidationError(ReasonCode.PARSE_FAILED, {
+                        "detail": "malformed_container",
+                        "error": type(error).__name__}), CLI_SUBJECT))
     return outcomes
 
 
@@ -850,15 +921,19 @@ def _outcome_record(outcome: ImportOutcome) -> dict:
         record["detail"] = {
             key: (list(value) if isinstance(value, tuple) else value)
             for key, value in outcome.detail.items()}
+    record["upload_id"] = (str(outcome.upload_id)
+                           if outcome.upload_id is not None else None)
     return record
 
 
 def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None,
          connect=None, out=None, err=None) -> int:
-    """批模式入口。返回 0=每个文件都有确定结局（接收或带码拒绝）。
+    """批模式入口。退出码显式（B1 收口）：
 
-    退出码 2 = 门禁/配置拒绝（稳定提示在 stderr）；1 = 有文件没能给出确定
-    结局（例如表约束拦下脏数据，事务整体回滚——这类失败不得记成拒绝）。
+    - 0 = 每个文件都被接收；
+    - 1 = 存在失败（带稳定码的拒绝，含容器损坏收敛出的 parse_failed）——
+      运维据此感知"批次没有全绿"，且全程无未捕获 traceback；
+    - 2 = 门禁/配置/输入路径问题（稳定提示在 stderr，不进入解析）。
     """
     env = os.environ if env is None else env
     out = sys.stdout if out is None else out
@@ -878,6 +953,13 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None,
         description="导入生意参谋手工导出（店铺/客户维度 xlsx）")
     parser.add_argument("paths", nargs="+", help="导出目录或 xlsx 文件")
     args = parser.parse_args(argv)
+    missing = [argument for argument in args.paths
+               if not Path(argument).exists()]
+    if missing:
+        # 输入路径错误是配置问题不是解析拒绝：稳定码 + 退出 2，不产生台账。
+        print(f"sycm_import: 输入路径不存在：{missing[0]} "
+              f"(code=SYCM_IMPORT_PATH_NOT_FOUND)", file=err)
+        return 2
     dsn = (env.get("BI_WRITER_DSN") or "").strip()
     if not dsn:
         print("sycm_import: 缺少 BI_WRITER_DSN "
@@ -894,7 +976,7 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None,
     for outcome in outcomes:
         print(json.dumps(_outcome_record(outcome), ensure_ascii=False,
                          sort_keys=True), file=out)
-    return 0
+    return 1 if any(outcome.status != "accepted" for outcome in outcomes) else 0
 
 
 if __name__ == "__main__":

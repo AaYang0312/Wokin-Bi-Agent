@@ -183,6 +183,30 @@ def write_fixture(path: Path, rows: list[list], **kwargs) -> Path:
     return path
 
 
+def crc_flip_first_member_byte(data: bytes) -> bytes:
+    """真实损坏样本（反向突变语料）：翻转工作表成员压缩数据的首字节。
+
+    翻转落在 deflate 流内：读取该成员时 CRC/解压层必然爆掉（BadZipFile 或
+    zlib.error）——这正是 B1 要求收敛为 parse_failed 的逃逸面。
+    """
+    payload = bytearray(data)
+    with zipfile.ZipFile(io.BytesIO(bytes(payload))) as archive:
+        info = next(i for i in archive.infolist()
+                    if i.filename.startswith("xl/worksheets/"))
+        offset = info.header_offset + 30 + len(info.filename)
+    payload[offset] ^= 0xFF
+    return bytes(payload)
+
+
+def parse_bytes(payload: bytes, *, registered=REGISTERED,
+                filename: str = "淘店-测试淘店-店铺维度_20261001_x.xlsx"):
+    """把任意字节样本送进校验管线（损坏样本经临时文件走真实读取路径）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / filename
+        path.write_bytes(payload)
+        return parse_sycm_file(path, registered_shops=registered)
+
+
 def parse(rows: list[list], *, registered=REGISTERED, **kwargs):
     with tempfile.TemporaryDirectory() as tmp:
         path = write_fixture(Path(tmp) / "淘店-测试淘店-店铺维度_20261001_x.xlsx",
@@ -332,6 +356,57 @@ class CustomerDimensionParsingTests(unittest.TestCase):
         rows[0] = rows[0] + ["收货人姓名"]
         rows[1] = rows[1] + ["李四"]
         expect_rejection(self, rows, ReasonCode.PII_COLUMNS_REJECTED)
+
+
+# ---------------------------------------------------------------------------
+# 容器层损坏收敛（B1/M4 欠账收口：任何 zip/XML 层异常都收敛为 parse_failed）
+# ---------------------------------------------------------------------------
+
+
+class CorruptContainerConvergenceTests(unittest.TestCase):
+    """B1 反向突变：zip 成员 CRC 损坏/截断/伪造单元引用不得以未捕获异常逃逸。"""
+
+    def _expect_parse_failed(self, payload: bytes, *, label: str):
+        with self.subTest(sample=label):
+            with self.assertRaises(SycmValidationError) as caught:
+                parse_bytes(payload)
+            self.assertEqual(caught.exception.reason_code,
+                             ReasonCode.PARSE_FAILED)
+            self.assertTrue(caught.exception.detail,
+                            "detail 必须结构化（进台账事件 payload）")
+
+    def test_crc_corrupted_member_converges_to_parse_failed(self):
+        self._expect_parse_failed(
+            crc_flip_first_member_byte(build_xlsx(shop_rows(1))),
+            label="crc_flip")
+
+    def test_truncated_zip_converges_to_parse_failed(self):
+        payload = build_xlsx(shop_rows(1))
+        self._expect_parse_failed(payload[:-40], label="truncated_eocd")
+
+    def test_non_zip_bytes_converge_to_parse_failed(self):
+        self._expect_parse_failed(b"plain text, not a container",
+                                  label="not_zip")
+
+    def test_numeric_cell_reference_converges_to_parse_failed(self):
+        """无字母前缀的单元引用（<c r="123">）是 XML 层损坏：收敛不逃逸。"""
+        raw = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<worksheet xmlns="http://schemas.openxmlformats.org/'
+               'spreadsheetml/2006/main"><sheetData>'
+               '<row r="1"><c r="123"><v>1</v></c></row>'
+               "</sheetData></worksheet>").encode("utf-8")
+        self._expect_parse_failed(build_xlsx([], raw_sheet=raw),
+                                  label="numeric_ref")
+
+    def test_shared_strings_out_of_bounds_converge_to_parse_failed(self):
+        """sharedStrings 索引越界（IndexError）：同样收敛，绝不 traceback。"""
+        raw = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+               '<worksheet xmlns="http://schemas.openxmlformats.org/'
+               'spreadsheetml/2006/main"><sheetData>'
+               '<row r="1"><c r="A1" t="s"><v>99999</v></c></row>'
+               "</sheetData></worksheet>").encode("utf-8")
+        self._expect_parse_failed(build_xlsx([], raw_sheet=raw),
+                                  label="sst_out_of_bounds")
 
 
 # ---------------------------------------------------------------------------

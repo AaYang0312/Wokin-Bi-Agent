@@ -160,8 +160,15 @@ class ConfigTests(unittest.TestCase):
             {"app_dsn", "shop_ids", "environment", "allowed_subjects", "public_origin",
              "auth_subject_header", "semantic_catalog_enabled", "controlled_sql_enabled",
              "approved_query_memory_enabled", "approver_subjects", "approver_dsn",
-             "isolated_analysis_enabled"})
+             "isolated_analysis_enabled",
+             # 计划 2026-10-02 manual-sycm-export-import D5：手工导入上传面门禁，
+             # 默认关（关闭时路由 404、CLI 拒绝、指标不注册）。
+             "sycm_manual_import_enabled"})
         self.assertIs(AppSettings.model_fields["controlled_sql_enabled"].default, False)
+        # 新门禁同规：缺席与显式 false 逐字同一份设置，缺省值恒为关。
+        self.assertFalse(load_app_settings(valid_app_env()).sycm_manual_import_enabled)
+        self.assertIs(
+            AppSettings.model_fields["sycm_manual_import_enabled"].default, False)
 
     def test_env_example_ships_the_controlled_sql_gate_closed(self):
         """`.env.example` 是部署方抄的那份：新门禁必须写在那儿且只写一次。"""

@@ -49,6 +49,7 @@ from .test_sycm_parser import (
     ITEM_HEADER,
     SHOP_HEADER,
     build_xlsx,
+    crc_flip_first_member_byte,
     customer_rows,
     shop_rows,
 )
@@ -138,6 +139,8 @@ class SycmManualImportTests(unittest.TestCase):
 
         upload = self._upload_row(path.name)
         self.assertIsNotNone(upload, "台账必须有一行")
+        self.assertEqual(str(outcome.upload_id), str(upload[0]),
+                         "结果携带台账行 id（上传面契约字段）")
         self.assertEqual(upload[1], "shop")
         self.assertEqual(upload[2], "accepted")
         self.assertIsNone(upload[3])
@@ -161,10 +164,13 @@ class SycmManualImportTests(unittest.TestCase):
                           "WHERE shop_id = %s", (["aov", "quantity"], SHOP_ID))
         outcome = import_sycm_file(self.conn, self._shop_file())
         expected = sorted({"aov", "quantity", *SYCM_MANUAL_CAPABILITIES})
-        self.assertEqual(outcome.granted_capabilities, tuple(expected))
+        # B2：granted_capabilities 只含**本次新增**授予的词；aov/quantity 是
+        # 店铺既有词，不是这次导入授的。
+        self.assertEqual(outcome.granted_capabilities,
+                         tuple(sorted(SYCM_MANUAL_CAPABILITIES)))
         stored = self._one("SELECT capabilities FROM bi.shops "
                            "WHERE shop_id = %s", (SHOP_ID,))[0]
-        self.assertEqual(list(stored), expected, "并入既有词表且有序")
+        self.assertEqual(list(stored), expected, "库内仍是并入后的完整词表")
 
     # -- 2) 幂等与后批覆盖 ------------------------------------------------------
 
@@ -353,6 +359,51 @@ class SycmManualImportTests(unittest.TestCase):
         self.assertIsNone(upload[1], "item 不是可导入 kind，台账 kind 为空")
         self.assertEqual(upload[3], "not_imported_this_round")
 
+    # -- 5b) B1 欠账收口：容器损坏收敛 + 批次逐文件隔离 ---------------------------
+
+    def test_corrupt_container_converges_to_parse_failed_with_ledger(self):
+        """zip 成员 CRC 损坏/截断绝不以未捕获异常逃逸：收敛 parse_failed + 台账。"""
+        self._shop()
+        payload = build_xlsx(shop_rows(1, shop=SHOP_NAME))
+        cases = {
+            "crc": crc_flip_first_member_byte(payload),
+            "truncated": payload[:-40],
+        }
+        for label, corrupted in cases.items():
+            with self.subTest(sample=label):
+                path = self.tmp / f"淘店-{SHOP_NAME}-店铺维度_20261001_{label}.xlsx"
+                path.write_bytes(corrupted)
+                outcome = import_sycm_file(self.conn, path)  # 不得抛异常
+                self.assertEqual(outcome.status, "rejected")
+                self.assertEqual(outcome.reason_code, "parse_failed")
+                upload = self._upload_row(path.name)
+                self.assertIsNotNone(upload, "损坏样本也留台账")
+                self.assertEqual(upload[2], "rejected")
+                self.assertEqual(upload[3], "parse_failed")
+                events = self._events(upload[0])
+                self.assertEqual({name for name, _ in events},
+                                 {"received", "rejected"})
+                self.assertEqual(self._one(
+                    "SELECT count(*) FROM bi.sycm_shop_daily WHERE shop_id=%s",
+                    (SHOP_ID,))[0], 0, "损坏样本不落任何事实")
+
+    def test_batch_import_isolates_a_corrupt_file(self):
+        """批内逐文件隔离：一个文件损坏不中止批次，其余文件照常导入。"""
+        self._shop()
+        self._shop_file("good.xlsx")
+        corrupt = self.tmp / "corrupt.xlsx"
+        corrupt.write_bytes(crc_flip_first_member_byte(
+            build_xlsx(shop_rows(1, shop=SHOP_NAME))))
+
+        outcomes = import_sycm_paths(self.conn, [self.tmp])
+        self.assertEqual([o.filename for o in outcomes],
+                         ["corrupt.xlsx", "good.xlsx"])
+        by_name = {o.filename: o for o in outcomes}
+        self.assertEqual(by_name["corrupt.xlsx"].status, "rejected")
+        self.assertEqual(by_name["corrupt.xlsx"].reason_code, "parse_failed")
+        self.assertEqual(by_name["good.xlsx"].status, "accepted",
+                         "单文件失败不中止批次")
+
     def test_entity_vocabulary_migration_replays_idempotently(self):
         """029 开放 sync_state.entity='shop_daily'；重放两遍不报错、词表只增。"""
         path = Path(__file__).parents[1] / "sql" / "029_sycm_shop_daily_entity.sql"
@@ -431,7 +482,9 @@ class SycmManualImportTests(unittest.TestCase):
             argv=[str(self.tmp)],
             env={"SYCM_MANUAL_IMPORT_ENABLED": "true", "BI_WRITER_DSN": "unused"},
             connect=lambda dsn: self.conn, out=out, err=err)
-        self.assertEqual(code, 0, err.getvalue())
+        # B1 退出码契约：存在失败（含带码拒绝）⇒ 1，且无未捕获 traceback。
+        self.assertEqual(code, 1, err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
         records = [json.loads(line) for line in out.getvalue().splitlines()]
         self.assertEqual(
             {(r["filename"], r["status"]) for r in records},
@@ -442,9 +495,50 @@ class SycmManualImportTests(unittest.TestCase):
         self.assertEqual(accepted["shops"], [SHOP_ID])
         self.assertEqual(sorted(accepted["granted_capabilities"]),
                          sorted(SYCM_MANUAL_CAPABILITIES))
+        self.assertIsNotNone(accepted["upload_id"], "台账行 id 随结果返回")
         rejected = next(r for r in records if r["status"] == "rejected")
         self.assertEqual(rejected["reason_code"], "shop_not_registered")
         self.assertEqual(rejected["detail"]["unknown_shops"], ["未登记店铺"])
+
+    def test_cli_exit_code_is_zero_only_when_every_file_is_accepted(self):
+        self._shop()
+        self._shop_file("all-good.xlsx")
+        out, err = io.StringIO(), io.StringIO()
+        code = main(
+            argv=[str(self.tmp)],
+            env={"SYCM_MANUAL_IMPORT_ENABLED": "true", "BI_WRITER_DSN": "unused"},
+            connect=lambda dsn: self.conn, out=out, err=err)
+        self.assertEqual(code, 0, err.getvalue())
+
+    def test_cli_corrupt_file_is_isolated_exits_one_without_traceback(self):
+        self._shop()
+        self._shop_file("good.xlsx")
+        corrupt = self.tmp / "corrupt.xlsx"
+        corrupt.write_bytes(crc_flip_first_member_byte(
+            build_xlsx(shop_rows(1, shop=SHOP_NAME))))
+
+        out, err = io.StringIO(), io.StringIO()
+        code = main(
+            argv=[str(self.tmp)],
+            env={"SYCM_MANUAL_IMPORT_ENABLED": "true", "BI_WRITER_DSN": "unused"},
+            connect=lambda dsn: self.conn, out=out, err=err)
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err.getvalue(), "无未捕获 traceback")
+        records = {r["filename"]: r
+                   for r in map(json.loads, out.getvalue().splitlines())}
+        self.assertEqual(records["corrupt.xlsx"]["status"], "rejected")
+        self.assertEqual(records["corrupt.xlsx"]["reason_code"], "parse_failed")
+        self.assertEqual(records["good.xlsx"]["status"], "accepted")
+
+    def test_cli_missing_path_fails_with_stable_code_not_traceback(self):
+        out, err = io.StringIO(), io.StringIO()
+        code = main(
+            argv=[str(self.tmp / "不存在的目录")],
+            env={"SYCM_MANUAL_IMPORT_ENABLED": "true", "BI_WRITER_DSN": "unused"},
+            connect=lambda dsn: self.conn, out=out, err=err)
+        self.assertEqual(code, 2)
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertIn("SYCM_IMPORT_PATH_NOT_FOUND", err.getvalue())
 
 
 if __name__ == "__main__":

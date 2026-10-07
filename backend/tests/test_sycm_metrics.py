@@ -34,6 +34,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from bi_agent import metrics as metrics_module
+from bi_agent import promotion as promotion_module
 from bi_agent.metrics import METRIC_DEFINITIONS, QueryRequest
 from bi_agent.sources import (
     ENTITY_REQUIREMENTS,
@@ -217,9 +218,15 @@ class CaliberIsolationTests(unittest.TestCase):
     _WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
     def _sql_constants(self):
-        return {name: getattr(metrics_module, name) for name in dir(metrics_module)
+        # 扫描面 = metrics + promotion（M3 遗留收口：ACTUAL_SPEND_SQL 曾在
+        # 扫描面外，promotion 实耗路径同样不得混口径）。
+        constants: dict[str, str] = {}
+        for module in (metrics_module, promotion_module):
+            constants.update({
+                name: getattr(module, name) for name in dir(module)
                 if name.isupper() and name.endswith("_SQL")
-                and isinstance(getattr(metrics_module, name), str)}
+                and isinstance(getattr(module, name), str)})
+        return constants
 
     def _words(self, sql: str) -> set[str]:
         return set(self._WORD.findall(sql))
@@ -228,6 +235,8 @@ class CaliberIsolationTests(unittest.TestCase):
         sycm_sqls = {name: sql for name, sql in self._sql_constants().items()
                      if "v_sycm_shop_daily" in sql}
         self.assertTrue(sycm_sqls, "sycm 查询路径必须有固定 SQL")
+        # 扫描面必须覆盖 promotion 的实耗读取（M3 遗留：它曾漏在扫描外）。
+        self.assertIn("ACTUAL_SPEND_SQL", sycm_sqls)
         for name, sql in sycm_sqls.items():
             with self.subTest(sql=name):
                 self.assertNotIn("paid_amount",
@@ -592,6 +601,40 @@ class SycmMetricQueryDatabaseTests(unittest.TestCase):
             "missing_range": ["2026-09-05", "2026-09-20"]})
         model_payload = to_model_result(result, catalog)
         self.assertNotIn("remediation", model_payload)
+
+    def test_never_imported_shop_gets_upload_remediation_without_covered_window(
+            self):
+        """M3 遗留收口：从未导入（整窗缺失）时 covered_window 必须是 null 且
+        公开载荷校验接受它——不能编造一个“已覆盖窗口”。"""
+        from bi_agent.business_query.tool import to_public_artifact
+        from bi_agent.catalog import build_catalog
+
+        shop_c = "SY-NEVER"
+        # 能力已授予（可解析到手工来源绑定），但无任何 sync_state 覆盖与事实行。
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name, capabilities) "
+            "VALUES (%s, 'tb', '从未导入店', %s) ON CONFLICT (shop_id) DO UPDATE "
+            "SET capabilities = EXCLUDED.capabilities, "
+            "display_name = EXCLUDED.display_name",
+            (shop_c, sorted(MANUAL_METRICS)))
+        result = self._query(["ad_spend"], shop_ids=(shop_c,),
+                             allowed=(self.SHOP_A, self.SHOP_B, shop_c))
+        self.assertEqual(result.status, "missing_data", result.limitations)
+        self.assertEqual(result.data, [])
+        self.assertIsNotNone(result.remediation, result.limitations)
+        self.assertIsNone(result.remediation["covered_window"],
+                          "从未导入 ⇒ 无任何已覆盖段，covered_window 是 null")
+        self.assertEqual(result.remediation["missing_range"],
+                         ["2026-09-01", "2026-09-10"])
+        self.assertEqual(result.remediation["shop_ids"], [shop_c])
+
+        catalog = build_catalog(self.conn, result, allowed_shop_ids=frozenset(
+            {self.SHOP_A, self.SHOP_B, shop_c}))
+        public_payload = to_public_artifact(result, catalog)
+        self.assertIsNone(public_payload["remediation"]["covered_window"],
+                          "公开形状必须接受 covered_window=null（前端据此隐藏窗口）")
+        self.assertEqual(public_payload["remediation"]["shop_refs"],
+                         [catalog.shop_ref(shop_c)])
 
     def test_capability_gap_uses_manual_wording_and_stays_fail_closed(self):
         self.conn.execute("RESET ROLE")

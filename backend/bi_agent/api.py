@@ -33,6 +33,7 @@ from .llm import ChatModel
 from .query_memory.api import mount_reviewer_api
 from .semantic_catalog import CATALOG
 from .semantic_catalog.schema_check import validate_catalog_schema
+from .sycm_upload import mount_sycm_upload_api
 
 
 class EmptyBody(BaseModel):
@@ -181,5 +182,11 @@ def create_app(settings: AppSettings, model: ChatModel | None = None) -> FastAPI
     # 查询里做，read/ack 的 owner 复核在 023 的两个固定函数内部重做。
     mount_notification_api(app, get_subject=get_subject,
                            require_web_write=require_web_write, get_conn=get_conn)
+
+    # 计划 §3.M4：生意参谋手工导出上传面。路由常驻、gate 在依赖里判
+    # （SYCM_MANUAL_IMPORT_ENABLED 关闭时 404、不建连接）；写面边界用
+    # 字节体适配版（X-BI-Agent + Origin + 主体），写权限由 031 收口。
+    mount_sycm_upload_api(app, settings, get_subject=get_subject,
+                          get_conn=get_conn)
 
     return app
