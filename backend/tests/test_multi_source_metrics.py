@@ -207,8 +207,12 @@ class CapabilityTagTests(unittest.TestCase):
 
     def test_capability_vocabulary_covers_every_published_metric(self):
         from bi_agent.metrics import METRIC_DEFINITIONS
+        from bi_agent.sources import MANUAL_METRIC_CAPABILITIES
 
-        self.assertEqual(set(METRIC_CAPABILITIES), set(METRIC_DEFINITIONS))
+        # ERP 族（注册表 ceiling 词表，对账证据授予）+ 手工导出族（导入面授予）
+        # = 全部已发布指标：自造标签在这两份词表之外没有落点。
+        self.assertEqual(set(METRIC_CAPABILITIES) | set(MANUAL_METRIC_CAPABILITIES),
+                         set(METRIC_DEFINITIONS))
 
     def test_answerable_metric_reports_no_reason(self):
         # 能回答时必须是 None，不能拿一个看起来像原因码的字符串占位。

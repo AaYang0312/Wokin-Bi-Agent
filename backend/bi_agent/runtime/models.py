@@ -45,7 +45,13 @@ from bi_agent.listing_audit.rules import (
     LISTING_NUMERIC_RESULT_COLUMNS, LISTING_PUBLIC_LIMITATIONS,
     LISTING_REF_RE, LISTING_REF_RESULT_COLUMNS,
     LISTING_RESULT_COLUMNS, LISTING_SOURCE_KINDS, MAX_ROSTER_ITEMS, PRICE_BASES)  # noqa: E501
-from bi_agent.metrics import BASIS_POLICIES, Coverage, METRIC_DEFINITIONS
+from bi_agent.metrics import (
+    BASIS_POLICIES,
+    Coverage,
+    METRIC_DEFINITIONS,
+    SYCM_LIMITATION_PATTERNS,
+    SYCM_PUBLIC_LIMITATIONS,
+)
 from bi_agent.presentation.charts import (
     CHART_BASELINES, CHART_KINDS, CHART_NULL_HANDLES, CHART_PAYLOAD_KEYS,
     CHART_REQUIRED_PAYLOAD_KEYS, CHART_SERIES_COLUMNS, CHART_SPEC_NAME,
@@ -195,6 +201,9 @@ _LIMITATION_CODES = frozenset({
     "unmatched_refunds", "matched_cohort_only", "unverified_payments",
     # 跨口径汇总/比较被拒：口径不兼容是参数范围问题。
     "basis_incompatible",
+    # 同源比值分母为 0（零花费/零支付/零访客）：比值只能发布 null 并披露，
+    # 不能算成 0。发射方在 metrics（手工导出族），文本→码回环由测试钉住。
+    "ratio_not_computable",
     # 商品运营面（Task 7）：范围、成本覆盖、单据口径与候选排序各自归因。
     *COMMERCE_LIMITATION_CODES,
     # 上架复核（Task 9）：来源 / 快照 / 时效 / 枚举 / 本轮目标价 / 业务发现各自归因。
@@ -226,7 +235,8 @@ _PUBLIC_LIMITATIONS = frozenset({
     "多店商品排行请改用 basis_policy=partitioned 重新发起 group_by=product 查询，"
     "服务端按口径分区各自出Top-N",
 }) | PROMOTION_PUBLIC_LIMITATIONS | COMMERCE_PUBLIC_LIMITATIONS \
-    | LISTING_PUBLIC_LIMITATIONS | INVENTORY_PUBLIC_LIMITATIONS
+    | LISTING_PUBLIC_LIMITATIONS | INVENTORY_PUBLIC_LIMITATIONS \
+    | SYCM_PUBLIC_LIMITATIONS
 _PUBLIC_LIMITATION_PATTERNS = (
     re.compile(r"^存在[0-9]+条未匹配的平台成功退款，退款归属未确认$"),
     re.compile(r"^结果超过[0-9]+组，请缩小日期范围或店铺范围$"),
@@ -277,6 +287,9 @@ _PUBLIC_LIMITATION_PATTERNS = (
         + r"元（本期与上期对比按同一剔除口径）$"),
     *PROMOTION_LIMITATION_PATTERNS,
     *COMMERCE_LIMITATION_PATTERNS,
+    # 生意参谋手工导出族（M3）：能力缺口与缺值披露的数字/指标名可变，句式固定；
+    # 文本由 metrics 的构造方生成，漏登会让手工查询在载荷校验处被误拒。
+    *SYCM_LIMITATION_PATTERNS,
 )
 _STATE_KEYS = frozenset({
     "run_id", "node", "status", "revision", "normalized_request", "problems",
@@ -319,6 +332,9 @@ _ARTIFACT_KEYS = frozenset({
     "inventory",
     # 分区商品排行：每个已发布分区的身份与口径陈述（行上的 rank_group 靠它解释）。
     "rank_groups",
+    # 缺数上传提示（D3）：服务端从覆盖凭证派生，只进公开 Artifact——
+    # 模型可见载荷带它即违约（见 _PUBLIC_ONLY_ARTIFACT_KEYS）。
+    "remediation",
 })
 
 # ---------------------------------------------------------------------------
@@ -375,7 +391,9 @@ _DIAGNOSIS_FIELDS = {
         "shops_published", "shops_missing", "shops_disabled"}),
 }
 # 名称只在授权展示层出现：模型载荷带上这两项就是契约违规。
-_PUBLIC_ONLY_ARTIFACT_KEYS = frozenset({"entities", "catalog_version"})
+# remediation 同理（反向公开块）：上传提示由服务端派生，模型可见载荷带它就是
+# 给“模型伪造上传按钮/文案”留门（D3）。
+_PUBLIC_ONLY_ARTIFACT_KEYS = frozenset({"entities", "catalog_version", "remediation"})
 _FILTER_KEYS = frozenset({
     "start", "end", "shop_refs", "metrics", "group_by", "compare", "top_n", "currency",
     "basis_policy", "mode", "sales_basis", "profit_basis", "platforms", "product_ref",
@@ -417,6 +435,9 @@ _METRIC_RESULT_COLUMNS = frozenset({
     "day", "shop_ref", "product_ref", "line_kind", "currency",
     "paid_amount", "paid_orders", "erp_documents", "aov", "refund_amount",
     "cash_difference", "cohort_refund_rate", "quantity", "product_paid_amount", "notice",
+    # 生意参谋手工导出族（M3）：比值列的取值仍走通用十进制/整数校验。
+    "ad_spend", "ad_spend_ratio", "roas", "visitors", "pay_conversion_rate",
+    "cart_count",
     # 分区商品排行：名次只在分区内计数，所以名次必须与分区标签一起出现。
     "rank", "rank_group",
 })
@@ -1373,6 +1394,8 @@ def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
         _basis_items(payload["basis"])
     if "diagnostics" in payload:
         _diagnostics(payload["diagnostics"])
+    if "remediation" in payload:
+        _remediation(payload["remediation"])
     # 契约 v2（spec §3）：范围三面分开，被排除的店铺与原因逐条可核对。
     if "requested_scope" in payload:
         _requested_scope(payload["requested_scope"])
@@ -1441,6 +1464,29 @@ def _basis_items(value: object) -> None:
 def _diagnosis_value_ok(item: object) -> bool:
     """诊断字段只许是计数或标签：浮点与布尔不得冒充计数。"""
     return isinstance(item, (int, str)) and not isinstance(item, bool)
+
+
+_REMEDIATION_KINDS = frozenset({"upload"})
+# file_kind 是导入面的文件类别词表（M2 FileKind 的用户可见名），不是自由文本。
+_REMEDIATION_FILE_KINDS = frozenset({"店铺维度"})
+
+
+def _remediation(value: object) -> None:
+    """缺数上传提示（D3）的公开形状：键集、kind、文件类别与窗口成对校验。
+
+    结构由服务端从覆盖凭证派生；这里的白名单保证前端能安全地把它渲染成
+    “上传缺失文件”按钮——任何未登记的键/取值都进不了展示层。
+    """
+    block = _mapping(value, allowed=frozenset({"kind", "file_kind", "shop_refs",
+                                               "covered_window", "missing_range"}),
+                     required=frozenset({"kind", "file_kind", "shop_refs",
+                                         "missing_range"}))
+    _string_in(block["kind"], _REMEDIATION_KINDS)
+    _string_in(block["file_kind"], _REMEDIATION_FILE_KINDS)
+    _string_list(block["shop_refs"], _ref)
+    if block.get("covered_window") is not None:
+        _date_pair(block["covered_window"])
+    _date_pair(block["missing_range"])
 
 
 def _diagnostics(value: object) -> None:

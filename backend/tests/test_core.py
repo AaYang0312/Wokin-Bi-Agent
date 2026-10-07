@@ -2753,8 +2753,11 @@ class PromotionTests(unittest.TestCase):
         self.assertEqual(PROMOTION_RESULT_COLUMNS & ARTIFACT_RESULT_COLUMNS,
                          PROMOTION_RESULT_COLUMNS)
         self.assertIn("mode", ARTIFACT_FILTER_COLUMNS)
-        for phantom in ("actual_spend", "over_budget", "daily_cap", "contribution_cap"):
+        for phantom in ("over_budget", "daily_cap", "contribution_cap"):
             self.assertNotIn(phantom, ARTIFACT_RESULT_COLUMNS)
+        # M3 actual_budget：实耗列已按契约声明（它曾是这里的反例幻影列）。
+        self.assertIn("actual_spend", PROMOTION_RESULT_COLUMNS)
+        self.assertIn("actual_spend", ARTIFACT_RESULT_COLUMNS)
 
     def test_column_drift_fails_at_the_producer(self):
         """新增列忘改契约时先在 promotion 一侧失败，而不是漂到投影处。"""

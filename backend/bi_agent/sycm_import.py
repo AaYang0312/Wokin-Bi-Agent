@@ -55,17 +55,19 @@ from psycopg.types.multirange import Multirange
 from psycopg.types.range import TimestamptzRange
 
 from .config import _flag
+from .sources import (MANUAL_EXPORT_ENTITY, MANUAL_EXPORT_SOURCE,
+                      MANUAL_METRIC_CAPABILITIES)
 
 logger = logging.getLogger(__name__)
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 
 # 覆盖凭证与能力授予契约（计划 §2/D1、§3.M2；词表与 M3 查询层对齐）。
-SYCM_MANUAL_SOURCE = "manual.sycm.export"
-SHOP_DAILY_ENTITY = "shop_daily"
+# 名字的唯一真源在 sources 注册表；这里保留 M2 的公开名字（CLI/测试沿用）。
+SYCM_MANUAL_SOURCE = MANUAL_EXPORT_SOURCE
+SHOP_DAILY_ENTITY = MANUAL_EXPORT_ENTITY
 MANUAL_QUALITY_RULE = "manual-export/unverified"
-SYCM_MANUAL_CAPABILITIES = ("ad_spend", "ad_spend_ratio", "roas", "visitors",
-                            "pay_conversion_rate", "cart_count")
+SYCM_MANUAL_CAPABILITIES = tuple(sorted(MANUAL_METRIC_CAPABILITIES))
 CLI_SUBJECT = "sycm_import_cli"
 
 # 读取器防护上限（计划 §3.M2；值本身被 tests.test_sycm_parser 钉死）。

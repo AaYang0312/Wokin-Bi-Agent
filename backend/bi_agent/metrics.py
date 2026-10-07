@@ -7,15 +7,16 @@
 from __future__ import annotations
 
 import contextlib
+import re
 import time
 from collections import Counter
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Literal, NamedTuple
+from zoneinfo import ZoneInfo
 
 import psycopg
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from zoneinfo import ZoneInfo
 
 from bi_agent.catalog import pick_sku_label
 
@@ -40,7 +41,13 @@ HALF_MONTH_DAYS = 15
 
 Metric = Literal["paid_amount", "paid_orders", "erp_documents", "aov",
                  "refund_amount", "cash_difference", "cohort_refund_rate",
-                 "quantity", "product_paid_amount"]
+                 "quantity", "product_paid_amount",
+                 # 生意参谋手工导出族（manual.sycm.export/shop_daily）：词表与
+                 # sources.MANUAL_METRIC_CAPABILITIES 一一对应。工具 schema 静态
+                 # 列出这些名字是已批准偏差——gate 关闭时无法导入数据，任何相关
+                 # 提问都走能力/覆盖 fail-closed 拒答，回答行为逐字一致。
+                 "ad_spend", "ad_spend_ratio", "roas", "visitors",
+                 "pay_conversion_rate", "cart_count"]
 
 METRIC_DEFINITIONS: dict[str, str] = {
     "paid_amount": "已验证商业订单支付金额之和（人民币，按支付时间归属，[start,end)）"
@@ -57,7 +64,54 @@ METRIC_DEFINITIONS: dict[str, str] = {
                           "（同批分母不减关闭后退款单：退款保持可见）",
     "quantity": "有效非赠品父项数量（含套件/组合/加工，按line_kind标注）",
     "product_paid_amount": "已核验的非赠品父项行级分摊支付金额（按line_kind标注）",
+    # 手工导出族（D1 立即可用+披露；D2 同源比值）：口径声明点名手工导入与统计
+    # 日期归属；比值指标的分子分母都只来自手工导出店铺维度。
+    "ad_spend": "全站推广花费合计=手工导入生意参谋「全站推广花费」之和"
+                "（人民币，按统计日期归属，[start,end)）；来源未核验，"
+                "渠道细分列本轮不开放",
+    "ad_spend_ratio": "推广费率=全站推广花费÷生意参谋支付金额（同源比值：分子分母"
+                      "都来自手工导入生意参谋店铺维度，按统计日期归属；窗口合计口径，"
+                      "不平均日费率；与ERP支付金额无关）",
+    "roas": "ROAS=生意参谋支付金额÷全站推广花费（同源比值：分子分母都来自手工导入"
+            "生意参谋店铺维度，按统计日期归属；窗口合计口径；与ERP支付金额无关）",
+    "visitors": "访客数合计=手工导入生意参谋「访客数」之和（按统计日期归属，"
+                "[start,end)）；来源未核验",
+    "pay_conversion_rate": "支付转化率=支付买家数÷访客数（窗口内合计重算，"
+                           "不平均日转化率；来源为手工导入生意参谋店铺维度，"
+                           "按统计日期归属）",
+    "cart_count": "加购人数合计=手工导入生意参谋「加购人数」之和（按统计日期归属，"
+                  "[start,end)）；来源未核验",
 }
+
+# ---------------------------------------------------------------------------
+# 手工导出族（M3）的披露词表：文本只在这里拼装一次，runtime/models 的公开载荷
+# 白名单与 business_query/nodes 的文本→码映射都引用这一份（S3 教训：漏登一处，
+# 真实数据上的合法披露就会被契约校验误杀）。
+# ---------------------------------------------------------------------------
+
+# 质量未核验（quality unknown，D1）：沿用既有 source_quality_unverified 披露码。
+SOURCE_QUALITY_UNVERIFIED_LIMITATION = "来源质量未核验（尚无对账记录）"
+# 口径隔离：手工族与 ERP 族是不同来源家族，连分列也不开放（家族混查必然把
+# paid_amount_sycm 与 paid_amount 放进同一份结果，D2 的测试钉死的就是这个）。
+SYCM_MIXED_CALIBER_LIMITATION = ("生意参谋手工口径与 ERP 口径的指标不能出现在"
+                                 "同一次查询，请分开查询")
+# remediation（D3）的公开文案：服务端固定模板，模型只转述不生成。
+SYCM_UPLOAD_LIMITATION = "缺少该窗口的手工导出数据，请上传店铺维度导出文件后重新查询"
+# 同源比值分母为 0（零花费/零支付/零访客是导入侧的合法状态）：不可计算，发布 null。
+SYCM_RATIO_NOT_COMPUTABLE_LIMITATION = ("推广花费、生意参谋支付金额或访客数合计为0，"
+                                        "同源比值（ROAS、推广费率、支付转化率）不可计算")
+# 手工能力缺口：与 ERP 的「已核验能力」分开措辞——手工能力是导入授予，未核验。
+SYCM_CAPABILITY_GAP_PATTERN = re.compile(
+    r"^[0-9]+ 家店铺缺少 [a-z_、]+ 的手工导入数据，未执行查询$")
+# 覆盖内的缺值（导入侧存 NULL 不补零）：合计拒绝部分汇总，逐日发布 null。
+SYCM_NULL_VALUE_PATTERN = re.compile(
+    r"^窗口内 [a-z_]+ 缺 [0-9]+ 天(?:、[a-z_]+ 缺 [0-9]+ 天)*，拒绝部分汇总$")
+
+SYCM_PUBLIC_LIMITATIONS = frozenset({
+    SYCM_MIXED_CALIBER_LIMITATION, SYCM_UPLOAD_LIMITATION,
+    SYCM_RATIO_NOT_COMPUTABLE_LIMITATION,
+})
+SYCM_LIMITATION_PATTERNS = (SYCM_CAPABILITY_GAP_PATTERN, SYCM_NULL_VALUE_PATTERN)
 
 # 指标→实体依赖与覆盖来源定义在 sources 注册表（唯一真源）；data_quality 向外转发，
 # 本模块只引用，不再存第二份，避免门禁与指标两边口径漂移。
@@ -68,8 +122,10 @@ from bi_agent.data_quality import (
     money_text, refund_attribution_gap, required_entities, switched_sources_between,
     unverified_payments)
 from bi_agent.sources import (
-    METRIC_VERSION, ShopRecord, binding_signature, payment_caliber_excludes_closed_refunded,
-    resolve_metric_sources, unsupported_reason)
+    MANUAL_EXPORT_ENTITY, MANUAL_EXPORT_SOURCE,
+    MANUAL_METRIC_CAPABILITIES, METRIC_VERSION, ShopRecord, binding_signature,
+    payment_caliber_excludes_closed_refunded, resolve_metric_sources,
+    unsupported_reason)
 
 
 class QueryRequest(BaseModel):
@@ -146,6 +202,9 @@ class ToolResult(BaseModel):
     rank_groups: list[dict[str, object]] = Field(default_factory=list)
     # 被排除的店铺逐家带原因（内部形状）：公开投影成 excluded_scope。
     rank_exclusions: list[dict[str, object]] = Field(default_factory=list)
+    # 缺数上传提示（D3，内部形状带真实 shop_id）：公开投影换成 shop_ref 进
+    # Artifact，模型可见载荷一律不含（防模型伪造上传提示）。
+    remediation: dict[str, object] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +428,87 @@ _SHOPS_SQL = """
 SELECT shop_id, enabled, currency, platform, capabilities
 FROM reporting.v_shops WHERE shop_id = ANY(%s)
 """
+
+# ---------------------------------------------------------------------------
+# 生意参谋手工导出族（M3）的固定 SQL：只读 030 的 sycm 视图、只引用 sycm 列。
+# 口径隔离是结构约束（tests.test_sycm_metrics.CaliberIsolationTests 扫描全部
+# SQL 常量钉死）：ERP 的 paid_amount 与 reporting.v_shop_daily 永不出现在这里，
+# 这里的 paid_amount_sycm 也永不出现在 ERP 的 SQL 里。
+# ---------------------------------------------------------------------------
+
+# total/shop 分组：按店在 SQL 端聚合；比值在 Python 端由两个同源合计计算。
+# NULL 计数列是缺值披露的证据（覆盖内缺值不补零，合计必须拒绝部分汇总）。
+_SYCM_AGG_SQL = """
+SELECT shop_id,
+       coalesce(sum(ad_spend_all), 0),
+       coalesce(sum(paid_amount_sycm), 0),
+       coalesce(sum(paid_buyers), 0)::bigint,
+       coalesce(sum(visitors), 0)::bigint,
+       coalesce(sum(cart_count), 0)::bigint,
+       count(*) FILTER (WHERE paid_amount_sycm IS NULL),
+       count(*) FILTER (WHERE visitors IS NULL),
+       count(*) FILTER (WHERE paid_buyers IS NULL),
+       count(*) FILTER (WHERE cart_count IS NULL)
+FROM reporting.v_sycm_shop_daily
+WHERE shop_id = ANY(%s) AND stat_date >= %s AND stat_date < %s
+GROUP BY shop_id
+ORDER BY shop_id
+LIMIT %s
+"""
+
+# day 分组：覆盖完整的窗口里每个 (店, 统计日) 都有导入行，日行原样发布，
+# 缺值存 NULL 就发布 null，绝不补零。
+_SYCM_DAILY_SQL = """
+SELECT shop_id, stat_date,
+       ad_spend_all, paid_amount_sycm, paid_buyers, visitors, cart_count
+FROM reporting.v_sycm_shop_daily
+WHERE shop_id = ANY(%s) AND stat_date >= %s AND stat_date < %s
+ORDER BY stat_date, shop_id
+LIMIT %s
+"""
+
+_SYCM_GROUP_COUNT_SQL = """
+SELECT count(*) FROM (
+    SELECT DISTINCT shop_id, stat_date FROM reporting.v_sycm_shop_daily
+    WHERE shop_id = ANY(%s) AND stat_date >= %s AND stat_date < %s
+) t
+"""
+
+# 指标 → 它依赖的 sycm 基础列（缺值披露按此归因；ad_spend_all 由导入侧
+# 「零花费+披露」保证非 NULL，不列在内）。
+_SYCM_METRIC_BASE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "ad_spend": (),
+    "ad_spend_ratio": ("paid_amount_sycm",),
+    "roas": ("paid_amount_sycm",),
+    "visitors": ("visitors",),
+    "pay_conversion_rate": ("visitors", "paid_buyers"),
+    "cart_count": ("cart_count",),
+}
+
+
+def compute_roas(paid_amount_sycm: Decimal, ad_spend: Decimal) -> Decimal | None:
+    """ROAS=生意参谋支付金额÷全站推广花费（D2 同源比值：两个操作数都来自
+    bi.sycm_shop_daily 的窗口合计）。分母为 0（零花费）不可计算，返回 None。"""
+    if ad_spend == 0:
+        return None
+    return paid_amount_sycm / ad_spend
+
+
+def compute_ad_spend_ratio(ad_spend: Decimal,
+                           paid_amount_sycm: Decimal) -> Decimal | None:
+    """推广费率=全站推广花费÷生意参谋支付金额（D2 同源比值，与 ROAS 互为
+    反比的两种口径）。分母为 0（无支付）不可计算，返回 None。"""
+    if paid_amount_sycm == 0:
+        return None
+    return ad_spend / paid_amount_sycm
+
+
+def compute_pay_conversion_rate(paid_buyers: int, visitors: int) -> Decimal | None:
+    """支付转化率=支付买家数÷访客数（窗口合计重算，不平均日转化率）。
+    分母为 0 不可计算，返回 None。"""
+    if visitors == 0:
+        return None
+    return Decimal(paid_buyers) / Decimal(visitors)
 
 
 def _set_query_budget(conn, deadline: float) -> bool:
@@ -645,6 +785,26 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         filters["requested_shop_ids"] = requested_shop_ids
 
     records = [shops[shop_id].record for shop_id in request.shop_ids]
+
+    # 手工导出族（M3）走自己的固定 SQL 与覆盖凭证：与 ERP 族连分列都不开放——
+    # 家族混查必然把 paid_amount_sycm 与 ERP paid_amount 放进同一份结果，
+    # 违反 D2 的口径隔离铁律。分流在来源解析之前，ERP 门禁一个都不用改。
+    requested_metrics = [str(metric) for metric in request.metrics]
+    if any(metric in MANUAL_METRIC_CAPABILITIES for metric in requested_metrics):
+        if not all(metric in MANUAL_METRIC_CAPABILITIES
+                   for metric in requested_metrics):
+            return ToolResult(
+                status="invalid_parameters",
+                coverage=Coverage(status="missing", start=None, end=None),
+                metric_definition={m: METRIC_DEFINITIONS[m]
+                                   for m in requested_metrics},
+                filters=filters,
+                limitations=[SYCM_MIXED_CALIBER_LIMITATION])
+        return _sycm_query_in_transaction(conn, request, records=records,
+                                          filters=filters,
+                                          limitations=limitations,
+                                          deadline=deadline)
+
     entities = required_entities(request.metrics)
     bindings_by_shop_metric = {
         (record.shop_id, str(metric)): resolve_metric_sources(record, str(metric))
@@ -742,7 +902,7 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
                           basis=basis, diagnostics=diagnostics)
     if assessment.quality_status == "unknown":
         # 从未对账不等于数据有错：可以出数，但必须把未核验这件事说明白。
-        limitations.append("来源质量未核验（尚无对账记录）")
+        limitations.append(SOURCE_QUALITY_UNVERIFIED_LIMITATION)
 
     # 商品归属披露：已核验支付额里没进商品维度的部分，连成因一起说清，
     # 不給模型留下自己猜原因的空间。
@@ -1033,6 +1193,292 @@ def _period_rows(conn, request: QueryRequest, *, start_ts: datetime, end_ts: dat
             rows.append({"shop_id": shop_id, "day": day.isoformat(),
                          **_group_rows(entry, metrics)})
             day += timedelta(days=1)
+    return rows
+
+
+class _SycmValuesMissing(Exception):
+    """手工族合计窗口内存在缺值（导入侧存 NULL 不补零）：拒绝部分汇总。
+
+    与「查询真的返回零行」不同：缺值冒充 0 会把合计说小，缺哪几天由披露文本
+    逐列给出，逐日分组不受影响（日行原样发布 null）。
+    """
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.text = text
+
+
+def _window_span(window) -> tuple[int, str]:
+    """覆盖/缺口段的排序键：先比长度再比起点的确定序。"""
+    return (date.fromisoformat(window[1]) - date.fromisoformat(window[0]), window[0])
+
+
+def _manual_remediation(assessment,
+                        bindings_by_shop_metric) -> dict[str, object] | None:
+    """缺数上传提示（D3）：只由覆盖凭证与来源绑定服务端派生，模型无权生成。
+
+    shop_ids 是本查询绑定了手工来源、且该实体覆盖缺了请求窗口的店；
+    covered_window 取请求内最大的公共已覆盖段（与 coverage.suggested_window
+    同源同值），missing_range 取最大的公共缺口段。逐店完整缺口仍在
+    coverage.gaps，这里只负责把「要补传哪一类文件、缺哪一段」说清。
+    """
+    manual_shops = sorted({shop_id for (shop_id, _metric), bindings
+                           in bindings_by_shop_metric.items()
+                           if any(binding.source == MANUAL_EXPORT_SOURCE
+                                  for binding in bindings)})
+    if not manual_shops or not assessment.missing_windows:
+        return None
+    gapped = sorted({gap.shop_id for gap in assessment.gaps
+                     if gap.entity == MANUAL_EXPORT_ENTITY}) or manual_shops
+    covered = (max(assessment.covered_windows, key=_window_span)
+               if assessment.covered_windows else None)
+    missing = max(assessment.missing_windows, key=_window_span)
+    return {"kind": "upload", "file_kind": "店铺维度", "shop_ids": gapped,
+            "covered_window": list(covered) if covered else None,
+            "missing_range": list(missing)}
+
+
+def _sycm_capability_gap(records, metrics) -> list[str]:
+    """手工族的能力缺口措辞：与 ERP 的「已核验能力」分开——手工能力由导入授予、
+    质量未核验，说成"已核验"就是不诚实。只报家数与指标名，主键不进披露。"""
+    ungranted = sorted({record.shop_id for record in records
+                        for metric in metrics
+                        if unsupported_reason(record, str(metric)) is not None})
+    if not ungranted:
+        return []
+    names = "、".join(sorted({str(metric) for metric in metrics}))
+    return [f"{len(ungranted)} 家店铺缺少 {names} 的手工导入数据，未执行查询"]
+
+
+def _sycm_values(ad_spend, paid_amount_sycm, paid_buyers, visitors,
+                 cart_count) -> dict[str, Decimal | int | None]:
+    """一组（窗口合计或单日）的手工族指标值；比值只由同源两侧计算（D2）。
+
+    `paid_amount_sycm` 只作为比值的同源操作数存在，不在请求词表里，
+    `_group_rows` 只投影被请求的指标，它永远不进公开行。
+    """
+    both_amounts = ad_spend is not None and paid_amount_sycm is not None
+    both_counts = paid_buyers is not None and visitors is not None
+    return {
+        "ad_spend": ad_spend,
+        "paid_amount_sycm": paid_amount_sycm,
+        "visitors": visitors,
+        "cart_count": cart_count,
+        "roas": (compute_roas(paid_amount_sycm, ad_spend)
+                 if both_amounts else None),
+        "ad_spend_ratio": (compute_ad_spend_ratio(ad_spend, paid_amount_sycm)
+                           if both_amounts else None),
+        "pay_conversion_rate": (compute_pay_conversion_rate(paid_buyers, visitors)
+                                if both_counts else None),
+    }
+
+
+def _sycm_zero_denominator(values, requested: list[str]) -> bool:
+    """被请求的同源比值里有没有分母为 0 的（零花费/零支付/零访客是合法状态，
+    比值只能发布 null 并披露，不能算成 0）。"""
+    return (("roas" in requested and values["ad_spend"] == 0)
+            or ("ad_spend_ratio" in requested
+                and values["paid_amount_sycm"] == 0)
+            or ("pay_conversion_rate" in requested and values["visitors"] == 0))
+
+
+def _sycm_query_in_transaction(conn, request, *, records, filters, limitations,
+                               deadline: float) -> ToolResult:
+    """手工导出族的查询路径：能力门禁 → 覆盖门禁 → 固定 sycm SQL。
+
+    与 ERP 路径同一 fail-closed 顺序，差异只有三处：能力缺口用手工措辞；
+    覆盖不足时附服务端派生的 remediation（D3）；质量未核验沿用既有披露。
+    上期比较只在同源覆盖完整时进行——手工族的覆盖凭证只有一个来源，
+    不存在 ERP 路径的"换来源伪增长"形态。
+    """
+    start_ts, end_ts = _window_range(request.start, request.end)
+    definitions = {str(metric): METRIC_DEFINITIONS[str(metric)]
+                   for metric in request.metrics}
+    limitations = list(limitations)
+    bindings_by_shop_metric = {
+        (record.shop_id, str(metric)): resolve_metric_sources(record, str(metric))
+        for record in records for metric in request.metrics}
+
+    gap_texts = _sycm_capability_gap(records, request.metrics)
+    if gap_texts:
+        return ToolResult(
+            status="missing_data",
+            coverage=Coverage(status="missing", start=None, end=None),
+            metric_definition=definitions, filters=filters,
+            limitations=limitations + gap_texts)
+    basis = _basis_evidence(records, request.metrics, bindings_by_shop_metric)
+
+    if not _set_query_budget(conn, deadline):
+        return ToolResult(status="unavailable",
+                          coverage=Coverage(status="missing", start=None, end=None),
+                          filters=filters,
+                          limitations=limitations + ["本次查询时间预算已耗尽"])
+    assessment = assess_query_coverage(conn, request)
+    coverage = _coverage_of(assessment)
+    data_as_of = assessment.data_as_of
+
+    if assessment.quality_status == "failed":
+        return ToolResult(
+            status="unavailable", coverage=coverage,
+            metric_definition=definitions, filters=filters, data_as_of=data_as_of,
+            limitations=limitations + ["来源质量核验未通过，拒绝出数"], basis=basis)
+    if coverage.status != "complete" or data_as_of is None:
+        # 窗口不足不补零：缺口见 coverage.gaps，能补的窗口进建议窗口，
+        # 要补的数据由服务端派生的 remediation 指路上传。
+        remediation = _manual_remediation(assessment, bindings_by_shop_metric)
+        texts = limitations + ["覆盖未完成，拒绝部分汇总；缺口见coverage.gaps"]
+        if remediation is not None:
+            texts.append(SYCM_UPLOAD_LIMITATION)
+        if data_as_of is None:
+            texts.append("数据截止未知（回填未完成）")
+        return ToolResult(status="missing_data", coverage=coverage,
+                          metric_definition=definitions, filters=filters,
+                          data_as_of=data_as_of, limitations=texts, basis=basis,
+                          remediation=remediation)
+    if assessment.quality_status == "unknown":
+        limitations.append(SOURCE_QUALITY_UNVERIFIED_LIMITATION)
+
+    compare = request.compare == "previous_period"
+    prev_start = prev_end = None
+    if compare:
+        if request.group_by == "day":
+            compare = False
+            limitations.append("比较仅支持total/shop分组")
+        else:
+            span = request.end - request.start
+            prev_start, prev_end = request.start - span, request.start
+            prev_assessment = assess_query_coverage(conn, request.model_copy(
+                update={"start": prev_start, "end": prev_end}))
+            if (prev_assessment.status != "complete"
+                    or prev_assessment.data_as_of is None):
+                compare = False
+                limitations.append("上期覆盖不足，无法比较，仅返回绝对值")
+
+    if request.group_by == "day":
+        groups = conn.execute(_SYCM_GROUP_COUNT_SQL,
+                              (request.shop_ids, request.start,
+                               request.end)).fetchone()[0]
+        if groups > MAX_ROWS:
+            return ToolResult(
+                status="invalid_parameters", coverage=coverage,
+                metric_definition=definitions, filters=filters,
+                data_as_of=data_as_of,
+                limitations=[f"结果超过{MAX_ROWS}组，请缩小日期范围或店铺范围"],
+                basis=basis)
+
+    try:
+        rows = _sycm_period_rows(conn, request, start_ts=start_ts, end_ts=end_ts,
+                                 deadline=deadline, limitations=limitations)
+        if compare:
+            if not _set_query_budget(conn, deadline):
+                raise _BudgetExhausted
+            prev_request = request.model_copy(update={"start": prev_start,
+                                                      "end": prev_end,
+                                                      "compare": "none"})
+            prev_ts = _window_range(prev_start, prev_end)
+            prev_rows = _sycm_period_rows(conn, prev_request,
+                                          start_ts=prev_ts[0], end_ts=prev_ts[1],
+                                          deadline=deadline, limitations=[])
+            _attach_compare(rows, prev_rows, request)
+    except _BudgetExhausted:
+        return ToolResult(status="unavailable", coverage=coverage,
+                          metric_definition=definitions, filters=filters,
+                          data_as_of=data_as_of,
+                          limitations=limitations + ["本次查询时间预算已耗尽"])
+    except _RowsTruncated:
+        return ToolResult(status="unavailable", coverage=coverage,
+                          metric_definition=definitions, filters=filters,
+                          data_as_of=data_as_of,
+                          limitations=limitations + [
+                              f"结果行数达到{MAX_ROWS}上限，已拒绝出数以避免静默截断；"
+                              "请缩小日期范围或店铺范围"])
+    except _SycmValuesMissing as error:
+        return ToolResult(status="missing_data", coverage=coverage,
+                          metric_definition=definitions, filters=filters,
+                          data_as_of=data_as_of,
+                          limitations=limitations + [error.text], basis=basis)
+
+    return ToolResult(
+        status="ok", data=rows,
+        metric_definition=definitions,
+        filters=filters, data_as_of=data_as_of, coverage=coverage,
+        limitations=limitations, source_batches=assessment.source_batches,
+        basis=basis)
+
+
+def _sycm_period_rows(conn, request, *, start_ts: datetime, end_ts: datetime,
+                      deadline: float,
+                      limitations: list[str]) -> list[dict[str, str | int | None]]:
+    """手工族的 total/shop/day 行。
+
+    total/shop 在 SQL 端按店聚合后由 Python 跨店求和，比值在两个同源合计之间
+    重算（D2：分子分母都来自 bi.sycm_shop_daily）；day 取日行原样发布，覆盖
+    完整的窗口里每个 (店, 统计日) 都有导入行，缺值发布 null 不补零。
+    合计/分店聚合遇到被请求指标的基础列缺值时拒绝部分汇总（_SycmValuesMissing）；
+    预算耗尽/行数截断沿用既有私有异常，由调用方降级为 unavailable。
+    """
+    if not _set_query_budget(conn, deadline):
+        raise _BudgetExhausted
+    requested = [str(metric) for metric in request.metrics]
+    params = (request.shop_ids, start_ts.date(), end_ts.date())
+    zero_denominator = False
+
+    if request.group_by in ("total", "shop"):
+        raw = _fetch_capped(conn, _SYCM_AGG_SQL, params)
+        groups: dict[str | None, dict[str, Decimal | int]] = {}
+        null_days: Counter[str] = Counter()
+        for row in raw:
+            (shop_id, ad_spend, paid_sycm, paid_buyers, visitors, carts,
+             null_paid, null_visitors, null_buyers, null_carts) = row
+            for column, count in (("paid_amount_sycm", null_paid),
+                                  ("visitors", null_visitors),
+                                  ("paid_buyers", null_buyers),
+                                  ("cart_count", null_carts)):
+                if count:
+                    null_days[column] += count
+            key = shop_id if request.group_by == "shop" else "total"
+            entry = groups.setdefault(key, {
+                "ad_spend": Decimal(0), "paid_amount_sycm": Decimal(0),
+                "paid_buyers": 0, "visitors": 0, "cart_count": 0})
+            entry["ad_spend"] += ad_spend
+            entry["paid_amount_sycm"] += paid_sycm
+            entry["paid_buyers"] += paid_buyers
+            entry["visitors"] += visitors
+            entry["cart_count"] += carts
+        offending = {column: count for metric in requested
+                     for column, count in (
+                         (column, null_days.get(column, 0))
+                         for column in _SYCM_METRIC_BASE_COLUMNS[metric])
+                     if count}
+        if offending:
+            raise _SycmValuesMissing("窗口内 " + "、".join(
+                f"{column} 缺 {offending[column]} 天"
+                for column in sorted(offending)) + "，拒绝部分汇总")
+        rows: list[dict[str, str | int | None]] = []
+        for key in sorted(groups, key=str):
+            entry = groups[key]
+            values = _sycm_values(entry["ad_spend"], entry["paid_amount_sycm"],
+                                  entry["paid_buyers"], entry["visitors"],
+                                  entry["cart_count"])
+            zero_denominator = zero_denominator or _sycm_zero_denominator(
+                values, requested)
+            prefix = {} if request.group_by == "total" else {"shop_id": key}
+            rows.append({**prefix, **_group_rows(values, requested)})
+        if zero_denominator:
+            limitations.append(SYCM_RATIO_NOT_COMPUTABLE_LIMITATION)
+        return rows
+
+    raw = _fetch_capped(conn, _SYCM_DAILY_SQL, params)
+    rows = []
+    for row in raw:
+        shop_id, stat_date, ad_spend, paid_sycm, paid_buyers, visitors, carts = row
+        values = _sycm_values(ad_spend, paid_sycm, paid_buyers, visitors, carts)
+        zero_denominator = zero_denominator or _sycm_zero_denominator(
+            values, requested)
+        rows.append({"shop_id": shop_id, "day": stat_date.isoformat(),
+                     **_group_rows(values, requested)})
+    if zero_denominator:
+        limitations.append(SYCM_RATIO_NOT_COMPUTABLE_LIMITATION)
     return rows
 
 

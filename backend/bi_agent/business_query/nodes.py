@@ -16,6 +16,9 @@ from bi_agent.metrics import (
     Coverage,
     METRIC_DEFINITIONS,
     QueryRequest,
+    SYCM_MIXED_CALIBER_LIMITATION,
+    SYCM_RATIO_NOT_COMPUTABLE_LIMITATION,
+    SYCM_UPLOAD_LIMITATION,
     ToolResult,
     resolve_period_detail,
 )
@@ -561,6 +564,24 @@ def _limitation_codes(limitations: list[str]) -> list[str]:
             # 指标能力未开通与缺覆盖是两回事：前者缩小日期范围永远拿不到数，
             # 所以恢复策略归到缺口类（一次不追加），不能当成可重试的临时失败。
             code = "capability_unavailable"
+        if (code is None and " 家店铺缺少 " in limitation
+                and limitation.endswith(" 的手工导入数据，未执行查询")):
+            # 手工导出族的能力缺口：同一归因（导入授予、缺的就是这类词），
+            # 但措辞分开——手工能力未经核验，不能沿用“已核验能力”的说法。
+            code = "capability_unavailable"
+        if code is None and limitation == SYCM_MIXED_CALIBER_LIMITATION:
+            # 手工族与 ERP 族混在一次查询：同 basis_incompatible 的参数范围问题。
+            code = "basis_incompatible"
+        if code is None and limitation == SYCM_UPLOAD_LIMITATION:
+            # 上传提示只是覆盖缺口拒答的行动出口：归到覆盖类，不是新失败形态。
+            code = "coverage_incomplete"
+        if code is None and limitation == SYCM_RATIO_NOT_COMPUTABLE_LIMITATION:
+            # 同源比值分母为 0：可量化限制，与拒答/失败分开归因。
+            code = "ratio_not_computable"
+        if (code is None and limitation.startswith("窗口内 ")
+                and limitation.endswith("，拒绝部分汇总")):
+            # 覆盖内缺值（导入存 NULL 不补零）：合计诚实拒绝，归覆盖不完整。
+            code = "coverage_incomplete"
         if code is None and " 家店铺的数据覆盖不足或截止未知，未列入本次排行" in limitation:
             code = "coverage_incomplete"
         if code is None and " 家店铺的来源质量核验未通过，未列入本次排行" in limitation:

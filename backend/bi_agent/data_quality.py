@@ -24,7 +24,8 @@ BEIJING = ZoneInfo("Asia/Shanghai")
 # 指标→实体依赖定义在 sources 注册表（来源与能力的唯一真源）；本模块继续向外转发，
 # 不养第二份，否则覆盖门禁与指标层会各自演化出口径。
 from bi_agent.sources import (
-    ENTITY_REQUIREMENTS, ORDERS_ENTITY, PAYMENT_WINDOW_METRICS, PAY_TIME_METRICS, resolve_consign_source,
+    ENTITY_REQUIREMENTS, MANUAL_METRIC_CAPABILITIES, ORDERS_ENTITY,
+    PAYMENT_WINDOW_METRICS, PAY_TIME_METRICS, resolve_consign_source,
     ShopRecord, SourceBinding, resolve_metric_dependencies, resolve_order_source)
 
 # 默认来源名：只给 `reconcile_source_quality` 在调用方没显式传 source 时兜底。
@@ -655,7 +656,12 @@ def assess_query_coverage(conn, request) -> CoverageAssessment:
     batches: list[str] = []
 
     entities = required_entities(request.metrics)
-    unconfigured = _unconfigured_shops(conn, shop_ids, entities)
+    # 「来源尚未开通」只对 ERP 族的实体成立：手工导出族不依赖平台登记（导入面
+    # 按 display_name 映射），把它算进未开通会把导入店误报成来源缺失。
+    erp_entities = sorted({entity for metric in request.metrics
+                           for entity in ENTITY_REQUIREMENTS[metric]
+                           if metric not in MANUAL_METRIC_CAPABILITIES})
+    unconfigured = _unconfigured_shops(conn, shop_ids, erp_entities)
     profiles = {str(row[0]): ShopRecord.from_row(row[0], row[1], ())
                 for row in conn.execute(SHOP_PLATFORMS_SQL, (shop_ids,)).fetchall()}
 

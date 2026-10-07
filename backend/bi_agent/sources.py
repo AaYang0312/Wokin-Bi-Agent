@@ -90,6 +90,29 @@ PAY_TIME_METRICS: frozenset[str] = frozenset(
 # 设计 §4 明确它“仍可在对应覆盖成立时查询”，所以它只披露、不拒答。
 PAYMENT_WINDOW_METRICS: frozenset[str] = PAY_TIME_METRICS - {"erp_documents"}
 
+# ---------------------------------------------------------------------------
+# 手工导出来源族（计划 2026-10-02 manual-sycm-export-import §3.M2/M3）：
+# 生意参谋手工导出是独立来源，不经上面的平台注册表路由——能力由导入面授予
+# （bi.shops.capabilities，M2 `_grant_capabilities`），覆盖凭证挂在
+# (manual.sycm.export, shop_daily)。口径版本由 basis 名自身携带（换口径必须
+# 换 basis，与 PAYMENT_BASIS 同一规则）；不设独立版本常量，也不 bump
+# SOURCE_REGISTRY_VERSION——新增词表不改变既有 ERP 绑定，bump 只会无谓作废
+# 全部既有请求指纹（tests.test_sycm_metrics 钉住）。
+# 拼多多在导入登记面就被排除；注册表解析这里再加一道：manual 族对 pdd 永不解析。
+# ---------------------------------------------------------------------------
+MANUAL_EXPORT_SOURCE = "manual.sycm.export"
+MANUAL_EXPORT_ENTITY = "shop_daily"
+# 口径标签不是来源名：它必须匹配 runtime 载荷校验的口径名形状（首段只允许
+# [a-z0-9_-]，见 runtime.models._BASIS_NAME_RE），所以用下划线拼写并自带版本段。
+MANUAL_EXPORT_BASIS = "manual_sycm_export/v1"
+# 手工导出按「统计日期」归属（导出列名），不是任何接口的取数时间语义。
+MANUAL_EXPORT_TIME_BASIS = "stat_date"
+# 手工族指标：名字即能力标签（与指标同名，M2 导入面按这份授予），同时也是
+# 「哪些指标经手工来源解析」的家族判定，两用一份，不另设家族清单。
+MANUAL_METRIC_CAPABILITIES: frozenset[str] = frozenset((
+    "ad_spend", "ad_spend_ratio", "roas", "visitors", "pay_conversion_rate",
+    "cart_count"))
+
 # 指标 → 依赖的业务实体。覆盖门禁与来源解析共用这一份，两边不再各抄一遍。
 ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "paid_amount": (ORDERS_ENTITY,),
@@ -103,6 +126,8 @@ ENTITY_REQUIREMENTS: dict[str, tuple[str, ...]] = {
     "refund_amount": (AFTERSALE_ENTITY,),
     "cash_difference": (ORDERS_ENTITY, AFTERSALE_ENTITY),
     "cohort_refund_rate": (ORDERS_ENTITY, AFTERSALE_COHORT_ENTITY),
+    # 手工导出族只依赖手工覆盖凭证（sync_state 的 shop_daily 实体）。
+    **{metric: (MANUAL_EXPORT_ENTITY,) for metric in MANUAL_METRIC_CAPABILITIES},
 }
 
 TimeBasis = Literal["pay_time", "outstock_time", "aftersale_completion_time"]
@@ -354,7 +379,19 @@ def resolve_metric_dependencies(shop: ShopRecord,
     覆盖与质量判定需要同一份依赖表，但不能被能力标签卡住：能力未授予时它必须报
     「能力未开通」，而不是「覆盖未知」；两个原因混在一起就等于说错话。
     返回空元组表示这个平台的来源根本拿不到该口径（未登记平台、拼多多支付族）。
+
+    手工导出族（MANUAL_METRIC_CAPABILITIES）不经平台注册表路由：依赖就是
+    (manual.sycm.export, shop_daily) 一条绑定；只有 pdd 平台被硬性排除
+    （永久不接入，导入面两道守卫之外的注册表第三道守卫）。
     """
+    if metric in MANUAL_METRIC_CAPABILITIES:
+        if shop.platform == "pdd":
+            return ()
+        return (SourceBinding(
+            shop_id=shop.shop_id, platform=shop.platform,
+            entity=MANUAL_EXPORT_ENTITY, source=MANUAL_EXPORT_SOURCE,
+            basis=MANUAL_EXPORT_BASIS, time_basis=MANUAL_EXPORT_TIME_BASIS,
+            time_certification="unmeasured"),)
     reg = registration(shop.platform)
     if reg is None or metric not in METRIC_CAPABILITIES:
         return ()
@@ -393,10 +430,17 @@ def unsupported_reason(shop: ShopRecord, metric: str) -> str | None:
     - `source_unregistered`：平台没有登记来源，禁止回退到别的通道。
     - `capability_ungranted`：来源在，但这家店没被授予该指标能力。
     - `capability_unavailable`：授予了标签，但该来源口径拿不到这个指标（拼多多支付族、
-      未知指标名）。注册表上限优先于标签，误写进库的标签不会打开任何能力。
+      未知指标名、pdd 的手工族）。注册表上限优先于标签，误写进库的标签不会打开任何能力。
+
+    手工导出族先于平台注册表判定：它的能力由导入面授予、覆盖挂在 shop_daily，
+    未登记 ERP 平台不构成拒绝手工指标的理由；pdd 则永不解析（同上）。
 
     归因顺序把「没有来源」放在最前：换指标救不了没登记的平台，两种缺口的用户建议不同。
     """
+    if metric in MANUAL_METRIC_CAPABILITIES:
+        if shop.platform == "pdd":
+            return "capability_unavailable"
+        return None if metric in shop.capabilities else "capability_ungranted"
     reg = registration(shop.platform)
     if reg is None:
         return "source_unregistered"

@@ -28,10 +28,10 @@ from .data_quality import QUALITY_RULE, reconcile_source_quality
 from .kuaimai import KuaimaiClient, KuaimaiError, parse_page
 from .metrics import _BudgetExhausted, _set_query_budget
 from .sources import (
-    AFTERSALE_SOURCE, CONSIGN_ORDERS_ENTITY, ITEM_PRICE_SOURCE, OUTSTOCK_SOURCE,
-    ShopRecord, TRADE_LIST_SOURCE, capabilities_from_evidence, item_price_scan_allowed,
-    payment_window_fetch, platform_order_sources, resolve_consign_source,
-    resolve_order_source, PAYMENT_FETCH_API_PAY_TIME,
+    AFTERSALE_SOURCE, CONSIGN_ORDERS_ENTITY, ITEM_PRICE_SOURCE, MANUAL_METRIC_CAPABILITIES,
+    OUTSTOCK_SOURCE, ShopRecord, TRADE_LIST_SOURCE, capabilities_from_evidence,
+    item_price_scan_allowed, payment_window_fetch, platform_order_sources,
+    resolve_consign_source, resolve_order_source, PAYMENT_FETCH_API_PAY_TIME,
     PAYMENT_FETCH_WIDE_CONSIGN_LOCAL_FILTER)
 
 logger = logging.getLogger(__name__)
@@ -2369,6 +2369,10 @@ def recompute_shop_capabilities(conn, shop_ids, *,
         record = ShopRecord.from_row(shop_id, platform, capabilities)
         shop_evidence = evidence.get(str(shop_id), {})
         granted = capabilities_from_evidence(record.platform, shop_evidence)
+        # 手工导出族的能力由导入面授予（M2 `_grant_capabilities`），不归 ERP 对账
+        # 管：重算只保留、绝不回收这部分词，否则一次 `capabilities --apply` 会把
+        # 导入授予静默抹掉，手工指标随之全部 fail closed。
+        granted |= record.capabilities & MANUAL_METRIC_CAPABILITIES
         grants.append(CapabilityGrant(
             shop_id=str(shop_id), platform=record.platform,
             current=frozenset(record.capabilities), granted=frozenset(granted)))

@@ -15,7 +15,10 @@ from typing import Literal, get_args
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from zoneinfo import ZoneInfo
 
-from .metrics import MAX_SPAN_DAYS, Coverage, ToolResult
+from .metrics import (MAX_SPAN_DAYS, SOURCE_QUALITY_UNVERIFIED_LIMITATION,
+                      Coverage, ToolResult)
+from .sources import (MANUAL_EXPORT_ENTITY, MANUAL_EXPORT_SOURCE, ShopRecord,
+                      resolve_metric_sources)
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 ASSUMPTION_BASIS = "用户输入假设"
@@ -23,6 +26,35 @@ NO_SOURCE_LIMITATION = "没有费用实绩来源，结果基于用户输入假�
 NOT_AVAILABLE_LIMITATION = "尚未取得推广实耗及完整同口径成本，当前只能进行明确假设的预算测算"
 
 _MODE_AMOUNTS = ("sales_estimate", "target_ratio", "budget", "assumed_spend")
+
+# ---------------------------------------------------------------------------
+# actual_budget（M3）：实耗来自手工导入的生意参谋店铺维度（manual.sycm.export）。
+# 服务端从覆盖凭证与注册表绑定派生，模型无权把任何输入解释为实耗。
+# ---------------------------------------------------------------------------
+MANUAL_SPEND_BASIS = "手工导入生意参谋实耗"
+MANUAL_SPEND_DISCLOSURE = ("实耗来自手工导入的生意参谋导出（质量未核验），"
+                           "不代表广告账户实际扣费")
+ACTUAL_SPEND_DEFINITION = ("实耗=手工导入生意参谋「全站推广花费」窗口合计"
+                           "（人民币，按统计日期归属；来源未核验，"
+                           "不代表广告账户实际扣费）")
+# 覆盖不包含整个请求窗口（或从未导入）的店：拿不出“该窗口的实耗”，逐家计数披露。
+MANUAL_SPEND_EXCLUDED_PATTERN = re.compile(
+    r"^[0-9]+ 家店铺缺少该窗口的手工实耗数据$")
+
+# 实耗读取（一次集合查询）：覆盖凭证用 multirange 包含判定（窗口不齐不算覆盖），
+# 实耗合计与覆盖同行返回，不逐店往返。
+ACTUAL_SPEND_SQL = """
+SELECT c.shop_id,
+       (c.covered @> tstzmultirange(tstzrange(%s, %s, '[)'))) AS fully_covered,
+       c.data_as_of,
+       coalesce(sum(f.ad_spend_all), 0)
+FROM reporting.v_coverage c
+LEFT JOIN reporting.v_sycm_shop_daily f
+       ON f.shop_id = c.shop_id AND f.stat_date >= %s AND f.stat_date < %s
+WHERE c.source = %s AND c.entity = %s AND c.shop_id = ANY(%s)
+GROUP BY c.shop_id, c.data_as_of, c.covered
+ORDER BY c.shop_id
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +82,8 @@ PROMOTION_COLUMN_KINDS: Mapping[str, str] = {
     "overrun": "decimal",
     "daily_allowance": "decimal",
     "remaining_days": "int",
+    # actual_budget（M3）：实耗=手工导入生意参谋「全站推广花费」窗口合计。
+    "actual_spend": "decimal",
 }
 
 PROMOTION_RESULT_COLUMNS = frozenset(PROMOTION_COLUMN_KINDS)
@@ -60,10 +94,10 @@ PROMOTION_LABEL_RESULT_COLUMNS = frozenset(
 PROMOTION_NUMERIC_RESULT_COLUMNS = frozenset(
     key for key, kind in PROMOTION_COLUMN_KINDS.items() if kind in ("decimal", "int"))
 
-# 标签列的可取值集合：mode 只允许四种模式，basis 只允许假设口径。
+# 标签列的可取值集合：mode 只允许四种模式；basis 允许假设口径与手工导入实耗口径。
 PROMOTION_LABEL_VALUES: Mapping[str, frozenset[str]] = {
     "mode": PROMOTION_MODE_VALUES,
-    "basis": frozenset({ASSUMPTION_BASIS}),
+    "basis": frozenset({ASSUMPTION_BASIS, MANUAL_SPEND_BASIS}),
 }
 # 声明了 label 却没有可取集合的列，在白名单里会变成无规则列，先在源头拦住。
 assert frozenset(PROMOTION_LABEL_VALUES) == PROMOTION_LABEL_RESULT_COLUMNS
@@ -75,6 +109,10 @@ SPEND_CAP_COLUMNS: tuple[str, ...] = ("mode", "spend_cap", "sales_estimate", "ta
 BUDGET_SCENARIO_COLUMNS: tuple[str, ...] = ("mode", "budget", "assumed_spend",
                                             "remaining_budget", "overrun", "remaining_days",
                                             "daily_allowance", "spent_through", "basis")
+# actual_budget 的行声明：shop_id 不进声明集（真实 ERP 主键只能经既有投影换成
+# shop_ref），由调用方在行上附带并走通用投影。
+ACTUAL_BUDGET_COLUMNS: tuple[str, ...] = ("mode", "actual_spend", "spent_through",
+                                          "basis")
 
 SPEND_CAP_DEFINITIONS: Mapping[str, str] = {
     "spend_cap": "上限=假设销售额×假设费用率；预测销售不达预期时阈值需调整",
@@ -86,13 +124,14 @@ BUDGET_SCENARIO_DEFINITIONS: Mapping[str, str] = {
 }
 PROMOTION_METRIC_DEFINITIONS: Mapping[str, str] = {
     **SPEND_CAP_DEFINITIONS, **BUDGET_SCENARIO_DEFINITIONS,
+    "actual_spend": ACTUAL_SPEND_DEFINITION,
 }
 
 PERIOD_ENDED_LIMITATION = "周期已结束或无剩余天数，无法计算日均可用"
 ASSUMPTION_ONLY_LIMITATION = "预算测算只能使用当前用户明确输入的假设，不能沿用上轮参数"
 PROMOTION_PUBLIC_LIMITATIONS = frozenset({
     NO_SOURCE_LIMITATION, NOT_AVAILABLE_LIMITATION, PERIOD_ENDED_LIMITATION,
-    ASSUMPTION_ONLY_LIMITATION,
+    ASSUMPTION_ONLY_LIMITATION, MANUAL_SPEND_DISCLOSURE,
 })
 
 # 确认校验的问题是按键名生成的模板，按键名白名单收紧成可校验模式。
@@ -100,6 +139,7 @@ _CONFIRMATION_KEYS = "(?:" + "|".join(_MODE_AMOUNTS) + ")"
 PROMOTION_LIMITATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(rf"^缺少明确确认的 {_CONFIRMATION_KEYS}$"),
     re.compile(rf"^{_CONFIRMATION_KEYS} 与当前输入不一致，请重新确认$"),
+    MANUAL_SPEND_EXCLUDED_PATTERN,
 )
 
 
@@ -127,6 +167,8 @@ class PromotionRequest(BaseModel):
     budget: Decimal | None = Field(default=None, ge=0)
     assumed_spend: Decimal | None = Field(default=None, ge=0)
     spent_through: date | None = None  # 假设实耗覆盖的排他截止日
+    # actual_budget 专用的店铺范围（已解析的真实 shop_id；引用在主层先换回）。
+    shop_ids: list[str] | None = None
 
     @model_validator(mode="after")
     def _check(self) -> "PromotionRequest":
@@ -139,18 +181,93 @@ class PromotionRequest(BaseModel):
                 raise ValueError("sales_cap需要sales_estimate和target_ratio")
             if self.budget is not None or self.assumed_spend is not None or self.spent_through is not None:
                 raise ValueError("sales_cap不接受预算场景字段")
+            if self.shop_ids is not None:
+                raise ValueError("sales_cap不接受shop_ids")
         elif self.mode == "budget_scenario":
             if self.budget is None or self.assumed_spend is None or self.spent_through is None:
                 raise ValueError("budget_scenario需要budget、assumed_spend和spent_through")
             if self.sales_estimate is not None or self.target_ratio is not None:
                 raise ValueError("budget_scenario不接受销售额假设字段")
+            if self.shop_ids is not None:
+                raise ValueError("budget_scenario不接受shop_ids")
             if not (self.start <= self.spent_through <= self.end):
                 raise ValueError("spent_through必须在[start,end]范围内")
         else:
+            if self.mode == "contribution_cap" and self.shop_ids is not None:
+                raise ValueError("contribution_cap不接受shop_ids")
             for field_name in _MODE_AMOUNTS + ("spent_through",):
                 if getattr(self, field_name) is not None:
                     raise ValueError(f"{self.mode}模式当前不可用，不接受假设金额")
         return self
+
+
+def _actual_budget_result(request: PromotionRequest, *, conn: object,
+                          allowed_shop_ids: frozenset[str],
+                          filters: dict[str, object]) -> ToolResult:
+    """actual_budget 的手工实耗路径：服务端从来源绑定与覆盖凭证派生，两态分明。
+
+    - 越权店一律 forbidden；拿不到手工绑定、覆盖不含整个窗口或截止未知的店
+      计数披露、绝不当 0，也绝不出部分合计的行；
+    - 一家能答的店都没有时保持旧行为（missing_data + NOT_AVAILABLE）；
+    - 实耗行带 basis=手工导入实耗 与质量未核验披露（D1 立即可用+披露）。
+    """
+    if not set(request.shop_ids) <= allowed_shop_ids:
+        return ToolResult(
+            status="forbidden",
+            coverage=Coverage(status="missing", start=None, end=None),
+            limitations=["店铺不在授权范围"], filters=filters)
+
+    profiles = conn.execute(
+        "SELECT shop_id, platform, capabilities FROM reporting.v_shops "
+        "WHERE shop_id = ANY(%s)", (sorted(request.shop_ids),)).fetchall()
+    manual_capable: list[str] = []
+    for shop_id, platform, capabilities in profiles:
+        record = ShopRecord.from_row(str(shop_id), platform, capabilities)
+        if resolve_metric_sources(record, "ad_spend"):
+            manual_capable.append(str(shop_id))
+    manual_capable.sort()
+    if not manual_capable:
+        return ToolResult(
+            status="missing_data",
+            coverage=Coverage(status="missing", start=None, end=None),
+            limitations=[NOT_AVAILABLE_LIMITATION], filters=filters)
+
+    start_ts = datetime(request.start.year, request.start.month, request.start.day,
+                        tzinfo=BEIJING)
+    end_ts = datetime(request.end.year, request.end.month, request.end.day,
+                      tzinfo=BEIJING)
+    rows: list[dict[str, object]] = []
+    for shop_id, fully_covered, data_as_of, spend in conn.execute(
+            ACTUAL_SPEND_SQL,
+            (start_ts, end_ts, request.start, request.end,
+             MANUAL_EXPORT_SOURCE, MANUAL_EXPORT_ENTITY,
+             manual_capable)).fetchall():
+        if not fully_covered or data_as_of is None:
+            continue  # 覆盖不齐/截止未知：给不出“该窗口的实耗”，不当部分合计
+        rows.append({
+            "shop_id": str(shop_id),
+            **_project(ACTUAL_BUDGET_COLUMNS, {
+                "mode": "actual_budget",
+                "actual_spend": format(Decimal(str(spend)), "f"),
+                "spent_through": data_as_of.astimezone(BEIJING).date().isoformat(),
+                "basis": MANUAL_SPEND_BASIS,
+            }),
+        })
+    excluded = len(set(request.shop_ids) - {str(row["shop_id"]) for row in rows})
+    if not rows:
+        return ToolResult(
+            status="missing_data",
+            coverage=Coverage(status="missing", start=None, end=None),
+            limitations=[NOT_AVAILABLE_LIMITATION], filters=filters)
+    limitations = [MANUAL_SPEND_DISCLOSURE, SOURCE_QUALITY_UNVERIFIED_LIMITATION]
+    if excluded:
+        limitations.append(f"{excluded} 家店铺缺少该窗口的手工实耗数据")
+    return ToolResult(
+        status="ok", data=rows,
+        metric_definition={"actual_spend": ACTUAL_SPEND_DEFINITION},
+        filters=filters,
+        coverage=Coverage(status="missing", start=None, end=None),
+        limitations=limitations)
 
 
 def _decimal_input(confirmed: dict[str, object], key: str) -> Decimal | None:
@@ -186,14 +303,30 @@ def _check_confirmed(request: PromotionRequest,
 
 
 def evaluate_promotion(request: PromotionRequest, *, confirmed_inputs: dict[str, object],
-                       now: datetime) -> ToolResult:
-    """确定性情景测算：实绩与成本能力未满足时明确缺数据，不用0或推测补齐。"""
+                       now: datetime, conn: object | None = None,
+                       allowed_shop_ids: frozenset[str] = frozenset()) -> ToolResult:
+    """确定性情景测算：实绩和成本能力未满足时明确缺数据，不用0或推测补齐。
+
+    actual_budget 的例外（M3）：给了店铺范围与数据库连接时，实耗从手工导入的
+    生意参谋覆盖里读取——有 ad_spend 覆盖的店可答（带披露），无覆盖的店行为
+    不变（missing_data，不把缺数当 0）。不传连接的旧调用维持原行为。
+    """
     filters: dict[str, object] = {
         "mode": request.mode,
         "start": request.start.isoformat(),
         "end": request.end.isoformat(),
         "currency": request.currency,
     }
+    if request.mode == "actual_budget" and request.shop_ids:
+        if conn is None:
+            return ToolResult(
+                status="missing_data",
+                coverage=Coverage(status="missing", start=None, end=None),
+                limitations=[NOT_AVAILABLE_LIMITATION], filters=filters)
+        filters["shop_ids"] = sorted(request.shop_ids)
+        return _actual_budget_result(request, conn=conn,
+                                     allowed_shop_ids=allowed_shop_ids,
+                                     filters=filters)
     if request.mode in ("actual_budget", "contribution_cap"):
         return ToolResult(
             status="missing_data",

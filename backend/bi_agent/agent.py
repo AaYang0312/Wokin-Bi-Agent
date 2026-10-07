@@ -458,7 +458,9 @@ def _correction_message(call_id: str, problems: list[str]) -> Message:
                                        "problems": problems}, ensure_ascii=False))
 
 
-def _handle_evaluate_promotion(call: ToolCall, *, question: str, now: datetime) -> (
+def _handle_evaluate_promotion(call: ToolCall, *, question: str, now: datetime,
+                               conn: object, allowed_shop_ids: frozenset[str],
+                               shop_refs: dict[str, str]) -> (
         ToolResult) | list[str]:
     args = dict(call.arguments or {})
     values = explicit_assumptions(question)
@@ -472,13 +474,19 @@ def _handle_evaluate_promotion(call: ToolCall, *, question: str, now: datetime) 
         if isinstance(md, tuple):
             through = date(now.year, md[0], md[1]) + timedelta(days=1)
             args.setdefault("spent_through", through.isoformat())
+    # actual_budget 的 shop_ids 是 ent- 引用：先换回真实主键再进请求模型；
+    # 未识别的引用原样保留，授权检查会把它拒成 forbidden。
+    raw_shops = args.get("shop_ids")
+    if isinstance(raw_shops, list) and raw_shops:
+        args["shop_ids"] = [shop_refs.get(str(value), str(value))
+                            for value in raw_shops]
     try:
         request = PromotionRequest.model_validate(args)
     except Exception as exc:  # noqa: BLE001
         return [str(exc).split("\n")[0]]
     return evaluate_promotion(request, confirmed_inputs={
         key: value for key, value in values.items() if not key.startswith("_")
-    }, now=now)
+    }, now=now, conn=conn, allowed_shop_ids=allowed_shop_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -1170,7 +1178,10 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                     call.id, [call.arguments_error or "arguments不是对象"]))
                 continue
             if call.name == "evaluate_promotion":
-                outcome = _handle_evaluate_promotion(call, question=question, now=now)
+                outcome = _handle_evaluate_promotion(
+                    call, question=question, now=now, conn=conn,
+                    allowed_shop_ids=allowed_shop_ids,
+                    shop_refs=dict(state.shop_refs))
             else:
                 messages.append(Message(role="tool", tool_call_id=call.id,
                                         content=json.dumps(

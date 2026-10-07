@@ -175,6 +175,21 @@ def safe_result_body(
     raw_diagnostics = payload.get("diagnostics")
     diagnostics = raw_diagnostics if isinstance(raw_diagnostics, dict) else {}
 
+    # 缺数上传提示（D3）：结构由服务端从覆盖凭证派生。公开形状把内部 shop_ids
+    # 换成 shop_ref；模型可见载荷一律不含这一块（防模型伪造上传提示），带它
+    # 进模型视图会被 runtime 白名单直接拒掉。
+    remediation: dict[str, object] | None = None
+    raw_remediation = payload.get("remediation")
+    if not model_view and isinstance(raw_remediation, dict):
+        remediation = {
+            "kind": raw_remediation.get("kind"),
+            "file_kind": raw_remediation.get("file_kind"),
+            "shop_refs": [catalog.shop_ref(str(shop_id))
+                          for shop_id in (raw_remediation.get("shop_ids") or [])],
+            "covered_window": raw_remediation.get("covered_window"),
+            "missing_range": raw_remediation.get("missing_range"),
+        }
+
     # 分区榜身份：内部带真实 shop_id（分区是按签名分组的店集），公开形状只留引用，
     # 与行上的 rank_group 同名同值，否则名次就无法解释。
     rank_groups: list[dict[str, object]] = []
@@ -240,4 +255,6 @@ def safe_result_body(
         body["rank_groups"] = rank_groups
     if excluded_scope:
         body["excluded_scope"] = excluded_scope
+    if remediation is not None:
+        body["remediation"] = remediation
     return body
