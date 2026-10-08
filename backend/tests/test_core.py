@@ -163,7 +163,9 @@ class ConfigTests(unittest.TestCase):
              "isolated_analysis_enabled",
              # 计划 2026-10-02 manual-sycm-export-import D5：手工导入上传面门禁，
              # 默认关（关闭时路由 404、CLI 拒绝、指标不注册）。
-             "sycm_manual_import_enabled"})
+             "sycm_manual_import_enabled",
+             # 计划 2026-10-08 覆盖缺口部分答案：默认关，关闭时查询行为逐字不变。
+             "partial_answers_enabled"})
         self.assertIs(AppSettings.model_fields["controlled_sql_enabled"].default, False)
         # 新门禁同规：缺席与显式 false 逐字同一份设置，缺省值恒为关。
         self.assertFalse(load_app_settings(valid_app_env()).sycm_manual_import_enabled)

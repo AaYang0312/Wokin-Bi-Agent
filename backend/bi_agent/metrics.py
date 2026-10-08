@@ -12,7 +12,7 @@ import time
 from collections import Counter
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, Sequence
 from zoneinfo import ZoneInfo
 
 import psycopg
@@ -111,6 +111,17 @@ SYCM_PUBLIC_LIMITATIONS = frozenset({
     SYCM_MIXED_CALIBER_LIMITATION, SYCM_UPLOAD_LIMITATION,
     SYCM_RATIO_NOT_COMPUTABLE_LIMITATION,
 })
+
+
+def partial_answer_disclosure(answered_windows: Sequence[tuple[str, str]],
+                              missing_windows: Sequence[tuple[str, str]]) -> str:
+    """部分答案的披露句：窗口由服务端填进固定模板，模型不能改写措辞。
+
+    已覆盖段用「起~止」列出，缺口只报起始日（「Z 起缺口」）。序列顺序即披露顺序。
+    """
+    covered = "、".join(f"{start}~{end}" for start, end in answered_windows)
+    gap = "、".join(start for start, _end in missing_windows)
+    return f"仅覆盖 {covered}，{gap} 起缺口"
 SYCM_LIMITATION_PATTERNS = (SYCM_CAPABILITY_GAP_PATTERN, SYCM_NULL_VALUE_PATTERN)
 
 # 指标→实体依赖与覆盖来源定义在 sources 注册表（唯一真源）；data_quality 向外转发，

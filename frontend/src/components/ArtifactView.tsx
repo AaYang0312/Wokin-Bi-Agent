@@ -2,6 +2,8 @@ import type { Artifact, DisplayEntity, DrilldownIntent } from '../types'
 import { caliberLabel } from '../types'
 import { AnalysisArtifact } from './AnalysisArtifact'
 import { ChartArtifact } from './ChartArtifact'
+import { parsePartialAnswer } from '../partialAnswer'
+import type { PartialAnswerView } from '../partialAnswer'
 import { RemediationUpload, parseRemediation } from './RemediationUpload'
 import type { RemediationView } from './RemediationUpload'
 import { AlertIcon, ClockIcon, GaugeIcon, TableIcon } from './icons'
@@ -14,6 +16,19 @@ import { AlertIcon, ClockIcon, GaugeIcon, TableIcon } from './icons'
  */
 export function drilldownQuestion(intent: DrilldownIntent): string {
   return intent.question
+}
+
+function rejectedArtifact() {
+  return (
+    <section className="artifact" aria-label="查询结果未渲染">
+      <header className="artifact-head">
+        <span className="artifact-title"><AlertIcon size={15} />查询结果</span>
+      </header>
+      <p className="limitations">
+        查询结果载荷未通过展示侧校验，未渲染：不猜测形状，也不补任何数字。
+      </p>
+    </section>
+  )
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -456,19 +471,15 @@ export function ArtifactView({
   let remediation: RemediationView | null = null
   if (artifact.remediation !== undefined) {
     const parsed = parseRemediation(artifact.remediation)
-    if (!parsed.ok) {
-      return (
-        <section className="artifact" aria-label="查询结果未渲染">
-          <header className="artifact-head">
-            <span className="artifact-title"><AlertIcon size={15} />查询结果</span>
-          </header>
-          <p className="limitations">
-            查询结果载荷未通过展示侧校验，未渲染：不猜测形状，也不补任何数字。
-          </p>
-        </section>
-      )
-    }
+    if (!parsed.ok) return rejectedArtifact()
     remediation = parsed.remediation
+  }
+  // 部分答案的披露句同样只认结构化块：改写、缺窗口或未知键整卡拒绝。
+  let partialAnswer: PartialAnswerView | null = null
+  if (artifact.partial_answer !== undefined) {
+    const parsed = parsePartialAnswer(artifact.partial_answer)
+    if (!parsed.ok) return rejectedArtifact()
+    partialAnswer = parsed.partialAnswer
   }
   const entities = artifactEntities(artifact)
   const rows = Array.isArray(artifact.data) ? artifact.data.filter(
@@ -581,6 +592,9 @@ export function ArtifactView({
         {asOf && <span><ClockIcon size={13} />数据截止：{asOf}</span>}
         {coverage !== undefined && <span><GaugeIcon size={13} />覆盖：{text(coverage)}</span>}
       </div>
+      {partialAnswer && (
+        <p className="limitations" data-partial-answer="true">{partialAnswer.disclosure}</p>
+      )}
       {remediation && (
         <RemediationUpload remediation={remediation} entities={entities}
           questionText={questionText} onRequery={onRequery} />

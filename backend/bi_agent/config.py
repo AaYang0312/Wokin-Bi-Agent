@@ -43,6 +43,9 @@ class AppSettings(BaseModel):
     # 默认关：关闭时上传路由 404、导入 CLI 拒绝、指标不注册，聊天行为与
     # 现状逐字一致（既有 gate 纪律）。
     sycm_manual_import_enabled: bool = False
+    # 覆盖缺口的部分答案（计划 2026-10-08 D6）默认关：关闭与变量缺席时，
+    # 工具行为、载荷与聊天结果与现状逐字一致。
+    partial_answers_enabled: bool = False
 
 
 class SyncSettings(BaseModel):
@@ -175,6 +178,7 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
     # "1"/"yes"/"True" 之类一律当场报错（计划 Task 1 Step 5）。
     isolated_analysis_enabled = _flag(env, "ISOLATED_ANALYSIS_ENABLED")
     sycm_manual_import_enabled = _flag(env, "SYCM_MANUAL_IMPORT_ENABLED")
+    partial_answers_enabled = _flag(env, "PARTIAL_ANSWERS_ENABLED")
     return AppSettings(
         app_dsn=app_dsn,
         shop_ids=shop_ids,
@@ -189,6 +193,7 @@ def load_app_settings(env: Mapping[str, str]) -> AppSettings:
         approver_dsn=approver_dsn,
         isolated_analysis_enabled=isolated_analysis_enabled,
         sycm_manual_import_enabled=sycm_manual_import_enabled,
+        partial_answers_enabled=partial_answers_enabled,
     )
 
 

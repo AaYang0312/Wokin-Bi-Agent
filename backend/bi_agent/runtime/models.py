@@ -51,6 +51,7 @@ from bi_agent.metrics import (
     METRIC_DEFINITIONS,
     SYCM_LIMITATION_PATTERNS,
     SYCM_PUBLIC_LIMITATIONS,
+    partial_answer_disclosure,
 )
 from bi_agent.presentation.charts import (
     CHART_BASELINES, CHART_KINDS, CHART_NULL_HANDLES, CHART_PAYLOAD_KEYS,
@@ -335,6 +336,9 @@ _ARTIFACT_KEYS = frozenset({
     # 缺数上传提示（D3）：服务端从覆盖凭证派生，只进公开 Artifact——
     # 模型可见载荷带它即违约（见 _PUBLIC_ONLY_ARTIFACT_KEYS）。
     "remediation",
+    # 覆盖缺口的部分答案（计划 2026-10-08 D3）：模型可见披露句，但句子必须与
+    # 服务端模板逐字一致，改写即拒。
+    "partial_answer",
 })
 
 # ---------------------------------------------------------------------------
@@ -1396,6 +1400,8 @@ def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
         _diagnostics(payload["diagnostics"])
     if "remediation" in payload:
         _remediation(payload["remediation"])
+    if "partial_answer" in payload:
+        _partial_answer(payload["partial_answer"])
     # 契约 v2（spec §3）：范围三面分开，被排除的店铺与原因逐条可核对。
     if "requested_scope" in payload:
         _requested_scope(payload["requested_scope"])
@@ -1469,6 +1475,40 @@ def _diagnosis_value_ok(item: object) -> bool:
 _REMEDIATION_KINDS = frozenset({"upload"})
 # file_kind 是导入面的文件类别词表（M2 FileKind 的用户可见名），不是自由文本。
 _REMEDIATION_FILE_KINDS = frozenset({"店铺维度"})
+
+
+_PARTIAL_ANSWER_KEYS = frozenset({
+    "answered_windows", "missing_windows", "metric_refs", "disclosure",
+})
+
+
+def _exclusive_windows(value: object) -> list[tuple[str, str]]:
+    """非空的 [start, end) 列表：空列表、逆序或非日期对都不是可披露窗口。"""
+    if not isinstance(value, list) or not value:
+        _unsafe_payload()
+    windows: list[tuple[str, str]] = []
+    for item in value:
+        _date_pair(item)
+        start, end = str(item[0]), str(item[1])
+        if start >= end:
+            _unsafe_payload()
+        windows.append((start, end))
+    return windows
+
+
+def _partial_answer(value: object) -> None:
+    """部分答案公开块：四键齐全，披露句必须由窗口现算，指标名只许词表内。"""
+    block = _mapping(value, allowed=_PARTIAL_ANSWER_KEYS, required=_PARTIAL_ANSWER_KEYS)
+    answered = _exclusive_windows(block["answered_windows"])
+    missing = _exclusive_windows(block["missing_windows"])
+    refs = block["metric_refs"]
+    if not isinstance(refs, list) or not refs or len(set(refs)) != len(refs):
+        _unsafe_payload()
+    for metric in refs:
+        if metric not in _METRIC_DEFINITION_TEXTS:
+            _unsafe_payload()
+    if block["disclosure"] != partial_answer_disclosure(answered, missing):
+        _unsafe_payload()
 
 
 def _remediation(value: object) -> None:
