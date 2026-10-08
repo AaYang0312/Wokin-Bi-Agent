@@ -55,7 +55,7 @@ metadata:
 - 启动前先调用：
   1. `subagent({ action: "list", capabilities: true })`
   2. `subagent({ action: "models" })`
-- 子代理模型默认使用精确模型 `bailian/qwen3.8-flash`，并通过模型后缀或配置显式指定 **high** 思考强度：`bailian/qwen3.8-flash:high`。
+- 子代理模型默认使用精确模型 `deepseek/deepseek-v4-flash`，并通过模型后缀或配置显式指定 **high** 思考强度：`deepseek/deepseek-v4-flash:high`。
 - 若该模型不可用，不得静默替换；先报告并请求用户决定。
 
 ### 3.2 一个顶层工作流、一个写者
