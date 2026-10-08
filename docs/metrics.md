@@ -534,8 +534,9 @@ SELECT count(*) FROM bi.query_runs WHERE domain = 'inventory_watch';
    取数时间无关。`(shop_id, stat_date)` 幂等，后批替换前批，lineage = `batch_id`（内容哈希）。
 2. **同源比值（D2）**：`roas` / `ad_spend_ratio` 的分子分母都来自 `paid_amount_sycm` 与
    `ad_spend_all` 的**窗口合计**；生意参谋支付金额是独立口径列，与 ERP `paid_amount`
-   永不出现在同一合计/比较/排名。手工族指标与 ERP 指标混在一次请求里 = `invalid_parameters`
-   + `basis_incompatible`。
+   永不出现在同一合计/比较/排名。   手工族指标与 ERP 指标混在一次请求里 = `invalid_parameters`
+   + `basis_incompatible`。部分答案闸关闭时始终如此；闸开启后，只有一边没有来源时
+   才拆开出数，两边都能答仍拒绝合并，见 §4.11。
 3. **未核验披露（D1）**：上传数据立即可用，但覆盖凭证质量恒为 `unknown` +
    `manual-export/unverified`——每个成功结果都带「来源质量未核验（尚无对账记录）」
    （码 `source_quality_unverified`）。没有对账记录之前不得说数据已认证。
@@ -563,8 +564,32 @@ SELECT count(*) FROM bi.query_runs WHERE domain = 'inventory_watch';
 
 ```sh
 uv run --env-file ../.env.test python -m unittest tests.test_sycm_metrics tests.test_sycm_import tests.test_sycm_upload tests.test_sycm_parser tests.test_sycm_schema -v
-uv run --env-file ../.env.test python -m tests.acceptance --offline   # 32 题含 30–32 手工族
+uv run --env-file ../.env.test python -m tests.acceptance --offline   # 35 题；30–32 手工族，33–35 部分答案
 ```
+
+## 4.11 覆盖缺口的部分答案（`PARTIAL_ANSWERS_ENABLED`，默认关闭）
+
+开关缺省 `false`。关闭时，覆盖不完整仍整单 `missing_data`（离线题 31 钉住），
+查询结果与关闭基线一致。开启后只改变「有一段已覆盖窗口」或「部分指标没有来源」
+这两类请求，不新增 SQL，也不新增迁移。
+
+1. **单段窗口出数。** 请求窗口里只有一段连续已覆盖日期时，用原来的 SQL 在这段日期上
+   汇总。结果 `status=ok`，`coverage.status=partial`，`coverage.start/end` 仍是原请求
+   窗口。`partial_answer` 四键由服务端填写：`answered_windows`、`missing_windows`、
+   `metric_refs`，以及披露句「仅覆盖 {起~止}，{缺口起点} 起缺口」。能补传的缺口仍带
+   原来的 `remediation`。多段不连续窗口、跨源比值（`cash_difference`、
+   `cohort_refund_rate`）和时点库存不收窄，仍整单缺数。
+2. **指标不连坐。** 同一请求里没有来源的指标进入 `refused`（指标名 → 已登记原因码）。
+   手工指标可附逐项上传提示，只出现在公开结果里。已经能答的指标照常出数，不把缺来源
+   写成 0。两边都有来源的 ERP 指标和生意参谋指标仍然不能放进同一次查询。
+3. **不得把部分数说成完整数。** 模型提示要求原样复述披露句里的覆盖窗口和缺口起点。
+   前端在验形通过后渲染覆盖徽标和缺口日期；句子被改写、窗口为空或原因码不在词表内时，
+   整张卡片拒绝，不补数字。模型载荷上删掉或改写 `partial_answer` 不会替换服务端已经
+   投影好的披露。
+4. **复合口径降级留待后续。** 例如「含广告的净利不可算时，改报不含广告的毛利参考」
+   这类自动降级，等真实复合指标登记后再设计。本轮没有这条链。
+
+回退 = 把 `PARTIAL_ANSWERS_ENABLED` 改回 `false`（或删掉该变量）后重启。没有迁移要回滚。
 
 ## 5. 真实对账结果摘要
 
