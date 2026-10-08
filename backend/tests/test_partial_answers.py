@@ -1,13 +1,15 @@
-"""覆盖缺口部分答案的公开契约（计划 2026-10-08 T1）。
+"""覆盖缺口部分答案（计划 2026-10-08）。
 
-行为用例（聚合/比值/库存/关闸逐字一致）在分解函数与查询接线落地前不能绿；
-这一层只钉载荷形状：服务端披露文本、模型可见但不可改写、门禁默认关闭。
+T1 钉载荷形状。T2 钉不连库的可分解性：空覆盖、未知截止、混合指标、
+同源比值的公共窗口。查询接线与关闸逐字一致留到 T3。
 """
 
 from __future__ import annotations
 
 import pathlib
 import unittest
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 
 ANSWERED = [["2026-09-01", "2026-09-29"]]
@@ -110,3 +112,107 @@ class PartialAnswerGateTests(unittest.TestCase):
         assignments = [line for line in text.splitlines()
                        if line.startswith("PARTIAL_ANSWERS_ENABLED=")]
         self.assertEqual(assignments, ["PARTIAL_ANSWERS_ENABLED=false"])
+
+
+AS_OF = datetime(2026, 9, 30, 23, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+REQUESTED = ("2026-09-01", "2026-10-01")
+
+
+def _decompose(metrics, coverages):
+    from bi_agent.business_query.partial import decompose_partial_answer
+
+    return decompose_partial_answer(REQUESTED, metrics, coverages)
+
+
+def _covered(*windows, as_of=AS_OF):
+    from bi_agent.business_query.partial import MetricCoverage
+
+    return MetricCoverage(covered=tuple(windows), data_as_of=as_of)
+
+
+class PartialDecompositionTests(unittest.TestCase):
+    """T2：覆盖能否拆开出数，只由窗口与指标种类决定，不连库。"""
+
+    def test_empty_coverage_stays_missing_data(self):
+        decision = _decompose(("ad_spend",), {"ad_spend": _covered()})
+        self.assertEqual(decision.status, "missing_data")
+        self.assertEqual(decision.groups, ())
+        self.assertEqual(decision.refused, (("ad_spend", "coverage_incomplete"),))
+
+    def test_unknown_data_as_of_stays_missing_data(self):
+        decision = _decompose(
+            ("visitors",),
+            {"visitors": _covered(("2026-09-01", "2026-09-20"), as_of=None)})
+        self.assertEqual(decision.status, "missing_data")
+        self.assertEqual(decision.refused, (("visitors", "data_as_of_unknown"),))
+
+    def test_single_aggregate_uses_its_covered_spans(self):
+        decision = _decompose(
+            ("ad_spend",),
+            {"ad_spend": _covered(("2026-09-01", "2026-09-20"))})
+        self.assertEqual(decision.status, "partial")
+        self.assertEqual(decision.refused, ())
+        group = decision.groups[0]
+        self.assertEqual(group.metrics, ("ad_spend",))
+        self.assertEqual(group.answered_windows, (("2026-09-01", "2026-09-20"),))
+        self.assertEqual(group.missing_windows, (("2026-09-20", "2026-10-01"),))
+
+    def test_complete_aggregate_does_not_become_partial(self):
+        decision = _decompose(
+            ("paid_amount",),
+            {"paid_amount": _covered(("2026-09-01", "2026-10-01"))})
+        self.assertEqual(decision.status, "complete")
+        self.assertEqual(decision.groups[0].missing_windows, ())
+        self.assertEqual(decision.refused, ())
+
+    def test_manual_and_erp_metrics_do_not_share_a_refusal(self):
+        decision = _decompose(
+            ("paid_amount", "ad_spend"),
+            {
+                "paid_amount": _covered(("2026-09-01", "2026-10-01")),
+                "ad_spend": _covered(("2026-09-01", "2026-09-20")),
+            })
+        self.assertEqual(decision.status, "partial")
+        self.assertEqual(decision.refused, ())
+        by_metric = {group.metrics: group.answered_windows for group in decision.groups}
+        self.assertEqual(by_metric[("paid_amount",)], (("2026-09-01", "2026-10-01"),))
+        self.assertEqual(by_metric[("ad_spend",)], (("2026-09-01", "2026-09-20"),))
+
+    def test_same_source_ratio_uses_the_intersection(self):
+        decision = _decompose(
+            ("roas",),
+            {
+                "paid_amount_sycm": _covered(("2026-09-01", "2026-09-25")),
+                "ad_spend": _covered(("2026-09-10", "2026-09-30")),
+            })
+        self.assertEqual(decision.status, "partial")
+        self.assertEqual(decision.refused, ())
+        group = decision.groups[0]
+        self.assertEqual(group.metrics, ("roas",))
+        self.assertEqual(group.answered_windows, (("2026-09-10", "2026-09-25"),))
+        self.assertEqual(group.missing_windows, (
+            ("2026-09-01", "2026-09-10"), ("2026-09-25", "2026-10-01")))
+
+    def test_ratio_without_a_common_span_is_refused(self):
+        decision = _decompose(
+            ("aov",),
+            {
+                "paid_amount": _covered(("2026-09-01", "2026-09-10")),
+                "paid_orders": _covered(("2026-09-10", "2026-09-20")),
+            })
+        self.assertEqual(decision.status, "missing_data")
+        self.assertEqual(decision.refused, (("aov", "coverage_incomplete"),))
+
+    def test_cross_source_ratio_and_snapshot_stay_missing_data(self):
+        decision = _decompose(
+            ("cash_difference", "physical_total"),
+            {
+                "cash_difference": _covered(("2026-09-01", "2026-09-20")),
+                "physical_total": _covered(("2026-09-01", "2026-09-20")),
+            })
+        self.assertEqual(decision.status, "missing_data")
+        self.assertEqual(decision.groups, ())
+        self.assertEqual(decision.refused, (
+            ("cash_difference", "basis_incompatible"),
+            ("physical_total", "basis_incompatible"),
+        ))
