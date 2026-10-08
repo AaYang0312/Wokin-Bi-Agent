@@ -98,11 +98,15 @@ export function RichContent({ text }: { text: string }) {
 }
 
 export function MessageView({
-  message, onDrilldown,
+  message, questionText, onDrilldown, onRequery,
 }: {
   message: ChatMessage
+  /** 该条消息对应的原用户问题原文（助手消息才有）：重新查询只重发它。 */
+  questionText?: string | null
   /** 图表下钻：外层把它变成一次新的、仍由服务端展开授权的提问。 */
   onDrilldown?: (intent: DrilldownIntent) => void
+  /** 重新查询（D4）：用户点击后才重发原问题文本，绝不自动触发。 */
+  onRequery?: (question: string) => void
 }) {
   return (
     <article className={`message ${message.role}`}>
@@ -118,7 +122,9 @@ export function MessageView({
           key={index}
           artifact={artifact}
           datasets={message.artifacts}
-          onDrilldown={onDrilldown} />))}
+          questionText={questionText}
+          onDrilldown={onDrilldown}
+          onRequery={onRequery} />))}
     </article>
   )
 }

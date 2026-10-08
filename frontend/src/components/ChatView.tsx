@@ -5,6 +5,7 @@ import { ArtifactView } from './ArtifactView'
 import { Composer } from './Composer'
 import { AlertIcon, BrandMark, ClockIcon, GaugeIcon, MenuIcon } from './icons'
 import { MessageView } from './MessageView'
+import { originalQuestionOf } from './RemediationUpload'
 
 const examples = [
   '最近7天支付金额如何？',
@@ -20,7 +21,7 @@ function shortTime(value: string) {
 
 export function ChatView({
   messages, status, artifacts, error, disabled, title, updatedAt, chatCount, narrow, drawerOpen,
-  onOpenSidebar, onSend, onDrilldown, menuToggleRef,
+  onOpenSidebar, onSend, onDrilldown, onRequery, menuToggleRef,
 }: {
   messages: ChatMessage[]
   status: string | null
@@ -36,6 +37,8 @@ export function ChatView({
   onSend: (content: string) => void
   /** 图表上的平台下钻：和"输入一句新问题"走同一条路，因此仍会在服务端重新授权。 */
   onDrilldown?: (intent: DrilldownIntent) => void
+  /** 重新查询（D4）：与提问同一条通道，重发的是原用户问题原文。 */
+  onRequery?: (question: string) => void
   menuToggleRef?: RefObject<HTMLButtonElement | null>
 }) {
   const stamp = updatedAt ? shortTime(updatedAt) : null
@@ -73,8 +76,11 @@ export function ChatView({
               ))}
             </div>
           </div>
-        ) : messages.map((message) => (
-          <MessageView key={message.id} message={message} onDrilldown={onDrilldown} />
+        ) : messages.map((message, index) => (
+          <MessageView key={message.id} message={message}
+            questionText={message.role === 'assistant'
+              ? originalQuestionOf(messages, index) : null}
+            onDrilldown={onDrilldown} onRequery={onRequery} />
         ))}
         {status && <p className="stream-status" role="status">{status}</p>}
         {artifacts.map((artifact, index) => (

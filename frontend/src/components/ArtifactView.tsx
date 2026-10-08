@@ -2,7 +2,9 @@ import type { Artifact, DisplayEntity, DrilldownIntent } from '../types'
 import { caliberLabel } from '../types'
 import { AnalysisArtifact } from './AnalysisArtifact'
 import { ChartArtifact } from './ChartArtifact'
-import { ClockIcon, GaugeIcon, TableIcon } from './icons'
+import { RemediationUpload, parseRemediation } from './RemediationUpload'
+import type { RemediationView } from './RemediationUpload'
+import { AlertIcon, ClockIcon, GaugeIcon, TableIcon } from './icons'
 
 /**
  * 把下钻意图变成一句新提问：外层只负责把它当普通用户问题发出去。
@@ -434,7 +436,7 @@ export function isRef(value: unknown): value is string {
 }
 
 export function ArtifactView({
-  artifact, datasets = [], onDrilldown,
+  artifact, datasets = [], onDrilldown, questionText, onRequery,
 }: {
   artifact: Artifact
   /**
@@ -444,7 +446,30 @@ export function ArtifactView({
   datasets?: Artifact[]
   /** 图表下钻：只交出一个意图，外层负责把它变成一次**重新授权**的提问。 */
   onDrilldown?: (intent: DrilldownIntent) => void
+  /** 该条消息对应的原用户问题原文（D4）：重新查询按钮只重发这段文本。 */
+  questionText?: string | null
+  /** 重新查询：与下钻同一条路——外层把它当成一次普通提问重新发送。 */
+  onRequery?: (question: string) => void
 }) {
+  // 缺数上传提示（D3）只认结构化 remediation 块：载荷带这个键就必须先过展示侧
+  // 验形，验不过整卡拒绝——绝不因消息文本里有"请上传"字样而渲染任何按钮。
+  let remediation: RemediationView | null = null
+  if (artifact.remediation !== undefined) {
+    const parsed = parseRemediation(artifact.remediation)
+    if (!parsed.ok) {
+      return (
+        <section className="artifact" aria-label="查询结果未渲染">
+          <header className="artifact-head">
+            <span className="artifact-title"><AlertIcon size={15} />查询结果</span>
+          </header>
+          <p className="limitations">
+            查询结果载荷未通过展示侧校验，未渲染：不猜测形状，也不补任何数字。
+          </p>
+        </section>
+      )
+    }
+    remediation = parsed.remediation
+  }
   const entities = artifactEntities(artifact)
   const rows = Array.isArray(artifact.data) ? artifact.data.filter(
     (row): row is Record<string, unknown> => typeof row === 'object' && row !== null && !Array.isArray(row),
@@ -556,6 +581,10 @@ export function ArtifactView({
         {asOf && <span><ClockIcon size={13} />数据截止：{asOf}</span>}
         {coverage !== undefined && <span><GaugeIcon size={13} />覆盖：{text(coverage)}</span>}
       </div>
+      {remediation && (
+        <RemediationUpload remediation={remediation} entities={entities}
+          questionText={questionText} onRequery={onRequery} />
+      )}
       {notes.length > 0 && <p className="limitations">{notes.join('；')}</p>}
     </section>
   )

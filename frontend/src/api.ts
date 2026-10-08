@@ -238,3 +238,23 @@ export function acknowledgeInventoryAlert(alertRef: string) {
     { method: 'POST', headers: writeHeaders, body: '{}' },
   )
 }
+
+// ---------------------------------------------------------------- 手工导出上传
+// 生意参谋手工导出上传（M4/M5）：POST 原始字节体（application/octet-stream），
+// WebWrite 的字节体适配 = X-BI-Agent: web + 浏览器自动附带的 Origin。文件名只作
+// 参考与台账记账，消毒与全部校验都在服务端（不合格 422）；响应形状由调用方的
+// 解析器（RemediationUpload.parseUploadResult）逐键验证，这里不假装它可信。
+
+export async function uploadSycmFile(file: File): Promise<unknown> {
+  const response = await fetch(
+    `/api/uploads/sycm?filename=${encodeURIComponent(file.name)}`,
+    {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/octet-stream', 'X-BI-Agent': 'web' },
+      // Fetch 的 body 不接受 Promise：先取完字节再发（原始字节体，不是表单）。
+      body: await file.arrayBuffer(),
+    })
+  if (!response.ok) throw await apiError(response)
+  return response.json()
+}

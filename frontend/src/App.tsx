@@ -288,7 +288,8 @@ export default function App() {
           title={active?.title ?? null} updatedAt={active?.updated_at ?? null} chatCount={chats.length}
           narrow={narrow} drawerOpen={sidebarOpen} menuToggleRef={menuToggleRef}
           onOpenSidebar={() => setSidebarOpen(true)} onSend={send}
-          onDrilldown={(intent) => void send(intent.question)} />
+          onDrilldown={(intent) => void send(intent.question)}
+          onRequery={(question) => void send(question)} />
       </div>
       {reviewOpen && reviewAccess === 'available' && (
         <div className="review-dock" id="review-dock" role="dialog" aria-label="记忆审核">
