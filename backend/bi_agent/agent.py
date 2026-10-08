@@ -364,7 +364,8 @@ def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: Cha
                   allowed_shop_ids: frozenset[str], now: datetime,
                   controlled_sql_enabled: bool = False,
                   approved_query_memory_enabled: bool = False,
-                  isolated_analysis_enabled: bool = False) -> Iterator[ChatEvent]:
+                  isolated_analysis_enabled: bool = False,
+                  partial_answers_enabled: bool = False) -> Iterator[ChatEvent]:
     """保存可见消息并输出有限阶段事件；调用方负责会话锁和连接生命周期。"""
     from .chats import (
         load_chat_context,
@@ -403,6 +404,8 @@ def run_chat_turn(conn, chat_id: UUID, subject: str, content: str, *, model: Cha
             approved_query_memory_enabled=approved_query_memory_enabled,
             # 隔离分析默认关：关着时模型看不到分析 Tool，也不执行任何分析图。
             isolated_analysis_enabled=isolated_analysis_enabled,
+            # 覆盖缺口部分答案默认关：关着时缺覆盖仍整单 missing_data。
+            partial_answers_enabled=partial_answers_enabled,
         )
         artifacts = list(turn.artifacts)
         if artifacts:
@@ -668,7 +671,8 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
            turn_context: TurnContext | None = None,
            controlled_sql_enabled: bool = False,
            approved_query_memory_enabled: bool = False,
-           isolated_analysis_enabled: bool = False) -> TurnResult:
+           isolated_analysis_enabled: bool = False,
+           partial_answers_enabled: bool = False) -> TurnResult:
     deadline = time_module.monotonic() + TOTAL_BUDGET_SECONDS
     if run_store is None:
         run_store = MemoryQueryRunStore(forbidden_values=allowed_shop_ids)
@@ -840,6 +844,7 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                         now=now,
                         deadline=deadline,
                         attempt_no=business_attempt_no,
+                        partial_answers_enabled=partial_answers_enabled,
                     ),
                     conn,
                     run_store,
@@ -908,7 +913,8 @@ def answer(question: str, state: SessionState, *, model: ChatModel, conn,
                                 shop_refs=state.shop_refs,
                                 allowed_shop_ids=allowed_shop_ids, now=now,
                                 deadline=deadline, attempt_no=business_attempt_no,
-                                trusted_window_override=candidate),
+                                trusted_window_override=candidate,
+                                partial_answers_enabled=partial_answers_enabled),
                             conn, run_store)
                         if (fallback.domain_result.error is not None
                                 and fallback.domain_result.error.code in {

@@ -1,12 +1,13 @@
 """覆盖缺口部分答案（计划 2026-10-08）。
 
 T1 钉载荷形状。T2 钉不连库的可分解性：空覆盖、未知截止、混合指标、
-同源比值的公共窗口。查询接线与关闸逐字一致留到 T3。
+同源比值的公共窗口。T3 钉单段窗口收窄：跨源与多段仍整单缺数，SQL 模板不增。
 """
 
 from __future__ import annotations
 
 import pathlib
+import re
 import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -216,3 +217,97 @@ class PartialDecompositionTests(unittest.TestCase):
             ("cash_difference", "basis_incompatible"),
             ("physical_total", "basis_incompatible"),
         ))
+
+
+def _assessment(**overrides):
+    from bi_agent.data_quality import CoverageAssessment
+
+    fields = dict(
+        status="partial",
+        requested_window=("2026-09-01", "2026-10-01"),
+        covered_windows=(("2026-09-01", "2026-09-20"),),
+        missing_windows=(("2026-09-20", "2026-10-01"),),
+        data_as_of=datetime(2026, 9, 20, tzinfo=ZoneInfo("Asia/Shanghai")),
+        quality_status="passed",
+        source_batches=(),
+        gaps=(),
+        suggested_window=("2026-09-01", "2026-09-20"),
+    )
+    fields.update(overrides)
+    return CoverageAssessment(**fields)
+
+
+def _request(metrics):
+    from bi_agent.metrics import QueryRequest
+
+    return QueryRequest(start="2026-09-01", end="2026-10-01",
+                        shop_ids=["S1"], metrics=list(metrics))
+
+
+class PartialExecutionTests(unittest.TestCase):
+    def test_one_covered_span_is_the_execution_window(self):
+        from bi_agent.metrics import _single_covered_span
+
+        start, end, block = _single_covered_span(
+            _request(["ad_spend"]), _assessment())
+        self.assertEqual((start.isoformat(), end.isoformat()),
+                         ("2026-09-01", "2026-09-20"))
+        self.assertEqual(block["metric_refs"], ["ad_spend"])
+        self.assertEqual(block["disclosure"],
+                         "仅覆盖 2026-09-01~2026-09-20，2026-09-20 起缺口")
+
+    def test_disjoint_spans_are_not_narrowed(self):
+        from bi_agent.metrics import _single_covered_span
+
+        assessment = _assessment(
+            covered_windows=(("2026-09-01", "2026-09-05"),
+                             ("2026-09-10", "2026-09-15")),
+            missing_windows=(("2026-09-05", "2026-09-10"),
+                             ("2026-09-15", "2026-10-01")))
+        self.assertIsNone(_single_covered_span(_request(["ad_spend"]), assessment))
+
+    def test_cross_source_metric_is_not_narrowed(self):
+        from bi_agent.metrics import _single_covered_span
+
+        self.assertIsNone(_single_covered_span(
+            _request(["cash_difference"]), _assessment()))
+
+    def test_unknown_cutoff_is_not_narrowed(self):
+        from bi_agent.metrics import _single_covered_span
+
+        self.assertIsNone(_single_covered_span(
+            _request(["ad_spend"]), _assessment(data_as_of=None)))
+
+    def test_non_partition_ok_partial_classifies_as_partial(self):
+        from datetime import date
+
+        from bi_agent.business_query.nodes import _classify
+        from bi_agent.metrics import Coverage, ToolResult
+        from bi_agent.runtime.models import DomainStatus
+
+        result = ToolResult(
+            status="ok",
+            data=[{"ad_spend": "40"}],
+            coverage=Coverage(status="partial", start=date(2026, 9, 1),
+                              end=date(2026, 9, 20),
+                              gaps=["2026-09-05~2026-09-20"]),
+            partial_answer=_block(
+                answered_windows=[["2026-09-01", "2026-09-05"]],
+                missing_windows=[["2026-09-05", "2026-09-20"]],
+                disclosure="仅覆盖 2026-09-01~2026-09-05，2026-09-05 起缺口",
+            ),
+        )
+        status, error = _classify(result)
+        self.assertEqual(status, DomainStatus.PARTIAL)
+        self.assertIsNone(error)
+        self.assertEqual(result.rank_groups, [])
+
+    def test_partial_answers_do_not_add_sql_templates(self):
+        text = (pathlib.Path(__file__).parents[1] / "bi_agent" / "metrics.py"
+                ).read_text(encoding="utf-8")
+        names = re.findall(r"^(_[A-Z0-9_]+SQL) = ", text, re.MULTILINE)
+        self.assertEqual(names, [
+            "_DAILY_SQL", "_AGG_SQL", "_PRODUCT_SQL", "_GROUP_COUNT_SQL",
+            "_COHORT_SQL", "_SHOPS_SQL", "_SYCM_AGG_SQL", "_SYCM_DAILY_SQL",
+            "_SYCM_GROUP_COUNT_SQL",
+        ])

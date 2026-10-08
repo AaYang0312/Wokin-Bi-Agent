@@ -485,7 +485,8 @@ class SycmMetricQueryDatabaseTests(unittest.TestCase):
              _day_start(end_exclusive), _day_start(start),
              _day_start(end_exclusive), _day_start(end_exclusive)))
 
-    def _query(self, metrics_, shop_ids=(SHOP_A,), allowed=None, **overrides):
+    def _query(self, metrics_, shop_ids=(SHOP_A,), allowed=None, *,
+               partial_answers_enabled=False, **overrides):
         import time as time_module
 
         defaults = dict(start="2026-09-01", end="2026-09-10",
@@ -498,7 +499,8 @@ class SycmMetricQueryDatabaseTests(unittest.TestCase):
             allowed_shop_ids=frozenset(allowed) if allowed is not None
             else frozenset({self.SHOP_A, self.SHOP_B}),
             now=datetime(2026, 9, 10, 9, tzinfo=BEIJING),
-            deadline=time_module.monotonic() + 30)
+            deadline=time_module.monotonic() + 30,
+            partial_answers_enabled=partial_answers_enabled)
 
     def _codes(self, result) -> list[str]:
         from bi_agent.business_query.nodes import _limitation_codes
@@ -601,6 +603,67 @@ class SycmMetricQueryDatabaseTests(unittest.TestCase):
             "missing_range": ["2026-09-05", "2026-09-20"]})
         model_payload = to_model_result(result, catalog)
         self.assertNotIn("remediation", model_payload)
+        self.assertIsNone(result.partial_answer)
+        self.assertNotIn("partial_answer", model_payload)
+
+    def test_partial_gate_answers_one_covered_span_and_keeps_the_request_window(self):
+        """闸开时，单段已覆盖窗口出数；原请求窗口留在 coverage，缺口仍可上传。"""
+        from bi_agent.business_query.tool import to_model_result, to_public_artifact
+
+        closed = self._query(["ad_spend"], shop_ids=(self.SHOP_B,),
+                             start="2026-09-01", end="2026-09-20",
+                             partial_answers_enabled=False)
+        self.assertEqual(closed.status, "missing_data", closed.limitations)
+        self.assertEqual(closed.data, [])
+        self.assertIsNone(closed.partial_answer)
+
+        result = self._query(["ad_spend"], shop_ids=(self.SHOP_B,),
+                             start="2026-09-01", end="2026-09-20",
+                             partial_answers_enabled=True)
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(result.data[0]["ad_spend"]), Decimal("40"))
+        self.assertEqual(result.coverage.status, "partial")
+        self.assertEqual(result.coverage.start, date(2026, 9, 1))
+        self.assertEqual(result.coverage.end, date(2026, 9, 20))
+        self.assertEqual(result.coverage.gaps, ["2026-09-05~2026-09-20"])
+        self.assertEqual(list(result.coverage.suggested_window or ()),
+                         ["2026-09-01", "2026-09-05"])
+        self.assertEqual(result.filters["start"], "2026-09-01")
+        self.assertEqual(result.filters["end"], "2026-09-20")
+        self.assertEqual(result.partial_answer, {
+            "answered_windows": [["2026-09-01", "2026-09-05"]],
+            "missing_windows": [["2026-09-05", "2026-09-20"]],
+            "metric_refs": ["ad_spend"],
+            "disclosure": "仅覆盖 2026-09-01~2026-09-05，2026-09-05 起缺口",
+        })
+        self.assertNotIn("拒绝部分汇总", "".join(result.limitations))
+        self.assertIn(metrics_module.SYCM_UPLOAD_LIMITATION, result.limitations)
+        self.assertIn(metrics_module.SOURCE_QUALITY_UNVERIFIED_LIMITATION,
+                      result.limitations)
+        self.assertEqual(result.remediation, {
+            "kind": "upload", "file_kind": "店铺维度",
+            "shop_ids": [self.SHOP_B],
+            "covered_window": ["2026-09-01", "2026-09-05"],
+            "missing_range": ["2026-09-05", "2026-09-20"]})
+
+        catalog = self._catalog(result)
+        public_payload = to_public_artifact(result, catalog)
+        model_payload = to_model_result(result, catalog)
+        self.assertEqual(public_payload["partial_answer"], result.partial_answer)
+        self.assertEqual(model_payload["partial_answer"], result.partial_answer)
+        self.assertIn("remediation", public_payload)
+        self.assertNotIn("remediation", model_payload)
+
+    def test_partial_gate_answers_a_same_source_ratio_on_the_covered_span(self):
+        result = self._query(["roas"], shop_ids=(self.SHOP_B,),
+                             start="2026-09-01", end="2026-09-20",
+                             partial_answers_enabled=True)
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(result.data[0]["roas"]), Decimal("3"))
+        self.assertEqual(result.coverage.status, "partial")
+        self.assertEqual(result.partial_answer["metric_refs"], ["roas"])
+        self.assertEqual(result.partial_answer["disclosure"],
+                         "仅覆盖 2026-09-01~2026-09-05，2026-09-05 起缺口")
 
     def test_never_imported_shop_gets_upload_remediation_without_covered_window(
             self):

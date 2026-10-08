@@ -85,6 +85,7 @@ def execute_business_query_tool(
         deadline=context.deadline,
         attempt_no=context.attempt_no,
         trusted_window_override=context.trusted_window_override,
+        partial_answers_enabled=context.partial_answers_enabled,
     )
     return _execute_business_query_graph(
         conn,
@@ -257,4 +258,13 @@ def safe_result_body(
         body["excluded_scope"] = excluded_scope
     if remediation is not None:
         body["remediation"] = remediation
+    # 部分答案四键原样公开：模型可见，披露句已由服务端模板钉死。
+    raw_partial = payload.get("partial_answer")
+    if isinstance(raw_partial, dict):
+        body["partial_answer"] = {
+            "answered_windows": raw_partial.get("answered_windows"),
+            "missing_windows": raw_partial.get("missing_windows"),
+            "metric_refs": raw_partial.get("metric_refs"),
+            "disclosure": raw_partial.get("disclosure"),
+        }
     return body

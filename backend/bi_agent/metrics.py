@@ -216,6 +216,9 @@ class ToolResult(BaseModel):
     # 缺数上传提示（D3，内部形状带真实 shop_id）：公开投影换成 shop_ref 进
     # Artifact，模型可见载荷一律不含（防模型伪造上传提示）。
     remediation: dict[str, object] | None = None
+    # 部分答案（闸开且只有一段可出数窗口）：四键公开块，模型可见。
+    # 披露句由服务端模板现算，投影时原样带上，空着就不出现。
+    partial_answer: dict[str, object] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -731,8 +734,71 @@ def _capability_gap(records, metrics) -> list[str]:
     return texts
 
 
+def _single_covered_span(request: QueryRequest, assessment):
+    """单段已覆盖窗口才收窄执行。多段、拒答指标、未知截止都不在这一刀出数。"""
+    from bi_agent.business_query.partial import MetricCoverage, decompose_partial_answer
+
+    if assessment.data_as_of is None or assessment.status != "partial":
+        return None
+    if request.compare != "none" or request.basis_policy == PARTITIONED_POLICY:
+        return None
+    coverages = {
+        str(metric): MetricCoverage(covered=tuple(assessment.covered_windows),
+                                    data_as_of=assessment.data_as_of)
+        for metric in request.metrics
+    }
+    decision = decompose_partial_answer(
+        (request.start.isoformat(), request.end.isoformat()),
+        [str(metric) for metric in request.metrics], coverages)
+    if (decision.status != "partial" or decision.refused
+            or len(decision.groups) != 1):
+        return None
+    group = decision.groups[0]
+    if len(group.answered_windows) != 1:
+        return None
+    start_text, end_text = group.answered_windows[0]
+    block = {
+        "answered_windows": [[start, end] for start, end in group.answered_windows],
+        "missing_windows": [[start, end] for start, end in group.missing_windows],
+        "metric_refs": list(group.metrics),
+        "disclosure": partial_answer_disclosure(
+            group.answered_windows, group.missing_windows),
+    }
+    return date.fromisoformat(start_text), date.fromisoformat(end_text), block
+
+
+def _partial_result(conn, request: QueryRequest, assessment, *, now: datetime,
+                    deadline: float, coverage: Coverage, filters: dict[str, object],
+                    data_as_of: datetime, remediation: dict[str, object] | None
+                    ) -> ToolResult | None:
+    """用同一条查询把窗口收窄到唯一已覆盖段，再把原请求窗口贴回去。"""
+    narrowed = _single_covered_span(request, assessment)
+    if narrowed is None:
+        return None
+    start, end, block = narrowed
+    inner = _query_in_transaction(
+        conn, request.model_copy(update={"start": start, "end": end}),
+        now=now, deadline=deadline, partial_answers_enabled=False)
+    if inner.status != "ok" or inner.coverage.status != "complete":
+        return None
+    texts = list(inner.limitations)
+    if remediation is not None and SYCM_UPLOAD_LIMITATION not in texts:
+        texts.append(SYCM_UPLOAD_LIMITATION)
+    return inner.model_copy(update={
+        "coverage": Coverage(status="partial", start=request.start, end=request.end,
+                             gaps=list(coverage.gaps),
+                             suggested_window=coverage.suggested_window),
+        "filters": filters,
+        "limitations": texts,
+        "data_as_of": data_as_of,
+        "partial_answer": block,
+        "remediation": remediation,
+    })
+
+
 def query_business(conn, request: QueryRequest, *, allowed_shop_ids: frozenset[str],
-                   now: datetime, deadline: float) -> ToolResult:
+                   now: datetime, deadline: float,
+                   partial_answers_enabled: bool = False) -> ToolResult:
     """确定性指标查询：覆盖门禁优先，拒绝部分汇总冒充总额。"""
     if not set(request.shop_ids) <= allowed_shop_ids:
         return ToolResult(
@@ -744,7 +810,9 @@ def query_business(conn, request: QueryRequest, *, allowed_shop_ids: frozenset[s
             limitations=["本次查询时间预算已耗尽"], filters=_filters(request))
     try:
         with read_only_snapshot(conn):
-            return _query_in_transaction(conn, request, now=now, deadline=deadline)
+            return _query_in_transaction(
+                conn, request, now=now, deadline=deadline,
+                partial_answers_enabled=partial_answers_enabled)
     except psycopg.errors.QueryCanceled:
         return ToolResult(
             status="unavailable", coverage=Coverage(status="missing", start=None, end=None),
@@ -765,7 +833,8 @@ def _filters(request: QueryRequest) -> dict[str, object]:
 
 
 def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
-                          deadline: float) -> ToolResult:
+                          deadline: float,
+                          partial_answers_enabled: bool = False) -> ToolResult:
     start_ts, end_ts = _window_range(request.start, request.end)
     filters = _filters(request)
     limitations: list[str] = []
@@ -811,10 +880,10 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
                                    for m in requested_metrics},
                 filters=filters,
                 limitations=[SYCM_MIXED_CALIBER_LIMITATION])
-        return _sycm_query_in_transaction(conn, request, records=records,
-                                          filters=filters,
-                                          limitations=limitations,
-                                          deadline=deadline)
+        return _sycm_query_in_transaction(
+            conn, request, records=records, filters=filters,
+            limitations=limitations, now=now, deadline=deadline,
+            partial_answers_enabled=partial_answers_enabled)
 
     entities = required_entities(request.metrics)
     bindings_by_shop_metric = {
@@ -904,6 +973,13 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
             filters=filters, data_as_of=data_as_of,
             limitations=limitations + ["来源质量核验未通过，拒绝出数"], basis=basis)
     if coverage.status != "complete" or data_as_of is None:
+        if partial_answers_enabled and data_as_of is not None:
+            partial = _partial_result(
+                conn, request, assessment, now=now, deadline=deadline,
+                coverage=coverage, filters=filters, data_as_of=data_as_of,
+                remediation=None)
+            if partial is not None:
+                return partial
         limitations.append("覆盖未完成，拒绝部分汇总；缺口见coverage.gaps")
         if data_as_of is None:
             limitations.append("数据截止未知（回填未完成）")
@@ -1294,7 +1370,8 @@ def _sycm_zero_denominator(values, requested: list[str]) -> bool:
 
 
 def _sycm_query_in_transaction(conn, request, *, records, filters, limitations,
-                               deadline: float) -> ToolResult:
+                               now: datetime, deadline: float,
+                               partial_answers_enabled: bool = False) -> ToolResult:
     """手工导出族的查询路径：能力门禁 → 覆盖门禁 → 固定 sycm SQL。
 
     与 ERP 路径同一 fail-closed 顺序，差异只有三处：能力缺口用手工措辞；
@@ -1336,7 +1413,15 @@ def _sycm_query_in_transaction(conn, request, *, records, filters, limitations,
     if coverage.status != "complete" or data_as_of is None:
         # 窗口不足不补零：缺口见 coverage.gaps，能补的窗口进建议窗口，
         # 要补的数据由服务端派生的 remediation 指路上传。
+        # 闸开且只有一段已覆盖窗口时，同一条 SQL 收窄后出数，原请求窗口不动。
         remediation = _manual_remediation(assessment, bindings_by_shop_metric)
+        if partial_answers_enabled and data_as_of is not None:
+            partial = _partial_result(
+                conn, request, assessment, now=now, deadline=deadline,
+                coverage=coverage, filters=filters, data_as_of=data_as_of,
+                remediation=remediation)
+            if partial is not None:
+                return partial
         texts = limitations + ["覆盖未完成，拒绝部分汇总；缺口见coverage.gaps"]
         if remediation is not None:
             texts.append(SYCM_UPLOAD_LIMITATION)

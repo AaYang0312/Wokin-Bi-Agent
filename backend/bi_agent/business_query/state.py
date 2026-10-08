@@ -113,6 +113,8 @@ class BusinessQueryContext:
     # Only the server may set this after observing a real coverage gap. It never
     # enters the model schema or the persisted graph state.
     trusted_window_override: tuple[str, str] | None = None
+    # 覆盖缺口部分答案。默认关：关着时查询路径与以前逐字一致。
+    partial_answers_enabled: bool = False
 
 
 @dataclass

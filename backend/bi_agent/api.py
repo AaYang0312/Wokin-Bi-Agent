@@ -158,6 +158,7 @@ def create_app(settings: AppSettings, model: ChatModel | None = None) -> FastAPI
                     conn, chat_id, subject, body.content, model=model,
                     allowed_shop_ids=settings.shop_ids,
                     now=datetime.now(ZoneInfo("Asia/Shanghai")),
+                    partial_answers_enabled=settings.partial_answers_enabled,
                 ):
                     yield encode_sse(event)
             finally:

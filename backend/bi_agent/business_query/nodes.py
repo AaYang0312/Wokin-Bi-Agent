@@ -266,6 +266,7 @@ def execute_fixed_query(runtime: BusinessQueryRuntime, conn: object) -> Business
             allowed_shop_ids=runtime.context.allowed_shop_ids,
             now=runtime.context.now,
             deadline=runtime.context.deadline,
+            partial_answers_enabled=runtime.context.partial_answers_enabled,
         )
     except (psycopg.OperationalError, psycopg.InterfaceError, psycopg.TimeoutError) as error:
         # 已识别的连接/超时故障：可以被恢复决策重试一次，预算不重置。
@@ -482,7 +483,7 @@ def _classify(result: ToolResult) -> tuple[DomainStatus, ErrorEnvelope | None]:
         and result.coverage.status == "partial"
     ):
         # 分区榜可以“已评估但确实没有商品”：范围不完整不等于契约违规。
-        # 非分区路径不会产生 ok+partial（覆盖不完成在 metrics 里先降级成 missing_data）。
+        # 非分区路径在部分答案闸开、且只有一段已覆盖窗口时，也会产出 ok+partial。
         return DomainStatus.PARTIAL, None
     if result.status == "missing_data":
         return DomainStatus.MISSING_DATA, None
