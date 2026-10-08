@@ -965,8 +965,16 @@ def main(argv: list[str] | None = None, *, env: Mapping[str, str] | None = None,
         print("sycm_import: 缺少 BI_WRITER_DSN "
               "(code=SYCM_IMPORT_REQUIRES_BI_WRITER_DSN)", file=err)
         return 2
-    open_connection = connect if connect is not None else psycopg.connect
-    conn = open_connection(dsn)
+    if connect is None:
+        # CLI 自持连接用 autocommit（与上传面 get_conn 同一语义）：默认连接上
+        # 首条语句是店铺登记读取（SELECT），它开启的隐式事务会把之后每个
+        # 逐文件 `conn.transaction()` 降级成 SAVEPOINT，退出时整批回滚——
+        # CLI 会打印 accepted 却不落任何数据（M6 验收批次实测发现）。
+        # autocommit 下事务块仍逐文件 BEGIN/COMMIT，原子性与隔离不变。
+        conn = psycopg.connect(dsn, autocommit=True)
+    else:
+        # 注入连接的生命周期归调用方（测试外层事务）管。
+        conn = connect(dsn)
     try:
         outcomes = import_sycm_paths(
             conn, [Path(argument) for argument in args.paths])

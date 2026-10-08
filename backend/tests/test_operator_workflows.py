@@ -2338,12 +2338,12 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
         expected = self.questions[qid]["expected"]
         return expected[index] if isinstance(expected, list) else expected
 
-    def test_the_set_is_28_questions_and_ids_are_contiguous(self):
-        """题集扩到 29：27/28 双口径题 + 29 档案价商品报告题（S4）。"""
-        self.assertEqual(len(self.questions), 29)
+    def test_the_set_is_32_questions_and_ids_are_contiguous(self):
+        """题集扩到 32：27/28 双口径题 + 29 档案价 + 30–32 手工导入族（M6）。"""
+        self.assertEqual(len(self.questions), 32)
         self.assertEqual(sorted(self.questions),
-                         [f"{index:02d}" for index in range(1, 30)])
-        self.assertEqual(self.module.EXPECTED_QUESTION_COUNT, 29)
+                         [f"{index:02d}" for index in range(1, 33)])
+        self.assertEqual(self.module.EXPECTED_QUESTION_COUNT, 32)
         for qid in ("27", "28"):
             expected_list = (self.questions[qid]["expected"]
                              if isinstance(self.questions[qid]["expected"], list)
@@ -2361,6 +2361,38 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
                       "29 必须按结构化行核对档案参考列")
         self.assertIn("item_price_snapshot", self.questions["29"].get("seeds", []),
                       "29 必须自带新鲜快照种子")
+        for qid in ("30", "31", "32"):
+            self.assertEqual(self.questions[qid]["seeds"], ["sycm_manual_case"],
+                             f"{qid} 必须用 sycm 合成种子，不依赖真实店铺")
+            self.assertEqual(self.questions[qid]["allowed"], ["SY1"])
+
+    def test_sycm_questions_pin_disclosure_remediation_and_same_source_roas(self):
+        """M6 手工导入族三题的合同：披露、remediation 结构、ROAS 同源。"""
+        answerable, out_of_window, roas = (self._expected("30"),
+                                           self._expected("31"),
+                                           self._expected("32"))
+        # 30：覆盖窗口内可答，basis 是手工口径，且必须带"未核验"披露。
+        self.assertEqual(answerable["values"], {"ad_spend": "70"})
+        self.assertEqual(answerable["basis"],
+                         [["SY1", "ad_spend", "manual_sycm_export/v1",
+                           "stat_date"]])
+        self.assertIn("source_quality_unverified", answerable["codes"])
+        self.assertIn("来源质量未核验", answerable["limitations_contain"])
+        # 31：越窗必须 missing_data，且 remediation 是服务端派生的结构化上传提示。
+        self.assertEqual(out_of_window["status"], "missing_data")
+        self.assertTrue(out_of_window["no_values"])
+        self.assertEqual(out_of_window["remediation"], {
+            "kind": "upload", "file_kind": "店铺维度", "shop_ids": ["SY1"],
+            "covered_window": ["2026-09-05", "2026-09-08"],
+            "missing_range": ["2026-09-08", "2026-09-21"]})
+        # 32：ROAS 只由手工来源两侧计算——basis 恰为一条 manual 凭证。
+        self.assertEqual(roas["values"], {"roas": "3"})
+        self.assertTrue(roas["basis_exact"], "ROAS 题必须断言 basis 集合精确")
+        self.assertEqual(roas["basis"],
+                         [["SY1", "roas", "manual_sycm_export/v1",
+                           "stat_date"]])
+        self.assertIn("basis_incompatible", roas["not_codes"],
+                      "同源比值不得被记为口径混用")
 
     def test_every_answer_question_compares_structured_facts_not_only_words(self):
         """设计 §6 / 计划 Task 11：不能只用“最终正文含某个词”判通过。

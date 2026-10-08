@@ -15,6 +15,13 @@ Task 5 交付的多来源必验项。结构化期望因此不再只看"最终正
 `no_values` / `no_rows` / `no_total` 与 `calls`（一次提问里的多次工具调用）
 都要能机器核对。
 
+2026-10-08（计划 manual-sycm-export-import §3.M6）把题集从 29 题扩到 32 题：
+30–32 是手工导出族的合成基准（`sycm_manual_case` 种子，SY1 只依赖
+manual.sycm.export 覆盖、绝不借用真实导入店铺）：30 覆盖窗口内可答并断言
+「来源质量未核验」披露与手工口径 basis；31 越窗 missing_data 并逐字段核对
+服务端派生的 remediation{kind,file_kind,shop_ids,covered_window,missing_range}；
+32 ROAS 同源断言（值=生意参谋支付÷推广花费，basis 集合精确只含 manual 来源）。
+
 **21 / 23 / 26 的取证映射（S3 后更新）**：S2 取证后淘系同步改宽出库窗+本地过滤
 （`local_filter`）；S3 关闭单口径决策（默认建议，待所有者追认）落地后，覆盖齐全的
 淘系支付窗口类指标降为**可答+披露**：支付口径剔除结构性证明的关闭后退款单，退款
@@ -43,18 +50,26 @@ from bi_agent.agent import SessionState, answer
 from bi_agent.catalog import ref_for_key
 from bi_agent.llm import Message, ModelReply, ToolCall
 from bi_agent.metrics import ToolResult
-from bi_agent.sources import AFTERSALE_SOURCE, OUTSTOCK_SOURCE, TRADE_LIST_SOURCE
+from bi_agent.sources import (AFTERSALE_SOURCE, MANUAL_EXPORT_BASIS,
+                              MANUAL_EXPORT_ENTITY, MANUAL_EXPORT_SOURCE,
+                              MANUAL_METRIC_CAPABILITIES, OUTSTOCK_SOURCE,
+                              TRADE_LIST_SOURCE)
 from tests.fakeconn import S1_REF
 
 QUESTIONS_PATH = Path(__file__).with_name("questions.jsonl")
-EXPECTED_QUESTION_COUNT = 29
+EXPECTED_QUESTION_COUNT = 32
 # 多来源合成基准（原路线图 Task 5 的"新增多来源合成基准"一节）。
 TB1 = "TB1"
 PDD1 = "PDD1"
 FX1 = "FX1"
+SY1 = "SY1"
 TB1_REF = ref_for_key("shop", TB1)
 PDD1_REF = ref_for_key("shop", PDD1)
 FX1_REF = ref_for_key("shop", FX1)
+SY1_REF = ref_for_key("shop", SY1)
+# 手工导出合成店（M6）：display_name 与 platform 只服务档案面；
+# 指标可答性只由 capabilities + (manual.sycm.export, shop_daily) 覆盖决定。
+SYCM_MANUAL_SHOP_NAME = "手工导入合成店"
 ALL_NINE = ("paid_amount", "paid_orders", "erp_documents", "aov", "quantity",
             "product_paid_amount", "refund_amount", "cash_difference",
             "cohort_refund_rate")
@@ -265,9 +280,47 @@ def seed_item_price_snapshot(conn) -> None:
         "'40.00', 1, NULL, %s)", (captured,))
 
 
+def seed_sycm_manual_case(conn) -> None:
+    """M6 手工导出合成基准（Q30–32）：SY1 只带 manual.sycm.export 一族数据。
+
+    数值沿用 tests.test_sycm_metrics 的合成口径（每天访客100 / sycm支付30 /
+    买家2 / 全站推广花费10 / 加购5，共 7 天）：窗口合计 ad_spend=70、
+    paid_amount_sycm=210，同源比值干净——ROAS=3、推广费率=1/3、支付转化率
+    =14/700。覆盖 [2026-09-01,2026-09-08)，越窗题（Q31）因此缺
+    [09-08,09-21)。质量恒为 unknown + manual-export/unverified：合成种子没跑
+    过对账，写成 passed 就是拿测试夹具冒充对账证据；「未核验」披露因此是
+    这三题的可答预期之一。
+    """
+    from datetime import date
+
+    _shop_row(conn, SY1, "tb", SYCM_MANUAL_SHOP_NAME,
+              sorted(MANUAL_METRIC_CAPABILITIES))
+    for offset in range(7):
+        conn.execute(
+            "INSERT INTO bi.sycm_shop_daily(shop_id, stat_date, visitors, "
+            "paid_amount_sycm, paid_buyers, ad_spend_all, cart_count, batch_id) "
+            "VALUES (%s, %s, 100, 30, 2, 10, 5, 'acceptance-sycm-seed') "
+            "ON CONFLICT (shop_id, stat_date) DO UPDATE SET visitors = 100, "
+            "paid_amount_sycm = 30, paid_buyers = 2, ad_spend_all = 10, "
+            "cart_count = 5, batch_id = 'acceptance-sycm-seed'",
+            (SY1, date(2026, 9, 1 + offset)))
+    # 覆盖凭证与导入器同一质量口径（unknown/unverified），不借 _sync_state——
+    # 那个助手写 passed/test-seed，是 ERP 合成通道的语义。
+    conn.execute(
+        "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
+        "data_as_of, quality_status, quality_rule) VALUES "
+        "(%s, %s, %s, %s, tstzmultirange(tstzrange(%s, %s, '[)')), %s, "
+        "'unknown', 'manual-export/unverified') "
+        "ON CONFLICT (source, entity, shop_id) DO UPDATE SET "
+        "covered = EXCLUDED.covered, data_as_of = EXCLUDED.data_as_of",
+        (MANUAL_EXPORT_SOURCE, MANUAL_EXPORT_ENTITY, SY1,
+         _beijing(8, 0), _beijing(1, 0), _beijing(8, 0), _beijing(8, 0)))
+
+
 SEED_STEPS = {"multi_source": seed_multi_source_case,
               "coverage_holes": apply_coverage_holes,
-              "item_price_snapshot": seed_item_price_snapshot}
+              "item_price_snapshot": seed_item_price_snapshot,
+              "sycm_manual_case": seed_sycm_manual_case}
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +350,23 @@ def _model_script(question: dict) -> list[ModelReply]:
         query["metrics"] = (["refund_amount"] if qid == "10" else
                             ["cohort_refund_rate"] if qid == "11" else
                             ["cash_difference"] if qid == "12" else ["paid_amount"])
+    if qid in {"30", "31"}:
+        # M6 手工族：窗口日期交给服务端按问题文本解析（与 01/02 同一协议路径）。
+        query = {"shop_ids": [SY1_REF], "metrics": ["ad_spend"]}
+    elif qid == "32":
+        query = {"shop_ids": [SY1_REF], "metrics": ["roas"]}
+    if qid == "30":
+        return [_call_reply("query_business", query),
+                _reply(text="SY1 全站推广花费70元。来源是手工导入的生意参谋导出，"
+                            "数据质量未核验（尚无对账记录）。")]
+    if qid == "31":
+        return [_call_reply("query_business", query),
+                _reply(text="缺少该窗口的手工导出数据，请上传店铺维度导出后"
+                            "重新查询；9月8日至20日没有数据，本次不能出数。")]
+    if qid == "32":
+        return [_call_reply("query_business", query),
+                _reply(text="SY1 的ROAS是3：只用生意参谋支付金额与推广花费"
+                            "同源相除；来源质量未核验。")]
     if qid == "15":
         # 修订版：全平台汇总按授权集原样递进去，由服务端逐店解析来源与能力。
         query = {"shop_ids": sorted([S1_REF, TB1_REF, PDD1_REF]),
@@ -508,6 +578,26 @@ def _structured_problems(expected: dict, result: ToolResult) -> list[str]:
         shop_id, metric, basis, time_basis = entry
         if (shop_id, metric, basis, time_basis) not in _basis_keys(result):
             problems.append(f"口径凭证缺{entry}，实际{sorted(_basis_keys(result))}")
+    if expected.get("basis_exact"):
+        # 「basis 只含 manual 来源」这类断言要的是集合相等，不是"逐项在场"。
+        wanted = {tuple(entry) for entry in expected.get("basis", [])}
+        actual = _basis_keys(result)
+        if actual != wanted:
+            problems.append(f"口径凭证应恰为{sorted(wanted)}，"
+                            f"实际{sorted(actual)}")
+    for fragment in expected.get("limitations_contain", []):
+        if not any(fragment in str(line) for line in result.limitations):
+            problems.append(f"披露未包含“{fragment}”，实际{result.limitations}")
+    if expected.get("remediation") is not None:
+        # 缺数上传提示（D3）按结构化字段核对（内部形状带真实 shop_id）。
+        if result.remediation is None:
+            problems.append("期望 remediation 在场，实际缺失")
+        else:
+            for field, value in expected["remediation"].items():
+                actual_value = result.remediation.get(field)
+                if actual_value != value:
+                    problems.append(f"remediation.{field}期望{value}，"
+                                    f"实际{actual_value}")
     for key, expected_diagnostics in (expected.get("diagnostics") or {}).items():
         actual = result.diagnostics.get(key)
         if not isinstance(actual, dict):

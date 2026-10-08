@@ -21,7 +21,11 @@
    （主会话批准偏差：任务书清单 + bi.shops SELECT + bi.sync_state
    SELECT/INSERT/UPDATE，其中 sync_state 以 RLS 限定 manual 来源族）；
    RLS 正反向突变（bi_app 只见/只写 manual.sycm.export 行，bi_sync 全通，
-   bi_reader 经 v_coverage 的读取不回归）。
+   bi_reader 经 v_coverage 的读取不回归）；
+7) **032 迁移 + 响应词表收紧（M6）**：status ⇔ reason_code 配对不变式
+   （accepted ⇒ NULL、rejected ⇒ 非空）事务内应用、幂等重放、双向反向突变；
+   SycmUploadResult 的 status 用两词 Literal、reason_code 用 ReasonCode 枚举，
+   响应契约（键集与字符串形状）不变，词表外取值 ValidationError。
 
 数据库测试全部在外层回滚事务内进行（connect_test_db 协议），共享测试库零
 残留；无 BI_TEST_ADMIN_DSN 时显式 skip——skip 不是通过证明。迁移 031 在事务
@@ -630,6 +634,116 @@ class SycmUploadDatabaseTests(unittest.TestCase):
 def _migration_sql() -> str:
     path = Path(__file__).parents[1] / "sql" / "031_sycm_upload_write_path.sql"
     return path.read_text(encoding="utf-8")
+
+
+def _invariant_migration_sql() -> str:
+    path = Path(__file__).parents[1] / "sql" / "032_manual_upload_status_invariant.sql"
+    return path.read_text(encoding="utf-8")
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class SycmUploadStatusInvariantMigrationTests(unittest.TestCase):
+    """032 配对不变式（M6）：accepted ⇒ reason_code 为空；rejected ⇒ 非空。
+
+    事务内应用并重放两遍（幂等）；反向突变证明两个方向都在 DB 层被拒——
+    只有导入器"恰好不产这种行"是不够的，约束必须独立成立。
+    """
+
+    def setUp(self):
+        self.conn = connect_test_db(self)
+        self.conn.execute(_invariant_migration_sql())
+        self.conn.execute(_invariant_migration_sql())  # 幂等重放
+
+    def _upload(self, *, status, reason_code):
+        self.conn.execute(
+            "INSERT INTO bi.manual_uploads(id, subject_id, filename, "
+            "content_sha256, status, reason_code) VALUES (%s, 'subject-a', "
+            "'x.xlsx', %s, %s, %s)",
+            (uuid4(), "b" * 64, status, reason_code))
+
+    def test_constraint_exists_exactly_once_after_replay(self):
+        count = self.conn.execute(
+            "SELECT count(*) FROM pg_constraint WHERE conname = "
+            "'manual_uploads_status_reason_invariant'").fetchone()[0]
+        self.assertEqual(count, 1)
+
+    def test_contract_conforming_rows_are_accepted(self):
+        self._upload(status="accepted", reason_code=None)
+        from bi_agent.sycm_import import ReasonCode
+
+        for code in ReasonCode:
+            with self.subTest(code=code):
+                self._upload(status="rejected", reason_code=str(code))
+
+    def test_accepted_row_with_reason_code_is_rejected(self):
+        for code in ("shop_not_registered", ""):
+            with self.subTest(code=code or "empty_string"):
+                with self.assertRaises(psycopg.errors.CheckViolation), \
+                        self.conn.transaction():
+                    self._upload(status="accepted", reason_code=code)
+
+    def test_rejected_row_without_reason_code_is_rejected(self):
+        with self.assertRaises(psycopg.errors.CheckViolation), \
+                self.conn.transaction():
+            self._upload(status="rejected", reason_code=None)
+
+
+class SycmUploadResultVocabularyTests(unittest.TestCase):
+    """SycmUploadResult 的 status/reason_code 用 M2 集中枚举收紧（M6）。
+
+    响应契约（键集、形状、值语义）不变：status 仍是 accepted/rejected 两个词，
+    reason_code 仍是七词或 null——只是从裸 str 收紧为可校验的词表类型。
+    """
+
+    def _result(self, **overrides):
+        from bi_agent.sycm_upload import SycmUploadResult
+
+        values = dict(upload_id=uuid4(), status="accepted", reason_code=None,
+                      rows_read=1, rows_written=1, shops=["S1"])
+        values.update(overrides)
+        return SycmUploadResult(**values)
+
+    def test_reason_code_field_uses_the_m2_enum(self):
+        from bi_agent.sycm_import import ReasonCode
+        from bi_agent.sycm_upload import SycmUploadResult
+
+        self.assertEqual(SycmUploadResult.model_fields["reason_code"].annotation,
+                         ReasonCode | None,
+                         "reason_code 的类型必须就是 ReasonCode 枚举（可 None）")
+
+    def test_status_field_is_the_two_word_literal(self):
+        from typing import Literal, get_args, get_origin
+
+        from bi_agent.sycm_upload import SycmUploadResult
+
+        annotation = SycmUploadResult.model_fields["status"].annotation
+        self.assertIs(get_origin(annotation), Literal,
+                      "status 必须是 Literal 词表")
+        self.assertEqual(set(get_args(annotation)), {"accepted", "rejected"})
+
+    def test_valid_rows_round_trip_to_the_same_json_shape(self):
+        from bi_agent.sycm_import import ReasonCode
+
+        accepted = self._result()
+        self.assertEqual(accepted.status, "accepted")
+        self.assertIsNone(accepted.reason_code)
+        rejected = self._result(status="rejected",
+                                reason_code=ReasonCode.SHOP_NOT_REGISTERED)
+        self.assertEqual(rejected.reason_code, "shop_not_registered",
+                         "枚举词与既有稳定原因码逐字一致")
+        self.assertEqual(rejected.model_dump(mode="json")["reason_code"],
+                         "shop_not_registered", "序列化仍是纯字符串")
+
+    def test_off_vocabulary_values_are_rejected(self):
+        from pydantic import ValidationError
+
+        for bad in ({"status": "pending"},
+                    {"status": "ACCEPTED"},
+                    {"reason_code": "shop_not_found"},
+                    {"reason_code": "PARSE_FAILED"}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValidationError):
+                    self._result(**bad)
 
 
 @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")

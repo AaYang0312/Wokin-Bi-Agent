@@ -341,9 +341,14 @@ class SycmManualImportTests(unittest.TestCase):
         self.assertEqual(self._one(
             "SELECT count(*) FROM bi.sycm_shop_daily WHERE shop_id=%s",
             (SHOP_ID,))[0], 0, "整文件拒绝不落任何事实")
+        # 覆盖凭证断言按本用例店铺限定（M6 主会话批准的范围修正，非放宽）：
+        # 共享测试库可合法存在**其它店铺**的 manual 覆盖行——计划 §3.M6 的
+        # 真实导入批次（docs/手动导出表格/ 12 文件）按批准提交并留库；全表
+        # 计数=0 只是"表恰好为空"时代的偶然隔离形态。本断言语义仍是
+        # "这次拒绝没有写下任何覆盖"：本店在 manual 来源下必须零行。
         self.assertEqual(self._one(
-            "SELECT count(*) FROM bi.sync_state WHERE source=%s",
-            (SYCM_MANUAL_SOURCE,))[0], 0,
+            "SELECT count(*) FROM bi.sync_state WHERE source=%s AND shop_id=%s",
+            (SYCM_MANUAL_SOURCE, SHOP_ID))[0], 0,
             "拒绝不产生任何覆盖凭证")
 
     def test_item_file_rejection_leaves_ledger_with_unknown_kind(self):
@@ -509,6 +514,78 @@ class SycmManualImportTests(unittest.TestCase):
             env={"SYCM_MANUAL_IMPORT_ENABLED": "true", "BI_WRITER_DSN": "unused"},
             connect=lambda dsn: self.conn, out=out, err=err)
         self.assertEqual(code, 0, err.getvalue())
+
+    def test_cli_owned_connection_persists_after_close(self):
+        """CLI 自持连接必须真提交（M6 验收批次实测发现的 P1 收口）。
+
+        复现：默认（非 autocommit）连接上，首条语句是店铺登记读取
+        （`eligible_shop_mapping` 的 SELECT），它开启隐式事务；之后每个
+        逐文件 `conn.transaction()` 都被降级成 SAVEPOINT（transaction.py 按
+        连接是否 IDLE 判内外层），`conn.close()` 把未提交的外层事务整个丢弃
+        ——CLI 打印 accepted、退出码 0，却一条事实/台账都不落。
+        既有用例全部注入外层回滚事务内的连接，看不见这个洞。
+
+        契约：CLI 自持连接用 autocommit（与上传面 get_conn 同一语义），
+        逐文件事务块因此是真正的 BEGIN/COMMIT；本测试用独立连接核对
+        持久化并全量清理（共享测试库零残留）。
+        """
+        dsn = os.environ["BI_TEST_ADMIN_DSN"]
+        shop_id, shop_name = "M2-PERSIST", "M2持久化淘店"
+        filename = f"淘店-{shop_name}-店铺维度_20261001_persist.xlsx"
+        self._file(filename, shop_rows(1, shop=shop_name))
+        # 店铺行必须先提交：CLI 的独立连接看不见本测试外层事务里的未提交行。
+        seed = psycopg.connect(dsn)
+        try:
+            seed.execute(
+                "INSERT INTO bi.shops(shop_id, platform, display_name, "
+                "capabilities) VALUES (%s, 'tb', %s, '{}') "
+                "ON CONFLICT (shop_id) DO UPDATE SET capabilities = '{}'",
+                (shop_id, shop_name))
+            seed.commit()
+        finally:
+            seed.close()
+        try:
+            out, err = io.StringIO(), io.StringIO()
+            code = main(argv=[str(self.tmp / filename)],
+                        env={"SYCM_MANUAL_IMPORT_ENABLED": "true",
+                             "BI_WRITER_DSN": dsn},
+                        out=out, err=err)  # connect=None：CLI 自持连接生命周期
+            self.assertEqual(code, 0, err.getvalue())
+            records = [json.loads(line) for line in out.getvalue().splitlines()]
+            self.assertEqual(records[0]["status"], "accepted")
+            self.assertEqual(records[0]["shops"], [shop_id])
+            verify = psycopg.connect(dsn)
+            try:
+                facts = verify.execute(
+                    "SELECT count(*) FROM bi.sycm_shop_daily "
+                    "WHERE shop_id = %s", (shop_id,)).fetchone()[0]
+                ledger = verify.execute(
+                    "SELECT count(*) FROM bi.manual_uploads "
+                    "WHERE filename = %s", (filename,)).fetchone()[0]
+                coverage = verify.execute(
+                    "SELECT count(*) FROM bi.sync_state "
+                    "WHERE source = %s AND shop_id = %s",
+                    (SYCM_MANUAL_SOURCE, shop_id)).fetchone()[0]
+            finally:
+                verify.close()
+            self.assertEqual(facts, 1, "事实必须在 CLI 连接 close 后仍在")
+            self.assertEqual(ledger, 1, "台账必须真实落库")
+            self.assertEqual(coverage, 1, "覆盖凭证必须真实落库")
+        finally:
+            cleanup = psycopg.connect(dsn)
+            try:
+                # ON DELETE CASCADE 清 sycm 事实；台账删除级联事件。
+                cleanup.execute("DELETE FROM bi.shops WHERE shop_id = %s",
+                                (shop_id,))
+                cleanup.execute("DELETE FROM bi.manual_uploads "
+                                "WHERE filename = %s", (filename,))
+                cleanup.execute(
+                    "DELETE FROM bi.sync_state WHERE source = %s "
+                    "AND shop_id = %s", (SYCM_MANUAL_SOURCE, shop_id))
+                cleanup.commit()
+            finally:
+                cleanup.close()
+
 
     def test_cli_corrupt_file_is_isolated_exits_one_without_traceback(self):
         self._shop()

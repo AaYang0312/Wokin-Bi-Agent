@@ -41,7 +41,7 @@ import shutil
 import tempfile
 from collections.abc import Callable, Generator
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 import psycopg
@@ -61,6 +61,9 @@ from .sycm_import import (
 
 UPLOAD_ROUTE = "/api/uploads/sycm"
 
+# 响应词表（M6 收紧）：与 ImportOutcome.status 的两个字面量一致。
+UploadStatus = Literal["accepted", "rejected"]
+
 # 文件名消毒（A.1）：长度上限 + 字符白名单 + Windows 保留设备名。
 _FILENAME_MAX_BYTES = 255
 _FILENAME_EXTRA_CHARS = frozenset("-_.")
@@ -71,13 +74,18 @@ _WINDOWS_DEVICE_NAMES = frozenset(
 
 
 class SycmUploadResult(BaseModel):
-    """上传结果契约（M5 前端按它渲染；键集精确，多一个键都不许）。"""
+    """上传结果契约（M5 前端按它渲染；键集精确，多一个键都不许）。
+
+    M6 收紧：status 用两词 Literal、reason_code 用 M2 的集中枚举 ``ReasonCode``
+    （StrEnum，JSON 序列化仍是原词字符串）——词表外的取值在构造处即被拒，
+    响应契约（键集、取值域、形状）与 M4/M5 逐字不变。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     upload_id: UUID
-    status: str
-    reason_code: str | None
+    status: UploadStatus
+    reason_code: ReasonCode | None
     rows_read: int
     rows_written: int
     shops: list[str]

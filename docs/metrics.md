@@ -22,7 +22,8 @@
 | 当前库存 | `stock.api.status.query` 等 | 不在本版范围 | 2026-09-06 | 3条SKU样本 |
 | 历史成本 | `erp.item.history.cost.price.query` | 禁用（成功空结果≠无成本） | 2026-09-06 | 成交SKU无记录 |
 | 采购金额及采购明细 | `purchase.order.query` | 禁用（文档单位为分，本版不接入） | 2026-09-06 | 空 |
-| 推广消耗 | 无公开方法 | **未证实，禁用** | 2026-09-06 | 增值报表需联系实施取得授权 |
+| 推广消耗 | 无公开方法 | **未证实，禁用**（ERP/快麦通道） | 2026-09-06 | 增值报表需联系实施取得授权 |
+| 生意参谋手工导出（店铺维度/客户维度 xlsx） | 手工导出文件导入（`bi_agent.sycm_import` CLI / `POST /api/uploads/sycm`） | **已启用（默认关闸）**：6 个手工族指标可答+「未核验」披露，口径见 §4.10 | 2026-10-02 | `docs/手动导出表格/` 12 文件（4 店 × 3 维度 × 61 天） |
 
 ## 2. 字段规范化规则（按完整路径）
 
@@ -61,7 +62,7 @@
 | `quantity` / `product_paid_amount` | 有效非赠品父项数量与已核验行级分摊金额；结果以 `line_kind` 区分 sale/suite/combination/processing，套件不是子SKU排行 | order_items |
 | 商品运营参考指标（`sold_quantity` 等 6 项） | 只由 `analyze_product_performance` 发布；口径、覆盖与拒发规则见 §4.2 | order_items / orders / order_payments |
 | 平台 / 店铺对比值（同一批报告指标） | 只由 `compare_performance` 发布；分组、合计、排名与图表的拒发规则见 §4.3 | 与 §4.2 同一张视图（整店聚合粒度） |
-| 推广费率/ROAS | **未启用**：无实耗来源；折扣/成本不得替代广告费 | 无 |
+| 推广费率/ROAS | 手工导出族可答（§4.10，同源比值+未核验披露）；ERP/快麦通道仍无实耗来源，折扣/成本不得替代广告费 | manual.sycm.export / shop_daily |
 
 ## 4. 已知功能门槛
 
@@ -507,6 +508,63 @@ SELECT count(*) FROM bi.query_runs WHERE domain = 'inventory_watch';
 - 来源门禁按层级判定（所有者 2026-09-17 Option A）：`inventory_monitor_level_unverified_total` 的计数**永远不是零可用**的证据，更不是某层数量；缺层是一等 `data_missing`/unknown，不补零、不替位。
 - 来源 Artifact 是 graph 的 top-20 展示投影，本计划未实现全量决策投影；期望项超过 20 的策略作用域本轮不会出告警——`inventory_alerts_active` 为零不得读成“库存都安全”。
 - 本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [持续库存通知本地验收记录](superpowers/research/2026-09-25-continuous-inventory-notifications-acceptance.md)；生产监控保持 disabled（库存来源验收仍 FAIL，Task 11 门禁第 4–7 项仍 open），调度未注册，本节口径不构成启用许可。
+
+## 4.10 生意参谋手工导出指标（manual sycm 来源族，2026-10 起）
+
+来源是经营者从生意参谋后台**手工导出**的 xlsx（店铺维度为主、客户维度随附），经
+`bi_agent.sycm_import` CLI 或 `POST /api/uploads/sycm` 导入（操作与门禁见
+`docs/runbook.md`「生意参谋手工导出来源」）。它是独立来源族：不经平台注册表路由，
+能力由导入面授予（`bi.shops.capabilities`），覆盖凭证挂
+`(manual.sycm.export, shop_daily)`，拼多多永不进入（登记面/授予面/注册表三道守卫）。
+
+六个已登记指标（口径文案唯一真源 `bi_agent/metrics.py:METRIC_DEFINITIONS`）：
+
+| 指标 | 口径 | 不能是什么 |
+| --- | --- | --- |
+| `ad_spend` | 全站推广花费合计 = 手工导入「全站推广花费」列之和（导出空值按 0 计并披露计数） | 不是广告账户实际扣费；关键词/人群/智能/淘客佣金列不并入此指标 |
+| `ad_spend_ratio` | 推广费率 = 全站推广花费 ÷ 生意参谋支付金额（**同源比值**：分子分母都来自手工导入） | 不是「推广费 ÷ ERP 支付额」——两口径永不互除 |
+| `roas` | ROAS = 生意参谋支付金额 ÷ 全站推广花费（同源比值） | 不是 ERP 支付口径的 ROAS；分母为 0 时 null + `ratio_not_computable`，不算 0 倍 |
+| `visitors` | 访客数合计（按**统计日期**归属） | 不是按接口取数时间归属的流量数 |
+| `pay_conversion_rate` | 支付转化率 = 支付买家数合计 ÷ 访客数合计（窗口内合计重算，不用日率平均） | 不平均每日转化率；任一侧合计为 0 ⇒ null |
+| `cart_count` | 加购人数合计（按统计日期归属） | 不是加购件数或次数 |
+
+不可让步的口径规则（用例钉在 `backend/tests/test_sycm_metrics.py`）：
+
+1. **统计日期归属**：行按导出列「统计日期」落 `(shop_id, stat_date)`；窗口语义与任何接口的
+   取数时间无关。`(shop_id, stat_date)` 幂等，后批替换前批，lineage = `batch_id`（内容哈希）。
+2. **同源比值（D2）**：`roas` / `ad_spend_ratio` 的分子分母都来自 `paid_amount_sycm` 与
+   `ad_spend_all` 的**窗口合计**；生意参谋支付金额是独立口径列，与 ERP `paid_amount`
+   永不出现在同一合计/比较/排名。手工族指标与 ERP 指标混在一次请求里 = `invalid_parameters`
+   + `basis_incompatible`。
+3. **未核验披露（D1）**：上传数据立即可用，但覆盖凭证质量恒为 `unknown` +
+   `manual-export/unverified`——每个成功结果都带「来源质量未核验（尚无对账记录）」
+   （码 `source_quality_unverified`）。没有对账记录之前不得说数据已认证。
+4. **缺值不补零**：白名单列缺值存 NULL；窗口内合计遇到缺值日按列拒绝部分汇总
+   （`missing_data` + 逐列披露「窗口内 X 缺 N 天」），逐日分组照常发 null 行。
+   「零花费+披露」只适用于导入侧确认的推广花费空值（按 0 计，计数进导入结果）。
+5. **越窗 fail closed + remediation**：窗口超出已覆盖段 ⇒ `missing_data` + `coverage.gaps`
+   + 建议窗口，**且**公开 Artifact 附服务端派生的 `remediation`
+   `{kind: "upload", file_kind: "店铺维度", shop_refs, covered_window, missing_range}`
+   （`covered_window` 为 null 表示从未导入）。remediation 只进公开 Artifact（前端渲染
+   上传卡 + 重新查询），模型可见载荷一律不含——防模型伪造上传提示；公开文案为服务端
+   固定模板（「缺少该窗口的手工导出数据，请上传店铺维度导出文件后重新查询」）。
+   从未导入（能力已授予但零覆盖）时也走同一 remediation 形状。
+6. **能力门禁**：能力词与指标同名，由店铺维度导入成功授予（客户维度不授予任何词）；
+   未授予 ⇒ `capability_unavailable` + 「N 家店铺缺少 X 的手工导入数据，未执行查询」；
+   pdd 即便被伪造标签/事实也永不解析。
+7. **上期比较同口径**：`compare=previous_period` 只在上期同手工覆盖完整时进行，
+   上期覆盖不足则降级为仅绝对值（披露「上期覆盖不足，无法比较」）。
+
+`evaluate_promotion` 的 `actual_budget` 模式两态：对有 manual 覆盖的店铺可答
+（实耗=手工导入的全站推广花费，`basis=手工导入生意参谋实耗`，带「质量未核验」披露）；
+无覆盖店铺保持 missing_data。混合范围只出已覆盖店并披露「N 家店铺缺少该窗口的手工实耗数据」。
+
+回归命令（`backend/`）：
+
+```sh
+uv run --env-file ../.env.test python -m unittest tests.test_sycm_metrics tests.test_sycm_import tests.test_sycm_upload tests.test_sycm_parser tests.test_sycm_schema -v
+uv run --env-file ../.env.test python -m tests.acceptance --offline   # 32 题含 30–32 手工族
+```
 
 ## 5. 真实对账结果摘要
 

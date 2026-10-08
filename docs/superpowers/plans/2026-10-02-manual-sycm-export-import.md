@@ -97,3 +97,32 @@
 ## 6. 发布形态（本方案完成时）
 
 `SYCM_MANUAL_IMPORT_ENABLED=false` 默认；本地启用步骤、上传操作与回退写入 runbook；生产启用为所有者显式决定（沿用受控探索等子项目的延后模式）。完成态：两店推广/流量可答带披露、越窗问题给上传闭环、既有 29 题与全部门禁零回归。
+
+## 7. 执行附注（M6 收口追认，2026-10-08）
+
+主会话已批准的两项偏差在此追认留档：
+
+1. **D5 的「逐字一致」限定于回答行为，工具 schema 静态列出 6 个新指标名**
+   （M3 落地时的决定）：`query_business` 的指标词表（`QueryRequest` 的 enum）静态包含
+   `ad_spend` / `ad_spend_ratio` / `roas` / `visitors` / `pay_conversion_rate` /
+   `cart_count`，不随 `SYCM_MANUAL_IMPORT_ENABLED` 开关切换。理由：门禁关闭时无法导入
+   数据，任何相关提问都会走能力/覆盖 fail-closed 拒答（`capability_unavailable`），
+   词表在场不构成可用性主张；而按开关动态改 schema 会让工具契约随部署漂移，
+   违背「schema 是稳定契约」的既有纪律。先例：`evaluate_promotion` 等 Tool 描述也是
+   静态的（"未取得真实推广实耗"在 manual 来源落地后未改文案，见 runbook
+   「生意参谋手工导出来源」章的两态说明）。断言钉在
+   `tests/test_sycm_metrics.py:ManualMetricDefinitionTests.test_tool_schema_statically_lists_the_new_metrics`。
+2. **`SYCM_UPLOAD_LIMITATION` 的模型可见解释**（M4 复审后的决定）：该固定文本
+   「缺少该窗口的手工导出数据，请上传店铺维度导出文件后重新查询」**进入模型可见载荷**，
+   是唯一被批准的例外——因为「请上传」这句话必须让模型转述才能引导用户到上传闭环，
+   而文本本身是服务端常量、逐字进白名单校验（`tests/test_sycm_metrics.py:
+   SycmVocabularyConsistencyTests` 的文本→码→公开校验回环），模型无权改写或生成
+   remediation 内容（remediation 结构化载荷仍只在公开 Artifact，不在模型载荷）。
+   先例：S3 的可量化限制文本同样服务端固定、模型只转述。
+
+执行中另发现并修复一处 M2 缺陷（超出任务书清单的最小必要修复，红先行）：
+CLI 自持连接未用 autocommit，首条店铺登记 SELECT 开启的隐式事务把逐文件
+`conn.transaction()` 降级成 SAVEPOINT，`close()` 时整批回滚——CLI 打印 accepted
+却不落任何数据（上传面不受影响，其 `get_conn` 本就是 autocommit）。修复与
+持久化回归测试见 `backend/bi_agent/sycm_import.py`（main）与
+`tests/test_sycm_import.py:test_cli_owned_connection_persists_after_close`。
