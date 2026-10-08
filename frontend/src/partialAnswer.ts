@@ -77,3 +77,54 @@ export function parsePartialAnswer(value: unknown): ParsedPartialAnswer {
     },
   }
 }
+
+const REFUSED_KEYS = new Set(['metric', 'reason', 'remediation'])
+const REFUSED_REASONS = new Set([
+  'capability_unavailable',
+  'source_not_onboarded',
+  'coverage_incomplete',
+  'basis_incompatible',
+  'data_as_of_unknown',
+])
+
+export type RefusedMetricView = {
+  metric: string
+  reason: string
+}
+
+export type ParsedRefused =
+  | { ok: true; refused: readonly RefusedMetricView[] }
+  | { ok: false; reason: 'refused_payload_invalid' }
+
+/** 拒答子集：指标名与原因码必填，上传块若在场必须过 remediation 验形。 */
+export function parseRefused(
+  value: unknown,
+  remediationOk: (item: unknown) => boolean,
+): ParsedRefused {
+  if (!Array.isArray(value) || value.length === 0) {
+    return { ok: false, reason: 'refused_payload_invalid' }
+  }
+  const seen = new Set<string>()
+  const refused: RefusedMetricView[] = []
+  for (const item of value) {
+    if (!isRecord(item)) return { ok: false, reason: 'refused_payload_invalid' }
+    const keys = Object.keys(item)
+    if (keys.some((key) => !REFUSED_KEYS.has(key))
+      || !keys.includes('metric') || !keys.includes('reason')) {
+      return { ok: false, reason: 'refused_payload_invalid' }
+    }
+    if (typeof item.metric !== 'string' || !METRIC_REF_RE.test(item.metric)
+      || seen.has(item.metric)) {
+      return { ok: false, reason: 'refused_payload_invalid' }
+    }
+    if (typeof item.reason !== 'string' || !REFUSED_REASONS.has(item.reason)) {
+      return { ok: false, reason: 'refused_payload_invalid' }
+    }
+    if ('remediation' in item && !remediationOk(item.remediation)) {
+      return { ok: false, reason: 'refused_payload_invalid' }
+    }
+    seen.add(item.metric)
+    refused.push({ metric: item.metric, reason: item.reason })
+  }
+  return { ok: true, refused }
+}

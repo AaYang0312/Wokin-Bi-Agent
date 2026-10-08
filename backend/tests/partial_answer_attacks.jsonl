@@ -1,0 +1,3 @@
+{"id": "P01", "op": "drop", "reason": "server_disclosure_unchanged"}
+{"id": "P02", "op": "rewrite_disclosure", "disclosure": "覆盖已经完整", "reason": "forged_disclosure_rejected"}
+{"id": "P03", "op": "rewrite_windows", "answered_windows": [["2026-09-01", "2026-10-01"]], "missing_windows": [["2026-10-01", "2026-10-02"]], "reason": "forged_window_not_published"}

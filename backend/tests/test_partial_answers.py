@@ -7,6 +7,8 @@ T1 钉载荷形状。T2 钉不连库的可分解性：空覆盖、未知截止�
 
 from __future__ import annotations
 
+import copy
+import json
 import pathlib
 import re
 import unittest
@@ -114,6 +116,60 @@ class PartialAnswerGateTests(unittest.TestCase):
         assignments = [line for line in text.splitlines()
                        if line.startswith("PARTIAL_ANSWERS_ENABLED=")]
         self.assertEqual(assignments, ["PARTIAL_ANSWERS_ENABLED=false"])
+
+    def test_prompt_requires_the_actual_window_and_forbids_a_completeness_claim(self):
+        from bi_agent.agent import _SYSTEM_PROMPT
+
+        self.assertIn("partial_answer", _SYSTEM_PROMPT)
+        self.assertIn("必须原样复述其中的实际覆盖窗口与缺口起点", _SYSTEM_PROMPT)
+        self.assertIn("不得把这部分数字说成完整窗口", _SYSTEM_PROMPT)
+        self.assertIn("refused", _SYSTEM_PROMPT)
+        self.assertIn("不得把已经出数的指标说成整组指标都有数", _SYSTEM_PROMPT)
+
+
+class PartialAnswerTamperTests(unittest.TestCase):
+    """模型载荷上的删改不能换成服务端披露。
+
+    这些攻击不放进 exploration_attacks.jsonl：那份语料的每一行都是 SQL，
+    字段只有 id/sql/reason，策略层在碰库之前拒绝。部分答案的攻击对象是
+    已经投影好的载荷，不是一条查询。
+    """
+
+    def test_corpus_cannot_replace_the_server_disclosure(self):
+        from bi_agent.metrics import partial_answer_disclosure
+        from bi_agent.runtime.models import (
+            validate_artifact_payload, validate_model_payload)
+
+        path = pathlib.Path(__file__).with_name("partial_answer_attacks.jsonl")
+        text = path.read_text(encoding="utf-8")
+        self.assertTrue(text.endswith("\n"))
+        self.assertNotIn("\r", text)
+        rows = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual([row["id"] for row in rows], ["P01", "P02", "P03"])
+        server = validate_artifact_payload(_artifact(_block()))
+        disclosure = server["partial_answer"]["disclosure"]
+        self.assertEqual(disclosure, DISCLOSURE)
+        for row in rows:
+            tampered = copy.deepcopy(server)
+            block = tampered["partial_answer"]
+            if row["op"] == "drop":
+                del tampered["partial_answer"]
+                self.assertNotIn("partial_answer", validate_model_payload(tampered))
+            elif row["op"] == "rewrite_disclosure":
+                block["disclosure"] = row["disclosure"]
+                with self.assertRaises(ValueError):
+                    validate_model_payload(tampered)
+            elif row["op"] == "rewrite_windows":
+                block["answered_windows"] = row["answered_windows"]
+                block["missing_windows"] = row["missing_windows"]
+                block["disclosure"] = partial_answer_disclosure(
+                    [tuple(pair) for pair in row["answered_windows"]],
+                    [tuple(pair) for pair in row["missing_windows"]])
+                forged = validate_model_payload(tampered)
+                self.assertNotEqual(forged["partial_answer"], server["partial_answer"])
+            else:
+                self.fail(row["op"])
+            self.assertEqual(server["partial_answer"]["disclosure"], DISCLOSURE)
 
 
 AS_OF = datetime(2026, 9, 30, 23, 0, tzinfo=ZoneInfo("Asia/Shanghai"))

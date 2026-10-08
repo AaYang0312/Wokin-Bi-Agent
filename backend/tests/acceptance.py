@@ -15,7 +15,8 @@ Task 5 交付的多来源必验项。结构化期望因此不再只看"最终正
 `no_values` / `no_rows` / `no_total` 与 `calls`（一次提问里的多次工具调用）
 都要能机器核对。
 
-2026-10-08（计划 manual-sycm-export-import §3.M6）把题集从 29 题扩到 32 题：
+2026-10-08（计划 manual-sycm-export-import §3.M6）把题集从 29 题扩到 32 题，
+部分答案计划再扩到 35 题：
 30–32 是手工导出族的合成基准（`sycm_manual_case` 种子，SY1 只依赖
 manual.sycm.export 覆盖、绝不借用真实导入店铺）：30 覆盖窗口内可答并断言
 「来源质量未核验」披露与手工口径 basis；31 越窗 missing_data 并逐字段核对
@@ -57,16 +58,18 @@ from bi_agent.sources import (AFTERSALE_SOURCE, MANUAL_EXPORT_BASIS,
 from tests.fakeconn import S1_REF
 
 QUESTIONS_PATH = Path(__file__).with_name("questions.jsonl")
-EXPECTED_QUESTION_COUNT = 32
+EXPECTED_QUESTION_COUNT = 35
 # 多来源合成基准（原路线图 Task 5 的"新增多来源合成基准"一节）。
 TB1 = "TB1"
 PDD1 = "PDD1"
 FX1 = "FX1"
 SY1 = "SY1"
+PS1 = "PS1"
 TB1_REF = ref_for_key("shop", TB1)
 PDD1_REF = ref_for_key("shop", PDD1)
 FX1_REF = ref_for_key("shop", FX1)
 SY1_REF = ref_for_key("shop", SY1)
+PS1_REF = ref_for_key("shop", PS1)
 # 手工导出合成店（M6）：display_name 与 platform 只服务档案面；
 # 指标可答性只由 capabilities + (manual.sycm.export, shop_daily) 覆盖决定。
 SYCM_MANUAL_SHOP_NAME = "手工导入合成店"
@@ -317,10 +320,23 @@ def seed_sycm_manual_case(conn) -> None:
          _beijing(8, 0), _beijing(1, 0), _beijing(8, 0), _beijing(8, 0)))
 
 
+def seed_partial_split_case(conn) -> None:
+    """Q34：PS1 只有 ERP 支付能力，没有生意参谋来源。
+
+    闸开时支付金额应出数，推广花费逐项拒绝，两套口径不进同一行。
+    """
+    _shop_row(conn, PS1, "tb", "部分答案合成店", ["paid_amount"])
+    _trade(conn, shop_id=PS1, erp_id="E-PS1", commercial_id="C-PS1",
+           amount="100.00", day=2, source=OUTSTOCK_SOURCE, consigned_day=2)
+    _sync_state(conn, source=OUTSTOCK_SOURCE, entity="orders", shop_id=PS1,
+                spans=FULL_WINDOW, data_as_of=_beijing(8, 0))
+
+
 SEED_STEPS = {"multi_source": seed_multi_source_case,
               "coverage_holes": apply_coverage_holes,
               "item_price_snapshot": seed_item_price_snapshot,
-              "sycm_manual_case": seed_sycm_manual_case}
+              "sycm_manual_case": seed_sycm_manual_case,
+              "partial_split_case": seed_partial_split_case}
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +383,17 @@ def _model_script(question: dict) -> list[ModelReply]:
         return [_call_reply("query_business", query),
                 _reply(text="SY1 的ROAS是3：只用生意参谋支付金额与推广花费"
                             "同源相除；来源质量未核验。")]
+    if qid in {"33", "35"}:
+        query = {"shop_ids": [SY1_REF], "metrics": ["ad_spend"]}
+        reply = ("仅覆盖 2026-09-05~2026-09-08，2026-09-08 起缺口。"
+                 "已导入日期的全站推广花费是30元。")
+        return [_call_reply("query_business", query), _reply(text=reply)]
+    if qid == "34":
+        return [_call_reply("query_business", {
+            "shop_ids": [PS1_REF],
+            "metrics": ["paid_amount", "ad_spend"]}),
+            _reply(text="支付金额100元。全站推广花费没有来源，"
+                        "原因是 capability_unavailable，不能当成 0。")]
     if qid == "15":
         # 修订版：全平台汇总按授权集原样递进去，由服务端逐店解析来源与能力。
         query = {"shop_ids": sorted([S1_REF, TB1_REF, PDD1_REF]),
@@ -588,6 +615,20 @@ def _structured_problems(expected: dict, result: ToolResult) -> list[str]:
     for fragment in expected.get("limitations_contain", []):
         if not any(fragment in str(line) for line in result.limitations):
             problems.append(f"披露未包含“{fragment}”，实际{result.limitations}")
+    if expected.get("partial_answer") is not None:
+        block = result.partial_answer
+        if block is None:
+            problems.append("期望 partial_answer 在场，实际缺失")
+        else:
+            for field, value in expected["partial_answer"].items():
+                if block.get(field) != value:
+                    problems.append(f"partial_answer.{field}期望{value}，"
+                                    f"实际{block.get(field)}")
+    if expected.get("refused") is not None:
+        actual = [{"metric": item.get("metric"), "reason": item.get("reason")}
+                  for item in (result.refused or [])]
+        if actual != expected["refused"]:
+            problems.append(f"refused期望{expected['refused']}，实际{actual}")
     if expected.get("remediation") is not None:
         # 缺数上传提示（D3）按结构化字段核对（内部形状带真实 shop_id）。
         if result.remediation is None:
@@ -764,7 +805,8 @@ def _verify_product_turn(expected: dict, calls: list) -> list[str]:
     return problems
 
 
-def _run_turn(question: str, state: SessionState, model, conn, allowed, now, store):
+def _run_turn(question: str, state: SessionState, model, conn, allowed, now, store, *,
+              partial_answers_enabled: bool = False):
     from bi_agent.runtime import TurnContext
 
     turn_number = len([message for message in state.turns if message.role == "user"])
@@ -785,6 +827,7 @@ def _run_turn(question: str, state: SessionState, model, conn, allowed, now, sto
             ),
             subject_id=state.subject,
         ),
+        partial_answers_enabled=partial_answers_enabled,
     )
 
 
@@ -852,6 +895,9 @@ def _verify_turn(expected: dict, turn, recorded: list, store, recorded_start: in
     for fragment in expected.get("text_contains", []):
         if fragment not in (turn.text or ""):
             problems.append(f"回答未包含“{fragment}”")
+    for fragment in expected.get("text_absent", []):
+        if fragment in (turn.text or ""):
+            problems.append(f"回答不该宣称“{fragment}”")
     return problems
 
 
@@ -913,8 +959,9 @@ def _run_questions(questions: list[dict], conn, *, make_model, prefix: str,
                     store = _memory_store(allowed)
                     recorded_start = len(recorded)
                     commerce_start = len(recorded_commerce)
-                    turn = _run_turn(turn_text, state, model, conn, allowed,
-                                     FROZEN_NOW, store)
+                    turn = _run_turn(
+                        turn_text, state, model, conn, allowed, FROZEN_NOW, store,
+                        partial_answers_enabled=bool(question.get("partial_answers")))
                     state = turn.state
                     problems.extend(_verify_turn(expected, turn, recorded, store,
                                                  recorded_start, allowed))

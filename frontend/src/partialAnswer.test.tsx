@@ -36,6 +36,10 @@ describe('partial answer payload mirror', () => {
     expect(parsePartialAnswer(block()).ok).toBe(true)
     const html = renderToStaticMarkup(<ArtifactView artifact={artifact(block())} />)
     expect(html).toContain(DISCLOSURE)
+    expect(html).toContain('data-answered-window="true"')
+    expect(html).toContain('覆盖 2026-09-01 至 2026-09-29')
+    expect(html).toContain('data-missing-window="true"')
+    expect(html).toContain('缺口 2026-09-29 至 2026-10-01')
     expect(html).not.toContain('未通过展示侧校验')
 
     const rejected = renderToStaticMarkup(
@@ -51,5 +55,23 @@ describe('partial answer payload mirror', () => {
     })).ok).toBe(false)
     expect(parsePartialAnswer(block({ note: '完整' })).ok).toBe(false)
     expect(parsePartialAnswer(block({ metric_refs: ['ad_spend', 'ad_spend'] })).ok).toBe(false)
+  })
+
+  it('lists refused metrics and rejects a malformed refusal', () => {
+    const html = renderToStaticMarkup(
+      <ArtifactView artifact={{
+        ...artifact(undefined),
+        partial_answer: undefined,
+        refused: [{ metric: 'ad_spend', reason: 'capability_unavailable' }],
+      }} />)
+    expect(html).toContain('data-refused="true"')
+    expect(html).toContain('ad_spend：capability_unavailable')
+    const rejected = renderToStaticMarkup(
+      <ArtifactView artifact={{
+        ...artifact(block()),
+        refused: [{ metric: 'ad_spend', reason: 'please_upload' }],
+      }} />)
+    expect(rejected).toContain('未通过展示侧校验')
+    expect(rejected).not.toContain('90.00')
   })
 })

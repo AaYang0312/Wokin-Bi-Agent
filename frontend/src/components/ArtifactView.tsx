@@ -2,8 +2,8 @@ import type { Artifact, DisplayEntity, DrilldownIntent } from '../types'
 import { caliberLabel } from '../types'
 import { AnalysisArtifact } from './AnalysisArtifact'
 import { ChartArtifact } from './ChartArtifact'
-import { parsePartialAnswer } from '../partialAnswer'
-import type { PartialAnswerView } from '../partialAnswer'
+import { parsePartialAnswer, parseRefused } from '../partialAnswer'
+import type { PartialAnswerView, RefusedMetricView } from '../partialAnswer'
 import { RemediationUpload, parseRemediation } from './RemediationUpload'
 import type { RemediationView } from './RemediationUpload'
 import { AlertIcon, ClockIcon, GaugeIcon, TableIcon } from './icons'
@@ -481,6 +481,12 @@ export function ArtifactView({
     if (!parsed.ok) return rejectedArtifact()
     partialAnswer = parsed.partialAnswer
   }
+  let refused: readonly RefusedMetricView[] | null = null
+  if (artifact.refused !== undefined) {
+    const parsed = parseRefused(artifact.refused, (item) => parseRemediation(item).ok)
+    if (!parsed.ok) return rejectedArtifact()
+    refused = parsed.refused
+  }
   const entities = artifactEntities(artifact)
   const rows = Array.isArray(artifact.data) ? artifact.data.filter(
     (row): row is Record<string, unknown> => typeof row === 'object' && row !== null && !Array.isArray(row),
@@ -593,7 +599,28 @@ export function ArtifactView({
         {coverage !== undefined && <span><GaugeIcon size={13} />覆盖：{text(coverage)}</span>}
       </div>
       {partialAnswer && (
-        <p className="limitations" data-partial-answer="true">{partialAnswer.disclosure}</p>
+        <div data-partial-answer="true">
+          <p className="limitations">{partialAnswer.disclosure}</p>
+          <div className="artifact-meta">
+            {partialAnswer.answeredWindows.map(([start, end]) => (
+              <span className="pill" data-answered-window="true" key={`covered-${start}-${end}`}>
+                覆盖 {start} 至 {end}
+              </span>
+            ))}
+            {partialAnswer.missingWindows.map(([start, end]) => (
+              <span className="pill pill-warn" data-missing-window="true" key={`gap-${start}-${end}`}>
+                缺口 {start} 至 {end}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {refused && (
+        <ul data-refused="true">
+          {refused.map((item) => (
+            <li key={item.metric}>{item.metric}：{item.reason}</li>
+          ))}
+        </ul>
       )}
       {remediation && (
         <RemediationUpload remediation={remediation} entities={entities}

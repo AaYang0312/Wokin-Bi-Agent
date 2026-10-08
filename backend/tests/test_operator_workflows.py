@@ -2338,12 +2338,12 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
         expected = self.questions[qid]["expected"]
         return expected[index] if isinstance(expected, list) else expected
 
-    def test_the_set_is_32_questions_and_ids_are_contiguous(self):
-        """题集扩到 32：27/28 双口径题 + 29 档案价 + 30–32 手工导入族（M6）。"""
-        self.assertEqual(len(self.questions), 32)
+    def test_the_set_is_35_questions_and_ids_are_contiguous(self):
+        """题集扩到 35：30–32 手工导入族，33–35 覆盖缺口部分答案。"""
+        self.assertEqual(len(self.questions), 35)
         self.assertEqual(sorted(self.questions),
-                         [f"{index:02d}" for index in range(1, 33)])
-        self.assertEqual(self.module.EXPECTED_QUESTION_COUNT, 32)
+                         [f"{index:02d}" for index in range(1, 36)])
+        self.assertEqual(self.module.EXPECTED_QUESTION_COUNT, 35)
         for qid in ("27", "28"):
             expected_list = (self.questions[qid]["expected"]
                              if isinstance(self.questions[qid]["expected"], list)
@@ -2393,6 +2393,25 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
                            "stat_date"]])
         self.assertIn("basis_incompatible", roas["not_codes"],
                       "同源比值不得被记为口径混用")
+
+    def test_partial_answer_questions_pin_window_split_and_wording(self):
+        """33 越窗可答，34 混合指标不连坐，35 回答不得宣称完整。31 关闸仍整单缺数。"""
+        self.assertFalse(self.questions["31"].get("partial_answers", False))
+        self.assertEqual(self._expected("31")["status"], "missing_data")
+        window = self._expected("33")
+        self.assertTrue(self.questions["33"]["partial_answers"])
+        self.assertEqual(window["values"], {"ad_spend": "30"})
+        self.assertEqual(window["partial_answer"]["disclosure"],
+                         "仅覆盖 2026-09-05~2026-09-08，2026-09-08 起缺口")
+        self.assertEqual(window["domain_status"], "partial")
+        split = self._expected("34")
+        self.assertEqual(split["refused"],
+                         [{"metric": "ad_spend", "reason": "capability_unavailable"}])
+        self.assertEqual(self.questions["34"]["seeds"], ["partial_split_case"])
+        wording = self._expected("35")
+        self.assertIn("仅覆盖 2026-09-05~2026-09-08", wording["text_contains"])
+        self.assertIn("完整", wording["text_absent"])
+        self.assertEqual(wording["values"], {"ad_spend": "30"})
 
     def test_every_answer_question_compares_structured_facts_not_only_words(self):
         """设计 §6 / 计划 Task 11：不能只用“最终正文含某个词”判通过。
