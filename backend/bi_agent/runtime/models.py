@@ -339,6 +339,8 @@ _ARTIFACT_KEYS = frozenset({
     # 覆盖缺口的部分答案（计划 2026-10-08 D3）：模型可见披露句，但句子必须与
     # 服务端模板逐字一致，改写即拒。
     "partial_answer",
+    # 指标拆分的拒答子集（D5）：模型可见原因码。逐项 remediation 只进公开载荷。
+    "refused",
 })
 
 # ---------------------------------------------------------------------------
@@ -1402,6 +1404,8 @@ def _public_metric_payload(value: object, *, public: bool) -> dict[str, object]:
         _remediation(payload["remediation"])
     if "partial_answer" in payload:
         _partial_answer(payload["partial_answer"])
+    if "refused" in payload:
+        _refused(payload["refused"], public=public)
     # 契约 v2（spec §3）：范围三面分开，被排除的店铺与原因逐条可核对。
     if "requested_scope" in payload:
         _requested_scope(payload["requested_scope"])
@@ -1509,6 +1513,25 @@ def _partial_answer(value: object) -> None:
             _unsafe_payload()
     if block["disclosure"] != partial_answer_disclosure(answered, missing):
         _unsafe_payload()
+
+
+def _refused(value: object, *, public: bool) -> None:
+    """拒答子集：每项只有指标名和已登记原因码。上传提示只允许出现在公开载荷。"""
+    if not isinstance(value, list) or not value:
+        _unsafe_payload()
+    allowed = frozenset({"metric", "reason", "remediation"} if public
+                        else {"metric", "reason"})
+    seen: set[str] = set()
+    for item in value:
+        block = _mapping(item, allowed=allowed, required=frozenset({"metric", "reason"}))
+        metric = block["metric"]
+        if (not isinstance(metric, str) or metric not in _METRIC_DEFINITION_TEXTS
+                or metric in seen):
+            _unsafe_payload()
+        seen.add(metric)
+        _string_in(block["reason"], _LIMITATION_CODES)
+        if "remediation" in block:
+            _remediation(block["remediation"])
 
 
 def _remediation(value: object) -> None:

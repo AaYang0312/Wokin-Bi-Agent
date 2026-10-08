@@ -267,4 +267,27 @@ def safe_result_body(
             "metric_refs": raw_partial.get("metric_refs"),
             "disclosure": raw_partial.get("disclosure"),
         }
+    raw_refused = payload.get("refused")
+    if isinstance(raw_refused, list) and raw_refused:
+        items: list[dict[str, object]] = []
+        for item in raw_refused:
+            if not isinstance(item, dict):
+                continue
+            projected: dict[str, object] = {
+                "metric": item.get("metric"),
+                "reason": item.get("reason"),
+            }
+            raw_item_remediation = item.get("remediation")
+            if not model_view and isinstance(raw_item_remediation, dict):
+                projected["remediation"] = {
+                    "kind": raw_item_remediation.get("kind"),
+                    "file_kind": raw_item_remediation.get("file_kind"),
+                    "shop_refs": [catalog.shop_ref(str(shop_id))
+                                  for shop_id in (raw_item_remediation.get("shop_ids") or [])],
+                    "covered_window": raw_item_remediation.get("covered_window"),
+                    "missing_range": raw_item_remediation.get("missing_range"),
+                }
+            items.append(projected)
+        if items:
+            body["refused"] = items
     return body

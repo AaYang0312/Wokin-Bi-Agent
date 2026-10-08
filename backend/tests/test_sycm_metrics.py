@@ -737,9 +737,107 @@ class SycmMetricQueryDatabaseTests(unittest.TestCase):
         result = self._query(["paid_amount", "ad_spend"])
         self.assertEqual(result.status, "invalid_parameters", result.limitations)
         self.assertEqual(result.data, [])
+        self.assertIsNone(result.refused)
         self.assertIn(metrics_module.SYCM_MIXED_CALIBER_LIMITATION,
                       result.limitations)
         self.assertIn("basis_incompatible", self._codes(result))
+
+    def _seed_paid_amount(self):
+        from bi_agent.sync import apply_trade, normalise_trade
+
+        self.conn.execute("RESET ROLE")
+        trade = normalise_trade({
+            "sid": "E-SY-A", "userId": self.SHOP_A, "tid": "C-SY-A",
+            "payAmount": "100.00",
+            "payTime": int(datetime(2026, 9, 2, 10, tzinfo=BEIJING).timestamp() * 1000),
+            "updTime": int(datetime(2026, 9, 2, 11, tzinfo=BEIJING).timestamp() * 1000),
+            "status": "TRADE_NO_CREATED_EVALUATION", "sysStatus": 0,
+            "orders": [{"skuId": "S1", "num": "1", "payAmount": "100.00",
+                        "itemSysId": "P_A", "oid": "E-SY-A-1"}],
+        }, source="erp.trade.outstock.simple.query")
+        self.assertTrue(apply_trade(self.conn, trade, batch_id="sycm-m3-erp"))
+        self.conn.execute(
+            "INSERT INTO bi.sync_state(source, entity, shop_id, watermark, covered, "
+            "data_as_of, quality_status, quality_rule) VALUES "
+            "('erp.trade.outstock.simple.query', 'orders', %s, "
+            "'2026-09-10 00:00+08', tstzmultirange(tstzrange('2026-09-01',"
+            "'2026-09-10','[)')), '2026-09-10 00:00+08', 'passed', 'test-seed') "
+            "ON CONFLICT (source, entity, shop_id) DO UPDATE SET "
+            "covered = EXCLUDED.covered, data_as_of = EXCLUDED.data_as_of",
+            (self.SHOP_A,))
+
+    def test_partial_gate_answers_paid_amount_and_refuses_ungranted_ad_spend(self):
+        """闸开时，有来源的指标出数；没有来源的指标逐项拒绝，不连坐。"""
+        from bi_agent.business_query.tool import to_model_result, to_public_artifact
+
+        self._seed_paid_amount()
+        self.conn.execute(
+            "UPDATE bi.shops SET capabilities = '{paid_amount}' WHERE shop_id = %s",
+            (self.SHOP_A,))
+        closed = self._query(["paid_amount", "ad_spend"])
+        self.assertEqual(closed.status, "invalid_parameters", closed.limitations)
+        self.assertIsNone(closed.refused)
+
+        result = self._query(["paid_amount", "ad_spend"],
+                             partial_answers_enabled=True)
+        self.assertEqual(result.status, "ok", result.limitations)
+        self.assertEqual(Decimal(result.data[0]["paid_amount"]), Decimal("100"))
+        self.assertNotIn("ad_spend", result.data[0])
+        self.assertEqual(result.filters["metrics"], ["paid_amount", "ad_spend"])
+        self.assertEqual(result.refused, [{
+            "metric": "ad_spend",
+            "reason": "capability_unavailable",
+            "remediation": {
+                "kind": "upload", "file_kind": "店铺维度",
+                "shop_ids": [self.SHOP_A],
+                "covered_window": None,
+                "missing_range": ["2026-09-01", "2026-09-10"],
+            },
+        }])
+        catalog = self._catalog(result)
+        public_payload = to_public_artifact(result, catalog)
+        model_payload = to_model_result(result, catalog)
+        self.assertEqual(public_payload["refused"][0]["remediation"]["shop_refs"],
+                         [catalog.shop_ref(self.SHOP_A)])
+        self.assertNotIn("remediation", model_payload["refused"][0])
+        self.assertEqual(model_payload["refused"][0]["reason"],
+                         "capability_unavailable")
+
+    def test_partial_gate_lists_every_reason_when_nothing_is_answerable(self):
+        self.conn.execute("RESET ROLE")
+        self.conn.execute(
+            "UPDATE bi.shops SET capabilities = '{paid_amount}' WHERE shop_id = %s",
+            (self.SHOP_A,))
+        closed = self._query(["ad_spend", "visitors"])
+        self.assertEqual(closed.status, "missing_data", closed.limitations)
+        self.assertIsNone(closed.refused)
+        self.assertEqual(closed.data, [])
+
+        result = self._query(["ad_spend", "visitors"],
+                             partial_answers_enabled=True)
+        self.assertEqual(result.status, "missing_data", result.limitations)
+        self.assertEqual(result.data, [])
+        self.assertEqual(result.refused, [
+            {"metric": "ad_spend", "reason": "capability_unavailable",
+             "remediation": {
+                 "kind": "upload", "file_kind": "店铺维度",
+                 "shop_ids": [self.SHOP_A], "covered_window": None,
+                 "missing_range": ["2026-09-01", "2026-09-10"]}},
+            {"metric": "visitors", "reason": "capability_unavailable",
+             "remediation": {
+                 "kind": "upload", "file_kind": "店铺维度",
+                 "shop_ids": [self.SHOP_A], "covered_window": None,
+                 "missing_range": ["2026-09-01", "2026-09-10"]}},
+        ])
+        self.assertIn("capability_unavailable", self._codes(result))
+
+    def test_partial_gate_still_refuses_two_answerable_families_together(self):
+        result = self._query(["paid_amount", "ad_spend"],
+                             partial_answers_enabled=True)
+        self.assertEqual(result.status, "invalid_parameters", result.limitations)
+        self.assertIsNone(result.refused)
+        self.assertIn(metrics_module.SYCM_MIXED_CALIBER_LIMITATION,
+                      result.limitations)
 
     def test_zero_denominator_ratio_publishes_null_with_disclosure(self):
         self.conn.execute("RESET ROLE")

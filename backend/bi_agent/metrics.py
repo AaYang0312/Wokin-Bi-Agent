@@ -219,6 +219,9 @@ class ToolResult(BaseModel):
     # 部分答案（闸开且只有一段可出数窗口）：四键公开块，模型可见。
     # 披露句由服务端模板现算，投影时原样带上，空着就不出现。
     partial_answer: dict[str, object] | None = None
+    # 指标拆分后的拒答子集：metric + 稳定原因码。手工缺口可带上传提示，
+    # 公开投影才把 shop_id 换成 shop_ref；模型可见载荷只留原因。
+    refused: list[dict[str, object]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -832,6 +835,65 @@ def _filters(request: QueryRequest) -> dict[str, object]:
     }
 
 
+def _split_unsupported(request: QueryRequest, records) -> tuple[list, list[dict[str, object]]]:
+    """把没有来源的指标从请求里拿出来。能回答的留下，其余逐项给稳定原因码。"""
+    kept: list = []
+    refused: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for metric in request.metrics:
+        name = str(metric)
+        if name in seen:
+            continue
+        seen.add(name)
+        reasons = {unsupported_reason(record, name) for record in records}
+        reasons.discard(None)
+        if not reasons:
+            kept.append(metric)
+            continue
+        public = ("source_not_onboarded" if "source_unregistered" in reasons
+                  else "capability_unavailable")
+        item: dict[str, object] = {"metric": name, "reason": public}
+        remediation = _refusal_remediation(name, records, request)
+        if remediation is not None:
+            item["remediation"] = remediation
+        refused.append(item)
+    refused.sort(key=lambda item: str(item["metric"]))
+    return kept, refused
+
+
+def _refusal_remediation(metric: str, records, request: QueryRequest
+                         ) -> dict[str, object] | None:
+    """手工指标没被授予时，上传店铺维度文件是服务端能给出的补数动作。"""
+    if metric not in MANUAL_METRIC_CAPABILITIES:
+        return None
+    shops = sorted(record.shop_id for record in records
+                   if record.platform != "pdd"
+                   and unsupported_reason(record, metric) is not None)
+    if not shops:
+        return None
+    return {"kind": "upload", "file_kind": "店铺维度", "shop_ids": shops,
+            "covered_window": None,
+            "missing_range": [request.start.isoformat(), request.end.isoformat()]}
+
+
+def _refused_only(records, refused: list[dict[str, object]],
+                  filters: dict[str, object]) -> ToolResult:
+    """一个指标都回答不了：整单缺数，但原因按指标列出。"""
+    names = [str(item["metric"]) for item in refused]
+    manual = [name for name in names if name in MANUAL_METRIC_CAPABILITIES]
+    erp = [name for name in names if name not in MANUAL_METRIC_CAPABILITIES]
+    texts: list[str] = []
+    if manual:
+        texts.extend(_sycm_capability_gap(records, manual))
+    if erp:
+        texts.extend(_capability_gap(records, erp))
+    return ToolResult(
+        status="missing_data",
+        coverage=Coverage(status="missing", start=None, end=None),
+        metric_definition={name: METRIC_DEFINITIONS[name] for name in names},
+        filters=filters, limitations=texts, refused=refused)
+
+
 def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
                           deadline: float,
                           partial_answers_enabled: bool = False) -> ToolResult:
@@ -865,6 +927,24 @@ def _query_in_transaction(conn, request: QueryRequest, *, now: datetime,
         filters["requested_shop_ids"] = requested_shop_ids
 
     records = [shops[shop_id].record for shop_id in request.shop_ids]
+
+    # 闸开时先按指标拆：没有来源的指标不连坐其余指标。两边都能答的家族混查
+    # 仍走下面的口径隔离，不把两套数拼进同一行。
+    if partial_answers_enabled:
+        kept, refused = _split_unsupported(request, records)
+        if refused and not kept:
+            return _refused_only(records, refused, filters)
+        if refused:
+            inner = _query_in_transaction(
+                conn, request.model_copy(update={"metrics": kept}),
+                now=now, deadline=deadline, partial_answers_enabled=True)
+            return inner.model_copy(update={
+                "refused": refused,
+                "filters": filters,
+                "metric_definition": {
+                    str(metric): METRIC_DEFINITIONS[str(metric)]
+                    for metric in request.metrics},
+            })
 
     # 手工导出族（M3）走自己的固定 SQL 与覆盖凭证：与 ERP 族连分列都不开放——
     # 家族混查必然把 paid_amount_sycm 与 ERP paid_amount 放进同一份结果，

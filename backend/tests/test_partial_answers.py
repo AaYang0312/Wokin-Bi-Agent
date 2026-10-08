@@ -1,7 +1,8 @@
 """覆盖缺口部分答案（计划 2026-10-08）。
 
 T1 钉载荷形状。T2 钉不连库的可分解性：空覆盖、未知截止、混合指标、
-同源比值的公共窗口。T3 钉单段窗口收窄：跨源与多段仍整单缺数，SQL 模板不增。
+同源比值的公共窗口。T3 钉单段窗口收窄。T4 钉指标拆分：可答子集出数，
+拒答子集进 refused。
 """
 
 from __future__ import annotations
@@ -311,3 +312,64 @@ class PartialExecutionTests(unittest.TestCase):
             "_COHORT_SQL", "_SHOPS_SQL", "_SYCM_AGG_SQL", "_SYCM_DAILY_SQL",
             "_SYCM_GROUP_COUNT_SQL",
         ])
+
+
+def _refused_item(**overrides):
+    item = {"metric": "ad_spend", "reason": "capability_unavailable"}
+    item.update(overrides)
+    return item
+
+
+class RefusedMetricContractTests(unittest.TestCase):
+    def test_public_payload_keeps_per_metric_remediation(self):
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        payload = validate_artifact_payload({
+            "status": "ok",
+            "refused": [_refused_item(remediation={
+                "kind": "upload", "file_kind": "店铺维度",
+                "shop_refs": ["ent-0a1b2c3d"],
+                "covered_window": None,
+                "missing_range": ["2026-09-01", "2026-09-10"],
+            })],
+        })
+        self.assertEqual(payload["refused"][0]["reason"], "capability_unavailable")
+        self.assertEqual(payload["refused"][0]["remediation"]["file_kind"], "店铺维度")
+
+    def test_model_payload_sees_reasons_without_remediation(self):
+        from bi_agent.runtime.models import validate_model_payload
+
+        payload = validate_model_payload({
+            "status": "missing_data",
+            "refused": [
+                _refused_item(),
+                _refused_item(metric="visitors"),
+            ],
+        })
+        self.assertEqual([item["metric"] for item in payload["refused"]],
+                         ["ad_spend", "visitors"])
+        with self.assertRaises(ValueError):
+            validate_model_payload({
+                "status": "missing_data",
+                "refused": [_refused_item(remediation={
+                    "kind": "upload", "file_kind": "店铺维度",
+                    "shop_refs": ["ent-0a1b2c3d"],
+                    "missing_range": ["2026-09-01", "2026-09-10"],
+                })],
+            })
+
+    def test_malformed_refusals_are_rejected(self):
+        from bi_agent.runtime.models import validate_artifact_payload
+
+        cases = (
+            [],
+            [_refused_item(reason="please_upload")],
+            [_refused_item(metric="net_profit")],
+            [_refused_item(), _refused_item()],
+            [_refused_item(note="完整")],
+            "ad_spend",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError):
+                    validate_artifact_payload({"status": "missing_data", "refused": case})
