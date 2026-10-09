@@ -16,7 +16,7 @@
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020 → 021 → 022 → 023 → 024 → 025 → 026 → 027`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020，approved 查询学习记忆的样例表、不可变事件表、`bi_approver` 审核角色与只含 approved 行的投影视图落在 021，隔离分析的第五个领域 `isolated_analysis` 与 Artifact 类型 `analysis_result` 的两份 CHECK 扩展落在 022（它不建任何事实表），持续库存通知的观测事实落在 023，同步侧可运维性字段落在 024，出库口径的 `consigned_at` 列落在 025，关闭后退款支付剔除的时间列落在 026，S4 档案价快照两表、两个 reporting 视图与逐项授权落在 027；生意参谋手工导出的四张事实/台账表落在 028、`shop_daily` 覆盖实体与只读视图落在 029/030、上传写面授权与 `sync_state` RLS 落在 031、台账 status⇔reason_code 配对不变式落在 032（本功能默认关闭，见「生意参谋手工导出来源」章）。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。缺 021 时审核 API 的投影视图不存在，approved 查询学习记忆保持关闭（审核路由按未启用返回 404），不影响其它功能。缺 022 时隔离分析的 `analysis_result` 写不进 Artifact 表（CHECK 拒绝），图在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的分析结果；门禁关闭时 022 是否已应用都不影响聊天。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020 → 021 → 022 → 023 → 024 → 025 → 026 → 027`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020，approved 查询学习记忆的样例表、不可变事件表、`bi_approver` 审核角色与只含 approved 行的投影视图落在 021，隔离分析的第五个领域 `isolated_analysis` 与 Artifact 类型 `analysis_result` 的两份 CHECK 扩展落在 022（它不建任何事实表），持续库存通知的观测事实落在 023，同步侧可运维性字段落在 024，出库口径的 `consigned_at` 列落在 025，关闭后退款支付剔除的时间列落在 026，S4 档案价快照两表、两个 reporting 视图与逐项授权落在 027；生意参谋手工导出的四张事实/台账表落在 028、`shop_daily` 覆盖实体与只读视图落在 029/030、上传写面授权与 `sync_state` RLS 落在 031、台账 status⇔reason_code 配对不变式落在 032，事实表 upsert 所需的 `SELECT` 落在 033（本功能默认关闭，见「生意参谋手工导出来源」章）。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。缺 021 时审核 API 的投影视图不存在，approved 查询学习记忆保持关闭（审核路由按未启用返回 404），不影响其它功能。缺 022 时隔离分析的 `analysis_result` 写不进 Artifact 表（CHECK 拒绝），图在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的分析结果；门禁关闭时 022 是否已应用都不影响聊天。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
@@ -247,11 +247,14 @@ uv run --env-file ../.env.test python -m bi_agent.sync consign-scan   --start 20
 （请求 `timeType=consign_time`，分页完整性复用订单通道同一套机器）；单据规范化入库时
 **不重建/不新建任何支付事实**（`order_payments` 不经此路径）。只有整个窗口扫描完整且全部
 单据带发货时间、发货时间都落在窗口内，才把该窗口计入 `bi.sync_state`
-（source=`erp.trade.outstock.simple.query`，entity=`orders_consign`）；任何一页不完整、
-单据缺 `consignTime` 或发货时间越窗 → 整窗回滚，仅留 `last_error_code=
-consign_scan_incomplete` 等失败凭证（fail closed，不补零、不写部分覆盖）。拼多多店铺
-自动跳过（永久排除）。首次运行后需按既有对账流程核验来源质量
-（`reconcile_source_quality`），出库口径排名才会随认证状态亮起。
+（source=`erp.trade.outstock.simple.query`，entity=`orders_consign`），并把
+`data_as_of` 推进到该窗口的排他终点（只向前，不把 `last_success_at` 当成截止）。
+任何一页不完整、单据缺 `consignTime` 或发货时间越窗 → 整窗回滚，仅留
+`last_error_code=consign_scan_incomplete` 等失败凭证，`data_as_of` 也不前进
+（fail closed，不补零、不写部分覆盖）。拼多多店铺自动跳过（永久排除）。
+扫描不把 `quality_status` 写成 `passed`。首次运行后需按既有对账流程核验来源质量
+（`reconcile_source_quality`），出库口径排名才会随认证状态亮起；质量仍是
+`unknown` 时可以出数，但必须带「来源质量未核验」。
 
 ## 数据就绪与质量核对
 
@@ -640,12 +643,13 @@ uv run --locked --env-file ../.env.test python -m unittest tests.test_db tests.t
 缺省 `false`：上传路由 404、导入 CLI 拒绝执行（退出码 2 + `SYCM_MANUAL_IMPORT_DISABLED`）、
 聊天行为与关闭基线一致（无导入数据时相关提问按能力/覆盖 fail-closed 拒答）。
 
-### 迁移与数据面（028–032）
+### 迁移与数据面（028–033）
 
 启用前库必须按序含 `028_manual_sycm_export`（四张表：`bi.sycm_shop_daily` / `bi.sycm_customer_daily`
 / `bi.manual_uploads` / `bi.manual_upload_events`）、`029`（`sync_state.entity` 开放 `shop_daily`）、
 `030`（`reporting.v_sycm_shop_daily` 只读视图与授权）、`031`（词表 CHECK + `bi_app` 写面授权 +
-`sync_state` RLS）、`032`（status ⇔ reason_code 配对不变式）。全部幂等可重放；回退不需要回滚任何迁移。
+`sync_state` RLS）、`032`（status ⇔ reason_code 配对不变式）、`033`（两张事实表补 `SELECT`，
+否则 `bi_app` 的 `ON CONFLICT DO UPDATE` 在规划期就被拒，上传成功路径 503）。全部幂等可重放；回退不需要回滚任何迁移。
 
 031 的 RLS 边界一句话：`bi.sync_state` 启用行级安全后，`bi_app` 只见/只写
 `source='manual.sycm.export'` 行（erp.* 覆盖凭证不可见、改不动、插不进），`bi_sync` 与属主不受影响。
@@ -681,7 +685,7 @@ reason_code 为七词稳定码（`missing_columns` / `bad_date` / `shop_not_regi
 
 ### 启用步骤与回退
 
-1. 管理员确认迁移 028–032 已按序应用（本机 `*_test` 可重放验证幂等）；
+1. 管理员确认迁移 028–033 已按序应用（本机 `*_test` 可重放验证幂等）；
 2. `.env.app` 置 `SYCM_MANUAL_IMPORT_ENABLED=true` 并重启实例（取值只认 true/false）；
 3. 用 CLI 或上传面导入店铺维度导出（至少覆盖目标统计窗口）；
 4. 冒烟：窗口内「全站推广花费/ROAS」应可答并披露「来源质量未核验（尚无对账记录）」；
@@ -689,7 +693,7 @@ reason_code 为七词稳定码（`missing_columns` / `bad_date` / `shop_not_regi
 
 回退 = 把 `SYCM_MANUAL_IMPORT_ENABLED` 改回 `false`（或删掉该变量）后重启：上传路由 404、
 CLI 拒绝、聊天回到关闭基线。已导入的事实、台账与覆盖凭证保留可审计（再启用时按
-(shop_id, 统计日期) 幂等覆盖即可）；不需要回滚 028–032，也不需要清库。
+(shop_id, 统计日期) 幂等覆盖即可）；不需要回滚 028–033，也不需要清库。
 
 `evaluate_promotion` 工具描述在启用后**未改**（M3 遗留 P2 的收口说明）：模型看到的仍是
 「仅按当前用户明确假设测算预算；当前未取得真实推广消耗」，但服务端两态行为已上线——

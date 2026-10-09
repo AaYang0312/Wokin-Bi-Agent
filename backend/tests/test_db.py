@@ -4170,12 +4170,14 @@ class ConsignTimeSyncTests(unittest.TestCase):
         self.assertIsNotNone(order[1])
         self.assertNotEqual(order[0], order[1])
         state = self.conn.execute(
-            "SELECT covered, last_error_code FROM bi.sync_state "
+            "SELECT covered, last_error_code, data_as_of FROM bi.sync_state "
             "WHERE source=%s AND entity='orders_consign' AND shop_id='CT1'",
             (OUTSTOCK_SOURCE,)).fetchone()
         self.assertIsNotNone(state, "完整扫描后覆盖必须推进")
         self.assertIn("2026-09-01", str(state[0]))
         self.assertIsNone(state[1])
+        self.assertEqual(state[2], window.end,
+                         "完整窗口把业务截止推到窗口排他终点，不能留空")
         batch = self.conn.execute(
             "SELECT window_kind FROM bi.sync_batches WHERE source=%s "
             "AND entity='orders_consign' AND shop_id='CT1'",
@@ -4406,13 +4408,14 @@ class ConsignTimeSyncTests(unittest.TestCase):
             "SELECT count(*) FROM bi.orders WHERE shop_id='CT1'").fetchone()[0]
         self.assertEqual(orders, 0, "事务回滚：问题单据不入库")
         state = self.conn.execute(
-            "SELECT covered, last_error_code FROM bi.sync_state "
+            "SELECT covered, last_error_code, data_as_of FROM bi.sync_state "
             "WHERE source=%s AND entity='orders_consign' AND shop_id='CT1'",
             (OUTSTOCK_SOURCE,)).fetchone()
         self.assertIsNotNone(state)
         self.assertEqual(state[1], "consign_scan_incomplete",
                          "fail-closed 凭证在场，覆盖区间不得出现")
         self.assertEqual(str(state[0]), "{}", "覆盖分毫未写")
+        self.assertIsNone(state[2], "不完整窗口不得发布业务截止")
 
     def test_consign_scan_blocks_coverage_on_pagination_failure(self):
         """分页完整性破坏 → KuaimaiError 上抛，覆盖不推进、无半窗数据。"""

@@ -28,7 +28,8 @@ from bi_agent.commerce.graph import (
 from bi_agent.commerce.metrics import (
     COMMERCE_METRIC_DEFINITIONS, PRODUCT_ROWS, combine_reference_metrics,
     compute_reference_metrics, project)
-from bi_agent.commerce.models import DomainContext, ProductPerformanceRequest
+from bi_agent.commerce.models import (
+    DomainContext, ProductPerformanceRequest, normalize_platform)
 from bi_agent.commerce.tool import analyze_product_performance
 from bi_agent.data_quality import QUALITY_RULE
 from bi_agent.metrics import MAX_SPAN_DAYS
@@ -1441,11 +1442,37 @@ class CommerceContractTests(unittest.TestCase):
             _request(scope={"platforms": ["taobao"]},
                      profit_basis="existing_fields",
                      metrics=["erp_gross_profit_reference"])
+        self.assertEqual(
+            _request(scope={"platforms": ["抖音"]}).scope.platforms, ["fxg"])
         with self.assertRaises(ValidationError):
             _request(scope={"shop_refs": ["S1"]})
         with self.assertRaises(ValidationError):
             _request(opportunity_policy_ref="drop table")
         _request(scope={"platforms": ["fxg"]})
+
+    def test_platform_labels_reverse_to_registered_codes_only(self):
+        """已登记中文名精确反查；未知别名与未注册标签仍然拒绝。"""
+        from pydantic import ValidationError
+
+        from bi_agent.sources import registration
+
+        expected = {
+            "抖音": "fxg", "淘宝": "tb", "天猫": "tm", "京东": "jd",
+            "快手": "kuaishou", "视频号": "wxsph", "拼多多": "pdd",
+            "FXG": "fxg", " 抖音 ": "fxg",
+        }
+        for raw, code in expected.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_platform(raw), code)
+                self.assertIsNotNone(registration(code))
+        self.assertIsNone(registration("pdd").payment_basis,
+                          "拼多多反查只得到平台码，不因此开通支付口径")
+        for raw in ("", "抖店", "淘系", "1688", "淘工厂"):
+            with self.subTest(raw=raw or "empty"):
+                with self.assertRaises(ValueError):
+                    normalize_platform(raw)
+                with self.assertRaises(ValidationError):
+                    _request(scope={"platforms": [raw or "抖店"]})
 
     def test_report_kind_pairing_is_refused_not_downgraded(self):
         """Task 8 之后 comparison 已受支持，但**入参契约必须配对**。

@@ -1128,6 +1128,20 @@ def _record_window_success(conn, *, source: str, entity: str, shop_id: str,
                   mode=mode, batch_id=batch_id, row_count=row_count)
 
 
+def _publish_consign_cutoff(conn, *, shop_id: str, as_of: datetime) -> None:
+    """把出库口径的业务截止推进到已完整扫描窗口的排他终点。
+
+    只向前走（`greatest`），不把更早窗口的回放写成回退。质量状态不动：
+    扫描成功不是对账通过。
+    """
+    conn.execute(
+        "UPDATE bi.sync_state SET data_as_of = greatest("
+        "coalesce(data_as_of, %s), %s) "
+        "WHERE source=%s AND entity=%s AND shop_id=%s",
+        (as_of, as_of, OUTSTOCK_SOURCE, CONSIGN_ORDERS_ENTITY, shop_id),
+    )
+
+
 def record_failure(conn, *, source: str, entity: str, shop_id: str, code: str) -> None:
     """异常回滚后另开短事务记录；保留旧成功水位和已完成窗口。"""
     _ensure_state(conn, source, entity, shop_id)
@@ -1322,7 +1336,8 @@ def sync_consign_window(conn, client: KuaimaiClient, *, shop_id: str,
       order_payments**：已验证支付事实不会被本路径降级或覆盖；
     - 任何一单规范化无效、缺 consigned_at、或发货时间越出请求窗口 → 整窗回滚，
       记 `last_error_code=consign_scan_incomplete`，orders_consign 覆盖不推进；
-    - 完整扫描（包括"确实没有单据"的空窗）才把 [start,end) 计入覆盖。
+    - 完整扫描（包括"确实没有单据"的空窗）才把 [start,end) 计入覆盖，
+      并把 ``data_as_of`` 推进到 ``window.end``（只向前；质量状态不改）。
     """
     if mode not in ("backfill", "replay", "reconcile"):
         raise ValueError(f"出库口径窗口不支持模式 {mode}（只收业务时间模式）")
@@ -1363,6 +1378,10 @@ def sync_consign_window(conn, client: KuaimaiClient, *, shop_id: str,
                                    entity=CONSIGN_ORDERS_ENTITY, shop_id=shop_id,
                                    window=window, mode=mode, batch_id=batch_id,
                                    row_count=accepted)
+            # 业务截止只在本窗口完整提交后推进到窗口排他终点。
+            # 不用 last_success_at 顶替，也不把质量写成 passed：对账仍是另一件事。
+            # 失败分支在事务外，这里的写入会随整窗回滚。
+            _publish_consign_cutoff(conn, shop_id=shop_id, as_of=window.end)
     except ConsignScanIncomplete as exc:
         # 回滚后的短事务只留 fail-closed 凭证；覆盖区间分毫不动。
         record_failure(conn, source=OUTSTOCK_SOURCE, entity=CONSIGN_ORDERS_ENTITY,

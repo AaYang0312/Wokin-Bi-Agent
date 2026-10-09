@@ -39,6 +39,7 @@ import contextlib
 import hashlib
 import io
 import os
+import tempfile
 import unittest
 import zipfile
 from datetime import datetime
@@ -52,6 +53,7 @@ import psycopg
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
+from bi_agent.sycm_import import import_sycm_file
 from tests.dbfixtures import connect_test_db
 from tests.test_sycm_parser import (
     SHOP_HEADER,
@@ -78,10 +80,11 @@ CONTRACT_FIELDS = {"upload_id", "status", "reason_code", "rows_read",
 
 # 031 授予 bi_app 的精确授权集（含主会话批准偏差：任务书清单 + shops SELECT +
 # sync_state SELECT/INSERT/UPDATE，sync_state 由 RLS 限定 manual 来源族）。
+# 033 为两张事实表补 SELECT：ON CONFLICT DO UPDATE 规划期就需要它。
 APP_TABLE_GRANTS = {
     "shops": {"SELECT"},
-    "sycm_shop_daily": {"INSERT", "UPDATE"},
-    "sycm_customer_daily": {"INSERT", "UPDATE"},
+    "sycm_shop_daily": {"INSERT", "SELECT", "UPDATE"},
+    "sycm_customer_daily": {"INSERT", "SELECT", "UPDATE"},
     "manual_uploads": {"INSERT"},
     "manual_upload_events": {"INSERT"},
     "sync_state": {"SELECT", "INSERT", "UPDATE"},
@@ -641,6 +644,11 @@ def _invariant_migration_sql() -> str:
     return path.read_text(encoding="utf-8")
 
 
+def _select_migration_sql() -> str:
+    path = Path(__file__).parents[1] / "sql" / "033_sycm_fact_select_for_upsert.sql"
+    return path.read_text(encoding="utf-8")
+
+
 @unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
 class SycmUploadStatusInvariantMigrationTests(unittest.TestCase):
     """032 配对不变式（M6）：accepted ⇒ reason_code 为空；rejected ⇒ 非空。
@@ -758,6 +766,8 @@ class SycmUploadWritePathMigrationTests(unittest.TestCase):
         self.conn = connect_test_db(self)
         self.conn.execute(_migration_sql())
         self.conn.execute(_migration_sql())  # 幂等重放
+        self.conn.execute(_select_migration_sql())
+        self.conn.execute(_select_migration_sql())
 
     def _upload(self, *, status="accepted", reason_code=None,
                 sha256="a" * 64):
@@ -785,6 +795,90 @@ class SycmUploadWritePathMigrationTests(unittest.TestCase):
                         self.conn.transaction():
                     self._upload(status="rejected", reason_code=bad_code)
 
+    def test_bi_app_shop_upsert_needs_select_then_overwrites(self):
+        """没有 SELECT 时 bi_app 的成功导入必失败；033 之后同窗覆盖成立。
+
+        超级用户代写再数行不能证明写面身份。先收回 SELECT，确认 upsert 被拒，
+        再重放 033，用 bi_app 把同一店铺同一天导入两次。
+        """
+        self.conn.execute(
+            "REVOKE SELECT ON bi.sycm_shop_daily, bi.sycm_customer_daily "
+            "FROM bi_app")
+        self.conn.execute(
+            "INSERT INTO bi.shops(shop_id, platform, display_name, capabilities) "
+            "VALUES ('SY-APP', 'tb', '写面身份淘店', '{}') "
+            "ON CONFLICT (shop_id) DO UPDATE SET "
+            "platform = EXCLUDED.platform, display_name = EXCLUDED.display_name, "
+            "capabilities = '{}'")
+        self.conn.execute("SET LOCAL ROLE bi_app")
+        privileges = {
+            privilege: self.conn.execute(
+                "SELECT has_table_privilege(current_user, %s, %s)",
+                ("bi.sycm_shop_daily", privilege)).fetchone()[0]
+            for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE")}
+        self.conn.execute("RESET ROLE")
+        self.assertEqual(privileges, {
+            "SELECT": False, "INSERT": True, "UPDATE": True, "DELETE": False})
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+
+        def write_shop_file(name: str, paid: str) -> Path:
+            rows = shop_rows(1, shop="写面身份淘店")
+            rows[1][5] = paid
+            path = root / name
+            path.write_bytes(build_xlsx(rows))
+            return path
+
+        first_path = write_shop_file(
+            "淘店-写面身份淘店-店铺维度_20261001_aaaaaaaa.xlsx", "4,693.78")
+        with self.assertRaises(psycopg.errors.InsufficientPrivilege), \
+                self.conn.transaction():
+            self.conn.execute("SET LOCAL ROLE bi_app")
+            import_sycm_file(self.conn, first_path, subject_id="local-development")
+
+        self.conn.execute(_select_migration_sql())
+
+        def import_as_app(path: Path):
+            self.conn.execute("SET LOCAL ROLE bi_app")
+            try:
+                return import_sycm_file(
+                    self.conn, path, subject_id="local-development")
+            finally:
+                self.conn.execute("RESET ROLE")
+
+        first = import_as_app(first_path)
+        second_path = write_shop_file(
+            "淘店-写面身份淘店-店铺维度_20261002_bbbbbbbb.xlsx", "1,000.00")
+        second = import_as_app(second_path)
+        self.assertEqual(first.status, "accepted")
+        self.assertEqual(second.status, "accepted")
+        self.assertEqual(second.rows_written, 1)
+        stored = self.conn.execute(
+            "SELECT count(*), max(paid_amount_sycm) FROM bi.sycm_shop_daily "
+            "WHERE shop_id = 'SY-APP'").fetchone()
+        self.assertEqual(stored[0], 1)
+        self.assertEqual(stored[1], Decimal("1000.00"))
+        self.conn.execute("SET LOCAL ROLE bi_app")
+        try:
+            self.conn.execute(
+                "INSERT INTO bi.sycm_customer_daily(shop_id, stat_date, batch_id) "
+                "VALUES ('SY-APP', DATE '2026-09-30', 'batch-a') "
+                "ON CONFLICT (shop_id, stat_date) DO UPDATE SET "
+                "batch_id = EXCLUDED.batch_id")
+            self.conn.execute(
+                "INSERT INTO bi.sycm_customer_daily(shop_id, stat_date, batch_id) "
+                "VALUES ('SY-APP', DATE '2026-09-30', 'batch-b') "
+                "ON CONFLICT (shop_id, stat_date) DO UPDATE SET "
+                "batch_id = EXCLUDED.batch_id")
+        finally:
+            self.conn.execute("RESET ROLE")
+        customer = self.conn.execute(
+            "SELECT count(*), max(batch_id) FROM bi.sycm_customer_daily "
+            "WHERE shop_id = 'SY-APP'").fetchone()
+        self.assertEqual(customer, (1, "batch-b"))
+
     def test_grant_set_is_exactly_the_approved_matrix(self):
         """role_table_grants / role_column_grants 断言授权集精确（含批准偏差）。
 
@@ -792,7 +886,15 @@ class SycmUploadWritePathMigrationTests(unittest.TestCase):
         列级：role_column_grants 会把表级授权展开成逐列行，所以对写面六表
         断言"每列可见的权限 = 表级授权 ∪ (shops.capabilities 的列级 UPDATE)"
         ——多出任何一列/一种权限都算夹带。
+
+        先收回事实表 SELECT 再重放 033：本机若已有会话内手工 GRANT，
+        不能把它当成迁移已经交付。
         """
+        self.conn.execute(
+            "REVOKE SELECT ON bi.sycm_shop_daily, bi.sycm_customer_daily "
+            "FROM bi_app")
+        self.conn.execute(_select_migration_sql())
+        self.conn.execute(_select_migration_sql())
         grants: dict[str, set[str]] = {}
         for table, privilege in self.conn.execute(
                 "SELECT table_name, privilege_type FROM information_schema."

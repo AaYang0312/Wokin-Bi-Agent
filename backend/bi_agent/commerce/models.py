@@ -22,7 +22,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from bi_agent.catalog import REF_RE
+from bi_agent.catalog import PLATFORM_LABELS, REF_RE
 from bi_agent.metrics import MAX_SPAN_DAYS, ToolResult
 from bi_agent.sources import registration
 
@@ -49,15 +49,22 @@ _POLICY_REF_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}/[0-9][0-9._-]{0,15}$")
 def normalize_platform(value: object) -> str:
     """平台码规范化 + 未登记平台 fail closed。
 
-    只有 `sources` 注册表认识的平台才是平台：不在表里的写法（1688、淘工厂、
-    任何中文别名）一律拒绝，不猜名称也不猜能力（spec §3「未知平台不能猜测名称或能力」）。
+    已登记平台码原样收下（大小写不敏感）。`PLATFORM_LABELS` 里的中文名只做
+    精确反查（「抖音」→ ``fxg``），且反查结果必须仍在 `sources` 注册表里。
+    未登记的码、不在标签表里的中文、以及标签指向未注册平台的名字一律拒绝，
+    不猜别名、不猜能力（spec §3「未知平台不能猜测名称或能力」）。
     """
-    code = str(value or "").strip().lower()
+    raw = str(value or "").strip()
+    code = raw.lower()
     if not code:
         raise ValueError("platform_empty")
-    if registration(code) is None:
-        raise ValueError("platform_unregistered")
-    return code
+    if registration(code) is not None:
+        return code
+    matches = [platform for platform, label in PLATFORM_LABELS.items()
+               if label == raw]
+    if len(matches) == 1 and registration(matches[0]) is not None:
+        return matches[0]
+    raise ValueError("platform_unregistered")
 
 
 class ProductSelector(BaseModel):

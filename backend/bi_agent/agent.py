@@ -519,6 +519,9 @@ def _tool_schemas() -> list[dict[str, object]]:
             "description": "按平台或按店铺比较经营指标：group_by=platform 看跨平台，"
                            "group_by=shop 必须先在 scope.platforms 里选定恰好一个平台"
                            "（下钻就发这一句，不本身相信上一轮结果）；"
+                           "platforms 填已登记平台码或与之精确对应的中文名"
+                           "（fxg/抖音、tb/淘宝、tm/天猫、jd/京东、kuaishou/快手、"
+                           "wxsph/视频号），未登记写法会被拒绝，不要自造别名；"
                            "合计与排名只覆盖同口径且完整的分组，缺数分组只说原因不当 0",
             "parameters": comparison_request_schema()}},
         {"type": "function", "function": {
