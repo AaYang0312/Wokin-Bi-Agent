@@ -1,5 +1,5 @@
 import type { Artifact, DisplayEntity, DrilldownIntent } from '../types'
-import { caliberLabel } from '../types'
+import { caliberLabel, coverageStatusLabel, refusedReasonLabel } from '../types'
 import { AnalysisArtifact } from './AnalysisArtifact'
 import { ChartArtifact } from './ChartArtifact'
 import { parsePartialAnswer, parseRefused } from '../partialAnswer'
@@ -596,7 +596,10 @@ export function ArtifactView({
         {rangeStart && rangeEnd && <span>期间：{rangeStart} 至 {rangeEnd}</span>}
         {shopRefs.length > 0 && <span>范围：{shopRefs.map((ref) => cellText(ref, entities)).join('、')}</span>}
         {asOf && <span><ClockIcon size={13} />数据截止：{asOf}</span>}
-        {coverage !== undefined && <span><GaugeIcon size={13} />覆盖：{text(coverage)}</span>}
+        {coverage !== undefined && (
+          <span data-coverage-status={typeof coverage === 'string' ? coverage : undefined}>
+            <GaugeIcon size={13} />覆盖：{coverageStatusLabel(coverage)}</span>
+        )}
       </div>
       {partialAnswer && (
         <div data-partial-answer="true">
@@ -618,7 +621,10 @@ export function ArtifactView({
       {refused && (
         <ul data-refused="true">
           {refused.map((item) => (
-            <li key={item.metric}>{item.metric}：{item.reason}</li>
+            // 裸码留在 data 属性里供追查；可见文本用词表中文，未收录原样输出。
+            <li key={item.metric} data-refusal-reason={item.reason}>
+              {item.metric}：{refusedReasonLabel(item.reason)}
+            </li>
           ))}
         </ul>
       )}

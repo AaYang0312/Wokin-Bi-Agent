@@ -65,7 +65,8 @@ describe('partial answer payload mirror', () => {
         refused: [{ metric: 'ad_spend', reason: 'capability_unavailable' }],
       }} />)
     expect(html).toContain('data-refused="true"')
-    expect(html).toContain('ad_spend：capability_unavailable')
+    expect(html).toContain('ad_spend：指标能力未开通')
+    expect(html).toContain('data-refusal-reason="capability_unavailable"')
     const rejected = renderToStaticMarkup(
       <ArtifactView artifact={{
         ...artifact(block()),
@@ -73,5 +74,28 @@ describe('partial answer payload mirror', () => {
       }} />)
     expect(rejected).toContain('未通过展示侧校验')
     expect(rejected).not.toContain('90.00')
+  })
+
+  it('labels every refused reason code in Chinese, never as raw text', () => {
+    const html = renderToStaticMarkup(
+      <ArtifactView artifact={{
+        ...artifact(undefined),
+        partial_answer: undefined,
+        refused: [
+          { metric: 'ad_spend', reason: 'source_not_onboarded' },
+          { metric: 'roas', reason: 'coverage_incomplete' },
+          { metric: 'visitors', reason: 'basis_incompatible' },
+          { metric: 'cart_count', reason: 'data_as_of_unknown' },
+        ],
+      }} />)
+    expect(html).toContain('ad_spend：来源未接入')
+    expect(html).toContain('roas：覆盖不完整')
+    expect(html).toContain('visitors：口径不兼容')
+    expect(html).toContain('cart_count：数据截止未知')
+    // 裸码只允许出现在 data 属性里供追查，不允许作为可见文本。
+    expect(html).not.toContain('：source_not_onboarded')
+    expect(html).not.toContain('：coverage_incomplete')
+    expect(html).not.toContain('：basis_incompatible')
+    expect(html).not.toContain('：data_as_of_unknown')
   })
 })

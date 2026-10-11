@@ -76,6 +76,23 @@ describe('ArtifactView 名称投影', () => {
   it('lists the queried shop scope in the meta line', () => {
     expect(html).toContain('范围：元发钉枪(抖音)')
   })
+
+  it('labels the coverage status in Chinese, keeping the code on a data attribute', () => {
+    expect(html).toContain('覆盖：完整')
+    expect(html).toContain('data-coverage-status="complete"')
+    expect(html).not.toContain('覆盖：complete')
+    const missing = renderToStaticMarkup(<ArtifactView artifact={{
+      ...artifact,
+      coverage: { status: 'missing', start: null, end: null, gaps: [] },
+    }} />)
+    expect(missing).toContain('覆盖：缺数')
+    expect(missing).not.toContain('覆盖：missing')
+    const partial = renderToStaticMarkup(<ArtifactView artifact={{
+      ...artifact,
+      coverage: { status: 'partial', start: '2026-09-01', end: '2026-09-08', gaps: [] },
+    }} />)
+    expect(partial).toContain('覆盖：部分')
+  })
 })
 
 describe('名称解析纯函数', () => {

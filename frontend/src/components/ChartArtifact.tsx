@@ -1,5 +1,5 @@
 import type { Artifact, DrilldownIntent } from '../types'
-import { caliberLabel } from '../types'
+import { caliberLabel, coverageStatusLabel } from '../types'
 import { artifactEntities, cellText, isRef, platformLabel } from './ArtifactView'
 
 /**
@@ -453,7 +453,9 @@ export function ChartArtifact({
       <div className="artifact-meta">
         <span>分组：{x}</span>
         <span>系列：{Array.isArray(spec.series) ? spec.series.join('、') : '—'}</span>
-        <span>覆盖：{String(spec.coverage_status ?? '未知')}
+        <span data-coverage-status={typeof spec.coverage_status === 'string'
+          ? spec.coverage_status : undefined}>
+          覆盖：{coverageStatusLabel(spec.coverage_status)}
           {gaps.length > 0 && `（${gaps.join('；')}）`}</span>
         <span>引用数据集：{String(spec.dataset_type ?? '—')}</span>
       </div>

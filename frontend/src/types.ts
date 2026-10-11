@@ -17,6 +17,35 @@ export function caliberLabel(value: unknown): string | null {
     : null
 }
 
+/**
+ * 覆盖状态（后端 `Coverage` 的闭合三值）与拒答原因码的中文对照。
+ * 词表与 `partialAnswer.ts` 的 `REFUSED_REASONS`、后端公开原因同源；
+ * 不在表里的码**原样输出**——猜一个近义词就是把"没判过"说成已知结论。
+ */
+export const COVERAGE_STATUS_LABELS: Record<string, string> = {
+  complete: '完整',
+  partial: '部分',
+  missing: '缺数',
+}
+
+export function coverageStatusLabel(value: unknown): string {
+  if (typeof value !== 'string') return '未知'
+  return COVERAGE_STATUS_LABELS[value] ?? value
+}
+
+export const REFUSED_REASON_LABELS: Record<string, string> = {
+  capability_unavailable: '指标能力未开通',
+  source_not_onboarded: '来源未接入',
+  coverage_incomplete: '覆盖不完整',
+  basis_incompatible: '口径不兼容',
+  data_as_of_unknown: '数据截止未知',
+}
+
+export function refusedReasonLabel(value: unknown): string {
+  if (typeof value !== 'string') return String(value)
+  return REFUSED_REASON_LABELS[value] ?? value
+}
+
 export type ChatSummary = {
   id: string
   title: string

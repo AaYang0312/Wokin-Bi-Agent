@@ -89,6 +89,17 @@ function point(key: string, label: string, text: string, num: number | null) {
 }
 
 describe('图表卡片：只渲染已落库数据集', () => {
+  it('覆盖徽标用中文，裸码只留在 data 属性里', () => {
+    const markup = chart()
+    expect(markup).toContain('覆盖：完整')
+    expect(markup).not.toContain('覆盖：complete')
+    const partial = chart({ ...barSpec, coverage_status: 'partial' })
+    expect(partial).toContain('覆盖：部分')
+    expect(partial).not.toContain('覆盖：partial')
+    const missing = chart({ ...barSpec, coverage_status: 'missing' })
+    expect(missing).toContain('覆盖：缺数')
+  })
+
   it('一根轴只放一个指标，另一张图用它自己的单位与口径', () => {
     const markup = chart()
     expect(markup).toContain('sales_amount（CNY）｜sales_amount|platform_payment/v1|pay_time')
