@@ -89,6 +89,7 @@ from .metrics import (
     COMPARISON_TREND_SHOP_ROWS,
     DOCUMENT_ROWS,
     ERP_OUTSTOCK_CALIBER_TEXT,
+    COMMERCE_PUBLIC_LIMITATIONS,
     ITEM_PRICE_CATALOG_CALIBER_TEXT,
     METRIC_FACET,
     PAYMENT_CAPABILITY_COLUMNS,
@@ -300,6 +301,8 @@ class CommerceRuntime:
     payments: Mapping[str, repository.PaymentFacts] = field(default_factory=dict)
     # S4 档案价：每家店最新一份完整快照的参考价行（新鲜度判定延到 compute）。
     item_prices: Mapping[str, repository.ItemPriceSnapshot] = field(default_factory=dict)
+    # 成交 SKU 的档案价子集仍超过行数上限：参考价记缺失，销售查询继续。
+    item_price_lookup_capped: bool = False
     rows: list[dict[str, Any]] = field(default_factory=list)
     totals: list[dict[str, Any]] = field(default_factory=list)
     trend_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -469,6 +472,7 @@ _COMMERCE_CODE_BY_FRAGMENT = (
     ("ERP商品档案价", "item_price_catalog_caliber"),
     ("没有7天内的完整ERP档案价快照", "item_price_reference_missing"),
     ("的ERP档案价快照没有覆盖该商品成交的SKU", "item_price_reference_missing"),
+    ("档案价行数超过读取上限", "item_price_reference_missing"),
     ("成交跨多个SKU", "item_price_multi_sku"),
     ("不接入ERP档案价", "item_price_pdd_excluded"),
     ("ERP档案为已停用状态", "item_price_disabled"),
@@ -1509,11 +1513,18 @@ def execute_aggregates(runtime: CommerceRuntime) -> None:
             deadline=context.deadline)
         _apply_closed_refunded_exclusion(runtime)
     if plan.product_facet:
-        # S4：档案价参考事实与商品面同批读入（一次集合查询，预算护栏同一套）。
-        # 新鲜度在这里不判：compute 节点用 context.now 判定，策略只写一处。
-        runtime.item_prices = repository.load_item_prices(
-            context.conn, shop_ids=shops, erp_product_id=str(runtime.erp_product_id),
-            deadline=context.deadline)
+        # S4：档案价只取本窗口成交 SKU（外加商品级行）。目录里没卖出去的规格
+        # 不参与归类；用整份快照的行数去顶 500 上限，会把销售数字错拒成
+        # result_too_large，并让人去缩一个对这份快照无效的日期。
+        sold_skus = sorted({sku for line in runtime.lines for sku in line.sku_ids if sku})
+        try:
+            runtime.item_prices = repository.load_item_prices(
+                context.conn, shop_ids=shops,
+                erp_product_id=str(runtime.erp_product_id),
+                deadline=context.deadline, sku_ids=sold_skus)
+        except _RowsTruncated:
+            runtime.item_prices = {}
+            runtime.item_price_lookup_capped = True
     _attribution_disclosures(runtime)
 
 
@@ -1680,6 +1691,10 @@ def _item_price_reference(
             entry["reason"] = "excluded"
             reference[shop] = entry
             continue
+        if runtime.item_price_lookup_capped:
+            entry["reason"] = "lookup_capped"
+            reference[shop] = entry
+            continue
         snapshot = runtime.item_prices.get(shop)
         if snapshot is None or not item_price_fresh(
                 snapshot.captured_at, runtime.context.now):
@@ -1750,6 +1765,8 @@ def _item_price_disclosures(
                       "为data_missing："),
         "excluded": ("的平台不接入ERP档案价（拼多多永久排除），"
                      "参考价与参考毛利为data_missing："),
+        "lookup_capped": ("成交SKU的ERP档案价行数超过读取上限，"
+                          "参考价与参考毛利为data_missing："),
     }
     for reason, shops in sorted(groups.items()):
         text = reason_texts.get(reason)
@@ -3095,9 +3112,14 @@ def _execute(context: DomainContext, *, report_kind: str,
 def _run_nodes(runtime: CommerceRuntime, store: Any, *,
                arguments_error: str | None) -> CommerceExecution:
     if arguments_error is not None or runtime.request is None:
+        # 已知门禁句原样进模型载荷。其它校验失败仍只说“参数无效”：
+        # pydantic 原文可能带字段路径，不能当自由文本发出去。
+        known = (arguments_error
+                 if arguments_error in COMMERCE_PUBLIC_LIMITATIONS else None)
         _stop(runtime, kind="needs_input", code="invalid_parameters",
               problems=["invalid_parameters"], stage=CommerceNode.RESOLVE_SCOPE,
-              message="查询参数无效，请调整后重试。")
+              message="查询参数无效，请调整后重试。",
+              limitations=[known] if known else [])
         runtime.state = runtime.state.model_copy(update={"status": RunStatus.NEEDS_INPUT})
         _persist_transition(runtime, store, _event_payload(runtime))
         _finish(runtime, store)

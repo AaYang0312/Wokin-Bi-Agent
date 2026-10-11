@@ -1138,6 +1138,59 @@ class ItemPriceReferenceTests(unittest.TestCase):
         assert len(matches) == 1, (shop_key, payload["data"])
         return matches[0]
 
+    def test_unsold_catalog_rows_above_the_answer_cap_do_not_block_sales(self):
+        """目录里没卖出去的 SKU 再多，也不能把销售数字拒成 result_too_large。
+
+        档案价快照没有日期。用整份目录去顶 500 行上限时，缩小日期不会少一行，
+        成交 SKU 的参考价却仍然该能取到。
+        """
+        from bi_agent.metrics import MAX_ROWS
+
+        self._shop("1")
+        self._archive("P1")
+        self._cover("1", WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        prices = {f"decoy-{index}": ("1", "1") for index in range(MAX_ROWS + 1)}
+        prices["P1-sku"] = ("90", "40")
+        self._snapshot("1", captured_at=NOW, prices=prices)
+
+        result, payload = self._run()
+        row = self._row_for(payload, "1")
+        self.assertEqual(row["sales_amount"], "100")
+        self.assertEqual(row["reference_price"], "90",
+                         "成交 SKU 的档案价必须留下，未成交目录行不该挤掉它")
+        rendered = json.dumps(result.model_payload, ensure_ascii=False)
+        self.assertNotIn("result_too_large", rendered)
+        self.assertNotIn("缩小日期", rendered)
+
+    def test_item_price_cap_withholds_reference_without_rejecting_sales(self):
+        """成交 SKU 的档案价子集仍超上限时，只让参考价缺失，销售数字照常发。"""
+        from unittest.mock import patch
+
+        from bi_agent.commerce import repository
+        from bi_agent.metrics import _RowsTruncated
+
+        self._shop("1")
+        self._archive("P1")
+        self._cover("1", WINDOW_START, WINDOW_END)
+        self._sale("1", "E1", product="P1", day=date(2026, 9, 2),
+                   quantity="1", amount="100")
+        self._snapshot("1", captured_at=NOW, prices={"P1-sku": ("90", "40")})
+
+        def _overflow(*_args, **_kwargs):
+            raise _RowsTruncated
+
+        with patch.object(repository, "load_item_prices", _overflow):
+            result, payload = self._run()
+        row = self._row_for(payload, "1")
+        self.assertEqual(row["sales_amount"], "100")
+        self.assertIsNone(row["reference_price"])
+        limitations = result.model_payload.get("limitations") or []
+        self.assertTrue(any("档案价行数超过读取上限" in text for text in limitations),
+                        limitations)
+        self.assertFalse(any("缩小日期" in text for text in limitations), limitations)
+
     def test_reference_price_sits_beside_the_average_price_with_margin(self):
         self._shop("1")
         self._archive("P1")
@@ -1359,6 +1412,51 @@ class ItemPriceReferenceTests(unittest.TestCase):
 
 class CommerceContractTests(unittest.TestCase):
     """不需要数据库的契约用例：白名单、词表与算术自锁。"""
+
+    def test_profit_reference_needs_input_names_profit_basis(self):
+        """毛利参考缺 profit_basis 时，模型看见的是这个字段，不是平台名没认出来。"""
+        from bi_agent.commerce.tool import execute_commerce_tool
+        from bi_agent.llm import ToolCall
+
+        store = MemoryQueryRunStore(forbidden_values={"sentinel"})
+        context = DomainContext(
+            subject_id="hint", allowed_shop_ids=frozenset(), shop_refs={},
+            conn=None, store=store, chat_id=UUID(int=11),
+            user_message_id=UUID(int=12), root_request_id=UUID(int=13),
+            now=NOW, deadline=time.monotonic() + 30)
+        execution = execute_commerce_tool(ToolCall(
+            id="call_profit", name="compare_performance", arguments={
+                "start": "2026-09-05", "end": "2026-09-12",
+                "group_by": "platform",
+                "metrics": ["sold_quantity", "sales_amount",
+                            "erp_gross_profit_reference"],
+                "scope": {"mode": "selected", "platforms": ["抖音", "淘宝"]},
+            }), context)
+        payload = execution.domain_result.model_payload
+        self.assertEqual(payload["status"], "needs_input")
+        limitations = payload.get("limitations") or []
+        self.assertTrue(any("profit_basis=existing_fields" in text
+                            for text in limitations), payload)
+        joined = " ".join(limitations)
+        self.assertNotIn("platform_unregistered", joined)
+        self.assertNotIn("不在已登记名单", joined)
+
+        other = DomainContext(
+            subject_id="hint", allowed_shop_ids=frozenset(), shop_refs={},
+            conn=None, store=store, chat_id=UUID(int=11),
+            user_message_id=UUID(int=22), root_request_id=UUID(int=23),
+            now=NOW, deadline=time.monotonic() + 30, attempt_no=1)
+        unknown = execute_commerce_tool(ToolCall(
+            id="call_platform", name="compare_performance", arguments={
+                "start": "2026-09-05", "end": "2026-09-12",
+                "group_by": "platform",
+                "metrics": ["sold_quantity"],
+                "scope": {"mode": "selected", "platforms": ["抖店"]},
+            }), other)
+        platform_text = " ".join(unknown.domain_result.model_payload.get(
+            "limitations") or [])
+        self.assertIn("不在已登记名单", platform_text)
+        self.assertNotIn("profit_basis", platform_text)
 
     def test_node_chain_matches_the_domain_registry_exactly(self):
         self.assertEqual({node.value for node in CommerceNode}, set(COMMERCE_NODES))

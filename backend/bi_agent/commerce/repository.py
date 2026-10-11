@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Sequence
 
 from bi_agent.metrics import (  # noqa: F401  (预算与截断护栏只有一份实现)
     MAX_ROWS, _BudgetExhausted, _RowsTruncated, _SHOPS_SQL, _fetch_capped,
@@ -62,9 +62,10 @@ ORDER BY shop_id
 LIMIT %s
 """
 
-# S4 档案价参考事实：每家店**最新一份完整快照**里该商品的全部档案价行
-# （商品级行 sys_sku_id='' + SKU 级行）。新鲜度（快照是否在时效内）由查询侧
-# 按 captured_at 判定：SQL 只回答“最新一份是什么”，不在这里偷换时效策略。
+# S4 档案价参考事实：每家店**最新一份完整快照**里，该商品的商品级行
+# （sys_sku_id=''）加上调用方点名的成交 SKU。未成交的目录 SKU 不参与参考价
+# 归类，也不能因为目录行数把销售查询顶成 result_too_large。新鲜度仍由查询侧
+# 按 captured_at 判定：SQL 只回答“最新一份里这些行是什么”。
 _ITEM_PRICE_LATEST_SQL = """
 WITH latest AS (
   SELECT DISTINCT ON (s.shop_id)
@@ -80,6 +81,7 @@ FROM latest l
 JOIN reporting.v_item_price_snapshot_items i
   ON i.shop_id = l.shop_id AND i.snapshot_id = l.snapshot_id
 WHERE i.sys_item_id = %s
+  AND (i.sys_sku_id = '' OR i.sys_sku_id = ANY(%s))
 ORDER BY i.shop_id, i.sys_sku_id
 LIMIT %s
 """
@@ -363,20 +365,25 @@ def load_payment_facts(conn, *, shop_ids: list[str], start_ts: Any, end_ts: Any,
 
 
 def load_item_prices(conn, *, shop_ids: list[str], erp_product_id: str,
-                     deadline: float) -> dict[str, ItemPriceSnapshot]:
-    """取获准店铺各自**最新一份完整**档案价快照中该商品的全部档案价行。
+                     deadline: float,
+                     sku_ids: Sequence[str] = ()) -> dict[str, ItemPriceSnapshot]:
+    """取获准店铺各自**最新一份完整**档案价快照中该商品的参考价行。
 
     一次集合查询：按店取最新 scan_complete 快照（DISTINCT ON + captured_at
-    降序），再取其中该商品的商品级与 SKU 级行。快照过不过期由查询侧用
-    context.now 判定，这里不做时效决策；拼多多店铺永远没有快照行，天然
-    data_missing。命中 MAX_ROWS 一律抛 `_RowsTruncated`，截断的参考面比
-    缺失更危险。
+    降序），再取商品级行，以及 `sku_ids` 里实际成交的 SKU。未成交目录行不读。
+    快照过不过期由查询侧用 context.now 判定，这里不做时效决策；拼多多店铺
+    永远没有快照行，天然 data_missing。成交 SKU 子集仍命中 MAX_ROWS 时抛
+    `_RowsTruncated`：截断的参考面比缺失更危险，调用方应改记参考价缺失，
+    而不是拿这张无日期快照去拒绝销售数字。
     """
     if not shop_ids or not erp_product_id:
         return {}
     if not _set_query_budget(conn, deadline):
         raise _BudgetExhausted
-    raw = _fetch_capped(conn, _ITEM_PRICE_LATEST_SQL, (shop_ids, erp_product_id))
+    # 空列表推断不出数组类型；没有成交 SKU 时用空串占位，SQL 仍会留下商品级行。
+    wanted = sorted({str(sku) for sku in sku_ids if str(sku or "").strip()}) or [""]
+    raw = _fetch_capped(conn, _ITEM_PRICE_LATEST_SQL,
+                        (shop_ids, erp_product_id, wanted))
     snapshots: dict[str, ItemPriceSnapshot] = {}
     for row in raw:
         shop_id = str(row[0])

@@ -512,7 +512,9 @@ def _tool_schemas() -> list[dict[str, object]]:
             "name": "analyze_product_performance",
             "description": "查一个指定商品在获准店铺范围内的跨店经营报告与七日趋势；"
                            "product 用 ent- 商品引用或商品文字（歧义会返回 needs_input 与候选，"
-                           "不要自己选）；只能参考的毛利未扣售后/平台费/运费/广告费",
+                           "不要自己选）；只能参考的毛利未扣售后/平台费/运费/广告费；"
+                           "名称以 _reference 结尾的毛利指标必须先由用户确认口径，并显式设置 "
+                           "profit_basis=existing_fields，缺这个字段会 needs_input，不要改平台名重试",
             "parameters": commerce_request_schema()}},
         {"type": "function", "function": {
             "name": "compare_performance",
@@ -522,7 +524,9 @@ def _tool_schemas() -> list[dict[str, object]]:
                            "platforms 填已登记平台码或与之精确对应的中文名"
                            "（fxg/抖音、tb/淘宝、tm/天猫、jd/京东、kuaishou/快手、"
                            "wxsph/视频号），未登记写法会被拒绝，不要自造别名；"
-                           "合计与排名只覆盖同口径且完整的分组，缺数分组只说原因不当 0",
+                           "合计与排名只覆盖同口径且完整的分组，缺数分组只说原因不当 0；"
+                           "名称以 _reference 结尾的毛利指标必须先由用户确认口径，并显式设置 "
+                           "profit_basis=existing_fields，缺这个字段会 needs_input，不要改平台名重试",
             "parameters": comparison_request_schema()}},
         {"type": "function", "function": {
             "name": "audit_listing_prices",

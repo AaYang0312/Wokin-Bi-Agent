@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, Any, Mapping
 
 from bi_agent.business_query.tool import safe_result_body
 from bi_agent.catalog import Catalog
-from bi_agent.commerce.metrics import COMMERCE_METRIC_UNITS
+from bi_agent.commerce.metrics import (
+    COMMERCE_METRIC_UNITS, PLATFORM_UNREGISTERED_TEXT, PROFIT_BASIS_REQUIRED_TEXT)
 from bi_agent.runtime.models import (
     DomainResult, validate_artifact_payload, validate_model_payload)
 
@@ -162,14 +163,23 @@ def execute_commerce_tool(call: "ToolCall", context: DomainContext) -> CommerceE
     if error is None and arguments is not None:
         try:
             request = _commerce_model_for(call.name).model_validate(arguments)
-        except Exception as exc:  # noqa: BLE001 - 只取首行，不把校验细节发给模型
-            error = str(exc).split("\n")[0]
+        except Exception as exc:  # noqa: BLE001 - 只保留已登记的门禁句，不把校验细节发给模型
+            error = _public_argument_hint(str(exc)) or str(exc).split("\n")[0]
     elif error is None:
         error = "arguments不是对象"
     return run_commerce_graph(report_kind=_report_kind_for(call.name),
                               request=request, context=context,
                               tool_call_id=call.id, arguments=arguments,
                               arguments_error=error)
+
+
+def _public_argument_hint(error: str) -> str | None:
+    """把已知门禁换成公开披露句。未登记的校验错误仍只留首行，不进模型载荷。"""
+    if "profit_basis=existing_fields" in error:
+        return PROFIT_BASIS_REQUIRED_TEXT
+    if "platform_unregistered" in error:
+        return PLATFORM_UNREGISTERED_TEXT
+    return None
 
 
 def comparison_request_schema() -> dict[str, Any]:

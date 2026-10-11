@@ -318,6 +318,13 @@ ITEM_PRICE_CATALOG_CALIBER_TEXT = (
     "档案参考价与参考毛利按ERP商品档案价（priceOutput，kuaimai_item_api）"
     "计算，是档案目录价，不是渠道促销价或实际成交价")
 
+# 毛利参考指标的入口门禁：needs_input 必须把缺的字段说出来，模型才不会改去猜平台名。
+PROFIT_BASIS_REQUIRED_TEXT = (
+    "请求了毛利参考指标，需显式设置 profit_basis=existing_fields；"
+    "须先由用户确认按已有表项计算，确认前不要更换平台名重试")
+PLATFORM_UNREGISTERED_TEXT = (
+    "平台名不在已登记名单里，请改用已登记平台码或与之精确对应的中文名")
+
 COMMERCE_PUBLIC_LIMITATIONS = frozenset({
     "商品毛利参考未扣售后、平台费、运费与广告费，不是净利润",
     "商品毛利参考不含套件/组合/加工父项：这些行的成本语义未核验",
@@ -340,6 +347,8 @@ COMMERCE_PUBLIC_LIMITATIONS = frozenset({
     PAYMENT_CALIBER_TEXT,
     # S4 档案参考价：永久口径标签（档案目录价 ≠ 渠道实价）。
     ITEM_PRICE_CATALOG_CALIBER_TEXT,
+    PROFIT_BASIS_REQUIRED_TEXT,
+    PLATFORM_UNREGISTERED_TEXT,
 })
 
 # 参数化披露：家数 / 行数可变，句式固定。金额片段与 `runtime.models._MONEY` 同源。
@@ -392,6 +401,9 @@ COMMERCE_LIMITATION_PATTERNS: tuple[re.Pattern[str], ...] = (
                r"参考价与参考毛利为data_missing：" + _GROUP_KEYS + r"$"),
     re.compile(r"^[0-9]+ 家店铺该商品的ERP档案为已停用状态（activeStatus=0），"
                r"参考价按已停用档案披露：" + _GROUP_KEYS + r"$"),
+    # 成交 SKU 的档案价子集仍超过行数上限：只让参考价缺失，不许据此拒绝销售数字。
+    re.compile(r"^[0-9]+ 家店铺成交SKU的ERP档案价行数超过读取上限，"
+               r"参考价与参考毛利为data_missing：" + _GROUP_KEYS + r"$"),
 )
 
 COMMERCE_LIMITATION_CODES = frozenset({
