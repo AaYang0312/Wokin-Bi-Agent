@@ -27,3 +27,15 @@ deploy/postgres/backup/
 # 本机公网测试拓扑（域名、SSH别名、端口等）
 public_test.local.cmd
 .DS_Store
+
+# 本机隧道客户端、运行日志与本地计划（可能含域名、令牌或会话内容）
+.tools/
+.zcode/
+.cloudflared.*.log
+.streamlit.*.log
+
+# 生意参谋手动导出（店铺、商品、客户经营数据）
+docs/手动导出表格/
+
+# 淘系探测状态（本机探针输出）
+taoxi-probe-status.py
