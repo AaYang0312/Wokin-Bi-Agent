@@ -973,6 +973,8 @@ def _run_questions(questions: list[dict], conn, *, make_model, prefix: str,
             problems.append(f"异常：{type(exc).__name__}: {exc}")
         finally:
             conn.execute("ROLLBACK TO acceptance_question")
+            # 回滚到存点后立即释放，长跑不积累存点栈。
+            conn.execute("RELEASE SAVEPOINT acceptance_question")
         duration = time.monotonic() - started
         failures += 1 if problems else 0
         entry = {"id": question["id"], "status": "pass" if not problems else "fail",
@@ -1002,10 +1004,17 @@ def run_offline() -> int:
         print(json.dumps({"mode": "offline", "result": "skipped",
                           "reason": "未配置BI_TEST_ADMIN_DSN"}))
         return 2
+    from tests.dbfixtures import assert_isolated_test_target
     from tests.test_db import seed_business_case
 
-    # 单事务运行并在结束时回滚，不向共享测试库提交任何数据
+    # 单事务运行并在结束时回滚，不向共享测试库提交任何数据；连接先过
+    # 与 connect_test_db 相同的本机 *_test 身份边界。
     conn = psycopg.connect(os.environ["BI_TEST_ADMIN_DSN"])
+    try:
+        assert_isolated_test_target(conn)
+    except AssertionError:
+        conn.close()
+        raise
     seed_business_case(conn)
     seed_multi_source_case(conn)
     conn.execute(
@@ -1133,9 +1142,15 @@ def run_live() -> int:
     if not os.getenv("BI_TEST_ADMIN_DSN"):
         print(json.dumps({"result": "未实测", "reason": "缺少测试数据库配置"}))
         return 0
+    from tests.dbfixtures import assert_isolated_test_target
     from tests.test_db import seed_business_case
 
     conn = psycopg.connect(os.environ["BI_TEST_ADMIN_DSN"])
+    try:
+        assert_isolated_test_target(conn)
+    except AssertionError:
+        conn.close()
+        raise
     seed_business_case(conn)
     seed_multi_source_case(conn)
     conn.execute(

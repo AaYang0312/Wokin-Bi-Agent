@@ -30,15 +30,28 @@ PRODUCT_DAILY_COLUMNS = PRODUCT_DAILY_BASE_COLUMNS + [
 ]
 
 
+def assert_isolated_test_target(conn: psycopg.Connection) -> None:
+    """连接身份硬边界：只认本机 ``*_test`` 库；不满足立即断言失败。
+
+    ``connect_test_db`` 与 acceptance/评测 runner 的自建连接共用同一份规则，
+    避免两条路径的边界漂移。
+    """
+    if not conn.info.dbname.endswith("_test"):
+        raise AssertionError(
+            f"测试必须连接 *_test 数据库，实际 {conn.info.dbname}")
+    if (conn.info.host or "") not in LOCAL_HOSTS:
+        raise AssertionError(
+            f"测试必须连接本地测试实例，实际 {conn.info.host}")
+
+
 def connect_test_db(case: Any, dsn_env: str = "BI_TEST_ADMIN_DSN") -> psycopg.Connection:
     """连测试库并开启外层回滚事务；不在 *_test 或不在本机就直接失败。"""
     conn = psycopg.connect(os.environ[dsn_env])
-    if not conn.info.dbname.endswith("_test"):
+    try:
+        assert_isolated_test_target(conn)
+    except AssertionError:
         conn.close()
-        case.fail(f"测试必须连接 *_test 数据库，实际 {conn.info.dbname}")
-    if (conn.info.host or "") not in LOCAL_HOSTS:
-        conn.close()
-        case.fail(f"测试必须连接本地测试实例，实际 {conn.info.host}")
+        raise
     transaction = conn.transaction()
     transaction.__enter__()
     # tearDown 先跑，再跑 cleanups；所以回滚登记成 cleanup 时要用逆序保证外层先退出。

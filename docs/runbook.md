@@ -45,6 +45,30 @@ psql -d bi_agent -f backend/sql/027_item_price_snapshots.sql
 
 单实例：全程持有数据库 advisory 锁，重复启动立即失败。
 
+### 评测沙箱实例（2026-10-24 起）
+
+回归与评测的正常路径使用**独立**合成实例，不占用、不重建既有 `bi_agent_test`（它承载过真实导入与同步数据）：
+
+```bash
+# 仓库 backend/ 目录；bootstrap 生成仓库根 .env.evaluation（本地随机密码、空闲端口，默认 55439）、
+# 启动 deploy/evaluation/docker-compose.yml（独立 project name=bi-agent-eval、独立卷、只绑 127.0.0.1、
+# 密码认证）、按序重放全部迁移、给 bi_reader 设密码并写入沙箱标记 bi.evaluation_sandbox。
+uv run --locked python -m tests.evaluation.database --bootstrap
+
+# 日常测试/验收：--env-file 把既有入口指向沙箱（变量名不变：BI_TEST_ADMIN_DSN / BI_TEST_READER_DSN）
+uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .
+uv run --locked --env-file ../.env.evaluation python -m tests.acceptance --offline
+```
+
+边界由 `tests/evaluation/database.py` 强制：数据库名必须恰为 `bi_agent_eval_test`、只连本机地址、
+目标库必须带本轮沙箱标记；不满足在任何种子/迁移 SQL 之前拒绝，且报错不含 DSN 或密码。
+已有沙箱标记的实例拒绝自动重建（`--initialize` 同样）。清理沙箱（数据全为合成）：
+
+```bash
+docker compose -f deploy/evaluation/docker-compose.yml --env-file .env.evaluation down -v
+rm .env.evaluation
+```
+
 ### 平台路由与来源注册表
 
 当前开发基线为 main，旧分支的同步入口统一迁入 backend。淘系“入库完成”与“查询可用”分别验收：[多来源契约](superpowers/specs/2026-09-12-multi-source-metrics-design.md)及[任务5/11](superpowers/plans/2026-09-07-ecommerce-bi-agent.md)。任务 5.1–5.3 已交付：来源注册表与逐指标能力门禁（`backend/bi_agent/sources.py`）、覆盖按 (店铺×来源×实体) 取交集与付款时间口径三态认证、未匹配退款/未认证支付改为可量化披露（`coverage_time_basis_unverified` 等进入词表）。**basis 全链路与版本失效（5.4）仍未完成**；pdd 不得因档案或单据存在被宣称支付可用（2026-09-12 已决定不接入拼多多支付）。

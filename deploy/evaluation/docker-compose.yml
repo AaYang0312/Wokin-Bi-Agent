@@ -1,0 +1,43 @@
+# 评测沙箱 PostgreSQL（计划 2026-10-24 T1）—— 与 deploy/postgres 完全隔离：
+#   独立 project name（bi-agent-eval）、独立卷、只绑 127.0.0.1、密码认证
+#   （不沿用主库 trust 语义）。迁移会改 cluster 级角色，因此必须整实例隔离，
+#   不能在共享实例上只换库名。
+#
+# 建立方式（仓库根目录）：
+#   uv run --project backend python -m tests.evaluation.database --bootstrap
+# bootstrap 会生成 .env.evaluation（本地密码 + 空闲端口，仓库已忽略）、
+# 启动本文件并按序重放 backend/sql 迁移、写入沙箱标记 bi.evaluation_sandbox。
+# 同名已有资源不自动重建。
+#
+# 用完清理（会删除沙箱数据，均为合成数据）：
+#   docker compose -f deploy/evaluation/docker-compose.yml --env-file .env.evaluation down -v
+name: bi-agent-eval
+
+services:
+  postgres:
+    image: postgres:17.6
+    container_name: bi-agent-eval-postgres
+    restart: "no"
+    ports:
+      # 只绑回环地址；端口由 .env.evaluation 的 BI_EVALUATION_PORT 提供，
+      # 默认 55439，被占用时 bootstrap 自动换空闲端口。
+      - "127.0.0.1:${BI_EVALUATION_PORT:-55439}:5432"
+    environment:
+      TZ: Asia/Shanghai
+      POSTGRES_USER: postgres
+      # 密码只经 .env.evaluation 注入，不入库、不进镜像层。
+      POSTGRES_PASSWORD: ${BI_EVALUATION_POSTGRES_PASSWORD:?需要 .env.evaluation 提供 BI_EVALUATION_POSTGRES_PASSWORD}
+      POSTGRES_DB: bi_agent_eval_test
+      PGDATA: /var/lib/postgresql/data/pgdata
+      # 与主库对齐：UTF8 + libc provider + C collate/ctype（::date 与排序语义）。
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C --locale-provider=libc"
+    volumes:
+      - bi_eval_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bi_agent_eval_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+volumes:
+  bi_eval_pg_data:
