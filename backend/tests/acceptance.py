@@ -41,7 +41,6 @@ import json
 import sys
 import time
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -55,6 +54,12 @@ from bi_agent.sources import (AFTERSALE_SOURCE, MANUAL_EXPORT_BASIS,
                               MANUAL_EXPORT_ENTITY, MANUAL_EXPORT_SOURCE,
                               MANUAL_METRIC_CAPABILITIES, OUTSTOCK_SOURCE,
                               TRADE_LIST_SOURCE)
+from tests.evaluation.verification import (
+    param_problems as _param_problems,
+    validate_case_shape,
+    verify_commerce_turn as _verify_commerce_turn,
+    verify_expected,
+)
 from tests.fakeconn import S1_REF
 
 QUESTIONS_PATH = Path(__file__).with_name("questions.jsonl")
@@ -89,13 +94,6 @@ def _reply(text=None, calls=None):
 
 def _call(name: str, arguments: dict, call_id: str = "call_1") -> ToolCall:
     return ToolCall(id=call_id, name=name, arguments=arguments)
-
-
-def _quantize(value) -> Decimal:
-    try:
-        return Decimal(str(value)).quantize(Decimal("0.01"))
-    except (InvalidOperation, ValueError):
-        return Decimal("0")
 
 
 def _load_questions() -> list[dict]:
@@ -508,71 +506,6 @@ def _call_reply(name: str, arguments: dict, call_id: str = "call_1") -> ModelRep
     return _reply(calls=[_call(name, arguments, call_id)])
 
 
-def _normalize_params(request) -> dict:
-    return {
-        "start": request.start.isoformat(),
-        "end": request.end.isoformat(),
-        "shop_ids": sorted(request.shop_ids),
-        "metrics": sorted(request.metrics),
-        "group_by": request.group_by,
-        "compare": request.compare,
-        "top_n": request.top_n,
-        "basis_policy": request.basis_policy,
-    }
-
-
-def _value_problems(expected_values: dict, result: ToolResult) -> list[str]:
-    problems: list[str] = []
-    rows = result.data
-    if not rows:
-        return ["工具结果无数据行"]
-    for key, expected in expected_values.items():
-        if key == "products":
-            got = [(row.get("product_id"), str(row.get(
-                "product_paid_amount" if _is_money(expected[0][1]) else "quantity")))
-                for row in rows if row.get("product_id")]
-            got_values = {pid: _quantize(value) for pid, value in got}
-            for pid, value in expected:
-                if got_values.get(pid) != _quantize(value):
-                    problems.append(f"商品{pid}期望{value}，实际{got_values.get(pid)}")
-            continue
-        if isinstance(expected, list):
-            got = [str(row.get(key)) for row in rows]
-            got_q = [_quantize(v) for v in got]
-            exp_q = [_quantize(v) for v in expected]
-            if got_q != exp_q:
-                problems.append(f"{key}期望{expected}，实际{got}")
-            continue
-        actual = rows[0].get(key)
-        if actual is None or _quantize(actual) != _quantize(expected):
-            problems.append(f"{key}期望{expected}，实际{actual}")
-    return problems
-
-
-def _is_money(value: str) -> bool:
-    return value not in {"7", "4"}
-
-
-def _param_problems(expected_params: dict, request) -> list[str]:
-    actual = _normalize_params(request)
-    problems = []
-    for key, value in expected_params.items():
-        actual_value = actual.get(key)
-        if key in ("shop_ids", "metrics"):
-            if sorted(value if isinstance(value, list) else [value]) != sorted(
-                    actual_value if isinstance(actual_value, list) else [actual_value]):
-                problems.append(f"{key}期望{value}，实际{actual_value}")
-        elif actual_value != value:
-            problems.append(f"{key}期望{value}，实际{actual_value}")
-    return problems
-
-
-def _limitation_codes(result: ToolResult) -> list[str]:
-    from bi_agent.business_query.nodes import _limitation_codes as codes
-
-    return codes(list(result.limitations))
-
-
 def _basis_keys(result: ToolResult) -> set[tuple[str, str, str, str]]:
     return {(str(item["shop_id"]), str(item["metric"]), str(item["basis"]),
              str(item["time_basis"])) for item in result.basis}
@@ -588,221 +521,29 @@ def _coverage_shape(result: ToolResult) -> dict:
             if coverage.suggested_window else None}
 
 
-def _structured_problems(expected: dict, result: ToolResult) -> list[str]:
-    """结构化期望：口径、原因码、诊断与覆盖都要能机器核对。
+def _observation(result: ToolResult | None, *, text: str | None,
+                 calls: list | None = None) -> dict:
+    """把一轮实际执行采集成判定器的白名单观测投影。
 
-    设计 §6 与计划 Task 11 都要求"不能只用最终自然语言包含某个词判定通过"。
+    判定语义（含数值精度与非法值拒绝）在 tests.evaluation.verification，
+    本函数只做投影，不做判断。
     """
-    problems: list[str] = []
-    codes = _limitation_codes(result)
-    for code in expected.get("codes", []):
-        if code not in codes:
-            problems.append(f"原因码期望{code}，实际{codes}")
-    for code in expected.get("not_codes", []):
-        if code in codes:
-            problems.append(f"原因码不应出现{code}，实际{codes}")
-    for entry in expected.get("basis", []):
-        shop_id, metric, basis, time_basis = entry
-        if (shop_id, metric, basis, time_basis) not in _basis_keys(result):
-            problems.append(f"口径凭证缺{entry}，实际{sorted(_basis_keys(result))}")
-    if expected.get("basis_exact"):
-        # 「basis 只含 manual 来源」这类断言要的是集合相等，不是"逐项在场"。
-        wanted = {tuple(entry) for entry in expected.get("basis", [])}
-        actual = _basis_keys(result)
-        if actual != wanted:
-            problems.append(f"口径凭证应恰为{sorted(wanted)}，"
-                            f"实际{sorted(actual)}")
-    for fragment in expected.get("limitations_contain", []):
-        if not any(fragment in str(line) for line in result.limitations):
-            problems.append(f"披露未包含“{fragment}”，实际{result.limitations}")
-    if expected.get("partial_answer") is not None:
-        block = result.partial_answer
-        if block is None:
-            problems.append("期望 partial_answer 在场，实际缺失")
-        else:
-            for field, value in expected["partial_answer"].items():
-                if block.get(field) != value:
-                    problems.append(f"partial_answer.{field}期望{value}，"
-                                    f"实际{block.get(field)}")
-    if expected.get("refused") is not None:
-        actual = [{"metric": item.get("metric"), "reason": item.get("reason")}
-                  for item in (result.refused or [])]
-        if actual != expected["refused"]:
-            problems.append(f"refused期望{expected['refused']}，实际{actual}")
-    if expected.get("remediation") is not None:
-        # 缺数上传提示（D3）按结构化字段核对（内部形状带真实 shop_id）。
-        if result.remediation is None:
-            problems.append("期望 remediation 在场，实际缺失")
-        else:
-            for field, value in expected["remediation"].items():
-                actual_value = result.remediation.get(field)
-                if actual_value != value:
-                    problems.append(f"remediation.{field}期望{value}，"
-                                    f"实际{actual_value}")
-    for key, expected_diagnostics in (expected.get("diagnostics") or {}).items():
-        actual = result.diagnostics.get(key)
-        if not isinstance(actual, dict):
-            problems.append(f"诊断缺{key}，实际{result.diagnostics}")
-            continue
-        for field, value in expected_diagnostics.items():
-            if str(actual.get(field)) != str(value):
-                problems.append(f"诊断{key}.{field}期望{value}，实际{actual.get(field)}")
-    for field, value in (expected.get("coverage") or {}).items():
-        actual = _coverage_shape(result).get(field)
-        if actual != value:
-            problems.append(f"覆盖{field}期望{value}，实际{actual}")
-    if expected.get("no_values") and result.data:
-        problems.append(f"期望无成功数值，实际{result.data}")
-    if expected.get("no_rows") and result.data:
-        problems.append(f"期望零行（真实没有），实际{result.data}")
-    if expected.get("no_total") and any(
-            "shop_id" not in row for row in result.data):
-        problems.append("分列结果里出现了不带店铺的合计行")
-    return problems
-
-
-def _verify_commerce_turn(expected: dict, calls: list) -> list[str]:
-    """compare_performance / analyze_product_performance 回合的机器核对。
-
-    断言全部落在已校验载荷的**结构化字段**上（filters.caliber、data、
-    metric_statuses、ranking、group_statuses、excluded_scope），
-    不做跨 UUID 载荷的子串扫描。
-    """
-    problems: list[str] = []
-    if expected.get("tool") == "analyze_product_performance":
-        return _verify_product_turn(expected, calls)
-    if expected.get("tool") != "compare_performance":
-        return problems
-    if not calls:
-        return ["compare_performance未被调用"]
-    entry = calls[-1]
-    arguments = entry["arguments"]
-    for key, value in (expected.get("parameters") or {}).items():
-        actual_value = arguments.get(key)
-        if key in ("metrics", "platforms", "shop_refs"):
-            if sorted(value if isinstance(value, list) else [value]) != sorted(
-                    actual_value if isinstance(actual_value, list) else [actual_value]):
-                problems.append(f"{key}期望{value}，实际{actual_value}")
-        elif actual_value != value:
-            problems.append(f"{key}期望{value}，实际{actual_value}")
-    payload = entry["payload"]
-    if not isinstance(payload, dict) or "filters" not in payload:
-        problems.append(f"compare_performance无已发布载荷：{payload}")
-        return problems
-    caliber = (expected.get("parameters") or {}).get("caliber", "erp_outstock")
-    if payload["filters"].get("caliber") != caliber:
-        problems.append(f"口径期望{caliber}，"
-                        f"实际{payload['filters'].get('caliber')}")
-    rows = {row["platform"]: row for row in payload.get("data", [])
-            if isinstance(row, dict) and "platform" in row}
-    for platform, cells in (expected.get("rows") or {}).items():
-        if platform == "total":
-            continue
-        row = rows.get(platform)
-        if row is None:
-            problems.append(f"期望{platform}的分组行在场，实际行：{sorted(rows)}")
-            continue
-        for metric, value in cells.items():
-            if row.get(metric) != value:
-                problems.append(f"{platform}.{metric}期望{value}，实际{row.get(metric)}")
-    if "total" in (expected.get("rows") or {}):
-        totals = [row for row in payload.get("data", [])
-                  if isinstance(row, dict) and "platform" not in row
-                  and "shop_ref" not in row]
-        for metric, value in expected["rows"]["total"].items():
-            got = totals[0].get(metric) if totals else None
-            if got != value:
-                problems.append(f"合计.{metric}期望{value}，实际{got}")
-    cells = {(item.get("platform"), str(item["metric"])): item
-             for item in payload.get("metric_statuses", [])
-             if isinstance(item, dict) and "platform" in item}
-    for platform, metric, status, reason in expected.get("cells", []):
-        item = cells.get((platform, metric))
-        if item is None:
-            problems.append(f"缺状态格({platform},{metric})，实际{sorted(cells)}")
-            continue
-        if item.get("status") != status or item.get("reason") != reason:
-            problems.append(f"({platform},{metric})期望{status}/{reason}，"
-                            f"实际{item.get('status')}/{item.get('reason')}")
-    blocks = {block["metric"]: block for block in payload.get("ranking", [])
-              if isinstance(block, dict)}
-    for metric, want in (expected.get("ranking") or {}).items():
-        block = blocks.get(metric)
-        if block is None:
-            problems.append(f"缺{metric}排名块")
-            continue
-        if block.get("status") != want.get("status"):
-            problems.append(f"{metric}排名状态期望{want.get('status')}，"
-                            f"实际{block.get('status')}")
-        if block.get("caliber") != caliber:
-            problems.append(f"{metric}排名块口径期望{caliber}，实际{block.get('caliber')}")
-        for entry_want in want.get("missing", []):
-            missing = block.get("missing") or []
-            if not any(item.get("platform") == entry_want[0]
-                       and item.get("reason") == entry_want[1]
-                       for item in missing):
-                problems.append(f"{metric}排名缺失清单缺{entry_want}，实际{missing}")
-    groups = {item.get("platform"): item for item in payload.get("group_statuses", [])
-              if isinstance(item, dict) and "platform" in item}
-    for platform, want in (expected.get("groups") or {}).items():
-        item = groups.get(platform)
-        if item is None:
-            problems.append(f"缺{platform}分组状态")
-            continue
-        for field in ("status", "shops_evaluated"):
-            if field in want and item.get(field) != want[field]:
-                problems.append(f"{platform}分组{field}期望{want[field]}，"
-                                f"实际{item.get(field)}")
-    reasons = sorted(str(item.get("reason")) for item in
-                     payload.get("excluded_scope", []) if isinstance(item, dict))
-    if "excluded_reasons" in expected and reasons != sorted(expected["excluded_reasons"]):
-        problems.append(f"excluded_scope原因期望{expected['excluded_reasons']}，实际{reasons}")
-    return problems
-
-
-def _verify_product_turn(expected: dict, calls: list) -> list[str]:
-    """商品报告回合的机器核对：参数、逐店行值、参考列、诊断与单位。
-
-    期望行以原始店号（如 S1）书写，映射到载荷里的 ent- 店引用再比对。"""
-    if not calls:
-        return ["analyze_product_performance未被调用"]
-    problems: list[str] = []
-    entry = calls[-1]
-    arguments = entry["arguments"]
-    for key, value in (expected.get("parameters") or {}).items():
-        actual_value = arguments.get(key)
-        if key in ("metrics",):
-            if sorted(value) != sorted(actual_value or []):
-                problems.append(f"{key}期望{value}，实际{actual_value}")
-        elif actual_value != value:
-            problems.append(f"{key}期望{value}，实际{actual_value}")
-    payload = entry["payload"]
-    if not isinstance(payload, dict) or "data" not in payload:
-        return problems + [f"analyze_product_performance无已发布载荷：{payload}"]
-    rows = {row.get("shop_ref"): row for row in payload.get("data", [])
-            if isinstance(row, dict) and row.get("shop_ref")}
-    for shop, cells in (expected.get("rows") or {}).items():
-        row = rows.get(ref_for_key("shop", shop))
-        if row is None:
-            problems.append(f"期望{shop}的行在场，实际行：{sorted(rows)}")
-            continue
-        for column, value in cells.items():
-            if row.get(column) != value:
-                problems.append(f"{shop}.{column}期望{value}，实际{row.get(column)}")
-    for key, want in (expected.get("diagnostics") or {}).items():
-        diag = (payload.get("diagnostics") or {}).get(key)
-        if not isinstance(diag, dict):
-            problems.append(f"诊断缺{key}，实际{payload.get('diagnostics')}")
-            continue
-        for field, value in want.items():
-            if str(diag.get(field)) != str(value):
-                problems.append(
-                    f"诊断{key}.{field}期望{value}，实际{diag.get(field)}")
-    for metric, unit in (expected.get("metric_units") or {}).items():
-        actual = (payload.get("metric_units") or {}).get(metric)
-        if actual != unit:
-            problems.append(f"单位{metric}期望{unit}，实际{actual}")
-    return problems
+    if result is None:
+        return {"rows": None, "limitations": [], "basis": [], "coverage": {},
+                "diagnostics": {}, "partial_answer": None, "refused": None,
+                "remediation": None, "text": text, "calls": calls}
+    return {
+        "rows": result.data,
+        "limitations": list(result.limitations),
+        "basis": sorted(_basis_keys(result)),
+        "coverage": _coverage_shape(result),
+        "diagnostics": dict(result.diagnostics),
+        "partial_answer": result.partial_answer,
+        "refused": list(result.refused or []),
+        "remediation": result.remediation,
+        "text": text,
+        "calls": calls,
+    }
 
 
 def _run_turn(question: str, state: SessionState, model, conn, allowed, now, store, *,
@@ -888,16 +629,11 @@ def _verify_turn(expected: dict, turn, recorded: list, store, recorded_start: in
             problems.append(f"domain_status期望{expected['domain_status']}，"
                             f"实际{statuses[-1] if statuses else '无运行记录'}")
     result = turn.results[-1] if turn.results else None
-    if expected.get("values") and result is not None:
-        problems.extend(_value_problems(expected["values"], result))
-    if result is not None:
-        problems.extend(_structured_problems(expected, result))
-    for fragment in expected.get("text_contains", []):
-        if fragment not in (turn.text or ""):
-            problems.append(f"回答未包含“{fragment}”")
-    for fragment in expected.get("text_absent", []):
-        if fragment in (turn.text or ""):
-            problems.append(f"回答不该宣称“{fragment}”")
+    this_turn = recorded[recorded_start:]
+    # 值/结构化/文本判定走同一判定器：无工具结果时也照常核对（缺行即问题，
+    # 不再静默跳过已声明的 values 检查）。
+    problems.extend(verify_expected(
+        expected, _observation(result, text=turn.text, calls=this_turn)))
     return problems
 
 
@@ -950,12 +686,14 @@ def _run_questions(questions: list[dict], conn, *, make_model, prefix: str,
         allowed = _allowed_for(question)
         model = make_model(question)
         expected_list = _expected_list(question)
-        problems: list[str] = []
+        problems: list[str] = validate_case_shape(question)
         try:
             with patch("bi_agent.business_query.nodes.metrics.query_business",
                        side_effect=spy),                     patch("bi_agent.agent.execute_commerce_tool",
                           side_effect=commerce_spy):
                 for turn_text, expected in zip(question["turns"], expected_list):
+                    if problems:
+                        break  # 形状非法的题不执行：错形不允许靠 zip 截断蒙混
                     store = _memory_store(allowed)
                     recorded_start = len(recorded)
                     commerce_start = len(recorded_commerce)

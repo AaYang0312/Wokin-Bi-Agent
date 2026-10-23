@@ -118,14 +118,56 @@
   （沙箱内全为合成数据）。
 - 主库 `bi_agent`、共享 `bi_agent_test` 本轮零连接、零写入。
 
+## T2 — 判定器自检（2026-10-24，完成）
+
+### 交付
+
+- `backend/tests/evaluation/verification.py`（判定器单一实现，acceptance 与 T3
+  runner 共用）：
+  - `parse_finite_decimal`：None/空串/垃圾串/布尔/NaN/Infinity 一律
+    `ValueError`；**没有任何"解析失败当 0"的路径**（旧 `_quantize` 的异常路径
+    已随迁移删除，acceptance 中不再存在）。
+  - 精度策略显式化：`MONEY_VALUE_KEYS` 白名单（与既有题库金额键一致）按 2 位
+    小数比较；数量/单数/比值按精确数值比较（`7.00`==`7` 成立、`7.005`≠`7`）；
+    未登记新键默认精确比较——只会更严不会更松。
+  - `verify_expected(expected, observed)`：observed 为白名单投影
+    （rows/limitations/basis/coverage/diagnostics/partial_answer/refused/
+    remediation/text/calls）；期望侧 `calls` 保持既有"前 N 次调用参数核对"语义
+    （Q21 依赖），总数断言用新增显式 `call_count`。
+  - `verify_commerce_turn` / `verify_product_turn` / `param_problems` /
+    `validate_case_shape` 从 acceptance 原样迁入（语义不变）。
+- `backend/tests/test_evaluation_verification.py`：44 用例——非法值不等于 0
+  （None/空串/"bad"/True/NaN/Infinity/期望本身非法/无数据行）、精度策略、
+  13 项逐字段变异（金额/basis/time_basis/覆盖状态/覆盖区间/缺口披露/refused/
+  not_codes/no_values/text/禁用词/调用次数/缺调用记录）、commerce 变异
+  （excluded_scope/参数/行值/状态格/缺调用）、形状校验（空 turns/错长
+  expected/非对象项）。
+- `backend/tests/acceptance.py`：`_observation` 适配器把每轮执行投影给同一判定器；
+  错形题（expected 列表与 turns 不等长）先判红再不执行，`zip` 静默丢轮次不可能；
+  无工具结果时已声明的 values/refused 等照常核对（旧代码会静默跳过，属收紧）。
+  迁出的 `_quantize/_value_problems/_structured_problems/_verify_commerce_turn/
+  _verify_product_turn/_param_problems/_normalize_params` 已删除。
+
+### 验证
+
+| 命令 | 结果 |
+| --- | --- |
+| `uv run --locked python -m unittest tests.test_evaluation_verification -v` | 44/44 OK |
+| `uv run --locked --env-file ../.env.evaluation python -m tests.acceptance --offline` | 35/35 pass（同一判定器下既有合同零回归） |
+| `uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .` | **2065/2065 OK**（2021 既有 + 44 新增） |
+
+发现并修正的判定器缺口：变异测试暴露"期望 `calls` 列表被当总数"会误伤 Q21
+（其 calls=前 2 次调用参数核对，实际脚本 3 次调用）——引入 `call_count` 分离语义。
+
 ## 任务状态总览
 
 | 任务 | 状态 |
 | --- | --- |
 | T0 | 完成 |
 | T1 | 完成 |
-| T2 | 进行中（下一步） |
-| T3–T8 | 未开始 |
+| T2 | 完成 |
+| T3 | 进行中（下一步） |
+| T4–T8 | 未开始 |
 
 下一条可执行命令：
-`cd backend && uv run --locked python -m unittest tests.test_evaluation_verification -v`（T2 红灯先行）。
+`cd backend && uv run --locked python -m unittest tests.test_evaluation_runner tests.test_evaluation_reporting -v`（T3 红灯先行）。
