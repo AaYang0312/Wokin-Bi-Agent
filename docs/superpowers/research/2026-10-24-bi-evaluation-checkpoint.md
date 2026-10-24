@@ -159,6 +159,53 @@
 发现并修正的判定器缺口：变异测试暴露"期望 `calls` 列表被当总数"会误伤 Q21
 （其 calls=前 2 次调用参数核对，实际脚本 3 次调用）——引入 `call_count` 分离语义。
 
+## T3 — 扩展 runner、计量与结构化报告（2026-10-24，完成）
+
+### 交付
+
+- `backend/tests/evaluation/contracts.py`：`EvaluationCase`（pydantic，未知字段
+  拒绝；id/category/family_id/split/turns/expected/seed_names/allowed/
+  feature_flags/scripted_replies/requires_human_review 全字段契约）、
+  `load_cases`（ID 唯一、expected 与 turns 等长、种子步骤与 feature flag
+  （`FEATURE_FLAG_REGISTRY={"PARTIAL_ANSWERS_ENABLED"}`）必须在注册表内——
+  校验发生在任何数据库或模型调用之前）、`CaseResult`/`EvaluationSummary`、
+  dataset SHA-256。
+- `backend/tests/evaluation/telemetry.py`：`MeteredModel`（原协议
+  `complete(messages, tools, *, timeout_s)` 透传，ModelReply 原样返回，采集
+  次数/单调耗时/usage）、`ScriptedModel`（耗尽显式 `ScriptExhaustedError`）、
+  `aggregate_usage`（complete/partial/unavailable；缺任一调用总量为 null、
+  保留 known 部分）、`build_scripted_reply`。
+- `backend/tests/evaluation/runner.py`：串行 `run_suite`（每题独立
+  SessionState/授权集/savepoint（回滚后 RELEASE），多轮共享题内状态；判定
+  复用 acceptance `_verify_turn`/`verify_commerce_turn` 同一实现）；种子与
+  acceptance.run_offline 完全同一套合成基准；usage 从真实 `ModelReply.usage`
+  累计；环境未就绪全部记 blocked 而非失败；live 默认拒绝（`--allow-live` 才
+  放开，缺配置联网前退出 2，live 完全不发送 expected/scripted_replies——脚本
+  在 live 下被忽略）；CLI 退出码 0/1/2（blocked/skipped/零 executed/人工待核
+  →2）；`--order reverse` 支持（T6 反序验证用）。
+- `backend/tests/evaluation/reporting.py`：`write_report` 写 cases.jsonl /
+  summary.json / report.md 三层；已有 run 目录不覆盖；`sanitize` 把
+  DSN/password= 形态的密码换成 ***；异常只落类别名+安全摘要（不序列化异常
+  对象/模型请求/SQL 参数）；offline 报告固定标注"脚本模型下的协议与业务回归，
+  不衡量自然语言理解"；零 executed 通过率 null。
+- `backend/tests/evaluation/cases/operator_core.jsonl`：3 个初始场景
+  （S1 窗口出数 / PDD1 能力拒答 / TB1 出库口径披露），T6 扩到 30+。
+- 源码版本（git head + dirty 标记）、dataset SHA-256、冻结时间、门禁、重复
+  次数、命令摘要入 summary；不导出环境变量。
+
+### 验证
+
+| 命令 | 结果 |
+| --- | --- |
+| `uv run --locked python -m unittest tests.test_evaluation_runner tests.test_evaluation_reporting -v` | OK（无环境 28 过 6 跳过） |
+| `uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_evaluation_runner tests.test_evaluation_reporting -v` | **34/34 OK** |
+| `uv run --locked --env-file ../.env.evaluation python -m tests.evaluation.runner --mode offline --suite tests/evaluation/cases/operator_core.jsonl --repeat 1 --output ../.tmp/evaluation/run-001` | **3/3 pass，exit 0**，三层报告落盘（`.tmp/` 已忽略） |
+| `uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .` | **2099/2099 OK** |
+
+过程记录：场景问题文本的日期窗口按服务端"含当日"语义解析（"1日至8日"=
+[09-01,09-09)），首跑暴露 oc-003 越覆盖被正确拒答——改问题为"1日至7日"后
+通过；这本身验证了窗口排他语义在 suite 里可被断言。
+
 ## 任务状态总览
 
 | 任务 | 状态 |
@@ -166,8 +213,9 @@
 | T0 | 完成 |
 | T1 | 完成 |
 | T2 | 完成 |
-| T3 | 进行中（下一步） |
-| T4–T8 | 未开始 |
+| T3 | 完成 |
+| T4 | 进行中（下一步） |
+| T5–T8 | 未开始 |
 
 下一条可执行命令：
-`cd backend && uv run --locked python -m unittest tests.test_evaluation_runner tests.test_evaluation_reporting -v`（T3 红灯先行）。
+`cd backend && uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_commerce tests.test_product_ranking tests.test_comparison tests.test_core -v`（T4）。
