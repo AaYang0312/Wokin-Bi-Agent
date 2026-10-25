@@ -210,6 +210,39 @@ class ReviewMutationTests(unittest.TestCase):
         self.assertEqual(case.expected[0].get("call_statuses"),
                          ["needs_input", "needs_input"])
 
+    def test_f4_oc010_asserts_independently_derived_weighted_price(self):
+        """金标准独立计算：(3×100+1×200)/(3+1)=125；均店均价陷阱 150 必须不同。"""
+        rows = self.cases["oc-010"].expected[0]["rows"]
+        shops = [key for key in rows if key != "total"]
+        self.assertGreaterEqual(len(shops), 2, "加权均价需要至少两个量级不同的店铺")
+        total_qty = sum(Decimal(rows[shop]["sold_quantity"]) for shop in shops)
+        total_amount = sum(Decimal(rows[shop]["sales_amount"]) for shop in shops)
+        weighted = total_amount / total_qty
+        average_of_averages = sum(
+            Decimal(rows[shop]["sales_amount"])
+            / Decimal(rows[shop]["sold_quantity"]) for shop in shops) / len(shops)
+        self.assertEqual(rows["total"]["weighted_avg_paid_price"],
+                         str(weighted),
+                         "总行必须断言按量加权的均价金标准")
+        self.assertNotEqual(weighted, average_of_averages,
+                            "数据必须让加权值与均店均价可区分，否则断言无牙")
+        self.assertEqual(weighted, Decimal("125"))
+        self.assertEqual(average_of_averages, Decimal("150"))
+
+    def test_f4_average_of_shop_averages_must_fail(self):
+        """把金标准偷换成均店均价（150）必须翻红：断言要能抓错聚合。"""
+        from tests.evaluation.runner import run_suite
+
+        def to_average_of_averages(payload):
+            payload["expected"][0]["rows"]["total"][
+                "weighted_avg_paid_price"] = "150"
+
+        summary = run_suite([self._mutant("oc-010", to_average_of_averages)],
+                            mode="offline", repeat=1)
+        self.assertNotEqual(
+            summary.cases[0].status, "pass",
+            f"均店均价150必须被加权金标准125拒收：{summary.cases[0].problems}")
+
     def test_f2_misspelled_expected_key_is_rejected_at_load(self):
         """valuez 拼写错误在 load_cases 就拒绝，轮不到数据库或模型。"""
         def misspell(payload):

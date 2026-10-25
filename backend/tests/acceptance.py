@@ -330,11 +330,40 @@ def seed_partial_split_case(conn) -> None:
                 spans=FULL_WINDOW, data_as_of=_beijing(8, 0))
 
 
+def seed_weighted_price_case(conn) -> None:
+    """加权均价基准（复核 F4）：两家量级不同的店卖同一商品。
+
+    WP1 三笔各 1 件 100 元（3 件/300 元），WP2 一笔 1 件 200 元（1 件/200 元）。
+    商品级加权均价 = (300+200)/(3+1) = **125**；两家店均价的简单平均 =
+    (100+200)/2 = **150** ≠ 125——场景金标准必须取 125，"平均各店均价"必错。
+    数值手工可算，不来自实现输出。
+    """
+    _shop_row(conn, "WP1", "fxg", "加权店一",
+              ["paid_amount", "quantity", "product_paid_amount"])
+    _shop_row(conn, "WP2", "fxg", "加权店二",
+              ["paid_amount", "quantity", "product_paid_amount"])
+    conn.execute(
+        "INSERT INTO bi.products(product_id, title, normalization_status) "
+        "VALUES ('PW', '加权测试钉枪', 'normal') "
+        "ON CONFLICT (product_id) DO UPDATE SET title = EXCLUDED.title")
+    for index in range(3):
+        _trade(conn, shop_id="WP1", erp_id=f"E-W1-{index}",
+               commercial_id=f"C-W1-{index}", amount="100.00", day=2 + index,
+               source=TRADE_LIST_SOURCE, product_id="PW", consigned_day=2 + index)
+    _trade(conn, shop_id="WP2", erp_id="E-W2", commercial_id="C-W2",
+           amount="200.00", day=3, source=TRADE_LIST_SOURCE,
+           product_id="PW", consigned_day=3)
+    for shop_id in ("WP1", "WP2"):
+        _sync_state(conn, source=TRADE_LIST_SOURCE, entity="orders",
+                    shop_id=shop_id, spans=FULL_WINDOW, data_as_of=_beijing(8, 0))
+
+
 SEED_STEPS = {"multi_source": seed_multi_source_case,
               "coverage_holes": apply_coverage_holes,
               "item_price_snapshot": seed_item_price_snapshot,
               "sycm_manual_case": seed_sycm_manual_case,
-              "partial_split_case": seed_partial_split_case}
+              "partial_split_case": seed_partial_split_case,
+              "weighted_price_case": seed_weighted_price_case}
 
 
 # ---------------------------------------------------------------------------

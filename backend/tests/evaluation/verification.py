@@ -473,7 +473,21 @@ def verify_product_turn(expected: dict, calls: list) -> list[str]:
         return problems + [f"analyze_product_performance无已发布载荷：{payload}"]
     rows = {row.get("shop_ref"): row for row in payload.get("data", [])
             if isinstance(row, dict) and row.get("shop_ref")}
+    aggregate_rows = [row for row in payload.get("data", [])
+                      if isinstance(row, dict) and not row.get("shop_ref")]
     for shop, cells in (expected.get("rows") or {}).items():
+        if shop == "total":
+            # 商品级聚合行（shop_ref 为空）：加权均价等口径必须落在这一行
+            # 断言（复核 F4：只断店行会漏掉聚合口径错误）。
+            row = aggregate_rows[0] if aggregate_rows else None
+            if row is None:
+                problems.append("期望商品级合计行在场，实际没有聚合行")
+                continue
+            for column, value in cells.items():
+                if row.get(column) != value:
+                    problems.append(
+                        f"合计.{column}期望{value}，实际{row.get(column)}")
+            continue
         row = rows.get(ref_for_key("shop", shop))
         if row is None:
             problems.append(f"期望{shop}的行在场，实际行：{sorted(rows)}")
