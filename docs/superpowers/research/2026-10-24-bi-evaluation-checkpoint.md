@@ -343,19 +343,45 @@ basis 为发生口径/完成时间、文本子串笔误；判定器缺口 3 处�
   掩盖缺口）；上传"重复点击"的 busy 交互在 App 层（用户 WIP 文件），未加用例——
   事实层幂等已由后端（同窗重传合计不变）与 api 层（非 2xx→ApiError）钉住。
 
-## 任务状态总览
+## T8 — 最终验收与接续交付（2026-10-26，完成）
 
-| 任务 | 状态 |
-| --- | --- |
-| T0 | 完成 |
-| T1 | 完成 |
-| T2 | 完成 |
-| T3 | 完成 |
-| T4 | 完成 |
-| T5 | 完成 |
-| T6 | 完成 |
-| T7 | 完成 |
-| T8 | 进行中（下一步） |
+- 最终验收文档：[2026-10-24-bi-evaluation-acceptance.md](2026-10-24-bi-evaluation-acceptance.md)
+  （四栏结论、五条合成演示路径、证据摘要、待办清单、未执行边界）。
+- 文档按实际变化更新：`README.md`（沙箱回归路径指针）、`docs/runbook.md`
+  （T1 已加「评测沙箱实例」节）、`docs/demo.md`（五条合成演示路径）；
+  `docs/metrics.md` 未动（指标语义零变化）。
+- 最终门禁（同一基线、同一实例、串行）：后端全量 **2129/2129 OK（0 skip）**、
+  acceptance offline **35/35**、扩展套件 **repeat 3 = 102/102**（dataset SHA-256
+  与源文件逐字节一致）、反序 **34/34**、前端 `npm ci→test→build`
+  **223/223 + build ✓**、`git diff --check` 干净。
+- 审查确认：8 个提交不含用户 WIP（前端 5 文件仍为未提交修改）、无凭据、
+  无真实数据、无生产开关变化；`.env.evaluation` 被忽略未入库；
+  `.tmp/evaluation/` 报告目录被忽略。
+- 未推送、未合并、未部署。
 
-下一条可执行命令（T8 全量验收）：
-`cd backend && uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .`
+## 任务状态总览（最终）
+
+| 任务 | 状态 | 关键证据 |
+| --- | --- | --- |
+| T0 基线 | 完成 | WIP/修复清单/环境/题数（35）核实 |
+| T1 沙箱 | 完成 | 15 用例 + 2021 基线 |
+| T2 判定器 | 完成 | 47 自检（后 3 项并入 T4/T6 修复） |
+| T3 runner/报告 | 完成 | 34 用例 + CLI 端到端 |
+| T4 历史修复验真 | 完成 | 20 店×42 行 + 499/500/501 + oc-004 |
+| T5 多轮授权 | 完成 | 14 用例，agent.py 零改动 |
+| T6 场景集 | 完成 | 34 场景 + 3×串行/反序一致 |
+| T7 前端契约 | 完成 | 223/223 + 流中断不发 done |
+| T8 验收交付 | 完成 | 本节 + 验收文档 |
+
+### 恢复位置与下一条可执行命令
+
+分支 `reliability-evaluation-2026-10-24`（未推送）。沙箱容器
+`bi-agent-eval-postgres`（restart=no，宿主休眠后会退出；恢复：
+`docker start bi-agent-eval-postgres`）。接续第一步：
+
+```bash
+cd backend && uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .
+```
+
+期望 2129/2129 OK。其后按验收文档 §2.4 待办逐项决策（每项均为所有者决定，
+不阻塞本分支合并评估）。

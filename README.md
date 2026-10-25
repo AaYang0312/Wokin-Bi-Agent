@@ -77,6 +77,14 @@ docker compose up -d
 
 备份还原、其他主机经 Tailscale 连接与安全边界见 [deploy/postgres/README.md](deploy/postgres/README.md)。
 
+回归与评测的正常路径使用**独立合成沙箱**（不占用、不重建既有测试库）：`backend/` 下
+`uv run --locked python -m tests.evaluation.database --bootstrap` 一次建立，之后
+`uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .`
+与 `python -m tests.acceptance --offline` 都在新实例上串行执行；34 场景合成回归集
+（`python -m tests.evaluation.runner --mode offline --suite tests/evaluation/cases/operator_core.jsonl …`）
+与完整说明见 [runbook「评测沙箱实例」](docs/runbook.md) 与
+[2026-10-24 最终验收](docs/superpowers/research/2026-10-24-bi-evaluation-acceptance.md)。
+
 ```powershell
 Set-Location backend
 uv sync --locked

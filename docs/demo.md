@@ -70,3 +70,28 @@ uv run --env-file ../.env.app python -m tests.acceptance --live
 另需注意：`--live` 只从环境变量取模型配置。若沿用 `.env.test` 里的桩模型，它会以
 `"model": "fake-model"` 静默跑完并报出 17 题失败——那不是产品结果。执行前必须确认
 输出的 `model` 字段是真实型号。
+
+## 合成评测套件演示路径（2026-10-24 起，离线可复跑）
+
+不调用真实模型、不碰真实数据：在独立合成沙箱上，用脚本模型驱动工具调用，
+演示五条经营者核心路径（场景定义与机器期望见
+`backend/tests/evaluation/cases/operator_core.jsonl`，总览与证据见
+[2026-10-24 最终验收](superpowers/research/2026-10-24-bi-evaluation-acceptance.md)）：
+
+```bash
+cd backend
+uv run --locked --env-file ../.env.evaluation python -m tests.evaluation.runner \
+  --mode offline --suite tests/evaluation/cases/operator_core.jsonl \
+  --repeat 1 --output ../.tmp/evaluation/demo
+```
+
+| 路径 | 场景 | 看点 |
+| --- | --- | --- |
+| 平台可比结果 | oc-017 | 支付口径只认已认证平台；未认证格 missing 不补零 |
+| 精确店铺下钻 | oc-024 | 换店后口径与披露随之切换，不继承上一轮 |
+| 部分答案披露 | oc-012 | 已覆盖段出数 + 缺口起点 + 未核验披露 |
+| 毛利确认 | oc-004 | 缺确认/换平台重试都 needs_input，显式确认才执行 |
+| 上传后原题重查 | oc-028/029 | 越窗仍缺（上传成功≠覆盖成功）；同窗重查不重复计数 |
+
+离线报告固定标注「脚本模型下的协议与业务回归，不衡量自然语言理解」；
+它不证明真实模型准确率，也不构成任何平台真实来源就绪的证据。
