@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { ApiError, createSseParser, uploadSycmFile } from './api'
+import { ApiError, createSseParser, sendMessage, uploadSycmFile } from './api'
 import type { ChatEvent } from './types'
 
 describe('createSseParser', () => {
@@ -29,6 +29,45 @@ describe('createSseParser', () => {
       parser.push(new TextEncoder().encode('event: done\ndata: {"status":"complete"}'))
       parser.finish()
     }).toThrow('不完整')
+  })
+
+  it('reassembles frames split across chunks at arbitrary boundaries (T7)', () => {
+    const events: ChatEvent[] = []
+    const parser = createSseParser((event) => events.push(event))
+    const bytes = new TextEncoder().encode(
+      'event: status\ndata: {"stage":"thinking"}\n\n'
+      + 'event: done\ndata: {"status":"complete"}\n\n')
+    // 逐字节喂入：任何切分点都不能丢帧或拆错
+    for (const byte of bytes) parser.push(new Uint8Array([byte]))
+    parser.finish()
+    expect(events).toEqual([
+      { event: 'status', data: { stage: 'thinking' } },
+      { event: 'done', data: { status: 'complete' } },
+    ])
+  })
+
+  it('accepts CRLF line endings and mixed separators (T7)', () => {
+    const events: ChatEvent[] = []
+    const parser = createSseParser((event) => events.push(event))
+    parser.push(new TextEncoder().encode(
+      'event: status\r\ndata: {"stage":"querying"}\r\n\r\n'
+      + 'event: done\ndata: {"status":"error"}\n\n'))
+    parser.finish()
+    expect(events).toEqual([
+      { event: 'status', data: { stage: 'querying' } },
+      { event: 'done', data: { status: 'error' } },
+    ])
+  })
+
+  it('rejects invalid JSON in data without emitting any event (T7)', () => {
+    const events: ChatEvent[] = []
+    const parser = createSseParser((event) => events.push(event))
+    expect(() => {
+      parser.push(new TextEncoder().encode(
+        'event: error\ndata: {"code":"demo",}\n\n'))
+      parser.finish()
+    }).toThrow('SSE JSON不合法')
+    expect(events).toEqual([])
   })
 })
 
@@ -69,6 +108,74 @@ describe('uploadSycmFile 请求形式（M4 契约：原始字节体 + WebWrite �
         .catch((caught: unknown) => caught)
       expect(await failure).toBeInstanceOf(ApiError)
       expect(await failure.then((caught) => (caught as ApiError).status)).toBe(404)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+})
+
+describe('sendMessage 流契约（T7：done 前结束不能当成功）', () => {
+  const encoder = new TextEncoder()
+
+  function streamOf(chunks: string[]) {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+    return new Response(body, { status: 200 })
+  }
+
+  it('resolves in order on a clean stream that ends with a done frame', async () => {
+    const events: ChatEvent[] = []
+    const fetchMock = vi.fn(async () => streamOf([
+      'event: status\ndata: {"stage":"thinking"}\n\n',
+      'event: message\ndata: {"role":"assistant","id":"m1","content":"好了",'
+      + '"artifacts":[],"status":"complete","created_at":"2026-10-26T00:00:00Z"}\n\n',
+      'event: done\ndata: {"status":"complete"}\n\n',
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      await sendMessage('chat-1', '问题', (event) => events.push(event),
+        new AbortController().signal)
+      expect(events.map((event) => event.event)).toEqual(
+        ['status', 'message', 'done'])
+      expect(events[2]).toEqual({ event: 'done', data: { status: 'complete' } })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('rejects a stream cut mid-frame and never emits done (fail closed)', async () => {
+    const events: ChatEvent[] = []
+    const fetchMock = vi.fn(async () => streamOf([
+      'event: status\ndata: {"stage":"querying"}\n\n',
+      // 第二帧只到一半就关流：模拟服务端/网络在 done 前中断
+      'event: done\ndata: {"status":"comp',
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const attempt = sendMessage('chat-1', '问题',
+        (event) => events.push(event), new AbortController().signal)
+      await expect(attempt).rejects.toThrow('不完整')
+      // 被掐断的流绝不能发出 done：不完整回复不允许标 complete
+      expect(events.map((event) => event.event)).toEqual(['status'])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('surfaces a non-2xx response as ApiError before parsing any body', async () => {
+    const fetchMock = vi.fn(async () => new Response(
+      JSON.stringify({ message: '服务器开小差' }), { status: 503 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const attempt = sendMessage('chat-1', '问题', () => {},
+        new AbortController().signal)
+      await expect(attempt).rejects.toBeInstanceOf(ApiError)
+      await expect(attempt.catch((caught: unknown) =>
+        (caught as ApiError).status)).resolves.toBe(503)
     } finally {
       vi.unstubAllGlobals()
     }
