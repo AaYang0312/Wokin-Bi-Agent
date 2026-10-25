@@ -206,6 +206,41 @@
 [09-01,09-09)），首跑暴露 oc-003 越覆盖被正确拒答——改问题为"1日至7日"后
 通过；这本身验证了窗口排他语义在 suite 里可被断言。
 
+## T4 — 验真两项历史修复（2026-10-25，完成）
+
+### 结论（按计划要求三类分开，不合并为"商品查询全面可用"）
+
+| 项 | 结论 |
+| --- | --- |
+| 参考价快照筛选（10-09 P1 后续修复 1） | **当前已修且通过**。既有用例 `test_commerce.py::test_unsold_catalog_rows_above_the_answer_cap_do_not_block_sales` / `test_item_price_cap_withholds_reference_without_rejecting_sales` 保持绿；本轮补 20 店 × 42 行（840 行）复现用例 `test_twenty_shop_snapshot_catalog_replication`：无关快照不把销售拒成 result_too_large、成交 SKU 参考价保留、未授权店铺（m21）店号与价格零出现、无"缩小日期"建议 |
+| 公开校验提示（10-09 P1 后续修复 2） | **当前已修且通过**。既有 `test_profit_reference_needs_input_names_profit_basis`（缺 profit_basis→公开披露句；未登记平台"抖店"→另一句；互不串扰）保持绿；本轮补三轮回放场景 `oc-004`（见下） |
+| 判定器/回合接缝（本轮发现） | **本轮修复且通过**。commerce needs_input 回合曾被告定器误判"无已发布载荷"、`status/limitations_contain/call_count` 在回合级与 commerce 载荷级同键双义、commerce 调用数不进观测——修复于 `verification.py`（needs_input 分支）与 `acceptance._verify_turn`（键剥离+commerce_calls 通道），47 项判定器自检全绿 |
+| 行数上限 500 边界 | **已验证**。哨兵策略=LIMIT MAX_ROWS+1 超限抛 `_RowsTruncated`；新增 `test_sales_parent_rows_at_499/500/501_publish/refuse`：499/500 出数（20 店行、合计 500 件）、501 拒出数（中文披露句、零数据集、status failed/unavailable），未靠调上限过测试 |
+| 商品级出库口径 / 淘系支付认证 | **仍受业务来源限制**（产品决策，不属本轮）：付款口径未认证的 fail-closed 行为不变；未改来源/成本/支付认证 |
+
+### 新增证据
+
+- `tests/test_commerce.py::ItemPriceReferenceTests` 4 个新用例（20 店复现 + 499/500/501 边界）。
+- `tests/evaluation/cases/operator_core.jsonl::oc-004`：三轮毛利确认回放——
+  轮1 无 profit_basis 调用→needs_input（披露句含 `profit_basis=existing_fields`），
+  模型换平台（scope=fxg）重试→**仍 needs_input**（确认不可跳过）；
+  轮2 用户明确确认→带 `profit_basis=existing_fields` 执行成功，数值与 Q27 金标准
+  同源（tb 1件/100元、fxg 真实 0、pdd 分组 partial、排除原因
+  coverage_time_basis_unverified）。suite 4/4 pass、exit 0。
+- 过程发现（记入行为理解）：commerce 的 needs_input 不硬停 agent 循环——模型
+  读披露后可自行修正参数重试；服务端只认参数里的显式 `profit_basis`，用户确认
+  语义由工具描述约束（live 模型行为契约，离线脚本可控复现）。
+
+### 验证
+
+| 命令 | 结果 |
+| --- | --- |
+| `uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_commerce tests.test_product_ranking tests.test_comparison tests.test_core -v` | **348 OK** |
+| `uv run --locked python -m unittest tests.test_evaluation_verification -v` | **47 OK** |
+| `uv run --locked --env-file ../.env.evaluation python -m tests.evaluation.runner --mode offline --suite tests/evaluation/cases/operator_core.jsonl --repeat 1 --output ../.tmp/evaluation/run-002` | **4/4 pass，exit 0** |
+| `uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .` | **2106/2106 OK** |
+| `uv run --locked --env-file ../.env.evaluation python -m tests.acceptance --offline` | **35/35 pass** |
+
 ## 任务状态总览
 
 | 任务 | 状态 |
@@ -214,8 +249,9 @@
 | T1 | 完成 |
 | T2 | 完成 |
 | T3 | 完成 |
-| T4 | 进行中（下一步） |
-| T5–T8 | 未开始 |
+| T4 | 完成 |
+| T5 | 进行中（下一步） |
+| T6–T8 | 未开始 |
 
 下一条可执行命令：
-`cd backend && uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_commerce tests.test_product_ranking tests.test_comparison tests.test_core -v`（T4）。
+`cd backend && uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_core tests.test_runtime tests.test_operator_workflows -v`（T5）。

@@ -1191,6 +1191,128 @@ class ItemPriceReferenceTests(unittest.TestCase):
                         limitations)
         self.assertFalse(any("缩小日期" in text for text in limitations), limitations)
 
+    def test_twenty_shop_snapshot_catalog_replication(self):
+        """复现 2026-10-09 的行数场景（P1 后续）：20 店 × 42 行档案快照。
+
+        全部店铺/商品使用合成 ID；无关快照行（840 行）不得把销售查询顶成
+        result_too_large；未授权店铺的价格不进结果（模型载荷里连店号都不出现）。
+        """
+        from bi_agent.commerce.tool import analyze_product_performance
+
+        selling = ["m01", "m02", "m03"]
+        watching = [f"m{index:02d}" for index in range(4, 21)]
+        for key in selling + watching + ["m21"]:
+            self._shop(key)
+        self._archive("P2")
+        for key in selling + watching + ["m21"]:
+            self._cover(key, WINDOW_START, WINDOW_END)
+        for key in selling:
+            self._sale(key, f"E-{key}", product="P2", day=date(2026, 9, 2),
+                       quantity="2", amount="200", sku="P2-sold")
+        # 每店 42 行：1 条商品级行 + 41 条 SKU 行（其中 1 条是成交 SKU）。
+        catalog = {f"P2-{index:02d}": ("80", "35") for index in range(40)}
+        catalog["P2-sold"] = ("90", "40")
+        for key in selling + watching + ["m21"]:
+            self._snapshot(key, captured_at=NOW, prices=dict(catalog),
+                           product="P2")
+
+        allowed = frozenset(self.shops[key] for key in selling + watching)
+        refs = {shop: ref_for_key("shop", shop) for shop in allowed}
+        context = DomainContext(
+            subject_id=f"s4b-{self.tag}", allowed_shop_ids=allowed,
+            shop_refs=refs, conn=self.conn,
+            store=MemoryQueryRunStore(forbidden_values=set(allowed)),
+            chat_id=UUID(int=31), user_message_id=UUID(int=32),
+            root_request_id=UUID(int=33), now=NOW,
+            deadline=time.monotonic() + 30, attempt_no=1)
+        result = analyze_product_performance(
+            _request(product={"text": "档案P2"}, profit_basis="existing_fields",
+                     metrics=["sold_quantity", "sales_amount",
+                              "weighted_avg_paid_price",
+                              "product_gross_margin_reference"]),
+            context)
+        payload = _payload_for(result, "metric_result")
+        rendered = json.dumps(result.model_payload, ensure_ascii=False)
+        self.assertNotIn("result_too_large", rendered,
+                         "840 行无关档案快照不得拒掉销售数字")
+        self.assertNotIn("缩小日期", rendered)
+        self.assertNotIn(self.shops["m21"], rendered,
+                         "未授权店铺的真实店号不得出现在公开载荷")
+        for key in selling:
+            row = self._row_for(payload, key)
+            self.assertEqual(row["sales_amount"], "200")
+            self.assertEqual(row["reference_price"], "90",
+                             "成交 SKU 的参考价必须留下")
+        self.assertNotIn(ref_for_key("shop", self.shops["m21"]),
+                         [row.get("shop_ref") for row in payload["data"]])
+
+    def _boundary_setup(self, prefix: str, shops: int, days: int,
+                        extra_shop: bool) -> None:
+        start_day = date(2026, 8, 16)
+        self._archive("P3")
+        keys = [f"{prefix}{index:02d}" for index in range(1, shops + 1)]
+        if extra_shop:
+            keys.append(f"{prefix}x1")
+        for key in keys:
+            self._shop(key)
+            self._cover(key, datetime(2026, 8, 16, tzinfo=BEIJING),
+                        datetime(2026, 9, 11, tzinfo=BEIJING))
+        for key in keys:
+            count = days if not (extra_shop and key.endswith("x1")) else 1
+            for offset in range(count):
+                day = start_day + timedelta(days=offset)
+                self._sale(key, f"E-{key}-{offset:02d}", product="P3", day=day,
+                           quantity="1", amount="10")
+
+    def _boundary_run(self, prefix: str):
+        from bi_agent.commerce.tool import analyze_product_performance
+
+        keys = sorted(key for key in self.shops if key.startswith(prefix))
+        request = _request(product={"text": "档案P3"},
+                           start="2026-08-16", end="2026-09-10",
+                           metrics=["sold_quantity", "sales_amount"])
+        return analyze_product_performance(request, self._context()), keys
+
+    def test_sales_parent_rows_at_499_publish(self):
+        self._boundary_setup("a", shops=20, days=25, extra_shop=False)
+        # 20 店 × 25 天 = 500 个 (店,日,kind) 父行，去掉最后一个 = 499。
+        self.conn.execute(
+            "DELETE FROM bi.order_items WHERE erp_id=%s",
+            (f"E-a{19:02d}-{24:02d}",))
+        self.conn.execute(
+            "DELETE FROM bi.orders WHERE erp_id=%s",
+            (f"E-a{19:02d}-{24:02d}",))
+        result, _keys = self._boundary_run("a")
+        self.assertEqual(result.status.value, "success",
+                         result.model_payload.get("limitations"))
+        rendered = json.dumps(result.model_payload, ensure_ascii=False)
+        self.assertNotIn("result_too_large", rendered)
+
+    def test_sales_parent_rows_at_500_publish(self):
+        self._boundary_setup("b", shops=20, days=25, extra_shop=False)
+        result, _keys = self._boundary_run("b")
+        self.assertEqual(result.status.value, "success",
+                         result.model_payload.get("limitations"))
+        payload = _payload_for(result, "metric_result")
+        shop_rows = [row for row in payload["data"] if row.get("shop_ref")]
+        self.assertEqual(len(shop_rows), 20, "20 家店各一行")
+        total_sold = sum(int(row["sold_quantity"]) for row in shop_rows)
+        self.assertEqual(total_sold, 500)
+        rendered = json.dumps(result.model_payload, ensure_ascii=False)
+        self.assertNotIn("result_too_large", rendered)
+
+    def test_sales_parent_rows_at_501_refuse(self):
+        self._boundary_setup("c", shops=20, days=25, extra_shop=True)
+        result, _keys = self._boundary_run("c")
+        self.assertEqual(result.status.value, "failed")
+        self.assertEqual(result.model_payload.get("status"), "unavailable")
+        limitations = result.model_payload.get("limitations") or []
+        self.assertTrue(any("已拒绝出数以避免静默截断" in text
+                            for text in limitations), limitations)
+        self.assertEqual(result.artifacts, [],
+                         "超上限不得发布任何数据集")
+        self.assertEqual(result.model_payload.get("data") or [], [])
+
     def test_reference_price_sits_beside_the_average_price_with_margin(self):
         self._shop("1")
         self._archive("P1")

@@ -286,6 +286,17 @@ def verify_commerce_turn(expected: dict, calls: list) -> list[str]:
         elif actual_value != value:
             problems.append(f"{key}期望{value}，实际{actual_value}")
     payload = entry["payload"]
+    if expected.get("status") == "needs_input":
+        # needs_input 是正确的门禁结果，不是"没有载荷"的失败：只核对
+        # 状态与披露句，不要求已发布数据。
+        if not isinstance(payload, dict) or payload.get("status") != "needs_input":
+            problems.append(f"期望needs_input，实际载荷：{payload}")
+            return problems
+        joined = " ".join(str(line) for line in payload.get("limitations") or [])
+        for fragment in expected.get("limitations_contain", []):
+            if fragment not in joined:
+                problems.append(f"needs_input披露未包含“{fragment}”，实际{joined}")
+        return problems
     if not isinstance(payload, dict) or "filters" not in payload:
         problems.append(f"compare_performance无已发布载荷：{payload}")
         return problems

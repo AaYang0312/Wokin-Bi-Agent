@@ -182,7 +182,8 @@ def _run_case(conn, case: EvaluationCase, repetition: int,
                     artifact_count += len(store.artifacts)
                     problems.extend(_verify_turn(
                         expected, turn, recorded, store, recorded_start,
-                        allowed))
+                        allowed,
+                        commerce_calls=recorded_commerce[commerce_start:]))
                     problems.extend(_verify_commerce_turn(
                         expected, recorded_commerce[commerce_start:]))
                     if problems:

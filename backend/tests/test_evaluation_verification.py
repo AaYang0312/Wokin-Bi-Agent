@@ -327,6 +327,30 @@ class CommerceMutationTests(unittest.TestCase):
     def test_missing_call_fails(self):
         self.assertTrue(verify_commerce_turn(self.EXPECTED, []))
 
+    def test_needs_input_turn_is_a_valid_outcome(self):
+        expected = {"tool": "compare_performance", "status": "needs_input",
+                    "limitations_contain": ["profit_basis=existing_fields"]}
+        calls = [{
+            "arguments": {"metrics": ["erp_gross_profit_reference"]},
+            "payload": {"status": "needs_input",
+                        "limitations": ["请求了毛利参考指标，需显式设置"
+                                        "profit_basis=existing_fields"]},
+        }]
+        self.assertEqual(verify_commerce_turn(expected, calls), [])
+
+    def test_needs_input_missing_disclosure_fails(self):
+        expected = {"tool": "compare_performance", "status": "needs_input",
+                    "limitations_contain": ["profit_basis=existing_fields"]}
+        calls = [{
+            "arguments": {},
+            "payload": {"status": "needs_input", "limitations": ["别的披露"]},
+        }]
+        self.assertTrue(verify_commerce_turn(expected, calls))
+
+    def test_needs_input_expected_but_published_payload_fails(self):
+        expected = {"tool": "compare_performance", "status": "needs_input"}
+        self.assertTrue(verify_commerce_turn(expected, self.CALL))
+
 
 class CaseShapeTests(unittest.TestCase):
     def test_turns_must_be_non_empty(self):

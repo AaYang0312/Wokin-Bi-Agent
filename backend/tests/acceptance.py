@@ -572,8 +572,12 @@ def _run_turn(question: str, state: SessionState, model, conn, allowed, now, sto
     )
 
 
+_COMMERCE_TOOLS = ("compare_performance", "analyze_product_performance")
+
+
 def _verify_turn(expected: dict, turn, recorded: list, store, recorded_start: int,
-                 allowed: frozenset[str]) -> list[str]:
+                 allowed: frozenset[str],
+                 commerce_calls: list | None = None) -> list[str]:
     problems: list[str] = []
     if expected.get("clarify"):
         if not turn.clarification:
@@ -616,7 +620,9 @@ def _verify_turn(expected: dict, turn, recorded: list, store, recorded_start: in
                       if shop not in allowed}
             if leaked:
                 problems.append(f"越权店铺进了查询：{sorted(leaked)}")
-    if expected.get("status"):
+    # 回合级 status 描述 query_business 的 ToolResult 状态；commerce 回合的
+    # status 是工具载荷语义（如 needs_input），由 _verify_commerce_turn 判。
+    if expected.get("status") and expected.get("tool") not in _COMMERCE_TOOLS:
         if turn.results:
             actual_status = turn.results[-1].status
         else:
@@ -630,10 +636,19 @@ def _verify_turn(expected: dict, turn, recorded: list, store, recorded_start: in
                             f"实际{statuses[-1] if statuses else '无运行记录'}")
     result = turn.results[-1] if turn.results else None
     this_turn = recorded[recorded_start:]
-    # 值/结构化/文本判定走同一判定器：无工具结果时也照常核对（缺行即问题，
-    # 不再静默跳过已声明的 values 检查）。
+    # 回合级判定只消费回合级键；commerce 回合的 status/limitations_contain/
+    # call_count 描述的是**工具载荷与调用记录**，由 _verify_commerce_turn 判，
+    # 不在回合观测上重复判（needs_input 回合没有 ToolResult，回合级 status
+    # 只会是 no_result，不是矛盾）。
+    turn_expected = dict(expected)
+    if expected.get("tool") in _COMMERCE_TOOLS:
+        for key in ("status", "limitations_contain", "call_count"):
+            turn_expected.pop(key, None)
+    calls_for_observation = (commerce_calls if commerce_calls is not None
+                             else this_turn)
     problems.extend(verify_expected(
-        expected, _observation(result, text=turn.text, calls=this_turn)))
+        turn_expected,
+        _observation(result, text=turn.text, calls=calls_for_observation)))
     return problems
 
 
@@ -701,8 +716,9 @@ def _run_questions(questions: list[dict], conn, *, make_model, prefix: str,
                         turn_text, state, model, conn, allowed, FROZEN_NOW, store,
                         partial_answers_enabled=bool(question.get("partial_answers")))
                     state = turn.state
-                    problems.extend(_verify_turn(expected, turn, recorded, store,
-                                                 recorded_start, allowed))
+                    problems.extend(_verify_turn(
+                        expected, turn, recorded, store, recorded_start,
+                        allowed, commerce_calls=recorded_commerce[commerce_start:]))
                     problems.extend(_verify_commerce_turn(
                         expected, recorded_commerce[commerce_start:]))
                     if problems:
