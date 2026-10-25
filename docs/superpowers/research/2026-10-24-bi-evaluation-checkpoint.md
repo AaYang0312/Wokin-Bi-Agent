@@ -276,6 +276,51 @@
 | `uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_core tests.test_runtime tests.test_operator_workflows -v` | **399 OK**（含 14 新增） |
 | `uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .` | **2120/2120 OK** |
 
+## T6 — 业务核心场景集与稳定性检查（2026-10-26，完成）
+
+### 交付
+
+- `tests/evaluation/cases/operator_core.jsonl` 扩到 **34 个场景**（T3/T4 的 4 个
+  + 本轮 30 个），10 类每类 ≥3 个独立条件；期望全部由种子算术手工推导
+  （S1 值表：窗口 09-01..09-08 支付 1000/6 笔、P_A 7 件 600 元、P_B 4 件 400 元；
+  拆单 E3/E4 记 2 笔支付——oc-009 首轮 3 笔预期被实际 4 笔纠正后按拆单语义定标）。
+  金额期望 Decimal 可精确表达；0/null/字段不存在分立（oc-011 真实零
+  status=ok 值'0' 带"未认证"披露 vs oc-008 无覆盖 missing_data）。
+- 类别覆盖要点：排他结束日（单日 500 不含次日）、跨月 1500、窗口冲突不继承、
+  aov 分母（4 笔 125）、加权价（产品工具 7 件 600）、部分答案（单段出数 50/
+  多段整拒/指标拆分 refused）、多来源（未核验披露 basis_exact、pdd 整组排除
+  payload missing_data、支付口径缺失格 missing 不补零）、参考价（快照在 90/
+  指标子集不含价格列）、澄清（毛利确认 oc-004、未登记平台 1688、销售额口径）、
+  授权（切店、越权引用被裁、全公司=授权集分列）、上传族（越窗仍缺、ROAS 同源、
+  重查稳定）、故障（模型超时 ModelError 注入、非法参数一次修正/两次停止）、
+  终态（fxg 真实 0 图表同源、退款披露保留、4 次工具预算后明确终态）。
+- `tests/test_evaluation_cases.py`（9 用例）：≥30/类≥3/family 唯一（防同义改写）/
+  split 不跨集/金额 Decimal 精确/部分答案语义必须显式开门禁；稳定性：串行×3
+  与反序逐场景状态一致（题间零状态泄漏）；上传族补充事实层幂等（同窗种子写
+  两遍合计仍 70——文件级幂等另由 test_sycm_import 钉住）。
+- runner/判定器配套：`ScriptedReply.error`（ModelError 注入）；commerce
+  拒答形态通用键 `payload_status`（needs_input/missing_data/failed 不再被判
+  "无已发布载荷"）；`_verify_turn` 的 tool 键缺失守卫与调用数观测修复
+  （空 commerce 列表不得顶替 query 调用数——oc-035 首轮 0 次误报的根因）。
+
+### 验证
+
+| 命令 | 结果 |
+| --- | --- |
+| `uv run --locked --env-file ../.env.evaluation python -m tests.evaluation.runner --mode offline --suite tests/evaluation/cases/operator_core.jsonl --repeat 1 --output ../.tmp/evaluation/run-003` | **34/34 pass，exit 0** |
+| 同上 `--repeat 3` | **102/102 pass，exit 0** |
+| 同上 `--order reverse` | **34/34 pass，exit 0** |
+| `uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_evaluation_cases -v` | **9/9 OK** |
+| `uv run --locked python -m unittest tests.test_evaluation_runner tests.test_evaluation_reporting tests.test_evaluation_verification tests.test_evaluation_cases -v` | 90 用例 OK（无环境 9 skip：DB 稳定性组） |
+| `uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .` | **2129/2129 OK** |
+| `uv run --locked --env-file ../.env.evaluation python -m tests.acceptance --offline` | **35/35 pass** |
+
+首轮 12 失败全部定位为**期望侧错误或判定器缺口**（非业务缺陷）：拆单笔数、
+商品档案需种子、`reference_price` 非请求指标名（应为 product_gross_margin_
+reference）、含当日窗口语义、needs_input 由 reference 指标触发、退款口径
+basis 为发生口径/完成时间、文本子串笔误；判定器缺口 3 处已修（见上）。
+未放宽任何门禁、未改业务代码来迎合期望。
+
 ## 任务状态总览
 
 | 任务 | 状态 |
@@ -286,8 +331,8 @@
 | T3 | 完成 |
 | T4 | 完成 |
 | T5 | 完成 |
-| T6 | 进行中（下一步） |
-| T7–T8 | 未开始 |
+| T6 | 完成 |
+| T7 | 进行中（下一步） |
+| T8 | 未开始 |
 
-下一条可执行命令：扩展 `tests/evaluation/cases/operator_core.jsonl` 至 30+ 场景后
-`cd backend && uv run --locked python -m unittest tests.test_evaluation_cases -v`（T6）。
+下一条可执行命令：`cd frontend && npm ci && npm test && npm run build`（T7）。

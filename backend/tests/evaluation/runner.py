@@ -33,7 +33,6 @@ from tests.evaluation.telemetry import (
     ScriptExhaustedError,
     ScriptedModel,
     aggregate_usage,
-    build_scripted_reply,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -257,10 +256,8 @@ def run_suite(cases: list[EvaluationCase], *, mode: str, repeat: int,
     def model_factory(case: EvaluationCase) -> MeteredModel:
         if mode == "live":
             return MeteredModel(live_model)
-        scripted = ScriptedModel(
-            [build_scripted_reply(spec) for spec in case.scripted_replies],
-            case_id=case.id)
-        return MeteredModel(scripted)
+        return MeteredModel(ScriptedModel(case.scripted_replies,
+                                          case_id=case.id))
 
     try:
         conn = connect_evaluation_db(dsn)

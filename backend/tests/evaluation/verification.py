@@ -297,6 +297,14 @@ def verify_commerce_turn(expected: dict, calls: list) -> list[str]:
             if fragment not in joined:
                 problems.append(f"needs_input披露未包含“{fragment}”，实际{joined}")
         return problems
+    if "payload_status" in expected:
+        # 正确拒答的通用形态（missing_data/failed 等）：只核对载荷状态，
+        # 不要求已发布数据集。
+        wanted = expected["payload_status"]
+        actual = payload.get("status") if isinstance(payload, dict) else None
+        if actual != wanted:
+            problems.append(f"载荷状态期望{wanted}，实际{actual}")
+        return problems
     if not isinstance(payload, dict) or "filters" not in payload:
         problems.append(f"compare_performance无已发布载荷：{payload}")
         return problems
@@ -380,8 +388,18 @@ def verify_product_turn(expected: dict, calls: list) -> list[str]:
 
     if not calls:
         return ["analyze_product_performance未被调用"]
-    problems: list[str] = []
     entry = calls[-1]
+    if ("payload_status" in expected
+            or expected.get("status") == "needs_input"):
+        # 正确拒答形态（needs_input/failed/missing_data）：只核对载荷状态。
+        payload = entry["payload"]
+        wanted = expected.get("payload_status",
+                              expected.get("status"))
+        actual = payload.get("status") if isinstance(payload, dict) else None
+        if actual != wanted:
+            return [f"载荷状态期望{wanted}，实际{actual}"]
+        return []
+    problems: list[str] = []
     arguments = entry["arguments"]
     for key, value in (expected.get("parameters") or {}).items():
         actual_value = arguments.get(key)

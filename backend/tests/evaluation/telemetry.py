@@ -25,9 +25,13 @@ class ScriptExhaustedError(RuntimeError):
 
 
 class ScriptedModel:
-    """按预制脚本逐次回复；与真实模型走同一条 agent 协议路径。"""
+    """按预制脚本逐次回复；与真实模型走同一条 agent 协议路径。
 
-    def __init__(self, replies: list[ModelReply], *, case_id: str = ""):
+    规格里带 ``error`` 的回复转成 ``ModelError(code)``（脱敏类别码），
+    复现超时/限流等故障路径。
+    """
+
+    def __init__(self, replies: list, *, case_id: str = ""):
         self._replies = list(replies)
         self._case_id = case_id
         self.consumed = 0
@@ -41,9 +45,15 @@ class ScriptedModel:
         if not self._replies:
             raise ScriptExhaustedError(
                 f"场景{self._case_id}的脚本回复已耗尽（已用{self.consumed}次）")
-        reply = self._replies.pop(0)
+        spec = self._replies.pop(0)
         self.consumed += 1
-        return reply
+        if isinstance(spec, ModelReply):
+            return spec
+        if spec.error is not None:
+            from bi_agent.llm import ModelError
+
+            raise ModelError(spec.error)
+        return build_scripted_reply(spec)
 
 
 class MeteredModel:

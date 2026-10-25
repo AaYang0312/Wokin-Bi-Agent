@@ -593,7 +593,7 @@ def _verify_turn(expected: dict, turn, recorded: list, store, recorded_start: in
             if fragment in (turn.clarification or ""):
                 problems.append(f"澄清不该宣布“{fragment}”")
         return problems
-    if expected["tool"] == "query_business":
+    if expected.get("tool") == "query_business":
         if expected.get("status") == "forbidden":
             if recorded:
                 problems.append("期望拒绝执行，但query_business被调用")
@@ -641,11 +641,15 @@ def _verify_turn(expected: dict, turn, recorded: list, store, recorded_start: in
     # 不在回合观测上重复判（needs_input 回合没有 ToolResult，回合级 status
     # 只会是 no_result，不是矛盾）。
     turn_expected = dict(expected)
-    if expected.get("tool") in _COMMERCE_TOOLS:
+    commerce_owned = expected.get("tool") in _COMMERCE_TOOLS
+    if commerce_owned:
         for key in ("status", "limitations_contain", "call_count"):
             turn_expected.pop(key, None)
-    calls_for_observation = (commerce_calls if commerce_calls is not None
-                             else this_turn)
+    # commerce 回合的调用数看 commerce 调用记录；其余回合看 query_business 记录
+    # （空列表与非 commerce 回合都不能顶替 query 调用数）。
+    calls_for_observation = (
+        commerce_calls if commerce_owned and commerce_calls is not None
+        else this_turn)
     problems.extend(verify_expected(
         turn_expected,
         _observation(result, text=turn.text, calls=calls_for_observation)))

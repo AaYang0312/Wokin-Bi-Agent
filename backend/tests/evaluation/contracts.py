@@ -47,13 +47,18 @@ class ToolCallSpec(BaseModel):
 
 
 class ScriptedReply(BaseModel):
-    """一次脚本回复：显式声明 text / tool_calls / 合成 usage（可缺省）。"""
+    """一次脚本回复：显式声明 text / tool_calls / 合成 usage（可缺省）。
+
+    ``error`` 非空时不产生回复，而是让模型调用抛 ``ModelError(error)``，
+    用于故障场景（超时/限流等脱敏类别码）。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     text: str | None = None
     tool_calls: list[ToolCallSpec] = Field(default_factory=list)
     usage: dict[str, int | None] | None = None
+    error: str | None = None
 
 
 class EvaluationCase(BaseModel):
@@ -68,7 +73,7 @@ class EvaluationCase(BaseModel):
     seed_names: list[str] = Field(default_factory=list)
     allowed: list[str] = Field(default_factory=lambda: ["S1"])
     feature_flags: dict[str, bool] = Field(default_factory=dict)
-    scripted_replies: list[ScriptedReply] = Field(min_length=1)
+    scripted_replies: list[ScriptedReply] = Field(default_factory=list)
     requires_human_review: bool = False
 
     @field_validator("turns")
