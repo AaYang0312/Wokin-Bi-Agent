@@ -166,6 +166,38 @@ describe('sendMessage 流契约（T7：done 前结束不能当成功）', () => 
     }
   })
 
+  it('rejects an empty stream without a done terminal (review F3)', async () => {
+    const fetchMock = vi.fn(async () => streamOf([]))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const attempt = sendMessage('chat-1', '问题', () => {},
+        new AbortController().signal)
+      await expect(attempt).rejects.toThrow('done')
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('rejects complete frames followed by EOF without done (review F3)', async () => {
+    // 完整的 status + message 帧后流干净地结束、但没有 done 终态：
+    // 字节流读完不等于业务完成，不允许 resolve 成"正常返回"
+    const events: ChatEvent[] = []
+    const fetchMock = vi.fn(async () => streamOf([
+      'event: status\ndata: {"stage":"answering"}\n\n',
+      'event: message\ndata: {"role":"assistant","id":"m1","content":"半途",'
+      + '"artifacts":[],"status":"complete","created_at":"2026-10-26T00:00:00Z"}\n\n',
+    ]))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const attempt = sendMessage('chat-1', '问题',
+        (event) => events.push(event), new AbortController().signal)
+      await expect(attempt).rejects.toThrow('done')
+      expect(events.map((event) => event.event)).toEqual(['status', 'message'])
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('surfaces a non-2xx response as ApiError before parsing any body', async () => {
     const fetchMock = vi.fn(async () => new Response(
       JSON.stringify({ message: '服务器开小差' }), { status: 503 }))

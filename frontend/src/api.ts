@@ -154,7 +154,14 @@ export async function sendMessage(
     body: JSON.stringify({ content }),
   })
   if (!response.ok || !response.body) throw await apiError(response)
-  const parser = createSseParser(onEvent)
+  // 终态契约：一次回答必须以 done 事件（status complete|error，由 parseEvent
+  // 保证）收尾。字节流读完不等于业务完成——完整帧后静默 EOF 也算中断，
+  // 不能当正常返回，否则前端会把不完整回复当成完成（复核 F3）。
+  let sawDoneTerminal = false
+  const parser = createSseParser((event) => {
+    if (event.event === 'done') sawDoneTerminal = true
+    onEvent(event)
+  })
   const reader = response.body.getReader()
   for (;;) {
     const { done, value } = await reader.read()
@@ -162,6 +169,7 @@ export async function sendMessage(
     parser.push(value)
   }
   parser.finish()
+  if (!sawDoneTerminal) throw new Error('SSE流未以done终态结束')
 }
 
 // ---------------------------------------------------------------- 记忆审核 API
