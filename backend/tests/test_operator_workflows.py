@@ -38,7 +38,8 @@ from unittest import mock
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
-from bi_agent.agent import SessionState, answer
+from bi_agent.agent import (SessionState, answer, _anonymize_question,
+                            _detect_shop_ids, _ensure_shop_refs)
 from bi_agent.catalog import ref_for_key
 from bi_agent.catalog.channel_mapping import (
     CHANNEL_MAPPING_VERSION, DEFAULT_NAMESPACE, IdentifierMapping,
@@ -2566,9 +2567,275 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
         self.assertIn("合成", text)
 
 
+class ShopScopeDetectionTests(unittest.TestCase):
+    """纯函数接缝：名称识别、引用派生与脱敏（计划 2026-10-24 T5）。
+
+    这些是确定性路径：已登记精确名、同名歧义、未知名、伪造引用、撤销授权旧引用
+    的行为不依赖模型。范围选择本身由模型工具参数决定，服务端只保授权集。
+    """
+
+    def test_registered_exact_name_matches(self):
+        matched, ambiguous = _detect_shop_ids(
+            "看元发钉枪的支付金额",
+            [("SA", "元发钉枪"), ("SB", "元发工具")], {"SA": "ent-a"})
+        self.assertEqual(matched, ["SA"])
+        self.assertEqual(ambiguous, [])
+
+    def test_same_name_shops_flagged_ambiguous_not_chosen(self):
+        matched, ambiguous = _detect_shop_ids(
+            "看同名店的支付金额",
+            [("SA", "同名店"), ("SB", "同名店")], {"SA": "ent-a", "SB": "ent-b"})
+        self.assertEqual(ambiguous, ["同名店"])
+        # 歧义名同时命中两家，不替用户挑一家
+        self.assertEqual(sorted(matched), ["SA", "SB"])
+
+    def test_unknown_name_is_not_matched_and_never_expands(self):
+        matched, ambiguous = _detect_shop_ids(
+            "看未登记的某某专卖店的支付金额",
+            [("SA", "元发钉枪")], {"SA": "ent-a"})
+        self.assertEqual(matched, [])
+        self.assertEqual(ambiguous, [])
+
+    def test_forged_ref_is_not_resolved(self):
+        matched, _ambiguous = _detect_shop_ids(
+            "看 ent-deadbeef 的支付金额",
+            [("SA", "元发钉枪")], {"SA": "ent-a"})
+        self.assertEqual(matched, [])
+
+    def test_revoked_ref_no_longer_resolves(self):
+        # 撤销授权后 refs 里没有旧引用：问题带着它也不解析回任何店铺
+        matched, _ambiguous = _detect_shop_ids(
+            "看 ent-b 的支付金额", [("SA", "元发钉枪")], {"SA": "ent-a"})
+        self.assertEqual(matched, [])
+
+    def test_anonymize_replaces_registered_names_with_refs(self):
+        anonymized = _anonymize_question(
+            "元发钉枪和元发工具各支付多少",
+            [("SA", "元发钉枪"), ("SB", "元发工具")],
+            {"SA": "ent-a", "SB": "ent-b"})
+        self.assertNotIn("元发钉枪", anonymized)
+        self.assertNotIn("元发工具", anonymized)
+        self.assertIn("ent-a", anonymized)
+        self.assertIn("ent-b", anonymized)
+
+    def test_anonymize_marks_missing_ref_as_unauthorized(self):
+        anonymized = _anonymize_question(
+            "元发钉枪支付多少", [("SA", "元发钉枪")], {})
+        self.assertEqual(anonymized, "未授权店铺支付多少")
+
+    def test_ensure_shop_refs_drops_revoked_and_keeps_numbers_stable(self):
+        refs = {"SA": ref_for_key("shop", "SA"), "SB": ref_for_key("shop", "SB")}
+        state = SessionState(subject="t5-refs", shop_refs=refs)
+        narrowed = _ensure_shop_refs(state, frozenset({"SA"}))
+        self.assertEqual(set(narrowed.shop_refs), {"SA"})
+        # 引用由 (kind, shop_id) 纯派生：重跑、重排不换号
+        again = _ensure_shop_refs(narrowed, frozenset({"SA"}))
+        self.assertEqual(again.shop_refs, narrowed.shop_refs)
+        restored = _ensure_shop_refs(narrowed, frozenset({"SA", "SC"}))
+        self.assertEqual(restored.shop_refs["SC"], ref_for_key("shop", "SC"))
+        self.assertEqual(restored.shop_refs["SA"], ref_for_key("shop", "SA"))
+
+
+@unittest.skipUnless(os.getenv("BI_TEST_ADMIN_DSN"), "未配置独立测试数据库")
+class MultiTurnShopScopeTests(OperatorFixture):
+    """多轮店铺范围与授权变化（计划 2026-10-24 T5）。
+
+    断言落在规范化后的工具请求（shop_ids、窗口）与完整模型消息对象上，
+    不靠自然语言里出现店名判定通过。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.nail = self._shop("nail")
+        self.tools = self._shop("tools")
+        for key in ("nail", "tools"):
+            self._cover(key)
+            self._sale(key, f"E-{key}", quantity="1", amount="100")
+        self.nail_name = f"元发钉枪{self.tag}"
+        self.tools_name = f"元发工具{self.tag}"
+        self.conn.execute(
+            "UPDATE bi.shops SET display_name=%s WHERE shop_id=%s",
+            (self.nail_name, self.nail))
+        self.conn.execute(
+            "UPDATE bi.shops SET display_name=%s WHERE shop_id=%s",
+            (self.tools_name, self.tools))
+
+    def _recorded_turn(self, question, replies, state, allowed):
+        """跑一轮并记录规范化后的 query_business 请求与完整模型消息。"""
+        import bi_agent.metrics as metrics_module
+
+        real_query = metrics_module.query_business
+        recorded: list = []
+
+        def spy(connection, request, **kwargs):
+            recorded.append(request)
+            return real_query(connection, request, **kwargs)
+
+        model = mock.Mock()
+        model.complete.side_effect = list(replies)
+        store = MemoryQueryRunStore(forbidden_values=set(allowed))
+        with mock.patch("bi_agent.business_query.nodes.metrics.query_business",
+                        side_effect=spy):
+            turn = answer(question, state, model=model, conn=self.conn,
+                          allowed_shop_ids=allowed, now=NOW, run_store=store)
+        return turn, recorded, model
+
+    def test_three_turn_narrowing_and_switch_normalizes_scope(self):
+        allowed = self._allow("nail", "tools")
+        nail_ref = ref_for_key("shop", self.nail)
+        tools_ref = ref_for_key("shop", self.tools)
+
+        state = SessionState(subject=f"t5a-{self.tag}")
+        turn1, recorded1, _model1 = self._recorded_turn(
+            f"{self.nail_name}和{self.tools_name}最近7天支付金额",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": sorted([nail_ref, tools_ref]),
+                "metrics": ["paid_amount"]})]),
+             _reply(text="两家各100元。")],
+            state, allowed)
+        state = turn1.state
+        turn2, recorded2, _model2 = self._recorded_turn(
+            f"只看{self.nail_name}，最近7天支付金额",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": [nail_ref], "metrics": ["paid_amount"]})]),
+             _reply(text="这家100元。")],
+            state, allowed)
+        state = turn2.state
+        turn3, recorded3, _model3 = self._recorded_turn(
+            f"改看{self.tools_name}",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": [tools_ref], "metrics": ["paid_amount"]})]),
+             _reply(text="换成另一家100元。")],
+            state, allowed)
+
+        self.assertEqual(sorted(recorded1[-1].shop_ids),
+                         sorted([self.nail, self.tools]))
+        self.assertEqual(recorded2[-1].shop_ids, [self.nail])
+        self.assertEqual(recorded3[-1].shop_ids, [self.tools])
+        # 授权集不变：两家的引用都还在（模型每轮自行收窄，服务端只保授权）
+        self.assertEqual(set(turn3.state.shop_refs),
+                         {self.nail, self.tools})
+
+    def test_model_messages_never_contain_names_or_raw_ids(self):
+        allowed = self._allow("nail", "tools")
+        nail_ref = ref_for_key("shop", self.nail)
+        state = SessionState(subject=f"t5b-{self.tag}")
+        _turn_result, _recorded, model = self._recorded_turn(
+            f"只看{self.nail_name}，最近7天支付金额",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": [nail_ref], "metrics": ["paid_amount"]})]),
+             _reply(text="这家100元。")],
+            state, allowed)
+        for call in model.complete.call_args_list:
+            messages = call.args[0]
+            for message in messages:
+                content = message.content or ""
+                self.assertNotIn(self.nail_name, content,
+                                 "真实店名不得进入模型消息")
+                self.assertNotIn(self.tools_name, content)
+                self.assertNotIn(self.nail, content, "真实店号不得进入模型消息")
+                self.assertNotIn(self.tools, content)
+
+    def test_same_name_shops_clarify_without_running_tools(self):
+        # 两家店同名：必须澄清而不是替用户挑一家
+        for shop_id in (self.nail, self.tools):
+            self.conn.execute(
+                "UPDATE bi.shops SET display_name=%s WHERE shop_id=%s",
+                ("同名测试店", shop_id))
+        state = SessionState(subject=f"t5c-{self.tag}")
+        turn, recorded, model = self._recorded_turn(
+            "看同名测试店的支付金额", [], state, self._allow("nail", "tools"))
+        self.assertTrue(turn.clarification, "同名店铺必须澄清")
+        self.assertIn("同名", turn.clarification)
+        self.assertEqual(recorded, [], "澄清回合不得执行查询")
+        self.assertEqual(model.complete.call_count, 0)
+
+    def test_revoked_authorization_drops_ref_and_blocks_old_ref(self):
+        allowed_full = self._allow("nail", "tools")
+        nail_ref = ref_for_key("shop", self.nail)
+        state = SessionState(subject=f"t5d-{self.tag}")
+        turn1, _recorded1, _model1 = self._recorded_turn(
+            f"{self.nail_name}最近7天支付金额",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": [nail_ref], "metrics": ["paid_amount"]})]),
+             _reply(text="100元。")],
+            state, allowed_full)
+        # 撤销 tools 授权后：引用从会话状态消失，被撤销店铺不得再进查询
+        allowed_narrow = self._allow("nail")
+        turn2, recorded2, _model2 = self._recorded_turn(
+            f"改看{self.tools_name}，最近7天支付金额",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": [nail_ref], "metrics": ["paid_amount"]})]),
+             _reply(text="只能继续看授权内的店铺。")],
+            turn1.state, allowed_narrow)
+        self.assertEqual(set(turn2.state.shop_refs), {self.nail},
+                         "撤销授权的旧引用必须从会话状态消失")
+        leaked = {shop for request in recorded2
+                  for shop in request.shop_ids if shop not in allowed_narrow}
+        self.assertEqual(leaked, set(), "被撤销店铺不得再进查询")
+
+    def test_parallel_subjects_do_not_share_refs_or_messages(self):
+        allowed = self._allow("nail")
+        allowed_other = self._allow("tools")
+        nail_ref = ref_for_key("shop", self.nail)
+        state_a = SessionState(subject=f"t5e-a-{self.tag}")
+        state_b = SessionState(subject=f"t5e-b-{self.tag}")
+        self._recorded_turn(
+            f"{self.nail_name}最近7天支付金额",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": [nail_ref], "metrics": ["paid_amount"]})]),
+             _reply(text="A主题100元。")],
+            state_a, allowed)
+        tools_ref = ref_for_key("shop", self.tools)
+        _turn_b, recorded_b, model_b = self._recorded_turn(
+            "我的店最近7天支付金额",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": [tools_ref], "metrics": ["paid_amount"]})]),
+             _reply(text="B主题100元。")],
+            state_b, allowed_other)
+        self.assertEqual(set(_turn_b.state.shop_refs), {self.tools})
+        # B 的模型消息里没有 A 的店铺引用、名称与店号（含 system 提示的 ref_doc）
+        for call in model_b.complete.call_args_list:
+            for message in call.args[0]:
+                content = message.content or ""
+                self.assertNotIn(nail_ref, content)
+                self.assertNotIn(self.nail_name, content)
+                self.assertNotIn(self.nail, content)
+        leaked = {shop for request in recorded_b
+                  for shop in request.shop_ids if shop not in allowed_other}
+        self.assertEqual(leaked, set())
+
+    def test_time_and_scope_change_together_do_not_inherit(self):
+        allowed = self._allow("nail", "tools")
+        nail_ref = ref_for_key("shop", self.nail)
+        tools_ref = ref_for_key("shop", self.tools)
+        state = SessionState(subject=f"t5f-{self.tag}")
+        turn1, recorded1, _model1 = self._recorded_turn(
+            f"{self.nail_name}2026年8月25日至31日支付金额",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": [nail_ref], "metrics": ["paid_amount"],
+                "start": "2026-08-25", "end": "2026-09-01"})]),
+             _reply(text="8月100元。")],
+            state, allowed)
+        turn2, recorded2, _model2 = self._recorded_turn(
+            f"{self.tools_name}2026年9月1日至7日支付金额",
+            [_reply(calls=[_call("query_business", {
+                "shop_ids": [tools_ref], "metrics": ["paid_amount"],
+                "start": "2026-09-01", "end": "2026-09-08"})]),
+             _reply(text="9月100元。")],
+            turn1.state, allowed)
+        self.assertEqual(recorded1[-1].shop_ids, [self.nail])
+        self.assertEqual(recorded1[-1].start.isoformat(), "2026-08-25")
+        self.assertEqual(recorded2[-1].shop_ids, [self.tools],
+                         "换店不得继承上一轮的店铺范围")
+        self.assertEqual(recorded2[-1].start.isoformat(), "2026-09-01",
+                         "换时间不得继承上一轮的窗口")
+
+
 __all__ = ["OperatorFixture", "OperatorTestDatabaseGatingTests",
            "OperatorProductWorkflowTests",
            "OperatorComparisonWorkflowTests", "OperatorListingWorkflowTests",
            "OperatorInventoryWorkflowTests", "OperatorAgentRoutingTests",
            "OperatorMultiSourceGuardrailTests", "OperatorAcceptanceSetTests",
-           "QueryMemoryOperatorGateTests"]
+           "QueryMemoryOperatorGateTests", "ShopScopeDetectionTests",
+           "MultiTurnShopScopeTests"]

@@ -241,6 +241,41 @@
 | `uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .` | **2106/2106 OK** |
 | `uv run --locked --env-file ../.env.evaluation python -m tests.acceptance --offline` | **35/35 pass** |
 
+## T5 — 多轮店铺范围与授权变化回归（2026-10-25，完成）
+
+### 结论
+
+**既有实现验证通过，本轮无需修复 agent.py。** 新增 14 个用例（8 纯函数 +
+6 agent 级多轮）全绿；确定性路径（名称识别/引用派生/脱敏/授权裁剪）行为正确：
+
+- `ShopScopeDetectionTests`（纯函数，无库）：已登记精确名命中；同名店铺
+  标记歧义且同时命中两家（不替用户挑）；未登记名不匹配不扩大；伪造引用
+  `ent-deadbeef` 不解析；撤销授权旧引用不再解析；脱敏把已登记名换引用、
+  无引用名换"未授权店铺"；`_ensure_shop_refs` 撤销即删、重跑/重排不换号。
+- `MultiTurnShopScopeTests`（真实图+脚本模型，断言规范化请求与完整消息对象）：
+  - 三轮 全部授权→精确指定一家→改另一家：逐轮规范化 `shop_ids` 收窄/切换
+    正确，授权集引用保留（模型每轮自选范围，服务端只保授权）；
+  - 模型完整消息对象零真实店名/零真实店号；
+  - 两家同名店→澄清且零查询零模型调用；
+  - 撤销授权：会话状态引用即删，被撤销店铺不得再进任何查询；
+  - 两个 subject 并行（串行执行）：B 的模型消息/查询里没有 A 的引用、
+    名称、店号；
+  - 时间+范围同时变化：换店不继承上轮店铺、换窗不继承上轮窗口。
+
+### 记录（不修）
+
+- `agent.py:714` 的 `matched_shops` 计算后未使用（范围由模型工具参数决定），
+  属无害死代码，P2 记录不顺手改。
+- "上次金额最高的那家"无确定性解析能力（模型侧看不到名称映射）：**待设计**，
+  不为通过测试发明新能力；平台级收窄已由授权平台目录约束（既有测试覆盖）。
+
+### 验证
+
+| 命令 | 结果 |
+| --- | --- |
+| `uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_core tests.test_runtime tests.test_operator_workflows -v` | **399 OK**（含 14 新增） |
+| `uv run --locked --env-file ../.env.evaluation python -m unittest discover -s tests -t .` | **2120/2120 OK** |
+
 ## 任务状态总览
 
 | 任务 | 状态 |
@@ -250,8 +285,9 @@
 | T2 | 完成 |
 | T3 | 完成 |
 | T4 | 完成 |
-| T5 | 进行中（下一步） |
-| T6–T8 | 未开始 |
+| T5 | 完成 |
+| T6 | 进行中（下一步） |
+| T7–T8 | 未开始 |
 
-下一条可执行命令：
-`cd backend && uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_core tests.test_runtime tests.test_operator_workflows -v`（T5）。
+下一条可执行命令：扩展 `tests/evaluation/cases/operator_core.jsonl` 至 30+ 场景后
+`cd backend && uv run --locked python -m unittest tests.test_evaluation_cases -v`（T6）。
