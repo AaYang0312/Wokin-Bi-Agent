@@ -195,6 +195,38 @@ class MeteredModelTests(unittest.TestCase):
         self.assertIsNone(agg["totals"])
         self.assertIsNone(agg["known"])
 
+    def test_failed_model_call_is_counted_as_missing_usage(self):
+        """复核 F5：调用抛异常时 usage 必须记为缺失，不能从聚合里消失。"""
+        from tests.evaluation.telemetry import (
+            MeteredModel,
+            ScriptedModel,
+            aggregate_usage,
+        )
+        from tests.evaluation.contracts import ScriptedReply
+
+        from bi_agent.llm import Message
+
+        metered = MeteredModel(ScriptedModel([
+            ScriptedReply(error="timeout"),
+            ScriptedReply(text="好了",
+                          usage={"prompt_tokens": 10,
+                                 "completion_tokens": 5,
+                                 "total_tokens": 15}),
+        ]))
+        messages = [Message(role="user", content="问")]
+        with self.assertRaises(Exception):
+            metered.complete(messages, [], timeout_s=1.0)
+        metered.complete(messages, [], timeout_s=1.0)
+        self.assertEqual(metered.call_count, 2)
+        self.assertEqual(len(metered.usage_records), 2,
+                         "两次调用都要留下记录（失败=缺失）")
+        agg = aggregate_usage(metered.usage_records)
+        self.assertEqual(agg["status"], "partial")
+        self.assertIsNone(agg["totals"])
+        self.assertEqual(agg["known"],
+                         {"prompt_tokens": 10, "completion_tokens": 5,
+                          "total_tokens": 15})
+
 
 class SanitizeTests(unittest.TestCase):
     def test_dsn_password_never_survives(self):
@@ -207,10 +239,50 @@ class SanitizeTests(unittest.TestCase):
         self.assertNotIn("AnotherSecret", clean)
         self.assertIn("postgresql://", clean)
 
+    def test_quoted_password_with_spaces_is_fully_masked(self):
+        """复核 F8：libpq 合法的带引号含空格密码必须整段脱敏。"""
+        from tests.evaluation.reporting import sanitize
+
+        dirty = "host=localhost password='Alpha SecretTail' dbname=demo"
+        clean = sanitize(dirty)
+        self.assertNotIn("SecretTail", clean)
+        self.assertNotIn("Alpha", clean)
+        self.assertIn("password=", clean)
+        dirty_double = 'host=localhost password="Beta OtherTail" dbname=demo'
+        clean_double = sanitize(dirty_double)
+        self.assertNotIn("OtherTail", clean_double)
+        self.assertNotIn("Beta", clean_double)
+
     def test_plain_text_untouched(self):
         from tests.evaluation.reporting import sanitize
 
         self.assertEqual(sanitize("支付金额1000元"), "支付金额1000元")
+
+
+class BlockedPathReportTests(unittest.TestCase):
+    """复核 F9：环境阻塞也要落报告，attempted/blocked 按 repeat 统一。"""
+
+    def test_blocked_run_writes_report_and_counts_repeats(self):
+        import json
+        from unittest import mock
+
+        from tests.evaluation import runner as runner_module
+        from tests.evaluation.runner import evaluate_exit_code, run_suite
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "blocked-run"
+            with mock.patch.object(runner_module, "_suite_dsn", return_value=None):
+                summary = run_suite([_case_line()], mode="offline", repeat=3,
+                                    output_dir=output)
+            self.assertEqual(summary.totals["attempted"], 3)
+            self.assertEqual(summary.totals["blocked"], 3)
+            self.assertEqual(summary.totals["executed"], 0)
+            self.assertIsNone(summary.totals["pass_rate"])
+            self.assertEqual(evaluate_exit_code(summary), 2)
+            for name in ("cases.jsonl", "summary.json", "report.md"):
+                self.assertTrue((output / name).exists(), name)
+            body = json.loads((output / "summary.json").read_text("utf-8"))
+            self.assertEqual(body["totals"]["blocked"], 3)
 
 
 class ExitCodeTests(unittest.TestCase):
@@ -251,6 +323,82 @@ class ExitCodeTests(unittest.TestCase):
 
 def _stub_suite(directory: Path) -> Path:
     return _write_suite(directory / "stub.jsonl", [_case_line()])
+
+
+@unittest.skipUnless(
+    os.getenv("BI_EVALUATION_ADMIN_DSN")
+    or (os.getenv("BI_TEST_ADMIN_DSN") or "").endswith("bi_agent_eval_test"),
+    "未配置评测沙箱 DSN")
+class FailureAccountingTests(unittest.TestCase):
+    """复核 F6/F7：错误计入分母；准备失败保留原异常并清理。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from tests.evaluation.runner import run_suite
+
+        cls.tmp = tempfile.TemporaryDirectory()
+        # 一条正常场景 + 一条脚本耗尽（第二个模型回合无回复）的场景
+        exhausted = _case_line(id="case-exhaust")
+        exhausted["scripted_replies"] = exhausted["scripted_replies"][:1]
+        cls.summary = run_suite([_case_line(), exhausted], mode="offline",
+                                repeat=1, output_dir=Path(cls.tmp.name) / "run")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_f6_errors_count_in_the_executed_denominator(self):
+        totals = self.summary.totals
+        self.assertEqual(totals["attempted"], 2)
+        self.assertEqual(totals["executed"], 2,
+                         "执行错误也是已执行的尝试，不得从分母里消失")
+        self.assertEqual(totals["passed"], 1)
+        self.assertEqual(totals["failed"], 1)
+        self.assertAlmostEqual(totals["pass_rate"], 0.5,
+                               msg="含错误的运行不得呈现为100%通过")
+
+    def test_f6_exit_code_still_signals_failure(self):
+        from tests.evaluation.runner import evaluate_exit_code
+
+        self.assertEqual(evaluate_exit_code(self.summary), 1)
+
+
+@unittest.skipUnless(
+    os.getenv("BI_EVALUATION_ADMIN_DSN")
+    or (os.getenv("BI_TEST_ADMIN_DSN") or "").endswith("bi_agent_eval_test"),
+    "未配置评测沙箱 DSN")
+class SeedFailureHandlingTests(unittest.TestCase):
+    """复核 F7：seed/模型工厂抛错要保留原异常并完成逐题清理。"""
+
+    def test_seed_failure_keeps_original_error_and_releases_savepoint(self):
+        from unittest import mock
+
+        from tests import acceptance as acceptance_module
+        from tests.evaluation.runner import run_suite
+
+        def broken_seed(_conn):
+            raise RuntimeError("合成种子爆炸")
+
+        case = _case_line()
+        case["seed_names"] = ["multi_source"]
+        with mock.patch.dict(acceptance_module.SEED_STEPS,
+                             {"multi_source": broken_seed}):
+            summary = run_suite([case], mode="offline", repeat=1)
+        result = summary.cases[0]
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.error_class, "RuntimeError",
+                         "原始异常类别必须保留，不得被 UnboundLocalError 覆盖")
+        self.assertTrue(any("合成种子爆炸" in problem
+                            for problem in result.problems), result.problems)
+
+        # 同一连接上紧接着再跑一次正常场景：savepoint 已释放，库可用
+        with mock.patch.dict(acceptance_module.SEED_STEPS):
+            del acceptance_module.SEED_STEPS["multi_source"]
+            acceptance_module.SEED_STEPS["multi_source"] = (
+                acceptance_module.seed_multi_source_case)
+            replay = run_suite([_case_line()], mode="offline", repeat=1)
+        self.assertEqual(replay.cases[0].status, "pass",
+                         "前题清理失败会拖垮后续场景的连接状态")
 
 
 @unittest.skipUnless(

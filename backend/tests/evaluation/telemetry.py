@@ -70,6 +70,11 @@ class MeteredModel:
         started = time.monotonic()
         try:
             reply = self.inner.complete(messages, tools, timeout_s=timeout_s)
+        except Exception:
+            # 失败的调用也是一次真实尝试：usage 记为缺失（None），不能从
+            # 聚合记录里消失——否则失败轮次会被当成零成本或"全量已知"。
+            self.usage_records.append(None)
+            raise
         finally:
             self.model_duration_ms += (time.monotonic() - started) * 1000.0
             self.call_count += 1

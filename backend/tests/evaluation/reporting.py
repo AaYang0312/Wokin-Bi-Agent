@@ -15,12 +15,19 @@ import re
 from pathlib import Path
 
 _DSN_PASSWORD = re.compile(r"(postgres(?:ql)?://[^:/@\s]+:)[^@/\s]+(@)")
+# libpq 键值串的合法形态：不带引号、单引号、双引号（引号内可含空格）。
 _PASSWORD_KV = re.compile(r"(password[=:\s])[^\s;]+", re.IGNORECASE)
+_PASSWORD_SINGLE = re.compile(r"(password[=:\s]?)'[^']*'",
+                              re.IGNORECASE)
+_PASSWORD_DOUBLE = re.compile(r'(password[=:\s]?)"[^"]*"',
+                              re.IGNORECASE)
 
 
 def sanitize(text: str) -> str:
-    """把 DSN/键值形态的密码替换成 ***；其余文本原样保留。"""
+    """把 DSN/键值形态的密码（含带引号、含空格）整段替换成 ***。"""
     cleaned = _DSN_PASSWORD.sub(r"\1***\2", text)
+    cleaned = _PASSWORD_SINGLE.sub(r"\1***", cleaned)
+    cleaned = _PASSWORD_DOUBLE.sub(r"\1***", cleaned)
     return _PASSWORD_KV.sub(r"\1***", cleaned)
 
 

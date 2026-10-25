@@ -83,22 +83,25 @@ def _blocked_summary(cases: list[EvaluationCase], *, mode: str, repeat: int,
                      reason: str, suite_path: Path | None,
                      command: str) -> EvaluationSummary:
     note = OFFLINE_NOTE if mode == "offline" else LIVE_NOTE
+    # attempted/blocked 与正常路径同一口径：场景数 × 重复次数（复核 F9）。
+    total = len(cases) * repeat
     return EvaluationSummary(
         mode=mode, note=note,
         dataset_sha256=_dataset_sha256(cases, suite_path),
         source=_git_source(), frozen_time=_frozen_time_iso(),
         flags={}, repeat=repeat, command=sanitize(command),
-        totals={"attempted": len(cases), "executed": 0, "passed": 0,
-                "failed": 0, "blocked": len(cases), "skipped": 0,
+        totals={"attempted": total, "executed": 0, "passed": 0,
+                "failed": 0, "blocked": total, "skipped": 0,
                 "human_review_pending": 0, "pass_rate": None},
         usage={"status": "unavailable", "totals": None, "known": None,
                "source": "synthetic" if mode == "offline" else "model"},
         cases=[CaseResult(
-            id=case.id, repeat=0, status="blocked",
+            id=case.id, repeat=repetition, status="blocked",
             problems=[sanitize(reason)], duration_ms=0.0,
             model_call_count=0, tool_call_count=0, run_count=0,
             artifact_count=0, error_class="EvaluationTargetError",
-            usage_source=None) for case in cases])
+            usage_source=None)
+            for repetition in range(1, repeat + 1) for case in cases])
 
 
 def _frozen_time_iso() -> str:
@@ -141,6 +144,7 @@ def _run_case(conn, case: EvaluationCase, repetition: int,
     problems: list[str] = []
     status = "pass"
     error_class: str | None = None
+    metered: MeteredModel | None = None
     conn.execute("SAVEPOINT evaluation_case")
 
     def spy(connection, request, **kwargs):
@@ -156,65 +160,68 @@ def _run_case(conn, case: EvaluationCase, repetition: int,
         return execution
 
     try:
+        # seed 与模型工厂都在清理边界内：任何一步抛错都保留原始异常类别，
+        # 并按题回滚/释放存点（复核 F7：不再被 UnboundLocalError 覆盖）。
         for step in case.seed_names:
             SEED_STEPS[step](conn)
         state = SessionState(subject=f"evaluation-{case.id}-{repetition}")
         allowed = frozenset(case.allowed or ["S1"])
         metered = model_factory(case)
-        try:
-            with patch("bi_agent.business_query.nodes.metrics.query_business",
-                       side_effect=spy),                     patch("bi_agent.agent.execute_commerce_tool",
-                          side_effect=commerce_spy):
-                for turn_index, (turn_text, expected) in enumerate(
-                        zip(case.turns, case.expected)):
-                    store = _memory_store(allowed)
-                    recorded_start = len(recorded)
-                    commerce_start = len(recorded_commerce)
-                    turn = _run_turn(
-                        turn_text, state, metered, conn, allowed, FROZEN_NOW,
-                        store,
-                        partial_answers_enabled=bool(
-                            case.feature_flags.get("PARTIAL_ANSWERS_ENABLED",
-                                                   False)))
-                    state = turn.state
-                    run_count += len(store.runs)
-                    artifact_count += len(store.artifacts)
-                    problems.extend(_verify_turn(
-                        expected, turn, recorded, store, recorded_start,
-                        allowed,
-                        commerce_calls=recorded_commerce[commerce_start:]))
-                    problems.extend(_verify_commerce_turn(
-                        expected, recorded_commerce[commerce_start:]))
-                    if problems:
-                        break
-            inner = metered.inner
-            if isinstance(inner, ScriptedModel) and inner.remaining:
-                problems.append(
-                    f"脚本回复未用完（剩{inner.remaining}条）——场景合同与实际"
-                    "执行不一致")
-        finally:
-            conn.execute("ROLLBACK TO evaluation_case")
-            conn.execute("RELEASE SAVEPOINT evaluation_case")
+        with patch("bi_agent.business_query.nodes.metrics.query_business",
+                   side_effect=spy),                     patch("bi_agent.agent.execute_commerce_tool",
+                      side_effect=commerce_spy):
+            for turn_text, expected in zip(case.turns, case.expected):
+                store = _memory_store(allowed)
+                recorded_start = len(recorded)
+                commerce_start = len(recorded_commerce)
+                turn = _run_turn(
+                    turn_text, state, metered, conn, allowed, FROZEN_NOW,
+                    store,
+                    partial_answers_enabled=bool(
+                        case.feature_flags.get("PARTIAL_ANSWERS_ENABLED",
+                                               False)))
+                state = turn.state
+                run_count += len(store.runs)
+                artifact_count += len(store.artifacts)
+                problems.extend(_verify_turn(
+                    expected, turn, recorded, store, recorded_start, allowed,
+                    commerce_calls=recorded_commerce[commerce_start:]))
+                problems.extend(_verify_commerce_turn(
+                    expected, recorded_commerce[commerce_start:]))
+                if problems:
+                    break
+        inner = metered.inner
+        if isinstance(inner, ScriptedModel) and inner.remaining:
+            problems.append(
+                f"脚本回复未用完（剩{inner.remaining}条）——场景合同与实际"
+                "执行不一致")
     except ScriptExhaustedError as exc:
         status, error_class = "error", "ScriptExhaustedError"
         problems.append(sanitize(str(exc)))
     except Exception as exc:  # noqa: BLE001
         status, error_class = "error", type(exc).__name__
         problems.append(sanitize(f"异常：{type(exc).__name__}: {exc}"[:300]))
+    finally:
+        # 逐题清理在一切路径上执行：seed 失败、模型工厂失败、执行失败 alike。
+        conn.execute("ROLLBACK TO evaluation_case")
+        conn.execute("RELEASE SAVEPOINT evaluation_case")
     if status == "pass" and problems:
         status = "fail"
     duration_ms = (time.monotonic() - started) * 1000.0
+    usage_source = None
+    if metered is not None:
+        usage_source = ("synthetic" if isinstance(metered.inner, ScriptedModel)
+                        else "model")
     result = CaseResult(
         id=case.id, repeat=repetition, status=status,
         problems=[sanitize(problem) for problem in problems],
         duration_ms=round(duration_ms, 3),
-        model_call_count=metered.call_count,
+        model_call_count=metered.call_count if metered else 0,
         tool_call_count=len(recorded) + len(recorded_commerce),
         run_count=run_count, artifact_count=artifact_count,
         error_class=error_class,
-        usage_source="synthetic" if isinstance(metered.inner, ScriptedModel)
-        else "model")
-    return result, list(metered.usage_records)
+        usage_source=usage_source)
+    return result, list(metered.usage_records) if metered else []
 
 
 def run_suite(cases: list[EvaluationCase], *, mode: str, repeat: int,
@@ -233,12 +240,18 @@ def run_suite(cases: list[EvaluationCase], *, mode: str, repeat: int,
         raise ValueError(f"未知模式：{mode}")
     cases = [case if isinstance(case, EvaluationCase) else EvaluationCase(**case)
              for case in cases]
+    def blocked(reason: str) -> EvaluationSummary:
+        # 阻塞也要落报告（复核 F9）：退出码 2 的同时保留可查的结构化结果。
+        summary = _blocked_summary(
+            cases, mode=mode, repeat=repeat, reason=reason,
+            suite_path=suite_path, command=command)
+        if output_dir is not None:
+            write_report(summary, Path(output_dir))
+        return summary
+
     dsn = _suite_dsn()
     if not dsn:
-        return _blocked_summary(
-            cases, mode=mode, repeat=repeat,
-            reason="未配置评测沙箱DSN（BI_EVALUATION_ADMIN_DSN）",
-            suite_path=suite_path, command=command)
+        return blocked("未配置评测沙箱DSN（BI_EVALUATION_ADMIN_DSN）")
 
     live_model = None
     if mode == "live":
@@ -248,10 +261,7 @@ def run_suite(cases: list[EvaluationCase], *, mode: str, repeat: int,
 
             live_model = create_model(load_model_settings(os.environ))
         except (OSError, ValueError) as exc:
-            return _blocked_summary(
-                cases, mode=mode, repeat=repeat,
-                reason=f"live模型配置缺失：{sanitize(str(exc)[:200])}",
-                suite_path=suite_path, command=command)
+            return blocked(f"live模型配置缺失：{sanitize(str(exc)[:200])}")
 
     def model_factory(case: EvaluationCase) -> MeteredModel:
         if mode == "live":
@@ -262,9 +272,7 @@ def run_suite(cases: list[EvaluationCase], *, mode: str, repeat: int,
     try:
         conn = connect_evaluation_db(dsn)
     except EvaluationTargetError as exc:
-        return _blocked_summary(
-            cases, mode=mode, repeat=repeat, reason=str(exc),
-            suite_path=suite_path, command=command)
+        return blocked(str(exc))
     results: list[CaseResult] = []
     usage_records: list[dict | None] = []
     try:
@@ -299,8 +307,9 @@ def run_suite(cases: list[EvaluationCase], *, mode: str, repeat: int,
 def _summarize(cases, results: list[CaseResult], *, mode: str, repeat: int,
                suite_path: Path | None, command: str,
                usage_records: list[dict | None]) -> EvaluationSummary:
+    # 执行错误也是已执行的尝试：计入分母，不得让含错运行呈现 100%（复核 F6）。
     executed = [case for case in results
-                if case.status in ("pass", "fail")]
+                if case.status in ("pass", "fail", "error")]
     passed = sum(1 for case in executed if case.status == "pass")
     failed = sum(1 for case in results if case.status == "fail")
     blocked = sum(1 for case in results if case.status == "blocked")
