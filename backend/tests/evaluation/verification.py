@@ -26,6 +26,28 @@ MONEY_VALUE_KEYS = frozenset({
     "overrun", "remaining_budget", "daily_allowance",
 })
 
+# 期望键注册表（复核 F2）：expected 里出现未登记键即拒绝——拼错一个键
+# 不能静默删掉一条断言。登记的语义全部有对应判定代码；新增检查项必须
+# 同时登记这里、写判定函数和反例，三者缺一不可。
+EXPECTED_KEYS = frozenset({
+    # 回合级（acceptance._verify_turn / verify_expected）
+    "tool", "status", "domain_status", "clarify", "clarify_contains",
+    "clarify_absent", "values", "calls", "call_count", "parameters",
+    "scope_only_authorized", "text_contains", "text_absent", "no_tool",
+    # 结构化（verify_expected）
+    "codes", "not_codes", "basis", "basis_exact", "limitations_contain",
+    "partial_answer", "refused", "remediation", "diagnostics", "coverage",
+    "no_values", "no_rows", "no_total",
+    # commerce 载荷级（verify_commerce_turn / verify_product_turn）
+    "rows", "cells", "ranking", "groups", "excluded_reasons", "metric_units",
+    "payload_status", "call_statuses",
+})
+
+
+def unknown_expected_keys(expected: dict) -> list[str]:
+    """期望字典里未登记的键（拼错/拼少都算），供加载与判定双层使用。"""
+    return sorted(key for key in expected if key not in EXPECTED_KEYS)
+
 
 def parse_finite_decimal(value: object) -> Decimal:
     """把观测/期望值解析成有限 Decimal；非法值抛 ``ValueError``。
@@ -178,6 +200,8 @@ def verify_expected(expected: dict, observed: dict) -> list[str]:
     """
     problems: list[str] = []
     rows = observed.get("rows")
+    for unknown in unknown_expected_keys(expected):
+        problems.append(f"未登记的期望键「{unknown}」：声明了但不检查等于没断言")
     limitations = observed.get("limitations") or []
     codes = limitation_codes(limitations)
     for code in expected.get("codes", []):
@@ -258,6 +282,40 @@ def verify_expected(expected: dict, observed: dict) -> list[str]:
         got = len(actual_calls) if isinstance(actual_calls, list) else 0
         if got != wanted:
             problems.append(f"期望{wanted}次工具调用，实际{got}次")
+    if expected.get("no_tool"):
+        actual_calls = observed.get("calls")
+        if isinstance(actual_calls, list) and actual_calls:
+            problems.append(
+                f"期望本轮零工具调用（no_tool），实际{len(actual_calls)}次")
+    return problems
+
+
+def _call_bookkeeping_problems(expected: dict, calls: list) -> list[str]:
+    """按轮核对调用次数与逐次载荷状态（复核 F1）。
+
+    只检查最后一次调用的参数会漏掉"删掉前一次必需调用"的场景：要求逐次
+    拒答/确认的合同必须逐次断言，删掉任何一次必需调用都要翻红。
+    """
+    problems: list[str] = []
+    if "call_count" in expected:
+        wanted = expected["call_count"]
+        if len(calls) != wanted:
+            problems.append(f"期望{wanted}次工具调用，实际{len(calls)}次")
+    wanted_statuses = expected.get("call_statuses")
+    if wanted_statuses is not None:
+        if len(calls) != len(wanted_statuses):
+            problems.append(
+                f"call_statuses长度（{len(wanted_statuses)}）必须等于实际调用数"
+                f"（{len(calls)}）")
+        for index, wanted_status in enumerate(wanted_statuses):
+            payload = (calls[index].get("payload")
+                       if index < len(calls) else None)
+            actual = (payload.get("status")
+                      if isinstance(payload, dict) else None)
+            if actual != wanted_status:
+                problems.append(
+                    f"第{index + 1}次调用载荷状态期望{wanted_status}，"
+                    f"实际{actual}")
     return problems
 
 
@@ -267,13 +325,15 @@ def verify_commerce_turn(expected: dict, calls: list) -> list[str]:
     （原 acceptance._verify_commerce_turn / _verify_product_turn：断言全部落在
     已校验载荷的结构化字段上，不做跨 UUID 载荷的子串扫描。）
     """
+    problems = _call_bookkeeping_problems(expected, calls) \
+        if expected.get("tool") in ("compare_performance",
+                                    "analyze_product_performance") else []
     if expected.get("tool") == "analyze_product_performance":
-        return verify_product_turn(expected, calls)
-    problems: list[str] = []
+        return problems + verify_product_turn(expected, calls)
     if expected.get("tool") != "compare_performance":
         return problems
     if not calls:
-        return ["compare_performance未被调用"]
+        return problems + ["compare_performance未被调用"]
     entry = calls[-1]
     arguments = entry["arguments"]
     for key, value in (expected.get("parameters") or {}).items():
@@ -438,8 +498,14 @@ def verify_product_turn(expected: dict, calls: list) -> list[str]:
 
 
 def validate_case_shape(question: dict) -> list[str]:
-    """场景形状校验：turns 非空、逐轮 expected 数量一致（防 zip 静默丢轮次）。"""
+    """场景形状校验：turns 非空、逐轮 expected 数量一致、期望键全部登记。
+
+    未登记键（复核 F2：拼错即静默丢断言）在执行前拒绝，先于任何数据库
+    或模型调用。
+    """
     problems: list[str] = []
+    if not isinstance(question, dict):
+        return ["场景行必须是JSON对象"]
     turns = question.get("turns")
     if not isinstance(turns, list) or not turns:
         problems.append("turns必须是非空列表")
@@ -454,6 +520,14 @@ def validate_case_shape(question: dict) -> list[str]:
                 f"（{len(turns)}）")
         if any(not isinstance(item, dict) for item in expected):
             problems.append("expected列表每一项都必须是对象")
+        for item in expected:
+            if isinstance(item, dict):
+                for unknown in unknown_expected_keys(item):
+                    problems.append(
+                        f"未登记的期望键「{unknown}」：拼错即丢断言，加载前拒绝")
     elif not isinstance(expected, dict):
         problems.append("expected必须是对象或与turns等长的列表")
+    else:
+        for unknown in unknown_expected_keys(expected):
+            problems.append(f"未登记的期望键「{unknown}」：拼错即丢断言，加载前拒绝")
     return problems

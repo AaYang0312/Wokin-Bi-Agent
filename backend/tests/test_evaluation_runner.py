@@ -83,24 +83,25 @@ class LoadCasesTests(unittest.TestCase):
         self.assertIn("not_a_seed", str(caught.exception))
 
     def test_unknown_field_rejected(self):
-        suite = _write_suite(self.path, _case_line(extra_field=1))
+        suite = _write_suite(self.path, [_case_line(extra_field=1)])
         with self.assertRaises(ValueError):
             load_cases(suite)
 
     def test_expected_length_mismatch_rejected(self):
-        suite = _write_suite(self.path, _case_line(
+        suite = _write_suite(self.path, [_case_line(
             turns=["问一", "问二"],
-            expected=[{"tool": "query_business", "status": "ok"}]))
-        with self.assertRaises(ValueError):
+            expected=[{"tool": "query_business", "status": "ok"}])])
+        with self.assertRaises(ValueError) as caught:
             load_cases(suite)
+        self.assertIn("turns长度", str(caught.exception))
 
     def test_empty_turns_rejected(self):
-        suite = _write_suite(self.path, _case_line(turns=[], expected=[]))
+        suite = _write_suite(self.path, [_case_line(turns=[], expected=[])])
         with self.assertRaises(ValueError):
             load_cases(suite)
 
     def test_bad_split_rejected(self):
-        suite = _write_suite(self.path, _case_line(split="benchmark"))
+        suite = _write_suite(self.path, [_case_line(split="benchmark")])
         with self.assertRaises(ValueError):
             load_cases(suite)
 

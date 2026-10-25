@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -159,6 +160,97 @@ class SuiteStabilityTests(unittest.TestCase):
         finally:
             conn.rollback()
             conn.close()
+
+
+@unittest.skipUnless(
+    os.getenv("BI_EVALUATION_ADMIN_DSN")
+    or (os.getenv("BI_TEST_ADMIN_DSN") or "").endswith("bi_agent_eval_test"),
+    "未配置评测沙箱 DSN")
+class ReviewMutationTests(unittest.TestCase):
+    """复核报告（2026-10-26）坏例回归：删步骤/拼错键必须翻红，不允许假通过。
+
+    这些用例固定住复核中证明过的两条假通过路径：
+    F1（oc-004 删掉首次 all_authorized 调用仍通过）与 F2（expected 键拼错
+    仍通过）。任何一条变绿都表示判定器又退回到"声明了但不检查"。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cases = {case.id: case for case in _suite_cases()}
+
+    def _mutant(self, case_id, mutate):
+        payload = self.cases[case_id].model_dump()
+        mutate(payload)
+        return payload
+
+    def test_f1_removing_the_first_required_call_from_oc004_fails(self):
+        """删掉"首次请求"脚本步骤后，剩余单次换平台调用不满足两步确认合同。"""
+        from tests.evaluation.runner import run_suite
+
+        def drop_first_call(payload):
+            # 首个脚本回复是 all_authorized 的毛利请求；删掉后第一轮只剩
+            # 换平台重试一次。期望保持 call_count=2 不变。
+            assert payload["scripted_replies"][0]["tool_calls"]
+            payload["scripted_replies"].pop(0)
+
+        summary = run_suite(
+            [self._mutant("oc-004", drop_first_call)],
+            mode="offline", repeat=1)
+        result = summary.cases[0]
+        self.assertNotEqual(result.status, "pass",
+                             "缺少首次调用的场景不允许通过（复核 F1 假通过）")
+        self.assertTrue(any("调用" in problem or "needs_input" in problem
+                            for problem in result.problems),
+                        result.problems)
+
+    def test_f1_oc004_asserts_every_call_was_needs_input(self):
+        """正例锁：原始 oc-004 的两次门禁拒答都被逐次断言。"""
+        case = self.cases["oc-004"]
+        self.assertEqual(case.expected[0].get("call_count"), 2)
+        self.assertEqual(case.expected[0].get("call_statuses"),
+                         ["needs_input", "needs_input"])
+
+    def test_f2_misspelled_expected_key_is_rejected_at_load(self):
+        """valuez 拼写错误在 load_cases 就拒绝，轮不到数据库或模型。"""
+        def misspell(payload):
+            payload["expected"][0]["valuez"] = {"paid_amount": "0"}
+            payload["expected"][0].pop("values", None)
+
+        bad = self._mutant("oc-001", misspell)
+        with tempfile.TemporaryDirectory() as tmp:
+            suite = Path(tmp) / "bad.jsonl"
+            suite.write_text(json.dumps(bad, ensure_ascii=False) + "\n",
+                             encoding="utf-8")
+            with self.assertRaises(ValueError) as caught:
+                load_cases(suite)
+            self.assertIn("valuez", str(caught.exception))
+
+    def test_f2_verifier_rejects_unconsumed_expected_keys(self):
+        """直接调用判定器时，未登记的期望键也是问题（第二道防线）。"""
+        from tests.evaluation.verification import verify_expected
+
+        problems = verify_expected(
+            {"valuez": {"paid_amount": "0"}}, {"rows": []})
+        self.assertTrue(problems, "拼错的期望键不能被静默忽略")
+
+    def test_f2_registered_keys_cover_the_legacy_question_contract(self):
+        """键注册表必须覆盖既有 35 题用到的全部期望键（不因登记不全误伤）。"""
+        from tests.evaluation.verification import EXPECTED_KEYS
+
+        legacy = Path(__file__).with_name("questions.jsonl")
+        used: set[str] = set()
+        for line in legacy.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            question = json.loads(line)
+            expected_list = (question["expected"]
+                             if isinstance(question["expected"], list)
+                             else [question["expected"]])
+            for expected in expected_list:
+                used.update(expected)
+        unknown = used - EXPECTED_KEYS
+        self.assertEqual(unknown, set(),
+                         f"35题使用了未登记期望键：{sorted(unknown)}")
 
 
 if __name__ == "__main__":

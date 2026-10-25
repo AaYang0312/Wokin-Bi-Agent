@@ -163,6 +163,12 @@ def load_cases(path: Path) -> list[EvaluationCase]:
             payload = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ValueError(f"第{number}行不是合法JSON：{exc.msg}") from exc
+        from tests.evaluation.verification import validate_case_shape
+
+        shape_problems = validate_case_shape(payload)
+        if shape_problems:
+            # 键拼错/轮数不符在触库触模型之前拒绝（复核 F2）。
+            raise ValueError(f"第{number}行场景不合法：{shape_problems}")
         try:
             case = EvaluationCase(**payload)
         except Exception as exc:  # pydantic 校验错误统一转成 ValueError 文本
