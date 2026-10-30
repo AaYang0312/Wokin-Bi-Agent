@@ -102,3 +102,21 @@ export function ClockIcon({ size = 14 }: IconProps) {
     </svg>
   );
 }
+
+export function BellIcon({ size = 15 }: IconProps) {
+  return (
+    <svg {...svg(size)}>
+      <path d="M6.5 16.5V11a5.5 5.5 0 0 1 11 0v5.5l1.5 1.5H5z" />
+      <path d="M10 20.5a2.2 2.2 0 0 0 4 0" />
+    </svg>
+  );
+}
+
+export function ReviewIcon({ size = 15 }: IconProps) {
+  return (
+    <svg {...svg(size)}>
+      <path d="M12 3.5 19 6v5.5c0 4.2-3 7.4-7 9-4-1.6-7-4.8-7-9V6z" />
+      <path d="M9 12l2.2 2.2L15.5 10" />
+    </svg>
+  );
+}

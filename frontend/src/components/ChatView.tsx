@@ -1,4 +1,4 @@
-import type { RefObject } from 'react'
+import type { ReactNode, RefObject } from 'react'
 
 import type { Artifact, ChatMessage, DrilldownIntent } from '../types'
 import { ArtifactView } from './ArtifactView'
@@ -21,7 +21,7 @@ function shortTime(value: string) {
 
 export function ChatView({
   messages, status, artifacts, error, disabled, title, updatedAt, chatCount, narrow, drawerOpen,
-  onOpenSidebar, onSend, onDrilldown, onRequery, menuToggleRef,
+  onOpenSidebar,   onSend, onDrilldown, onRequery, menuToggleRef, actions,
 }: {
   messages: ChatMessage[]
   status: string | null
@@ -40,6 +40,8 @@ export function ChatView({
   /** 重新查询（D4）：与提问同一条通道，重发的是原用户问题原文。 */
   onRequery?: (question: string) => void
   menuToggleRef?: RefObject<HTMLButtonElement | null>
+  /** 顶栏右侧的全局入口（库存通知、记忆审核）；抽屉浮出时随主区一起 inert。 */
+  actions?: ReactNode
 }) {
   const stamp = updatedAt ? shortTime(updatedAt) : null
   // 抽屉只在窄屏浮出：这时背后的内容才需要 inert + aria-hidden。
@@ -58,6 +60,7 @@ export function ChatView({
           <span className={`pill pill-live ${status ? 'on' : ''}`}>
             <span className="dot" aria-hidden="true" />{status ? '生成中' : '待命'}
           </span>
+          {actions}
         </div>
       </header>
 

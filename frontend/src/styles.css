@@ -340,7 +340,9 @@ kbd {
   mask-image: linear-gradient(180deg, transparent 0, #000 14px, #000 calc(100% - 26px), transparent 100%);
 }
 
-.message { position: relative; line-height: 1.7; white-space: pre-wrap; }
+/* 只用 backwards 填充：动画结束后不残留 transform，否则会给后代的 fixed 元素造出新的包含块。 */
+@keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+.message { position: relative; line-height: 1.7; white-space: pre-wrap; animation: rise .32s var(--ease-out) backwards; }
 .message-label {
   display: flex; align-items: center; gap: 6px;
   margin-bottom: 7px;
@@ -406,6 +408,11 @@ kbd {
   font-size: 12.5px; line-height: 1.55;
 }
 .rich-code.ascii-table { font-size: 12px; line-height: 1.35; }
+.rich-content .table-wrap {
+  margin: 0 0 12px;
+  border: 1px solid var(--hair);
+  background: rgba(0, 0, 0, .18);
+}
 .rich-table { width: max-content; min-width: 100%; }
 .rich-table th, .rich-table td { white-space: normal; min-width: 52px; vertical-align: top; }
 .rich-table th { font-weight: 620; color: var(--text-2); }
@@ -413,7 +420,16 @@ kbd {
 .rich-content hr { margin: 14px 0; border: 0; border-top: 1px solid var(--hair); }
 
 /* ============================================================ 空状态：欢迎卡（截图 Welcome Supply!） */
-.empty-state { margin: auto 0; text-align: center; }
+.empty-state { position: relative; margin: auto 0; text-align: center; animation: rise .4s var(--ease-out) backwards; }
+.empty-state::before {
+  content: "";
+  position: absolute; z-index: -1;
+  left: 50%; top: -40px;
+  width: min(560px, 90%); height: 260px;
+  transform: translateX(-50%);
+  pointer-events: none;
+  background: radial-gradient(closest-side, rgba(139, 92, 246, .22), transparent);
+}
 .hero-kicker {
   display: flex; align-items: baseline; justify-content: center; gap: 8px;
   color: var(--text-3);
@@ -446,6 +462,7 @@ kbd {
 .example-list button {
   display: flex; align-items: center; gap: 9px;
   padding: 13px 15px;
+  text-align: left;
   border: 1px solid var(--hair);
   border-radius: var(--r-md);
   background: var(--surface);
@@ -479,6 +496,7 @@ kbd {
   box-shadow: var(--shadow-card), var(--inset-hi);
   backdrop-filter: blur(18px) saturate(150%);
   white-space: normal;
+  animation: rise .36s var(--ease-out) backwards;
 }
 /* 卡片右上角的紫色光晕，对应截图第三张卡的 bloom */
 .artifact::after {
@@ -490,12 +508,13 @@ kbd {
 .artifact > * { position: relative; z-index: 1; }
 
 .artifact-head {
-  display: flex; align-items: center; justify-content: space-between;
+  display: flex; align-items: center; justify-content: flex-end;
   gap: 10px; flex-wrap: wrap;
   margin-bottom: 13px;
 }
 .artifact-title {
   display: inline-flex; align-items: center; gap: 7px;
+  margin-right: auto;
   font-family: var(--font-display);
   font-size: 13px; font-weight: 620; letter-spacing: -.005em;
   color: var(--text-2);
@@ -504,17 +523,31 @@ kbd {
 
 .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 9px; }
 .metric-card {
+  position: relative;
+  /* 数字字号按卡片自身宽度（cqi）收放：同一个数在窄卡里缩小，而不是从中间折行。 */
+  container-type: inline-size;
   display: grid; align-content: start; gap: 3px;
   padding: 12px 13px;
   border: 1px solid var(--hair);
   border-radius: var(--r-md);
   background: linear-gradient(180deg, rgba(255, 255, 255, .05), rgba(255, 255, 255, .014));
   box-shadow: var(--inset-hi);
+  transition: border-color .16s var(--ease-out);
 }
+.metric-card::before {
+  content: "";
+  position: absolute; top: -1px; left: 14px;
+  width: 22px; height: 2px;
+  border-radius: 0 0 2px 2px;
+  background: var(--accent-grad);
+  opacity: .9;
+}
+.metric-card.missing::before { background: var(--hair-strong); }
+.metric-card:hover { border-color: var(--hair-strong); }
 .metric-card span {
   color: var(--text-3);
   font-size: 10.5px; font-weight: 600;
-  letter-spacing: .07em; text-transform: uppercase;
+  letter-spacing: .05em; text-transform: uppercase;
   overflow-wrap: anywhere;
 }
 .metric-card strong {
@@ -523,6 +556,7 @@ kbd {
   color: var(--text);
   font-family: var(--font-display);
   font-size: clamp(20px, 2.3vw, 26px);
+  font-size: clamp(17px, 15cqi, 26px);
   font-weight: 660;
   line-height: 1.18;
   letter-spacing: -.028em;
@@ -531,8 +565,8 @@ kbd {
 }
 .metric-card.missing strong { color: var(--text-3); font-size: 15px; letter-spacing: -.01em; }
 /* 后端会直接回传高精度小数；这里只按字符长度收字号，不改动数值本身。 */
-.metric-card.num-md strong { font-size: 19.5px; }
-.metric-card.num-sm strong { font-size: 16px; letter-spacing: -.016em; }
+.metric-card.num-md strong { font-size: 19.5px; font-size: clamp(14px, 10.5cqi, 19.5px); }
+.metric-card.num-sm strong { font-size: 16px; font-size: clamp(13px, 8cqi, 16px); letter-spacing: -.016em; }
 .metric-card.num-xs strong { font-size: 13.5px; line-height: 1.45; letter-spacing: -.006em; word-break: break-all; }
 
 .table-wrap { overflow: auto; max-height: 58vh; border-radius: var(--r-md); }
@@ -586,8 +620,8 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
 
 /* 口径行：数据卡之前先说清这些数是什么口径，混口径时提高可见度。 */
 .basis-note {
-  margin: 0;
-  color: var(--text-muted, #8b93a1);
+  margin: 0 0 10px;
+  color: var(--text-3);
   font-size: 12px;
   line-height: 1.5;
 }
@@ -606,8 +640,37 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
   font-size: 12px;
 }
 
+.artifact ul[data-refused] {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid; gap: 4px;
+}
+.artifact ul[data-refused] li {
+  display: flex; align-items: center; gap: 7px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.artifact ul[data-refused] li::before {
+  content: ""; width: 5px; height: 5px; flex: 0 0 5px;
+  border-radius: 50%;
+  background: var(--orange);
+}
+
 /* ============================================================ 流式状态 / 错误 */
-.stream-status { display: flex; align-items: center; gap: 8px; margin: 0; color: var(--text-2); font-size: 13px; }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+.stream-status {
+  display: flex; align-items: center; gap: 8px; margin: 0;
+  width: fit-content;
+  font-size: 13px;
+  color: var(--text-2);
+  background: linear-gradient(90deg, var(--text-2) 0%, var(--text-2) 40%, var(--text) 50%, var(--text-2) 60%, var(--text-2) 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: shimmer 2.2s linear infinite;
+}
 .stream-status::before {
   content: ""; width: 7px; height: 7px; flex: 0 0 7px;
   border-radius: 50%;
@@ -728,7 +791,15 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
     color: var(--text-2);
   }
   .topbar { padding: 14px 0 10px; gap: 8px; }
+  .topbar-icon { display: none; }
+  .topbar-right { gap: 6px; }
   .topbar-right .pill-meta { display: none; }
+  .review-toggle, .notif-toggle { height: 32px; min-width: 32px; padding: 0 8px; justify-content: center; }
+  .review-toggle .toggle-text, .notif-toggle .toggle-text {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap;
+  }
+  .notif-badge { margin-right: 0; }
   .message-list { width: calc(100% - 28px); padding-bottom: 10px; }
   .composer-wrap { padding-bottom: 12px; }
   .composer { width: calc(100% - 20px); border-radius: var(--r-md); }
@@ -751,6 +822,7 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
     /* 连带过渡延迟一起清零：否则抽屉的 visibility 仍会晚 .24s 才生效。 */
     transition-delay: 0s !important;
   }
+  .stream-status { background: none; -webkit-text-fill-color: currentColor; }
 }
 
 /* 店铺所属平台标签：用已通过对比度门禁的 --text-3，不新 introducing 新色值。 */
@@ -768,31 +840,60 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
  * 不给它任何看起来像数据的高度。
  * ------------------------------------------------------------------------- */
 .chart-artifact .chart-svg-wrap {
-  margin-top: 10px; border: 1px solid var(--hair); border-radius: var(--r-md);
-  background: var(--surface-sunken);
+  margin-top: 10px; padding: 10px 16px 2px;
+  border: 1px solid var(--hair); border-radius: var(--r-md);
+  background:
+    radial-gradient(120% 90% at 50% 0%, rgba(139, 92, 246, .07), transparent 70%),
+    var(--surface-sunken);
 }
-.chart-artifact svg { display: block; width: 100%; height: auto; }
+/* 最后一个 x 轴刻度居中在右端点上，会伸出 viewBox；由外层留白承接，不裁掉。 */
+.chart-artifact svg { display: block; width: 100%; height: auto; overflow: visible; }
 .chart-axis { stroke: var(--hair-strong); stroke-width: 1; }
-.chart-tick, .chart-label { fill: var(--text-3); font-size: 10.5px; }
+.chart-tick, .chart-label { fill: var(--text-3); font-size: 10px; font-variant-numeric: tabular-nums; }
 .chart-label { text-anchor: middle; }
-.chart-bar { fill: var(--accent-grad); }
-.chart-bar-gap { fill: none; stroke: var(--hair-strong); stroke-dasharray: 4 3; }
-.chart-line { stroke: var(--accent-soft); stroke-width: 2; }
-.chart-point { fill: var(--accent-soft); }
-.chart-point.is-missing { fill: none; stroke: var(--hair-strong); }
-.chart-drill { cursor: pointer; }
-.chart-drill:focus-visible rect, .chart-drill:hover rect { stroke: var(--accent-soft); stroke-width: 1.5; }
+/* SVG 的 fill 不接受 CSS 渐变（会退成黑色），柱形用实色。 */
+.chart-bar { fill: var(--accent); fill-opacity: .88; rx: 3px; transition: fill .16s var(--ease-out), fill-opacity .16s var(--ease-out); }
+.chart-bar-gap { fill: rgba(255, 255, 255, .02); stroke: var(--hair-strong); stroke-dasharray: 4 3; rx: 3px; }
+.chart-line { stroke: var(--accent-soft); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.chart-point { fill: var(--accent-soft); stroke: var(--bg-app); stroke-width: 1.5; }
+.chart-point.is-missing { fill: none; stroke: var(--hair-strong); stroke-dasharray: 2 2; }
+.chart-drill { cursor: pointer; outline: none; }
+.chart-drill:hover .chart-bar, .chart-drill:focus-visible .chart-bar { fill: var(--accent-soft); fill-opacity: 1; }
+.chart-drill:focus-visible rect { stroke: var(--text); stroke-width: 1.5; }
 
-.chart-switch { display: grid; gap: 8px; margin-top: 12px; }
-.chart-switch > input { accent-color: var(--accent); justify-self: start; }
-.chart-switch > label { color: var(--text-2); font-size: 12px; }
+/* 图 / 表分段切换：单选框只做视觉隐藏，键盘与读屏仍落在原生 radio 上。 */
+.chart-switch { display: flex; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+.chart-switch > input {
+  position: absolute; width: 1px; height: 1px; margin: 0;
+  opacity: 0; pointer-events: none;
+}
+.chart-switch > label {
+  padding: 4px 14px;
+  border: 1px solid var(--hair);
+  background: rgba(0, 0, 0, .26);
+  color: var(--text-3);
+  font-size: 12px; font-weight: 600;
+  cursor: pointer;
+  transition: color .16s var(--ease-out), background .16s var(--ease-out), border-color .16s var(--ease-out);
+}
+.chart-switch > label:first-of-type { border-radius: var(--r-pill) 0 0 var(--r-pill); }
+.chart-switch > label:last-of-type { margin-left: -1px; border-radius: 0 var(--r-pill) var(--r-pill) 0; }
+.chart-switch > label:hover { color: var(--text-2); }
+.chart-switch > input:checked + label {
+  position: relative;
+  border-color: var(--accent-line);
+  background: var(--accent-veil);
+  color: var(--text);
+}
+.chart-switch > input:focus-visible + label { outline: 2px solid var(--accent-soft); outline-offset: 2px; }
 /* 两份视图都渲染，选中哪一份就显示哪一份：数字只有一份来源。 */
-.chart-view { display: none; }
+.chart-view { display: none; flex: 1 0 100%; }
 .chart-switch > input:nth-of-type(1):checked ~ .chart-view-plot,
 .chart-switch > input:nth-of-type(2):checked ~ .chart-view-table { display: block; }
+.chart-view-table .table-wrap { margin-top: 10px; }
 .chart-caption {
   caption-side: top; text-align: left; color: var(--text-3); font-size: 11.5px;
-  padding-bottom: 6px;
+  padding: 9px 11px 7px;
 }
 .chart-values {
   list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px;
@@ -841,22 +942,28 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
  * 记忆审核面板（approved 查询记忆计划 Task 4）：审核者专属的独立表面，
  * 不属于聊天消息流。颜色只取已通过对比度门禁的既有 token，不新引入色值。
  * ------------------------------------------------------------------------- */
-.review-toggle {
-  position: fixed; right: 18px; bottom: 18px; z-index: 25;
+/* 顶栏全局入口（库存通知 / 审核记忆）：与 .pill 同一套胶囊语言，但可点击。 */
+.review-toggle, .notif-toggle {
   display: inline-flex; align-items: center; gap: 6px;
-  padding: 8px 14px;
-  border: 1px solid var(--hair-strong);
+  height: 28px;
+  padding: 0 11px;
+  border: 1px solid var(--hair);
   border-radius: var(--r-pill);
   background: var(--surface-raised);
+  box-shadow: var(--inset-hi);
   color: var(--text-2);
   font-size: 12px; font-weight: 600;
-  box-shadow: var(--shadow-float), var(--inset-hi);
-  backdrop-filter: blur(18px) saturate(150%);
-  transition: color .16s var(--ease-out), border-color .16s var(--ease-out), transform .16s var(--ease-out);
+  white-space: nowrap;
+  transition: color .16s var(--ease-out), border-color .16s var(--ease-out), background .16s var(--ease-out);
 }
-.review-toggle:hover { color: var(--text); border-color: var(--accent-line); }
-.review-toggle:active { transform: translateY(1px); }
-.review-toggle.open { color: var(--accent-soft); border-color: var(--accent-line); background: var(--accent-veil); }
+.review-toggle svg, .notif-toggle svg { flex: 0 0 auto; color: var(--text-3); transition: color .16s var(--ease-out); }
+.review-toggle:hover, .notif-toggle:hover { color: var(--text); border-color: var(--hair-strong); }
+.review-toggle:hover svg, .notif-toggle:hover svg { color: var(--text-2); }
+.review-toggle:active, .notif-toggle:active { transform: translateY(1px); }
+.review-toggle.open, .notif-toggle.open { color: var(--text); border-color: var(--accent-line); background: var(--accent-veil); }
+.review-toggle.open svg, .notif-toggle.open svg { color: var(--accent-soft); }
+
+@keyframes pop { from { opacity: 0; transform: translateY(-6px) scale(.985); } }
 
 .review-dock {
   position: fixed; top: 12px; bottom: 12px; right: 12px; z-index: 40;
@@ -865,8 +972,9 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
   border: 1px solid var(--hair-strong);
   border-radius: var(--r-lg);
   background: var(--surface-solid);
-  box-shadow: var(--shadow-float);
+  box-shadow: var(--shadow-float), 0 30px 80px -30px rgba(0, 0, 0, .9);
   overflow: hidden;
+  animation: pop .22s var(--ease-out) backwards;
 }
 .review-panel { display: flex; flex-direction: column; min-height: 0; height: 100%; }
 .review-head {
@@ -967,7 +1075,6 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
 
 @media (max-width: 767px) {
   .review-dock { top: 0; bottom: 0; right: 0; width: 100vw; border-radius: 0; border: 0; }
-  .notif-panel { left: 12px; right: 12px; width: auto; bottom: 108px; }
 }
 
 /* 隔离分析卡片：确定性结论分块；证据不足的说法折叠，限制常显在卡片末尾。 */
@@ -1055,40 +1162,29 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
  * 库存通知中心（持续库存通知计划 Task 5）：入口固定在右下（审核按钮上方），
  * 面板复用既有表面 token；只使用已通过对比度门禁的既有颜色变量，不新引入色值。
  * ------------------------------------------------------------------------- */
-.notif-toggle {
-  position: fixed; right: 18px; bottom: 64px; z-index: 25;
-  display: inline-flex; align-items: center; gap: 6px;
-  padding: 8px 14px;
-  border: 1px solid var(--hair-strong);
-  border-radius: var(--r-pill);
-  background: var(--surface-raised);
-  color: var(--text-2);
-  font-size: 12px; font-weight: 600;
-  box-shadow: var(--shadow-float), var(--inset-hi);
-  backdrop-filter: blur(18px) saturate(150%);
-  transition: color .16s var(--ease-out), border-color .16s var(--ease-out), transform .16s var(--ease-out);
-}
-.notif-toggle:hover { color: var(--text); border-color: var(--accent-line); }
-.notif-toggle:active { transform: translateY(1px); }
-.notif-toggle.open { color: var(--accent-soft); border-color: var(--accent-line); background: var(--accent-veil); }
 .notif-badge {
   display: inline-flex; align-items: center; justify-content: center;
-  min-width: 18px; height: 18px; padding: 0 5px;
+  min-width: 17px; height: 17px; padding: 0 5px;
+  margin-right: -4px;
   border-radius: var(--r-pill);
-  background: var(--accent);
+  background: var(--accent-grad);
+  box-shadow: 0 0 10px -2px var(--accent);
   color: var(--text-on-accent);
-  font-size: 11px; font-variant-numeric: tabular-nums;
+  font-size: 10.5px; font-weight: 700; font-variant-numeric: tabular-nums;
 }
+/* 面板挂在顶栏右下方：顶栏高度约 62px，外壳留白随 --shell-pad 变化。 */
 .notif-panel {
-  position: fixed; right: 12px; bottom: 110px; z-index: 40;
+  position: fixed; right: calc(var(--shell-pad) + 16px); top: calc(var(--shell-pad) + 62px); z-index: 40;
   width: min(430px, calc(100vw - 24px));
-  max-height: min(600px, calc(100vh - 140px));
+  max-height: min(600px, calc(100dvh - var(--shell-pad) * 2 - 90px));
   display: flex; flex-direction: column;
   border: 1px solid var(--hair-strong);
   border-radius: var(--r-lg);
   background: var(--surface-solid);
-  box-shadow: var(--shadow-float);
+  box-shadow: var(--shadow-float), 0 30px 80px -30px rgba(0, 0, 0, .9);
   overflow: hidden;
+  transform-origin: top right;
+  animation: pop .2s var(--ease-out) backwards;
 }
 .notif-head {
   flex: 0 0 auto;
@@ -1151,3 +1247,8 @@ tbody tr:hover { background: rgba(139, 92, 246, .07); }
 .notif-btn:hover { color: var(--text); border-color: var(--accent-line); }
 .notif-btn.primary { border-color: var(--accent-line); color: var(--accent-soft); background: var(--accent-veil); }
 .notif-btn.primary:hover { color: var(--text-on-accent); filter: brightness(1.08); }
+
+/* 必须排在 .notif-panel 基础规则之后，否则同优先级下会被覆盖。 */
+@media (max-width: 767px) {
+  .notif-panel { left: 10px; right: 10px; top: 58px; width: auto; max-height: calc(100dvh - 130px); }
+}

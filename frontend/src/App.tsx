@@ -9,6 +9,7 @@ import { ChatView } from './components/ChatView'
 import {
   NotificationCenter, createNotificationPoller, parseNotificationList,
 } from './components/NotificationCenter'
+import { ReviewIcon } from './components/icons'
 import { QueryMemoryReviewSection } from './components/QueryMemoryReview'
 import { Sidebar } from './components/Sidebar'
 import type {
@@ -52,7 +53,8 @@ export function ReviewEntry({ access, open, onToggle }: {
   return (
     <button type="button" className={`review-toggle${open ? ' open' : ''}`}
       onClick={onToggle} aria-expanded={open} aria-controls="review-dock">
-      审核记忆
+      <ReviewIcon />
+      <span className="toggle-text">审核记忆</span>
     </button>
   )
 }
@@ -270,13 +272,6 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <ReviewEntry access={reviewAccess} open={reviewOpen}
-        onToggle={() => setReviewOpen((value) => !value)} />
-      <NotificationCenter notifications={notifications} open={notificationsOpen}
-        error={notificationsError}
-        onToggle={() => setNotificationsOpen((value) => !value)}
-        onRead={(ref) => void readNotification(ref)}
-        onAcknowledge={(ref) => void acknowledgeAlert(ref)} />
       <div className="workspace">
         <Sidebar chats={chats} selectedId={selectedId} busy={controller.current !== null}
           open={sidebarOpen} narrow={narrow} drawerRef={drawerRef}
@@ -289,7 +284,16 @@ export default function App() {
           narrow={narrow} drawerOpen={sidebarOpen} menuToggleRef={menuToggleRef}
           onOpenSidebar={() => setSidebarOpen(true)} onSend={send}
           onDrilldown={(intent) => void send(intent.question)}
-          onRequery={(question) => void send(question)} />
+          onRequery={(question) => void send(question)}
+          actions={<>
+            <NotificationCenter notifications={notifications} open={notificationsOpen}
+              error={notificationsError}
+              onToggle={() => setNotificationsOpen((value) => !value)}
+              onRead={(ref) => void readNotification(ref)}
+              onAcknowledge={(ref) => void acknowledgeAlert(ref)} />
+            <ReviewEntry access={reviewAccess} open={reviewOpen}
+              onToggle={() => setReviewOpen((value) => !value)} />
+          </>} />
       </div>
       {reviewOpen && reviewAccess === 'available' && (
         <div className="review-dock" id="review-dock" role="dialog" aria-label="记忆审核">

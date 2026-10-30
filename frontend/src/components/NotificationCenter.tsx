@@ -1,4 +1,5 @@
 import type { InventoryNotification } from '../types'
+import { BellIcon } from './icons'
 
 // 库存通知中心（计划 2026-09-14-continuous-inventory-notifications.md Task 5）。
 //
@@ -306,7 +307,8 @@ export function NotificationCenter({ notifications, open, error, onToggle,
       <button type="button" className={`notif-toggle${open ? ' open' : ''}`}
         onClick={onToggle} aria-expanded={open} aria-controls="notification-center"
         aria-label={`${unread} 条未读库存通知`}>
-        库存通知
+        <BellIcon />
+        <span className="toggle-text">库存通知</span>
         {unread > 0 && (
           <span className="notif-badge" aria-hidden="true">{unread}</span>
         )}
