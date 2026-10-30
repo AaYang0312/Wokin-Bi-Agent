@@ -1,7 +1,7 @@
 """多来源唯一注册表与指标能力门禁（原路线图 Task 5.1）。
 
-口径依据：`docs/superpowers/specs/2026-09-12-multi-source-metrics-design.md` §3–§4。
-范围决定：`docs/superpowers/research/2026-09-12-drop-pdd-onboarding.md`——拼多多不接入
+口径依据：`docs/archive/specs/2026-09-12-multi-source-metrics-design.md` §3–§4。
+范围决定：`docs/archive/research/2026-09-12-drop-pdd-onboarding.md`——拼多多不接入
 支付，注册表里没有 pdd 支付分支，也不保留「开通后再登记」的待办。
 
 分两层：

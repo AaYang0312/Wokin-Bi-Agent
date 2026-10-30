@@ -1,14 +1,14 @@
 # 指标口径与来源对账
 
-> 2026-09-12 修订：淘系 tb/tm 已通过非敏感出库通道接入统一 main，但查询侧单源覆盖、退款硬门禁与跨平台 basis 尚待原路线图 Task 5 实现。当前运行限制仍有效；目标合同以 [多来源指标设计](superpowers/specs/2026-09-12-multi-source-metrics-design.md) 为准。关闭但已付款单保留 active=false，独立认证支付事实并匹配退款；paid_amount 是退款前支付，不能叫净支付。未来退款未匹配降级为可答+比例声明，不能直接把本页历史拒答测试当新验收预期。
+> 项目进度、待办与验证状态见[项目状态](PROJECT_STATUS.md)；本文只维护指标口径、来源条件与拒答边界。多来源目标合同的历史设计见[多来源指标设计](archive/specs/2026-09-12-multi-source-metrics-design.md)（按需查阅）。关闭但已付款单保留 active=false，独立认证支付事实并匹配退款；paid_amount 是退款前支付，不能叫净支付。未匹配退款按可答+比例声明披露。
 
 | 当前整合状态 | 查询发布条件 |
 | --- | --- |
 | fxg 等已核验交易源 | 保留现有认证与覆盖，逐店可用性取实际状态 |
-| tb/tm 出库同步已合并 | 先完成来源路由门禁、时间语义核验、退款诊断与ERP口径标签；不能宣布平台账单GMV完整 |
+| tb/tm 出库同步已合并 | 来源路由、时间语义与退款诊断门禁已实现；支付窗口按 `local_filter` 口径，仅在完整且新鲜的覆盖及既有门禁成立时可答+披露；不能宣布平台账单GMV完整 |
 | pdd 有单据但无支付金额 | **2026-09-12 决定不接入拼多多支付**（方舟授权成本过高）：任务5以capabilities长期阻止支付指标，不再是待批项 |
 
-数据依据：[快麦复核报告](superpowers/research/2026-09-06-kuaimai-data-verification.md)、[脱敏实测统计](superpowers/research/2026-09-06-kuaimai-data-recheck.json)。本文是「可执行对账清单」：来源表记录接口、字段路径、单位、粒度、状态规则、抽样范围、启用状态和证据日期。**启用状态为「未启用/待对账」的项，代码与页面不得当作可用能力。**
+数据依据：[快麦复核报告](archive/research/2026-09-06-kuaimai-data-verification.md)、[脱敏实测统计](archive/research/2026-09-06-kuaimai-data-recheck.json)。本文是「可执行对账清单」：来源表记录接口、字段路径、单位、粒度、状态规则、抽样范围、启用状态和证据日期。**启用状态为「未启用/待对账」的项，代码与页面不得当作可用能力。**
 
 ## 1. 数据来源表
 
@@ -42,7 +42,7 @@
 | 采购 `totalAmount/actualTotalAmount`、明细 `price/amount` | 文档为分；本版不接入，不得误复用订单转换函数 |
 | `orders[].itemSysId/skuSysId` | 显式映射为商品查询的 `sysItemId/sysSkuId`；不按名字模糊匹配 |
 | 订单 `grossProfit` | ERP毛利参考；实际运费/包材/平台扣费缺失，不得称净利润 |
-| 拼多多 `payAmount/payment/modified` | 样本全部缺失；不得纳入支付指标，也不用其他字段反推。**2026-09-12 决定不再申请方舟授权，该限制为长期口径而非临时缺口**（见[范围决定](superpowers/research/2026-09-12-drop-pdd-onboarding.md)） |
+| 拼多多 `payAmount/payment/modified` | 样本全部缺失；不得纳入支付指标，也不用其他字段反推。**2026-09-12 决定不再申请方舟授权，该限制为长期口径而非临时缺口**（见[范围决定](archive/research/2026-09-12-drop-pdd-onboarding.md)） |
 | 合单（一张 ERP 单多个 `tid`/`tids`）的单头 `payAmount` | **只等于其中一个子单的金额**，不是整张合计（实测 287 张合单：单头 14.25 / 行级合计 386.05）。因此合单不得用单头与行级交叉咬合判核验：改按行级 `payAmount` 的 `tid` 归属取证（`basis='items_merged'`），且要求行全部带金额、行 tid 均在单头声明列表内、兄弟子单均有行，否则仍为 `undetermined` |
 | `verified` / `allocation_verified` | 均为**本系统派生的交叉咬合结论，不是 ERP 字段**；含义、三态与升级规则见第 6 节 |
 
@@ -221,7 +221,7 @@ cd ../frontend && npm test -- src/components/ChartArtifact.test.tsx src/componen
 
 入口仍是四个公开 Tool（`analyze_product_performance` / `compare_performance` /
 `audit_listing_prices` / `inspect_inventory`）与旧 `query_business`；本节只记验收结论与口径红线，
-逐条证据在 [Task 11 日期化发布验收报告](superpowers/research/2026-09-14-task-11-release-acceptance.md)。
+逐条证据在 [Task 11 日期化发布验收报告](archive/research/2026-09-14-task-11-release-acceptance.md)。
 
 | 口径 | 结论 | 不能是什么 |
 | --- | --- | --- |
@@ -297,7 +297,7 @@ cd ../frontend && npm test -- src/components/ChartArtifact.test.tsx src/componen
 uv run --locked --env-file ../.env.test python -m unittest tests.test_semantic_catalog -v
 ```
 
-30 题 gold set 的逐题结果、Top 5 召回率与“门禁关闭时行为不变”的对比证据见 [语义目录与 Schema 检索本地验收记录](superpowers/research/2026-09-14-semantic-catalog-acceptance.md)。
+30 题 gold set 的逐题结果、Top 5 召回率与“门禁关闭时行为不变”的对比证据见 [语义目录与 Schema 检索本地验收记录](archive/research/2026-09-14-semantic-catalog-acceptance.md)。
 
 ## 4.6 受控聚合探索的允许面（`backend/bi_agent/exploration/`，计划 Task 11 后置子项目 B）
 
@@ -399,7 +399,7 @@ uv run --locked --env-file ../.env.test python -m unittest tests.test_semantic_c
 - 拼多多保持不支持：本功能未新增任何连接器、来源登记、支付能力、凭证或 onboarding 路径，
   也不因 `erp_documents` 单据列的存在而打开支付族。
 - 本节全部放行证据来自本机 `*_test` 与事务内 seed 的合成行，逐条见
-  [受控 SQL 探索本地验收记录](../research/2026-09-14-controlled-sql-acceptance.md)；真实模型与
+  [受控 SQL 探索本地验收记录](archive/research/2026-09-14-controlled-sql-acceptance.md)；真实模型与
   真实来源的验证一律 `未执行`。
 
 回归命令（`backend/`）：
@@ -444,7 +444,7 @@ SELECT count(*) FROM reporting.v_approved_query_examples;
 - 门禁关闭时零记忆读取，聊天回合与无记忆基线逐字相同；门禁开启的 26 题离线证据在空投影视图上取得，**不证明**真实模型下的检索质量。
 - 检索只能改善 Tool/参数选择：身份、授权、能力、coverage、basis、来源与固定 Tool 优先级永远由服务端判定，样例不能覆盖它们。
 - 版本零召回是设计行为：七个版本维度任一失配即不可见，进入人工重审，不自动迁移；撤销在下一条检索立即生效。
-- 本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [approved 查询学习记忆本地验收记录](../research/2026-09-14-approved-query-memory-acceptance.md)；HTTP 生产启用被刻意延后（与 `CONTROLLED_SQL_ENABLED` 先例一致），Task 11 统一发布门禁第 4–7 项仍 open。
+- 本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [approved 查询学习记忆本地验收记录](archive/research/2026-09-14-approved-query-memory-acceptance.md)；HTTP 生产启用被刻意延后（与 `CONTROLLED_SQL_ENABLED` 先例一致），Task 11 统一发布门禁第 4–7 项仍 open。
 
 ## 4.8 隔离分析的观测口径（`backend/bi_agent/analysis/`，计划 Task 11 后置子项目 D）
 
@@ -464,7 +464,7 @@ SELECT count(*) FROM reporting.v_approved_query_examples;
 
 ### 不得从本功能读出的结论
 
-- 门禁关闭时零分析入口与零 Artifact 读取，聊天与 Task 11 基线逐字相同；本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [隔离分析本地验收记录](../research/2026-09-14-isolated-analysis-acceptance.md)。
+- 门禁关闭时零分析入口与零 Artifact 读取，聊天与 Task 11 基线逐字相同；本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [隔离分析本地验收记录](archive/research/2026-09-14-isolated-analysis-acceptance.md)。
 - 数值结论只来自 Decimal 纯函数与 gold set 对账；模型叙述只是已验证 finding 的总结，不能产生、改写或补充任何数字。
 - 分析不创造新数据能力：它只能消费当前用户已被授权读取的既有 Artifact，来源失权后下一次分析即拒绝。
 - HTTP 生产启用被刻意延后（与 `CONTROLLED_SQL_ENABLED` 先例一致），Task 11 统一发布门禁第 4–7 项仍 open。
@@ -507,7 +507,7 @@ SELECT count(*) FROM bi.query_runs WHERE domain = 'inventory_watch';
 
 - 来源门禁按层级判定（所有者 2026-09-17 Option A）：`inventory_monitor_level_unverified_total` 的计数**永远不是零可用**的证据，更不是某层数量；缺层是一等 `data_missing`/unknown，不补零、不替位。
 - 来源 Artifact 是 graph 的 top-20 展示投影，本计划未实现全量决策投影；期望项超过 20 的策略作用域本轮不会出告警——`inventory_alerts_active` 为零不得读成“库存都安全”。
-- 本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [持续库存通知本地验收记录](superpowers/research/2026-09-25-continuous-inventory-notifications-acceptance.md)；生产监控保持 disabled（库存来源验收仍 FAIL，Task 11 门禁第 4–7 项仍 open），调度未注册，本节口径不构成启用许可。
+- 本节全部证据来自本机 `*_test` 与离线/合成环境，逐条见 [持续库存通知本地验收记录](archive/research/2026-09-25-continuous-inventory-notifications-acceptance.md)；生产监控保持 disabled（库存来源验收仍 FAIL，Task 11 门禁第 4–7 项仍 open），调度未注册，本节口径不构成启用许可。
 
 ## 4.10 生意参谋手工导出指标（manual sycm 来源族，2026-10 起）
 
@@ -675,12 +675,12 @@ uv run --env-file ../.env.test python -m tests.acceptance --offline   # 35 题�
 S2 取证已消费）：`disproved` 的店不得给支付窗口类结果，返回
 `coverage_time_basis_unverified` 并拒答；`unmeasured` 的店照常出数但必须披露为可观测样本。
 `erp_documents` 是单据计数、不是支付窗口主张，所以各种情况都只披露不拒答（设计 §4：拼多多
-单据数仍可查）。`local_filter`（S2 取证，见 `docs/superpowers/research/2026-09-25-s2-acceptance.md`）
+单据数仍可查）。`local_filter`（S2 取证，见 `docs/archive/research/2026-09-25-s2-acceptance.md`）
 的含义是：淘系支付窗口同步改由**宽出库窗（consign_time ±15 天）+ 本地 payTime ∈ 窗口过滤**建立，
 窗口归属不再依赖 API 的 pay_time 参数语义（实测漂移 83/8367 行）；它修正的是取数方式，
 不等于「完整支付窗口」已认证——出库人群上限（未发货单不可见）仍在。
 **S3 关闭单口径决策（默认建议，待所有者追认，见
-`docs/superpowers/research/2026-09-25-s3-acceptance.md`）落地后**：`local_filter` 不再与
+`docs/archive/research/2026-09-25-s3-acceptance.md`）落地后**：`local_filter` 不再与
 `disproved` 同属拒绝层——在**完整且新鲜的 local_filter 覆盖**与全部既有门禁（能力、质量、
 覆盖、截止、预算）成立时可答+披露；查询侧按 026 的取证视图剔除「全部含该商业号的已入库
 单据均已关闭且存在同号平台成功 canonical 退款」的已核验支付（关闭**未**退款单不剔除，
@@ -789,7 +789,7 @@ replay 仍非必需。没有真实覆盖时照旧在覆盖门禁处 fail closed�
 | 1688 | 0/1（未启用） | **不可用**：`deadline=2025-01-21` 已过期且未启用 | 未执行 | 未执行 | 未执行 | 未执行 |
 
 已接入的 7 家店均已回款逐元核对（见
-`docs/superpowers/research/2026-09-11-production-deploy-and-sync.md`）。
+`docs/archive/research/2026-09-11-production-deploy-and-sync.md`）。
 所有店的 `aftersales_cohort` 仍为 `unknown`（同批 cohort 窗口不写批次凭证）；
 库存与上架价、跨渠道 SKU 映射属计划 Task 6 / 9 / 10，本表不因代码存在而改为“可用”。
 

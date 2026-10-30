@@ -4,8 +4,8 @@
 必须同时带来方法名、账号授权、时间语义与金额对账证据，登记进本文件之后，同步、覆盖、
 质量、能力与指标契约才能共同消费它。
 
-口径依据：`docs/superpowers/specs/2026-09-12-multi-source-metrics-design.md` §3–§4。
-范围决定：`docs/superpowers/research/2026-09-12-drop-pdd-onboarding.md`——2026-09-12
+口径依据：`docs/archive/specs/2026-09-12-multi-source-metrics-design.md` §3–§4。
+范围决定：`docs/archive/research/2026-09-12-drop-pdd-onboarding.md`——2026-09-12
 用户决定放弃拼多多方舟授权，因此注册表里**没有** pdd 支付分支，也不保留「开通后再登记」
 的待办；pdd 的支付依赖永久解析为能力不足。
 
@@ -24,10 +24,10 @@
 - `disproved`：实测不成立。销售出库接口按自身时间字段裁剪（83/8367 行 `paid_at`
   早于窗口起点，最早早 42 天），所以它的原始 `pay_time` 参数过滤永远给不出完整支付窗口。
 - `local_filter`：S2 取证（2026-09-25，两店半月窗口、对称差集 100% 归因，见
-  `docs/superpowers/research/2026-09-25-s2-acceptance.md`）后，淘系支付窗口改由
+  `docs/archive/research/2026-09-25-s2-acceptance.md`）后，淘系支付窗口改由
   **宽出库窗 + 本地 payTime 过滤**建立：窗口归属不再依赖 API 的 pay_time 参数语义，
   覆盖区间内的行按构造真在窗内。S3 口径决策（默认建议，待所有者追认，见
-  `docs/superpowers/research/2026-09-25-s3-acceptance.md`）落地后，它不再与
+  `docs/archive/research/2026-09-25-s3-acceptance.md`）落地后，它不再与
   `disproved` 同属拒绝层：在完整/新鲜覆盖与全部既有门禁成立时可答+披露，但
   支付口径剔除结构性证明的关闭后退款单，且出库人群上限仍在——「完整支付窗口」
   主张依旧不开放。

@@ -1,6 +1,6 @@
 """生意参谋手工指标与查询层（计划 §3.M3，红先行）。
 
-口径依据：docs/superpowers/plans/2026-10-02-manual-sycm-export-import.md
+口径依据：docs/archive/plans/2026-10-02-manual-sycm-export-import.md
 §2 设计决策 D1–D3、§3.M3、§4 工程约束。
 
 锁七件事：

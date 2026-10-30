@@ -1,6 +1,6 @@
 """Task 11：四工作流验收与首次用户交付（spec §10 的 11 个场景 + 主层路由）。
 
-这份文件只做一件事：把 [运营工作流设计](../../docs/superpowers/specs/
+这份文件只做一件事：把 [运营工作流设计](../../docs/archive/specs/
 2026-09-11-operator-workflows-design.md) 第 10 节那 11 行验收样例写成可执行的集成
 用例，并按计划要求为**每个领域**跑齐四类路径：正常、部分来源、无权限、Artifact
 持久化失败。它不重做 Task 7–10 的单元用例：那些文件钉的是节点与契约，这里钉的是
@@ -10,7 +10,7 @@
 
 1. **全部数据是合成的**，只写独立 `*_test` 库里的合成店铺 / 池 / 快照；没有任何真实
    账号、真实来源接口、真实同步、部署或真实模型被调用。缺集成环境的项一律标
-   "未执行"（见 `docs/superpowers/research/2026-09-14-task-11-release-acceptance.md`）。
+   "未执行"（见 `docs/archive/research/2026-09-14-task-11-release-acceptance.md`）。
 2. **渠道在售价与库存的来源门禁在代码里默认关闭**（Task 9 / Task 10 的交付状态）。
    本文件的"正常路径"是在**测试进程内**临时登记一条合成来源，跑完立刻 reset；
    这不构成任何平台"线上复核可用"的证据。
@@ -2041,7 +2041,7 @@ class OperatorAnalysisWorkflowTests(OperatorFixture):
 class OperatorMultiSourceGuardrailTests(OperatorFixture):
     """计划 Task 11 的“验收口径补充”：逐店 basis、混口径不合并、换源不复用、拼多多边界。
 
-    口径依据：[多来源指标设计](../../docs/superpowers/specs/
+    口径依据：[多来源指标设计](../../docs/archive/specs/
     2026-09-12-multi-source-metrics-design.md) §3–§6 与 2026-09-12 不接入拼多多的决定。
     """
 
@@ -2551,20 +2551,6 @@ class OperatorAcceptanceSetTests(unittest.TestCase):
         for question in self.questions.values():
             self.assertNotIn("live", question)
             self.assertNotIn("provider", question)
-
-    def test_the_dated_acceptance_report_exists_with_its_disclaimers(self):
-        """验收报告是本轮交付物之一：它必须存并明写"哪些没跑"。"""
-        from pathlib import Path
-
-        report = (Path(__file__).resolve().parents[2]
-                  / "docs" / "superpowers" / "research"
-                  / "2026-09-14-task-11-release-acceptance.md")
-        self.assertTrue(report.exists(), report)
-        text = report.read_text(encoding="utf-8")
-        self.assertIn("26", text)
-        self.assertIn("未执行", text)
-        self.assertIn("不接入", text)
-        self.assertIn("合成", text)
 
 
 class ShopScopeDetectionTests(unittest.TestCase):

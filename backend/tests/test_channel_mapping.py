@@ -1,6 +1,6 @@
 """Task 6：跨渠道商品 / SKU 映射与名称查询。
 
-计划验收数据（docs/superpowers/plans/2026-09-11-data-and-query-closure.md Task 6）：
+计划验收数据（docs/archive/plans/2026-09-11-data-and-query-closure.md Task 6）：
 同名「接头」的 6mm/8mm 必须返回两个候选；同一 ERP SKU 映射到淘宝、抖音两个链接可归为
 同 SKU；另一账号相同数字 ID 不归并；无成交的已映射 listing 必须保留。
 

@@ -1,4 +1,4 @@
-"""M4 上传接口契约（计划 §3.M4，docs/superpowers/plans/2026-10-02-manual-sycm-export-import.md）。
+"""M4 上传接口契约（计划 §3.M4，docs/archive/plans/2026-10-02-manual-sycm-export-import.md）。
 
 锁六件事：
 1) **gate**：SYCM_MANUAL_IMPORT_ENABLED 关（缺省）时路由 404（复用 query_memory

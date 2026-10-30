@@ -1,6 +1,6 @@
 """目录身份层：持久 opaque ref、唯一化展示名、正文确定性改写。
 
-口径来自 docs/superpowers/plans/2026-09-11-data-and-query-closure.md Task 2：
+口径来自 docs/archive/plans/2026-09-11-data-and-query-closure.md Task 2：
 模型只看 ref，真名只在授权展示层出现；本模块另加落库前的 ref→真名改写。
 """
 

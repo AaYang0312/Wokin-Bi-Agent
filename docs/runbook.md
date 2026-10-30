@@ -12,11 +12,11 @@
 
 `APP_ENV=development` 时身份固定为 `local-development`。生产必须设置 HTTPS 的 `APP_PUBLIC_ORIGIN`、非空 `APP_ALLOWED_SUBJECTS`，并通过反向代理写入 `AUTH_SUBJECT_HEADER`（默认 `X-Auth-Request-Sub`）。代理必须先删除浏览器传来的同名头，再写入 OIDC 的真实 `sub`。
 
-模型只支持 `LLM_PROVIDER=qwen|deepseek`。必须显式给出 `LLM_MODEL`，只填已选择 provider 的密钥；不做自动切换或重试。默认兼容地址是 Qwen 的 `https://dashscope.aliyuncs.com/compatible-mode/v1` 和 DeepSeek 的 `https://api.deepseek.com/v1`。真实联调前确认账号地域、型号和费用；当前两者均标记为“未实测”，直到在合成测试库跑完 smoke 和修订后的 26 题（旧 20 题的 14/20 只是历史基线，不代表多来源可用）。
+模型只支持 `LLM_PROVIDER=qwen|deepseek`。必须显式给出 `LLM_MODEL`，只填已选择 provider 的密钥；不做自动切换或重试。默认兼容地址是 Qwen 的 `https://dashscope.aliyuncs.com/compatible-mode/v1` 和 DeepSeek 的 `https://api.deepseek.com/v1`。真实联调前确认账号地域、型号和费用；真实 provider 的验收状态统一记录在[项目状态](PROJECT_STATUS.md)；离线或脚本模型结果不代表真实模型已验收。
 
 ## 本地开发
 
-先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020 → 021 → 022 → 023 → 024 → 025 → 026 → 027`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020，approved 查询学习记忆的样例表、不可变事件表、`bi_approver` 审核角色与只含 approved 行的投影视图落在 021，隔离分析的第五个领域 `isolated_analysis` 与 Artifact 类型 `analysis_result` 的两份 CHECK 扩展落在 022（它不建任何事实表），持续库存通知的观测事实落在 023，同步侧可运维性字段落在 024，出库口径的 `consigned_at` 列落在 025，关闭后退款支付剔除的时间列落在 026，S4 档案价快照两表、两个 reporting 视图与逐项授权落在 027；生意参谋手工导出的四张事实/台账表落在 028、`shop_daily` 覆盖实体与只读视图落在 029/030、上传写面授权与 `sync_state` RLS 落在 031、台账 status⇔reason_code 配对不变式落在 032，事实表 upsert 所需的 `SELECT` 落在 033（本功能默认关闭，见「生意参谋手工导出来源」章）。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。缺 021 时审核 API 的投影视图不存在，approved 查询学习记忆保持关闭（审核路由按未启用返回 404），不影响其它功能。缺 022 时隔离分析的 `analysis_result` 写不进 Artifact 表（CHECK 拒绝），图在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的分析结果；门禁关闭时 022 是否已应用都不影响聊天。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
+先由管理员在本地生产库或独立 `*_test` 库中按同一顺序初始化；每个库都必须完整执行`001 → 002 → 003 → 004 → 005 → 007 → 008 → 009 → 014 → 015 → 016 → 017 → 018 → 019 → 020 → 021 → 022 → 023 → 024 → 025 → 026 → 027 → 028 → 029 → 030 → 031 → 032 → 033`，不可跳过运行追踪迁移。编号 006 已作废（不补旧序号迁移），数据就绪能力落在 008，运行契约版本化落在 009，多来源契约与口径血缘落在 014/015，渠道映射落在 016，商品运营参考面与经营图所需的 reporting 视图落在 017，上架价复核的渠道在售快照与本轮目标价冻结落在 018，库存两级预警的实物 / 渠道可售快照、库存池连接关系与版本化阈值策略落在 019，受控聚合探索的运行契约（第四个领域 `controlled_sql_exploration`、Artifact 类型 `exploration_result`、四个终止原因，并把 `bi.query_diagnostics` 继续锁在应用/管理员身份之间）落在 020，approved 查询学习记忆的样例表、不可变事件表、`bi_approver` 审核角色与只含 approved 行的投影视图落在 021，隔离分析的第五个领域 `isolated_analysis` 与 Artifact 类型 `analysis_result` 的两份 CHECK 扩展落在 022（它不建任何事实表），持续库存通知的观测事实落在 023，同步侧可运维性字段落在 024，出库口径的 `consigned_at` 列落在 025，关闭后退款支付剔除的时间列落在 026，S4 档案价快照两表、两个 reporting 视图与逐项授权落在 027；生意参谋手工导出的四张事实/台账表落在 028、`shop_daily` 覆盖实体与只读视图落在 029/030、上传写面授权与 `sync_state` RLS 落在 031、台账 status⇔reason_code 配对不变式落在 032，事实表 upsert 所需的 `SELECT` 落在 033（本功能默认关闭，见「生意参谋手工导出来源」章）。缺 019 时库存预警读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“0 件库存”。缺 018 时上架复核读不到快照视图，会按“来源未取证 / 暂不可用”降级，不会把读不到演成“都没上架”。缺 020 时探索结果写不进运行表（约束会拒），在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的结果。缺 021 时审核 API 的投影视图不存在，approved 查询学习记忆保持关闭（审核路由按未启用返回 404），不影响其它功能。缺 022 时隔离分析的 `analysis_result` 写不进 Artifact 表（CHECK 拒绝），图在持久化那一步失败为 `persistence_failed`，不会发出一份没有证据的分析结果；门禁关闭时 022 是否已应用都不影响聊天。005 / 007 / 008 / 009 都是代码硬依赖：少了它们，`reporting.v_product_daily` 没有名称与规格列、`v_coverage` 没有质量列、`v_source_batches` 不存在，或运行层无法写入血缘与请求身份，会直接报列/表不存在；缺 017 则商品运营图与商品解析在 `bi_app` 身份下直接读不到视图。
 
 ```powershell
 psql -d bi_agent -f backend/sql/001_init.sql
@@ -41,6 +41,12 @@ psql -d bi_agent -f backend/sql/024_sync_role_operability.sql
 psql -d bi_agent -f backend/sql/025_outstock_consign_time.sql
 psql -d bi_agent -f backend/sql/026_closed_refunded_payment_caliber.sql
 psql -d bi_agent -f backend/sql/027_item_price_snapshots.sql
+psql -d bi_agent -f backend/sql/028_manual_sycm_export.sql
+psql -d bi_agent -f backend/sql/029_sycm_shop_daily_entity.sql
+psql -d bi_agent -f backend/sql/030_sycm_shop_daily_reader_view.sql
+psql -d bi_agent -f backend/sql/031_sycm_upload_write_path.sql
+psql -d bi_agent -f backend/sql/032_manual_upload_status_invariant.sql
+psql -d bi_agent -f backend/sql/033_sycm_fact_select_for_upsert.sql
 ```
 
 单实例：全程持有数据库 advisory 锁，重复启动立即失败。
@@ -71,12 +77,12 @@ rm .env.evaluation
 
 ### 平台路由与来源注册表
 
-当前开发基线为 main，旧分支的同步入口统一迁入 backend。淘系“入库完成”与“查询可用”分别验收：[多来源契约](superpowers/specs/2026-09-12-multi-source-metrics-design.md)及[任务5/11](superpowers/plans/2026-09-07-ecommerce-bi-agent.md)。任务 5.1–5.3 已交付：来源注册表与逐指标能力门禁（`backend/bi_agent/sources.py`）、覆盖按 (店铺×来源×实体) 取交集与付款时间口径三态认证、未匹配退款/未认证支付改为可量化披露（`coverage_time_basis_unverified` 等进入词表）。**basis 全链路与版本失效（5.4）仍未完成**；pdd 不得因档案或单据存在被宣称支付可用（2026-09-12 已决定不接入拼多多支付）。
+当前开发基线为 main，旧分支的同步入口统一迁入 backend。淘系“入库完成”与“查询可用”分别验收：[多来源契约](archive/specs/2026-09-12-multi-source-metrics-design.md)（历史设计，按需查阅）。原路线图任务 5.1–5.4 已交付：来源注册表与逐指标能力门禁（`backend/bi_agent/sources.py`）、覆盖按 (店铺×来源×实体) 取交集与付款时间口径三态认证、未匹配退款/未认证支付改为可量化披露（`coverage_time_basis_unverified` 等进入词表），以及口径凭证（basis）全链路与版本失效（5.4）；pdd 不得因档案或单据存在被宣称支付可用（2026-09-12 已决定不接入拼多多支付）。
 
 - 订单源由 `sources.py` 注册表按 `bi.shops.platform` 解析：`tb`/`tm`/`pdd` 用 `erp.trade.outstock.simple.query`（销售出库·非敏感字段），`fxg`/`jd`/`kuaishou`/`wxsph`/`wsxc` 用 `erp.trade.list.query`。**未登记平台（1688、淘工厂等）没有默认回退**：`_shop_order_source` 直接报错退出，逐店循环里该店被跳过并打印原因，绝不把“拿不到”写成“没有”。`sync_state` 主键含 source，两通道水位/覆盖互不干扰。
 - 新增一个来源必须先拿齐方法名、权限、时间语义与金额对账证据，再写进注册表；数据库里不维护第二套可自由配置的来源表。
 - 先跑 `shops` 刷店铺档案再跑订单命令，缺档案的店会直接报错（防假覆盖）。
-- 淘系口径为 **ERP 出库非敏感字段**，非平台账单口径；收件人/买家昵称/手机号等 PII 字段在规范化入口即丢弃并有守护用例，不得扩列。详见 `docs/superpowers/research/2026-09-12-taoxi-onboarding.md`。
+- 淘系口径为 **ERP 出库非敏感字段**，非平台账单口径；收件人/买家昵称/手机号等 PII 字段在规范化入口即丢弃并有守护用例，不得扩列。详见 `docs/archive/research/2026-09-12-taoxi-onboarding.md`。
 - 淘系（tb/tm）支付窗口回填/replay/reconcile 自 2026-09-25（S2 取证）起改走**宽出库窗 + 本地 payTime 过滤**：按 `timeType=consign_time` 请求 `[start-15d, end+15d)`，**逐日切片（≤1 天/片，官方建议跨度）且每片先在线（cursor/hasNext）后归档（total 证据）双通道**，任何一片分页不完整即整窗失败；本地只保留 `payTime ∈ [start, end)` 的行后入库，覆盖区间仍是请求窗口本身（宽窗只是取数范围，永远不写成覆盖）。代价是查询放大：每个 1 天支付窗口的宽窗取数为 31 个日切片 × 2 通道 = 每支付日至少 62 次 stream start（切片超 200 行另有分页请求；原 pay_time 路径每支付日仅 2 次 stream start），调度预算由运维控制；未发货的已付单在该路径不可见（出库人群上限，来源口径已披露），由 upd_time 增量与后续发货后的重放补齐。其余平台（fxg/jd/kuaishou/wxsph/wsxc/pdd）支付窗口仍按 API `pay_time` 过滤。
 
 分别启动后端和前端：
@@ -188,7 +194,7 @@ uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --apply
 
 空返回与支付核验的额外约束：
 
-- 「成功却没有结果列表」且没有 `total=0` / `hasNext=false` 正向完成证据时按**不可信空**处理：报 `unknown_empty`，整窗口不写 covered。只有实测会省略列表的接口（见 `docs/superpowers/research/2026-09-06-kuaimai-data-recheck.json`：`erp.item.history.cost.price.query`、`erp.item.sku.list.get`、`stock.api.status.query`、`erp.item.warehouse.list.get`、`erp.wave.logistics.order.query`、`erp.aftersale.refund.warehouse.query`、`purchase.order.query`）才容许把缺列表解析为「未核验的空」；同步链在用的 `erp.trade.list.query` / `erp.aftersale.list.query` / `erp.shop.list.query` 均实测返回列表，一处也不放开。
+- 「成功却没有结果列表」且没有 `total=0` / `hasNext=false` 正向完成证据时按**不可信空**处理：报 `unknown_empty`，整窗口不写 covered。只有实测会省略列表的接口（见 `docs/archive/research/2026-09-06-kuaimai-data-recheck.json`：`erp.item.history.cost.price.query`、`erp.item.sku.list.get`、`stock.api.status.query`、`erp.item.warehouse.list.get`、`erp.wave.logistics.order.query`、`erp.aftersale.refund.warehouse.query`、`purchase.order.query`）才容许把缺列表解析为「未核验的空」；同步链在用的 `erp.trade.list.query` / `erp.aftersale.list.query` / `erp.shop.list.query` 均实测返回列表，一处也不放开。
 - 已核验的支付事实不会被更旧或尚未齐平的证据静默清零。`rebuild_payments` 的降级守卫保留原事实（也不再抹掉 `order_items.allocation_verified`），拦截数记在各同步命令输出的 `payment_downgrade_blocked` 字段，日志字段 `error_code=payment_downgrade_blocked`（只带店铺与订单号摘要，不带订单号明文）。该计数持续上升说明有拆合单兄弟行未到齐，需对相应窗口执行 `replay`。
 
 部署时可注册每小时同步任务，工作目录固定为 `backend`：
@@ -377,7 +383,7 @@ uv run --env-file ../.env.sync python -m bi_agent.sync capabilities --all-shops 
 
 | `SEMANTIC_CATALOG_ENABLED` | 行为 |
 | --- | --- |
-| 缺省 / 空串 / 纯空白 / `false` | 关。不建预检连接、不发那条查询、不校验目录；“显式 false”与“变量缺席”两种写法的启动与聊天行为已逐项比对一致（见[验收记录](superpowers/research/2026-09-14-semantic-catalog-acceptance.md) §6），且本包在 Agent / 查询层没有任何调用路径 |
+| 缺省 / 空串 / 纯空白 / `false` | 关。不建预检连接、不发那条查询、不校验目录；“显式 false”与“变量缺席”两种写法的启动与聊天行为已逐项比对一致（见[验收记录](archive/research/2026-09-14-semantic-catalog-acceptance.md) §6），且本包在 Agent / 查询层没有任何调用路径 |
 | `true` | 开。`create_runtime_app()` 先建**一条** `BI_APP_DSN` 的 autocommit 连接，跑完预检再建模型与 FastAPI app |
 | 其它写法（`1` / `0` / `yes` / `True` / `on` / 带分号等） | 启动即失败：`SEMANTIC_CATALOG_ENABLED 只能是 true 或 false` |
 
@@ -424,7 +430,7 @@ uv run --locked --env-file ../.env.test python -m unittest tests.test_semantic_c
 
 本机：`.env.app` 写 `SEMANTIC_CATALOG_ENABLED=true` → 按原命令启动 `uv run --env-file ../.env.app uvicorn bi_agent.api:create_runtime_app --factory --host 127.0.0.1 --port 8001` → 确认预检通过（不打印任何 SQL 原文，只有成功启动或一个稳定错码）→ 跑 26 题离线验收与一次聊天冒烟。
 
-目标环境：先逐条完成上面 1–3 的核对（DDL 与 GRANT 只由管理员执行），再按现有单实例发布流程改配置并重启一个实例；预检失败即发布失败，不得绕过、不得重试到启动成功。本轮**未在任何非本机环境启用过该门禁**（见[验收记录](superpowers/research/2026-09-14-semantic-catalog-acceptance.md)的未执行清单）。
+目标环境：先逐条完成上面 1–3 的核对（DDL 与 GRANT 只由管理员执行），再按现有单实例发布流程改配置并重启一个实例；预检失败即发布失败，不得绕过、不得重试到启动成功。本轮**未在任何非本机环境启用过该门禁**（见[验收记录](archive/research/2026-09-14-semantic-catalog-acceptance.md)的未执行清单）。
 
 打开后仍不变的：`/api` 路由集合（7 条）与 Agent Tool 清单（6 个）不变；语义目录没有对外入口、没有后台任务、不写任何表。
 
@@ -504,7 +510,7 @@ uv run --locked --env-file ../.env.test python -m unittest tests.test_exploratio
 uv run --locked --env-file ../.env.test python -m tests.acceptance --offline
 ```
 
-4. 本轮**未在任何环境启用过该门禁**：真实 provider smoke 与 26 题 live、目标环境迁移与授权实测、生产启用、部署与一周试用全部记 `未执行`，逐条见 [受控 SQL 探索本地验收记录](superpowers/research/2026-09-14-controlled-sql-acceptance.md) §9。放行矩阵里的库存行只在回滚事务内 seed，不意味着库存或上架价来源已就绪；真实部署里 `listing_audit` / `inventory` 注册表仍为空，两个固定 Tool 依旧只报 `unsupported`。
+4. 本轮**未在任何环境启用过该门禁**：真实 provider smoke 与 26 题 live、目标环境迁移与授权实测、生产启用、部署与一周试用全部记 `未执行`，逐条见 [受控 SQL 探索本地验收记录](archive/research/2026-09-14-controlled-sql-acceptance.md) §9。放行矩阵里的库存行只在回滚事务内 seed，不意味着库存或上架价来源已就绪；真实部署里 `listing_audit` / `inventory` 注册表仍为空，两个固定 Tool 依旧只报 `unsupported`。
 
 ## approved 查询学习记忆（默认关闭）
 
@@ -580,7 +586,7 @@ uv run --locked --env-file ../.env.test python -m tests.acceptance --offline
 
 ### 当前状态（先读这一段）
 
-**默认关闭、未部署、未注册调度。** `INVENTORY_MONITOR_ENABLED=false` 是仓库与文档的默认值；本轮没有在任何机器注册计划任务，没有创建 systemd timer / Windows 任务，没有部署。启用前置是逐层库存来源验收（[验收记录](superpowers/research/2026-09-14-inventory-source-acceptance.md)，仍为 FAIL：`physical` 四维 NOT MET、`channel` 一等 `data_missing`）与 Task 11 统一发布门禁第 4–7 项（仍 open）——两者都未满足前，本节调度与回滚只是文档，不是操作记录。迁移 `023` 只在本机 `*_test` 库执行过；`bi_monitor` 是 NOLOGIN 最小权限身份，生产启用前必须另建独立登录与服务主体。
+**默认关闭、未部署、未注册调度。** `INVENTORY_MONITOR_ENABLED=false` 是仓库与文档的默认值；本轮没有在任何机器注册计划任务，没有创建 systemd timer / Windows 任务，没有部署。启用前置是逐层库存来源验收（[验收记录](archive/research/2026-09-14-inventory-source-acceptance.md)，仍为 FAIL：`physical` 四维 NOT MET、`channel` 一等 `data_missing`）与 Task 11 统一发布门禁第 4–7 项（仍 open）——两者都未满足前，本节调度与回滚只是文档，不是操作记录。迁移 `023` 只在本机 `*_test` 库执行过；`bi_monitor` 是 NOLOGIN 最小权限身份，生产启用前必须另建独立登录与服务主体。
 
 ### 门禁与变量
 
@@ -759,33 +765,31 @@ uv run --env-file ../.env.app uvicorn bi_agent.api:create_runtime_app --factory 
 ```powershell
 Set-Location backend
 # 四工作流与运营场景回归（计划 Task 7–11）
-uv run --env-file ../.env.test python -m unittest tests.test_channel_mapping tests.test_commerce tests.test_comparison tests.test_listing_audit tests.test_inventory tests.test_operator_workflows -v
+uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_channel_mapping tests.test_commerce tests.test_comparison tests.test_listing_audit tests.test_inventory tests.test_operator_workflows -v
 # 受控聚合探索（计划 Task 1–6：契约、固定 Tool 优先与编译器、AST 策略与攻击语料、
 # 成本门与投影、运行图，以及 Task 6 的 14 行放行矩阵 / 4 行负例 / 46 行攻击汇总）
-uv run --locked --env-file ../.env.test python -m unittest tests.test_exploration -v
+uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_exploration -v
 # approved 查询学习记忆（后置子项目 C：契约与生命周期、授权/版本过滤检索与撤销时效、
 # 路由接入与无自动写入；真库用例在 test_db / test_runtime_db / test_api 内）
-uv run --locked --env-file ../.env.test python -m unittest tests.test_query_memory -v
+uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_query_memory -v
 # 持续库存通知（后置子项目 E：契约与逐层门禁、状态机与 gold、runner 投影收窄、
 # CLI/投递；真库并发/崩溃矩阵在 test_db，通知 API 在 test_api）
-uv run --locked --env-file ../.env.test python -m unittest tests.test_monitoring -v
+uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_monitoring -v
 # 底座回归
 uv run python -m unittest tests.test_core -v
-uv run --env-file ../.env.test python -m unittest tests.test_db tests.test_api tests.test_runtime_db -v
-# 修订后的 26 题离线验收（题库与 runner 已不再是旧 20 题）
-uv run --env-file ../.env.test python -m tests.acceptance --offline
+uv run --locked --env-file ../.env.evaluation python -m unittest tests.test_db tests.test_api tests.test_runtime_db -v
+# 既有离线验收合同（题数以 runner 输出为准）
+uv run --locked --env-file ../.env.evaluation python -m tests.acceptance --offline
 Set-Location ../frontend
 npm test
 npm run build
 ```
 
 离线验收只能证明协议、口径与确定性执行；它不证明模型理解准确率，也不构成任何平台真实来源已就绪的证据。
-这些套件都写同一个 `bi_agent_test`（外层事务回滚，但种子行、advisory 锁与共享表仍是全局态），
+这些套件共用同一个评测沙箱实例（外层事务回滚，但种子行、advisory 锁与共享表仍是全局态），
 所以请**逐条顺序跑**。本轮出现过一次“两个套件并发跑时其中一份多一个错误、串行重跑两次均干净”的
 现场，未能稳定复现也不归因；验收报告里引用的数字均来自串行重跑。
-本轮验收结果、逐能力就绪清单与**未执行项**（真实 provider smoke/live、真实接口取证、生产迁移与恢复、
-一周试用）逐条记在 [Task 11 日期化发布验收](superpowers/research/2026-09-14-task-11-release-acceptance.md)；
-门禁七项中只有前三项已完成，因此不得拿本页的命令通过当作“可发布给运营用户试用”。
+当前验证证据、未执行项与发布门禁状态见[项目状态](PROJECT_STATUS.md)；历史 Task 11 发布门禁第 4–7 项完成前，不得拿本页的命令通过当作“可发布给运营用户试用”。
 上架价复核与库存预警在真实部署里只能返回 `unsupported`：两个领域的来源注册表默认为空，
 只有测试进程内的合成登记会暂时打开它们（跑完即恢复）。
 

@@ -820,7 +820,7 @@ def run_offline() -> int:
                "passed": len(questions) - failures, "failures": failures,
                "result": "pass" if failures == 0 else "fail",
                "note": "离线模式不能证明模型理解准确率，也不构成任何平台真实来源就绪的证据；"
-                       "live结果见docs/demo.md"}
+                       "live状态见docs/PROJECT_STATUS.md"}
     print(json.dumps(summary, ensure_ascii=False))
     return 0 if failures == 0 else 1
 

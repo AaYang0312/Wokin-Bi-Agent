@@ -347,7 +347,7 @@ class DatabaseTests(unittest.TestCase):
         例外：S4 档案价快照视图（v_item_price_snapshot_items）按 margin_ref
         口径显式暴露 ERP 档案参考成本——那是快照事实本身，与 bi.products
         采购成本是两个口径（2026-09-28 决策，见
-        docs/superpowers/research/2026-09-28-s4-acceptance.md）。
+        docs/archive/research/2026-09-28-s4-acceptance.md）。
         """
         columns = [row[0] for row in self.conn.execute(
             "SELECT column_name FROM information_schema.columns "

@@ -823,7 +823,7 @@ def mark_refund_canonical(conn, shop_id: str, platform_refund_ids: set[str]) -> 
 # ---------------------------------------------------------------------------
 
 
-# 实测会“成功却省略 list”的接口清单（docs/superpowers/research/
+# 实测会“成功却省略 list”的接口清单（docs/archive/research/
 # 2026-09-06-kuaimai-data-recheck.json）：erp.item.history.cost.price.query、
 # erp.item.sku.list.get、stock.api.status.query、erp.item.warehouse.list.get、
 # erp.wave.logistics.order.query、erp.aftersale.refund.warehouse.query、
@@ -1252,7 +1252,7 @@ def fetch_consign_window(client: KuaimaiClient, *, shop_id: str,
 
 
 # S2 取证（2026-09-25，两店半月窗口、A/B 对称差集 100% 归因于「未发货单」，
-# 见 docs/superpowers/research/2026-09-25-s2-acceptance.md）：出库通道的
+# 见 docs/archive/research/2026-09-25-s2-acceptance.md）：出库通道的
 # pay_time 参数语义随渠道漂移，淘系支付窗口改由宽出库窗 + 本地 payTime 过滤
 # 建立；±15 天保证实测全部差集类别都在解释闭集内。
 PAYMENT_WINDOW_PAD = timedelta(days=15)

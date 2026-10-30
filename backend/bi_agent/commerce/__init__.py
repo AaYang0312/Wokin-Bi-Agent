@@ -10,6 +10,6 @@
 `import bi_agent.agent` 变成一条循环导入。请从具体模块导入，例如
 `from bi_agent.commerce.tool import analyze_product_performance`。
 
-口径与验收来源：`docs/superpowers/plans/2026-09-11-data-and-query-closure.md`
-Task 7、`docs/superpowers/specs/2026-09-11-operator-workflows-design.md` §3–§6。
+口径与验收来源：`docs/archive/plans/2026-09-11-data-and-query-closure.md`
+Task 7、`docs/archive/specs/2026-09-11-operator-workflows-design.md` §3–§6。
 """

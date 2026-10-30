@@ -1,7 +1,7 @@
 """快麦开放平台只读客户端：官方参数、签名、HTTP、分页响应和会话续期。
 
 签名与公共参数依据官方公开全文「API调用方法详解」（llms-full.txt，快照
-SHA-256 见 docs/superpowers/research/2026-09-06-kuaimai-data-verification.md）。
+SHA-256 见 docs/archive/research/2026-09-06-kuaimai-data-verification.md）。
 错误只携带脱敏类别，不携带服务端原文；日志只输出字段白名单。
 """
 
@@ -69,7 +69,7 @@ def parse_page(payload: dict[str, object], *, allow_omitted_list: bool = False,
     `list`，而 `item.list.query` 实测返回 `items`（2026-09-11 只读核验）。
 
     allow_omitted_list 仅给实测确实会省略 list 的接口预留（见
-    docs/superpowers/research/2026-09-06-kuaimai-data-recheck.json 中
+    docs/archive/research/2026-09-06-kuaimai-data-recheck.json 中
     erp.item.history.cost.price.query / erp.item.sku.list.get /
     stock.api.status.query / erp.item.warehouse.list.get /
     erp.wave.logistics.order.query / erp.aftersale.refund.warehouse.query /

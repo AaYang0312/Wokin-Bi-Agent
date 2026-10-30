@@ -1,6 +1,6 @@
 """数据就绪判定：覆盖、业务截止、质量三件事分开取证。
 
-口径来自 docs/superpowers/plans/2026-09-11-data-and-query-closure.md Task 1：
+口径来自 docs/archive/plans/2026-09-11-data-and-query-closure.md Task 1：
 
 - `covered` 只说明哪段业务时间已完整入库，不说明数据对不对。
 - `data_as_of` 只说明已完整处理的源数据截止时刻，禁止用 `last_success_at` 顶替。

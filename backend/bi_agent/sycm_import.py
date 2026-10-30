@@ -1,6 +1,6 @@
 """生意参谋手工导出导入（计划 §3.M2）：标准库 xlsx 读取器 + 校验管线 + 导入器 + CLI。
 
-设计契约（全部 fail closed，见 docs/superpowers/plans/2026-10-02-manual-sycm-export-import.md）：
+设计契约（全部 fail closed，见 docs/archive/plans/2026-10-02-manual-sycm-export-import.md）：
 
 1. **读取器防护**：文件 ≤5MB、zip 解压总量 ≤64MB（在读取任何成员**之前**按
    ZipInfo 声明大小判，绝不先解压再发现是炸弹）、数据行 ≤20 万、列 ≤256、

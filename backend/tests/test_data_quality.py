@@ -1,6 +1,6 @@
 """Task 1：数据覆盖验收与版本来源。
 
-四类的失败面来自 docs/superpowers/plans/2026-09-11-data-and-query-closure.md Task 1：
+四类的失败面来自 docs/archive/plans/2026-09-11-data-and-query-closure.md Task 1：
 有店铺无事实、窗口有缺口、成功同步但业务截止未推进、对账失败。
 本模块只读 reporting 视图与新增的就绪凭证表，不碰快麦接口。
 """

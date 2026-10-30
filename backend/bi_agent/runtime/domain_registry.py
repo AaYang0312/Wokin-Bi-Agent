@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# Artifact 类型白名单（docs/superpowers/specs/2026-09-11-operator-workflows-design.md
+# Artifact 类型白名单（docs/archive/specs/2026-09-11-operator-workflows-design.md
 # 第 3 节），metric_result 是既有类型，必须继续可用。
 ARTIFACT_TYPES = frozenset({
     "metric_result",
