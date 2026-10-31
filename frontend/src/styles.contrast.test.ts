@@ -30,35 +30,32 @@ function contrast(foreground: string, background: string): number {
   return (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05)
 }
 
-// 卡片表面是半透明白渐变叠在 --bg-app 上；顶端最亮，也最容易吃掉文字对比度。
-function overlay(foregroundAlpha: number, background: string): string {
-  const base = rgb(background)
-  return base
-    .map((value) => Math.round(255 * foregroundAlpha + value * (1 - foregroundAlpha))
-      .toString(16).padStart(2, '0'))
-    .join('')
-    .replace(/^/, '#')
-}
+describe('浅色主题文字对比度', () => {
+  const surfaces = ['bg-app', 'bg-shell', 'surface', 'surface-sunken', 'surface-solid']
 
-describe('深色主题文字对比度', () => {
-  const bgApp = hex('bg-app')
-  const cardTop = overlay(0.062, bgApp)
-
-  it('保持 --bg-app 为近黑底', () => {
-    expect(bgApp).toBe('#0e0c14')
+  it('正文、次要文字与辅助标签在所有中性表面上满足 4.5:1', () => {
+    for (const foreground of ['text', 'text-2', 'text-3']) {
+      for (const background of surfaces) {
+        expect(contrast(hex(foreground), hex(background)), `${foreground} / ${background}`)
+          .toBeGreaterThanOrEqual(4.5)
+      }
+    }
+    expect(luminance(rgb(hex('text')))).toBeLessThan(luminance(rgb(hex('text-2'))))
+    expect(luminance(rgb(hex('text-2')))).toBeLessThan(luminance(rgb(hex('text-3'))))
   })
 
-  it('--text-3 在最亮实际底色上仍满足 4.5:1', () => {
-    const text3 = hex('text-3')
-    expect(contrast(text3, bgApp)).toBeGreaterThanOrEqual(4.5)
-    expect(contrast(text3, cardTop)).toBeGreaterThanOrEqual(4.5)
+  it('主按钮与链接在默认和悬停状态下满足 4.5:1', () => {
+    for (const background of ['accent', 'accent-deep']) {
+      expect(contrast(hex('text-on-accent'), hex(background))).toBeGreaterThanOrEqual(4.5)
+    }
+    for (const background of surfaces) {
+      expect(contrast(hex('accent-soft'), hex(background))).toBeGreaterThanOrEqual(4.5)
+    }
   })
 
-  it('--text-2 满足正文对比度且仍亮于 --text-3', () => {
-    const text2 = hex('text-2')
-    const text3 = hex('text-3')
-    expect(contrast(text2, bgApp)).toBeGreaterThanOrEqual(4.5)
-    expect(contrast(text2, cardTop)).toBeGreaterThanOrEqual(4.5)
-    expect(luminance(rgb(text2))).toBeGreaterThan(luminance(rgb(text3)))
+  it('警告、错误和成功文字满足 4.5:1', () => {
+    expect(contrast(hex('warning'), hex('warning-surface'))).toBeGreaterThanOrEqual(4.5)
+    expect(contrast(hex('danger'), hex('danger-surface'))).toBeGreaterThanOrEqual(4.5)
+    expect(contrast(hex('ok'), hex('surface'))).toBeGreaterThanOrEqual(4.5)
   })
 })
