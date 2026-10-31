@@ -20,6 +20,7 @@ exports/
 *.dump
 logs/
 .serena
+.vscode/
 
 # PostgreSQL 容器逻辑备份（含真实经营数据与角色定义）
 deploy/postgres/backup/
